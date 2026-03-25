@@ -2,7 +2,7 @@
 
 > 基于 OpenWrt 的防火墙 Web 管理面板
 
-**版本：** v0.7.5
+**版本：** v0.7.7
 
 Ghost Firewall 是一个运行在 OpenWrt 上的轻量防火墙管理工具，通过 Web 界面管理 nftables 规则，提供端口敲门、端口转发、DDNS、反向代理等功能。
 

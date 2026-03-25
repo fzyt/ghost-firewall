@@ -90,6 +90,33 @@ def generate_rules(variables, log_switches):
             "        meta nfproto ipv4 drop")
     template = template.replace("# LAN_MODE_BLOCK", lan_block)
 
+    # 白名单访问端口日志
+    if log_switches.get("whitelist_access_log"):
+        template = template.replace(
+            "        # IPv4授权访问\n"
+            "        #ip saddr @allowed4 tcp dport @tcp_services log prefix \"[I4-ALV-T] \" accept\n"
+            "        #ip saddr @allowed4 udp dport @udp_services log prefix \"[I4-ALV-UDP] \" accept\n"
+            "        ip saddr @allowed4 tcp dport @tcp_services accept\n"
+            "        ip saddr @allowed4 udp dport @udp_services accept\n"
+            "\n"
+            "        # IPv6授权访问\n"
+            "        #ip6 saddr @allowed6 tcp dport @tcp_services log prefix \"[I6-ALV-T] \" accept\n"
+            "        #ip6 saddr @allowed6 udp dport @udp_services log prefix \"[I6-ALV-UDP] \" accept\n"
+            "        ip6 saddr @allowed6 tcp dport @tcp_services accept\n"
+            "        ip6 saddr @allowed6 udp dport @udp_services accept",
+            "        # IPv4授权访问\n"
+            "        ip saddr @allowed4 tcp dport @tcp_services log prefix \"[I4-ALV-T] \" accept\n"
+            "        ip saddr @allowed4 udp dport @udp_services log prefix \"[I4-ALV-UDP] \" accept\n"
+            "        #ip saddr @allowed4 tcp dport @tcp_services accept\n"
+            "        #ip saddr @allowed4 udp dport @udp_services accept\n"
+            "\n"
+            "        # IPv6授权访问\n"
+            "        ip6 saddr @allowed6 tcp dport @tcp_services log prefix \"[I6-ALV-T] \" accept\n"
+            "        ip6 saddr @allowed6 udp dport @udp_services log prefix \"[I6-ALV-UDP] \" accept\n"
+            "        #ip6 saddr @allowed6 tcp dport @tcp_services accept\n"
+            "        #ip6 saddr @allowed6 udp dport @udp_services accept"
+        )
+
     # 3. 替换动态转发规则块
     template = template.replace("# FORWARD_RULES_BLOCK", variables.get("FORWARD_RULES_BLOCK", ""))
     template = template.replace("# NAT_RULES_BLOCK", variables.get("NAT_RULES_BLOCK", ""))

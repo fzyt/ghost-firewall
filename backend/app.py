@@ -1,4 +1,4 @@
-# Version: 0.7.5
+# Version: 0.7.7
 from flask import Flask, jsonify, request, send_from_directory
 import os, subprocess, shutil, json, time, re, hmac, hashlib, base64, datetime, uuid
 from template_engine import load_template, generate_rules
@@ -38,6 +38,7 @@ DEFAULT_CONFIG = {
     "wan_drop_log": False,
     "lan_drop_log": False,
     "forward_log": False,
+    "whitelist_access_log": True,
     # 网络段配置
     "lan_subnet4": "192.168.4.0/24",
     "lan_broadcast4": "192.168.4.255",
@@ -301,6 +302,7 @@ def config_to_log_switches(config):
         "wan_drop_log": config.get("wan_drop_log", False),
         "lan_drop_log": config.get("lan_drop_log", False),
         "forward_log": config.get("forward_log", False),
+        "whitelist_access_log": config.get("whitelist_access_log", True),
     }
 
 
@@ -2166,7 +2168,7 @@ def list_flush():
 
 
 # ======================= 反向代理模块 =======================
-# nftables-web v0.7.5 — HTTPS 反向代理管理
+# nftables-web v0.7.6 — HTTPS 反向代理管理
 
 ACME_SH_PATH = os.path.expanduser("~/.acme.sh/acme.sh")
 NGINX_SSL_DIR = "/etc/nginx/ssl"
@@ -2434,10 +2436,18 @@ def _generate_nginx_conf(rule, cert, settings):
     lines.append("    location / {")
     lines.append(f"        proxy_pass {protocol}://{target};")
     lines.append("")
-    lines.append("        proxy_set_header Host $host;")
+    lines.append("        proxy_set_header Host $http_host;")
     lines.append("        proxy_set_header X-Real-IP $remote_addr;")
     lines.append("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
     lines.append("        proxy_set_header X-Forwarded-Proto $scheme;")
+    lines.append("        proxy_set_header X-Forwarded-Host $host;")
+    lines.append("        proxy_set_header X-Forwarded-Port $server_port;")
+    lines.append("")
+    lines.append("        # DSM/Synology cookie 域重写（解决反代登录态丢失）")
+    lines.append("        proxy_cookie_domain ~^(\\d+\\.\\d+\\.\\d+\\.\\d+) $host;")
+    lines.append("")
+    lines.append("        proxy_buffering off;")
+    lines.append("        proxy_request_buffering off;")
     if websocket:
         lines.append("")
         lines.append("        # WebSocket")
@@ -2446,8 +2456,8 @@ def _generate_nginx_conf(rule, cert, settings):
         lines.append('        proxy_set_header Connection "upgrade";')
     lines.append("")
     lines.append("        proxy_connect_timeout 60s;")
-    lines.append("        proxy_send_timeout 60s;")
-    lines.append("        proxy_read_timeout 60s;")
+    lines.append("        proxy_send_timeout 300s;")
+    lines.append("        proxy_read_timeout 300s;")
     lines.append("    }")
     lines.append("}")
     lines.append("")
@@ -2457,17 +2467,20 @@ def _generate_nginx_conf(rule, cert, settings):
 def _write_nginx_conf_file(rule, cert, settings):
     """生成并写入 nginx 配置文件，返回配置文件路径"""
     domain = _sanitize_domain(rule["domain"])
+    listen_port = rule.get("listen_port", 443)
     conf_content = _generate_nginx_conf(rule, cert, settings)
-    conf_path = os.path.join(NGINX_CONF_DIR, f"{domain}.conf")
+    conf_path = os.path.join(NGINX_CONF_DIR, f"{domain}-{listen_port}.conf")
     os.makedirs(NGINX_CONF_DIR, exist_ok=True)
     with open(conf_path, "w") as f:
         f.write(conf_content)
     return conf_path
 
 
-def _remove_nginx_conf_file(domain):
-    """删除某域名的 nginx 配置文件"""
-    conf_path = os.path.join(NGINX_CONF_DIR, f"{_sanitize_domain(domain)}.conf")
+def _remove_nginx_conf_file(rule):
+    """删除反代规则的 nginx 配置文件"""
+    domain = _sanitize_domain(rule.get("domain", ""))
+    listen_port = rule.get("listen_port", 443)
+    conf_path = os.path.join(NGINX_CONF_DIR, f"{domain}-{listen_port}.conf")
     if os.path.exists(conf_path):
         os.remove(conf_path)
         return True
@@ -2631,19 +2644,24 @@ def _deploy_all_rules(config=None):
     settings = rp.get("settings", RP_DEFAULT_SETTINGS)
 
     # 先清理不再存在的域名的配置文件
-    active_domains = {r["domain"] for r in rules if r.get("enabled")}
+    # 构建当前所有启用规则的文件名集合
+    active_conf_files = set()
+    for rule in rules:
+        if rule.get("enabled"):
+            d = _sanitize_domain(rule["domain"])
+            p = rule.get("listen_port", 443)
+            active_conf_files.add(f"{d}-{p}.conf")
+
     if os.path.isdir(NGINX_CONF_DIR):
         for fname in os.listdir(NGINX_CONF_DIR):
             if fname.endswith(".conf"):
-                d = fname[:-5]
-                if d not in active_domains:
+                if fname not in active_conf_files:
                     os.remove(os.path.join(NGINX_CONF_DIR, fname))
 
     # 生成所有启用规则的配置
     for rule in rules:
         if not rule.get("enabled"):
-            # 禁用的规则也要删掉配置文件
-            _remove_nginx_conf_file(rule["domain"])
+            _remove_nginx_conf_file(rule)
             continue
         cert = certs.get(rule.get("ssl_cert_id", ""))
         _write_nginx_conf_file(rule, cert, settings)
@@ -2798,10 +2816,9 @@ def rp_delete_rule(rule_id):
     rule = _find_rp_rule(rp, rule_id)
     if not rule:
         return jsonify({"success": False, "message": "规则不存在"}), 404
-    domain = rule["domain"]
     rp["rules"] = [r for r in rp["rules"] if r["id"] != rule_id]
     _save_rp_config(config)
-    _remove_nginx_conf_file(domain)
+    _remove_nginx_conf_file(rule)
     deploy_ok, deploy_msg = _deploy_all_rules(config)
 
     # 更新防火墙

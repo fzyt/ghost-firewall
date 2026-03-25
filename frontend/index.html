@@ -407,6 +407,18 @@
                 class="absolute top-0.5 left-0 w-5 h-5 bg-white rounded-full shadow transition-transform"></span>
             </button>
           </div>
+          <div class="flex items-center justify-between">
+            <div>
+              <label class="text-sm font-medium">白名单访问日志</label>
+              <p class="text-xs text-gray-500">记录白名单 IP 访问开放端口的连接日志（IPv4/IPv6）</p>
+            </div>
+            <button @click="config.whitelist_access_log = !config.whitelist_access_log"
+              :class="config.whitelist_access_log ? 'bg-black' : 'bg-gray-300'"
+              class="relative w-11 h-6 rounded-full transition-colors flex-shrink-0">
+              <span :class="config.whitelist_access_log ? 'translate-x-5' : 'translate-x-0.5'"
+                class="absolute top-0.5 left-0 w-5 h-5 bg-white rounded-full shadow transition-transform"></span>
+            </button>
+          </div>
         </div>
         <button @click="saveConfig()" :disabled="saving"
           class="px-5 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50 transition-colors">
