@@ -180,8 +180,8 @@ check_env() {
     # 磁盘空间
     local avail
     avail="$(df -k / | awk 'NR==2{print $4}')"
-    if [ "$avail" -lt 51200 ] 2>/dev/null; then
-        die "磁盘空间不足（可用: $((avail/1024))MB，至少需要 50MB）"
+    if [ "$avail" -lt 30720 ] 2>/dev/null; then
+        die "磁盘空间不足（可用: $((avail/1024))MB，至少需要 30MB）"
     fi
     ok "磁盘空间: $((avail/1024))MB 可用"
 
@@ -209,6 +209,19 @@ install_deps() {
         nginx-ssl \
         curl openssl-util socat \
         ca-certificates wget-ssl
+
+    # 安装 Python 依赖（pip）
+    if ! python3 -c "import blinker" 2>/dev/null; then
+        info "安装 Python 依赖: blinker"
+        # 确保 pip 可用
+        if ! command -v pip3 >/dev/null 2>&1; then
+            case "$PKG_MANAGER" in
+                opkg) pkg_install python3-pip ;;
+                apk) pkg_install python3-pip ;;
+            esac
+        fi
+        pip3 install blinker --break-system-packages 2>/dev/null || pip3 install blinker 2>/dev/null || warn "blinker 安装失败"
+    fi
 
     ok "✅ 依赖安装完成"
 }
@@ -534,6 +547,20 @@ EOF
 # ============================================================
 # 7. init.d 服务
 # ============================================================
+ensure_ubus() {
+    if ! ubus list >/dev/null 2>&1; then
+        warn "ubus 不可用，尝试启动 ubusd..."
+        ubusd 2>/dev/null
+        sleep 1
+        if ! ubus list >/dev/null 2>&1; then
+            warn "ubus 仍不可用，init.d 服务可能无法正常工作"
+        else
+            ok "ubusd 已启动"
+        fi
+    fi
+}
+
+# ============================================================
 setup_service() {
     info "========== 配置服务 =========="
 
@@ -720,6 +747,7 @@ main() {
     setup_nginx
     deploy_project
     init_config
+    ensure_ubus
     setup_service
     setup_nftables
     show_summary
