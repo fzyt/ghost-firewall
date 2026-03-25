@@ -420,12 +420,24 @@ deploy_project() {
         tar -xzf "${tmp_dir}/archive.tar.gz" -C "$tmp_dir"
 
         mkdir -p "$INSTALL_DIR"
-        if [ -d "${tmp_dir}/ghost-firewall-${tag#v}" ]; then
-            cp -r "${tmp_dir}/ghost-firewall-${tag#v}/"* "$INSTALL_DIR/"
-        elif [ -d "${tmp_dir}/${PROJECT_NAME}-${tag}" ]; then
-            cp -r "${tmp_dir}/${PROJECT_NAME}-${tag}/"* "$INSTALL_DIR/"
+        # 查找解压后的项目目录（可能是 ghost-firewall-{tag} 或 ghost-firewall-{tag#v}）
+        local src_dir=""
+        for candidate in "ghost-firewall-${tag#v}" "ghost-firewall-${tag}" "ghost-firewall-main"; do
+            if [ -d "${tmp_dir}/${candidate}" ]; then
+                src_dir="${tmp_dir}/${candidate}"
+                break
+            fi
+        done
+        # 如果精确匹配失败，取 tmp_dir 下唯一的子目录
+        if [ -z "$src_dir" ]; then
+            src_dir="$(find "$tmp_dir" -mindepth 1 -maxdepth 1 -type d | head -1)"
+        fi
+        if [ -n "$src_dir" ] && [ -d "$src_dir" ]; then
+            cp -r "${src_dir}/." "$INSTALL_DIR/"
         else
-            cp -r "${tmp_dir}/"* "$INSTALL_DIR/"
+            error "解压后未找到项目目录"
+            rm -rf "$tmp_dir"
+            return 1
         fi
 
         rm -rf "$tmp_dir"
