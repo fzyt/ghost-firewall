@@ -11,7 +11,7 @@ set -e
 # ============================================================
 # 变量定义
 # ============================================================
-VERSION="0.7.0"
+VERSION="0.7.7"
 PROJECT_NAME="nftables-web-v2"
 INSTALL_DIR="/opt/nftables-web-v2"
 CONFIG_DIR="/etc/nftables"
@@ -19,9 +19,48 @@ CONFIG_FILE="${CONFIG_DIR}/nftables-web-config.json"
 NFTABLES_CONF="/etc/nftables.conf"
 INITD_SCRIPT="/etc/init.d/nftables-web"
 LOG_FILE="/var/log/nftables-web-setup.log"
-GITHUB_REPO="username/nftables-web-v2"
+GITHUB_REPO="fzyt/ghost-firewall"
 ACME_EMAIL="admin@example.com"
 ARG_FORCE=0
+
+# 自动检测包管理器
+detect_pkg_manager() {
+    if command -v opkg >/dev/null 2>&1; then
+        PKG_MANAGER="opkg"
+    elif command -v apk >/dev/null 2>&1; then
+        PKG_MANAGER="apk"
+    else
+        die "未找到包管理器（opkg 或 apk）"
+    fi
+}
+
+pkg_install() {
+    for pkg in "$@"; do
+        case "$PKG_MANAGER" in
+            opkg)
+                if opkg list-installed | grep -q "^${pkg} "; then
+                    info "已安装: ${pkg}"; continue
+                fi
+                info "安装: ${pkg}"
+                opkg install "$pkg" || warn "安装失败: ${pkg}"
+                ;;
+            apk)
+                if apk info -e "$pkg" >/dev/null 2>&1; then
+                    info "已安装: ${pkg}"; continue
+                fi
+                info "安装: ${pkg}"
+                apk add "$pkg" || warn "安装失败: ${pkg}"
+                ;;
+        esac
+    done
+}
+
+pkg_update() {
+    case "$PKG_MANAGER" in
+        opkg) opkg update ;;
+        apk) apk update ;;
+    esac
+}
 
 # 参数解析
 ARG_VERSION=""
@@ -146,6 +185,9 @@ check_env() {
     fi
     ok "磁盘空间: $((avail/1024))MB 可用"
 
+    detect_pkg_manager
+    ok "包管理器: ${PKG_MANAGER}"
+
     ok "✅ 环境检查通过"
 }
 
@@ -155,46 +197,18 @@ check_env() {
 install_deps() {
     info "========== 安装依赖 =========="
 
-    opkg update || warn "opkg update 失败，继续尝试安装..."
+    pkg_update || warn "包列表更新失败，继续尝试安装..."
 
-    local pkgs="
-        nftables
-        python3 python3-light python3-requests python3-flask
-        ddns-scripts
-        ddns-scripts-cloudflare ddns-scripts-dnspod
-        ddns-scripts-noip ddns-scripts-nsupdate
-        ddns-scripts-godaddy ddns-scripts-namecheap
-        nginx-ssl
-        curl openssl-util socat
+    pkg_install \
+        nftables \
+        python3 python3-light python3-requests python3-flask \
+        ddns-scripts \
+        ddns-scripts-cloudflare ddns-scripts-dnspod \
+        ddns-scripts-noip ddns-scripts-nsupdate \
+        ddns-scripts-godaddy ddns-scripts-namecheap \
+        nginx-ssl \
+        curl openssl-util socat \
         ca-certificates wget-ssl
-    "
-
-    local failed=""
-    local failed_pkgs=""
-
-    for pkg in $pkgs; do
-        if opkg list-installed | grep -q "^${pkg} "; then
-            info "已安装: ${pkg}"
-            continue
-        fi
-
-        info "安装: ${pkg}"
-        if opkg install "$pkg" 2>/dev/null; then
-            ok "安装成功: ${pkg}"
-        elif opkg install "$pkg" 2>/dev/null; then
-            ok "安装成功（重试）: ${pkg}"
-        else
-            warn "❌ 安装失败: ${pkg}"
-            failed_pkgs="${failed_pkgs} ${pkg}"
-            failed=1
-        fi
-    done
-
-    if [ -n "$failed" ]; then
-        error "以下包安装失败:${failed_pkgs}"
-        error "建议：更换 opkg 源后重试（opkg update），或检查网络连接"
-        die "依赖安装未完全成功"
-    fi
 
     ok "✅ 依赖安装完成"
 }
@@ -210,19 +224,13 @@ install_acme() {
         return
     fi
 
-    # 优先尝试 opkg
-    if opkg list-installed | grep -q "^acme-acmesh " 2>/dev/null; then
-        ok "acme-acmesh 已通过 opkg 安装"
+    info "尝试通过 ${PKG_MANAGER} 安装 acme-acmesh..."
+    if pkg_install acme-acmesh 2>/dev/null; then
+        ok "✅ acme-acmesh 安装成功"
         return
     fi
 
-    info "尝试通过 opkg 安装 acme-acmesh..."
-    if opkg install acme-acmesh 2>/dev/null; then
-        ok "✅ acme-acmesh 通过 opkg 安装成功"
-        return
-    fi
-
-    warn "opkg 安装 acme-acmesh 失败，尝试通过 curl pipe 安装..."
+    warn "${PKG_MANAGER} 安装 acme-acmesh 失败，尝试通过 curl pipe 安装..."
     warn "⚠️  安全提示：pipe 安装会从 get.acme.sh 下载并直接执行脚本"
     warn "    如果担心安全风险，请手动下载 acme.sh 源码后安装"
 
@@ -400,48 +408,21 @@ deploy_project() {
 
     # GitHub 安装
     local tag="${ARG_VERSION:-v${VERSION}}"
-    local filename="${PROJECT_NAME}-${tag}.tar.gz"
-    local url="https://github.com/${GITHUB_REPO}/releases/download/${tag}/${filename}"
-    local checksum_url="https://github.com/${GITHUB_REPO}/releases/download/${tag}/${filename}.sha256sum"
+    local url="https://github.com/${GITHUB_REPO}/archive/refs/tags/${tag}.tar.gz"
     local tmp_dir
     tmp_dir="$(mktemp -d)"
 
     info "下载 ${PROJECT_NAME} ${tag} ..."
     if curl --connect-timeout 30 --max-time 300 --retry 2 --retry-delay 3 \
-         -fsSL -o "${tmp_dir}/${filename}" "$url" 2>/dev/null; then
-
-        # 验证 SHA256 checksum（如果 checksum 文件可用）
-        # 发布时需在同目录附 ${filename}.sha256sum 文件
-        local checksum_found=0
-        if curl --connect-timeout 15 --max-time 60 -fsSL -o "${tmp_dir}/${filename}.sha256sum" "$checksum_url" 2>/dev/null; then
-            info "正在验证 SHA256 校验和..."
-            (cd "$tmp_dir" && sha256sum -c "${filename}.sha256sum" 2>/dev/null) && {
-                ok "SHA256 校验和验证通过"
-                checksum_found=1
-            } || {
-                warn "SHA256 校验和验证失败！文件可能已被篡改"
-                if is_interactive; then
-                    printf "校验和不匹配，是否继续安装？[y/N] "
-                    read -r answer
-                    case "$answer" in
-                        y|Y|yes|YES) warn "用户选择继续安装" ;;
-                        *) rm -rf "$tmp_dir"; die "安装已取消（校验和不匹配）" ;;
-                    esac
-                else
-                    rm -rf "$tmp_dir"
-                    die "SHA256 校验和不匹配，非交互模式中止安装"
-                fi
-            }
-        else
-            warn "⚠️  未找到 SHA256 校验和文件（${filename}.sha256sum）"
-            warn "    建议发布时附带 .sha256sum 文件以确保文件完整性"
-        fi
+         -fsSL -o "${tmp_dir}/archive.tar.gz" "$url" 2>/dev/null; then
 
         info "解压..."
-        tar -xzf "${tmp_dir}/${filename}" -C "$tmp_dir"
+        tar -xzf "${tmp_dir}/archive.tar.gz" -C "$tmp_dir"
 
         mkdir -p "$INSTALL_DIR"
-        if [ -d "${tmp_dir}/${PROJECT_NAME}-${tag}" ]; then
+        if [ -d "${tmp_dir}/ghost-firewall-${tag#v}" ]; then
+            cp -r "${tmp_dir}/ghost-firewall-${tag#v}/"* "$INSTALL_DIR/"
+        elif [ -d "${tmp_dir}/${PROJECT_NAME}-${tag}" ]; then
             cp -r "${tmp_dir}/${PROJECT_NAME}-${tag}/"* "$INSTALL_DIR/"
         else
             cp -r "${tmp_dir}/"* "$INSTALL_DIR/"
