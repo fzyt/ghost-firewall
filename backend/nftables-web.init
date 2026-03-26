@@ -1,0 +1,63 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+STOP=10
+
+APP_DIR="/opt/nftables-web-v2/backend"
+LOG_FILE="/var/log/nftables-web.log"
+PID_FILE="/var/run/nftables-web.pid"
+
+start() {
+    # 仅启动 Web 管理服务
+    # 首次安装不会影响现有防火墙配置
+
+    # 如果已存在自定义规则文件，说明用户已配置过，自动恢复
+    if [ -f /etc/nftables.d/99-custom-rules.nft ]; then
+        /etc/init.d/firewall stop 2>/dev/null
+        /etc/init.d/firewall disable 2>/dev/null
+        nft -f /etc/nftables.d/99-custom-rules.nft 2>/dev/null
+    fi
+
+    # 自动设置时区
+    [ "$(uci -q get system.@system[0].timezone)" != "CST-8" ] && {
+        uci set system.@system[0].timezone='CST-8'
+        uci set system.@system[0].zonename='Asia/Shanghai'
+        uci commit system
+    }
+    [ "$(cat /etc/TZ 2>/dev/null)" != "CST-8" ] && echo "CST-8" > /etc/TZ
+
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        echo "nftables-web is already running (PID $(cat "$PID_FILE"))"
+        return 0
+    fi
+    echo "Starting nftables-web..."
+    cd "$APP_DIR" || return 1
+    python3 app.py > "$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+    echo "Started (PID $!)"
+}
+
+stop() {
+    if [ -f "$PID_FILE" ]; then
+        local pid
+        pid=$(cat "$PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "Stopping nftables-web (PID $pid)..."
+            kill "$pid"
+            sleep 1
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -9 "$pid" 2>/dev/null
+            fi
+        fi
+        rm -f "$PID_FILE"
+        echo "Stopped"
+    else
+        echo "nftables-web is not running"
+    fi
+}
+
+restart() {
+    stop
+    sleep 1
+    start
+}

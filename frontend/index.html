@@ -1,0 +1,1653 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>nftables 防火墙管理</title>
+  <script src="/assets/tailwind.js"></script>
+  <script defer src="/assets/alpine.js"></script>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body class="bg-white text-gray-900 min-h-screen">
+  <div x-data="app()" class="flex min-h-screen">
+    <!-- 侧边导航 -->
+    <aside class="w-56 border-r flex-shrink-0 bg-gray-50 flex flex-col">
+      <div class="p-5 border-b">
+        <h1 class="text-lg font-bold">nftables</h1>
+        <p class="text-xs text-gray-400 mt-1">防火墙管理面板</p>
+      </div>
+      <nav class="flex-1 p-3 space-y-1">
+        <template x-for="item in navItems" :key="item.id">
+          <button @click="currentNav = item.id; if (item.id === 'ddns') loadDdns(); if (item.id === 'syslog') loadSystemLogs(); if (item.id === 'lists') loadLists(); if (item.id === 'firewall-status') loadFirewallStatus(); if (item.id === 'reverse-proxy') loadReverseProxy();"
+            :class="currentNav === item.id ? 'bg-black text-white' : 'text-gray-600 hover:bg-gray-100'"
+            class="w-full text-left px-3 py-2.5 rounded-lg text-sm font-medium transition-colors"
+            x-text="item.label"></button>
+        </template>
+      </nav>
+      <div class="p-4 border-t text-xs text-gray-400">
+        <div x-show="loading" class="flex items-center gap-2">
+          <svg class="animate-spin h-3 w-3" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+          加载中...
+        </div>
+      </div>
+    </aside>
+
+    <!-- 主内容区 -->
+    <main class="flex-1 p-8 overflow-auto">
+
+      <!-- Toast -->
+      <div x-show="toast.show" x-transition
+        class="fixed top-6 left-6 z-50 p-4 rounded-lg shadow-lg text-sm max-w-sm"
+        :class="toast.type === 'success' ? 'bg-green-50 text-green-800 border border-green-200' : 'bg-red-50 text-red-800 border border-red-200'"
+        x-text="toast.message"></div>
+
+      <!-- 右上角应用规则按钮 -->
+      <div class="fixed top-6 right-6 z-40 flex items-center gap-2">
+        <span class="text-xs text-gray-400 hidden md:block">先保存配置，再应用规则</span>
+        <button @click="if(confirm('确定要恢复到上一次备份的配置吗？')) restoreConfig()"
+          class="px-4 py-2 border border-red-500 text-red-600 rounded text-sm hover:bg-red-50 transition-colors">
+          恢复配置
+        </button>
+        <button @click="confirm('请确认已先保存配置，再点击确定应用防火墙规则。') ? applyRules() : null" :disabled="applying"
+          class="px-4 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50 transition-colors">
+          <span x-text="applying ? '应用中...' : '应用规则'"></span>
+        </button>
+      </div>
+
+      <!-- 加载遮罩 -->
+      <div x-show="loading" class="flex items-center justify-center py-20">
+        <div class="text-gray-400">加载配置中...</div>
+      </div>
+
+      <!-- ========== 网络接口 ========== -->
+      <div x-show="currentNav === 'network'">
+        <h1 class="text-2xl font-bold mb-6">网络接口</h1>
+
+        <!-- 可用接口显示 -->
+        <div class="mb-4 px-4 py-3 bg-blue-50 border border-blue-200 rounded-lg text-sm">
+          <span class="font-medium text-blue-800">可用接口：</span>
+          <span x-text="availableInterfaces" class="text-blue-600 ml-1"></span>
+        </div>
+
+        <!-- 自动识别提示 -->
+        <div x-show="autoDetected" x-transition class="mb-4 px-4 py-3 bg-green-50 border border-green-200 rounded-lg text-sm text-green-800">
+          <span x-text="autoDetectedMessage"></span>
+        </div>
+
+        <div class="space-y-6">
+          <!-- WAN 配置 -->
+          <div class="bg-gray-50 border rounded-lg p-5">
+            <h2 class="text-lg font-semibold mb-4">WAN 接口</h2>
+
+            <div class="space-y-4">
+              <!-- PPPoE 开关 -->
+              <div class="flex items-center justify-between">
+                <div>
+                  <label class="text-sm font-medium">PPPoE 拨号</label>
+                  <p class="text-xs text-gray-500">开启后 WAN 接口自动设为 pppoe-wan，关闭则使用 DHCP</p>
+                </div>
+                <button @click="togglePppoe()"
+                  :class="networkConfig.wan_pppoe ? 'bg-black' : 'bg-gray-300'"
+                  class="relative w-11 h-6 rounded-full transition-colors">
+                  <span :class="networkConfig.wan_pppoe ? 'translate-x-5' : 'translate-x-0.5'"
+                    class="absolute top-0.5 left-0 w-5 h-5 bg-white rounded-full shadow transition-transform"></span>
+                </button>
+              </div>
+
+              <!-- PPPoE 开：显示固定的 pppoe-wan -->
+              <div x-show="networkConfig.wan_pppoe" x-transition>
+                <label class="block text-sm font-medium mb-1">WAN 接口</label>
+                <input type="text" value="pppoe-wan" disabled
+                  class="w-full border border-gray-200 rounded px-3 py-2 text-sm bg-gray-100 text-gray-500">
+                <p class="text-xs text-gray-400 mt-1">PPPoE 拨号模式下自动设为 pppoe-wan</p>
+              </div>
+
+              <!-- PPPoE 关：显示从 network 读取的接口（不可修改） -->
+              <div x-show="!networkConfig.wan_pppoe" x-transition>
+                <label class="block text-sm font-medium mb-1">WAN 接口</label>
+                <input type="text" :value="networkConfig.wan_device" disabled
+                  class="w-full border border-gray-200 rounded px-3 py-2 text-sm bg-gray-100 text-gray-500">
+                <p class="text-xs text-gray-400 mt-1">从 OpenWrt 网络配置自动读取，如需修改请编辑 /etc/config/network</p>
+              </div>
+
+              <!-- PPPoE 账号密码（开关打开时显示） -->
+              <div x-show="networkConfig.wan_pppoe" x-transition class="space-y-4 pl-4 border-l-2 border-gray-200">
+                <div>
+                  <label class="block text-sm font-medium mb-1">宽带账号</label>
+                  <input type="text" x-model="networkConfig.wan_pppoe_username" placeholder="宽带用户名"
+                    class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+                </div>
+                <div>
+                  <label class="block text-sm font-medium mb-1">宽带密码</label>
+                  <input type="password" x-model="networkConfig.wan_pppoe_password" placeholder="宽带密码"
+                    class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+                </div>
+                <p class="text-xs text-amber-600">⚠️ PPPoE 配置需要重启网络才能生效</p>
+              </div>
+            </div>
+          </div>
+
+          <!-- LAN 配置 -->
+          <div class="bg-gray-50 border rounded-lg p-5">
+            <h2 class="text-lg font-semibold mb-4">LAN 接口</h2>
+
+            <div class="space-y-4">
+              <!-- LAN 接口显示（从 /etc/network 读取，不可修改） -->
+              <div>
+                <label class="block text-sm font-medium mb-1">LAN 接口</label>
+                <input type="text" :value="networkConfig.lan_device" disabled
+                  class="w-full border border-gray-200 rounded px-3 py-2 text-sm bg-gray-100 text-gray-500">
+                <p class="text-xs text-gray-400 mt-1">自动从 OpenWrt 网络配置识别，如需修改请编辑 /etc/config/network</p>
+              </div>
+
+              <!-- LAN IP -->
+              <div>
+                <label class="block text-sm font-medium mb-1">LAN IP 地址</label>
+                <input type="text" x-model="networkConfig.lan_ipaddr" placeholder="192.168.1.1" disabled
+                  class="w-full border rounded px-3 py-2 text-sm bg-gray-100 text-gray-500">
+                <p class="text-xs text-gray-400 mt-1">如需修改请编辑 /etc/config/network</p>
+              </div>
+
+              <!-- LAN 子网掩码 -->
+              <div>
+                <label class="block text-sm font-medium mb-1">LAN 子网掩码</label>
+                <input type="text" x-model="networkConfig.lan_netmask" placeholder="255.255.255.0" disabled
+                  class="w-full border rounded px-3 py-2 text-sm bg-gray-100 text-gray-500">
+                <p class="text-xs text-gray-400 mt-1">如需修改请编辑 /etc/config/network</p>
+              </div>
+            </div>
+          </div>
+
+          <!-- 路由器 IP（用于 nftables 规则） -->
+          <div class="bg-gray-50 border rounded-lg p-5">
+            <h2 class="text-lg font-semibold mb-4">路由器网关 IP</h2>
+            <p class="text-xs text-gray-500 mb-3">用于 nftables 规则中的 ROUTER_IP4 变量，通常与 LAN IP 相同</p>
+            <div class="w-1/2">
+              <input type="text" x-model="config.router_ip4" placeholder="192.168.1.1"
+                class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+              <p class="text-xs text-gray-400 mt-1">修改后需保存并应用到防火墙规则</p>
+            </div>
+            <div class="w-1/2 mt-3">
+              <input type="text" x-model="config.router_ip6" placeholder="fe80::11:32ff:fe2e:ff57"
+                class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+              <p class="text-xs text-gray-400 mt-1">用于 nftables 规则中的 ROUTER_IP6 变量，默认自动从路由器读取</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- 操作按钮 -->
+        <div class="flex gap-3 mt-6">
+          <div class="flex items-center gap-2">
+            <button @click="saveNetworkConfig()" :disabled="networkSaving"
+              class="px-5 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50">
+              <span x-text="networkSaving ? '保存中...' : '保存网络配置'"></span>
+            </button>
+            <span class="text-xs text-gray-400">⚠️ 请务必先配置好防火墙规则并"应用规则"，再点击保存网络配置！否则保存网络配置后网络重启期间防火墙无保护！</span>
+          </div>
+          <button @click="restartNetwork()" :disabled="networkRestarting"
+            class="px-5 py-2 border border-red-500 text-red-600 rounded text-sm hover:bg-red-50 disabled:opacity-50">
+            <span x-text="networkRestarting ? '重启中...' : '重启网络'"></span>
+          </button>
+          <div class="flex items-center gap-2">
+            <button @click="saveConfig()" :disabled="saving"
+              class="px-5 py-2 border border-black rounded text-sm hover:bg-gray-50 disabled:opacity-50">
+              保存防火墙配置
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ========== 端口敲门 ========== -->
+      <div x-show="currentNav === 'knock' && !loading">
+        <h1 class="text-2xl font-bold mb-6">端口敲门</h1>
+        <div class="bg-gray-50 border rounded-lg p-5 mb-6 space-y-4">
+          <p class="text-sm text-gray-500">按顺序访问4个端口完成敲门认证。建议使用高端口避免被扫描。</p>
+          <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <div>
+              <label class="block text-sm font-medium mb-1">敲门端口 1</label>
+              <input type="number" x-model.number="config.knock1_port" min="1" max="65535"
+                class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+            </div>
+            <div>
+              <label class="block text-sm font-medium mb-1">敲门端口 2</label>
+              <input type="number" x-model.number="config.knock2_port" min="1" max="65535"
+                class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+            </div>
+            <div>
+              <label class="block text-sm font-medium mb-1">敲门端口 3</label>
+              <input type="number" x-model.number="config.knock3_port" min="1" max="65535"
+                class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+            </div>
+            <div>
+              <label class="block text-sm font-medium mb-1">敲门端口 4</label>
+              <input type="number" x-model.number="config.knock4_port" min="1" max="65535"
+                class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+            </div>
+          </div>
+          <div class="flex items-center gap-3 pt-2">
+            <label class="text-sm font-medium whitespace-nowrap">白名单超时时间:</label>
+            <input type="number" x-model.number="whitelistTimeoutValue" min="1"
+              class="w-24 border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+            <select x-model="whitelistTimeoutUnit"
+              class="border rounded px-2 py-2 text-sm bg-white focus:outline-none focus:border-black">
+              <option value="s">秒(s)</option>
+              <option value="m">分(m)</option>
+              <option value="h">小时(h)</option>
+            </select>
+
+          </div>
+        </div>
+        <button @click="saveConfig()" :disabled="saving"
+          class="px-5 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50 transition-colors">
+          <span x-text="saving ? '保存中...' : '保存配置'"></span>
+        </button>
+      </div>
+
+      <!-- ========== 端口转发 ========== -->
+      <div x-show="currentNav === 'ports' && !loading">
+        <h1 class="text-2xl font-bold mb-6">端口转发</h1>
+
+        <div class="space-y-4 mb-6">
+          <template x-for="(rule, index) in config.forward_rules" :key="index">
+            <div class="bg-gray-50 border rounded-lg p-5 relative">
+              <span class="absolute top-3 left-4 text-xs font-bold text-gray-400" x-text="'#' + (index + 1)"></span>
+              <div class="space-y-4 pt-3">
+                <div>
+                  <label class="block text-sm font-medium mb-1">TCP 服务端口</label>
+                  <input type="text" x-model="rule.tcp_ports" placeholder="41820, 41825"
+                    class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+                  <p class="text-xs text-gray-400 mt-1">多个端口用逗号分隔</p>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium mb-1">UDP 服务端口</label>
+                  <input type="text" x-model="rule.udp_ports" placeholder="21116"
+                    class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+                </div>
+                <div>
+                  <label class="block text-sm font-medium mb-1">目标服务器 IPv4</label>
+                  <input type="text" x-model="rule.target_ip" placeholder="192.168.4.226"
+                    class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+                </div>
+                <div>
+                  <label class="block text-sm font-medium mb-1">IPv6 地址</label>
+                  <input type="text" x-model="rule.target_ipv6" placeholder="fd93:86bb:a142:0:e9d:92ff:fe87:fd28"
+                    class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+                  <p class="text-xs text-gray-400 mt-1">本地/公网 IPv6 地址均可</p>
+                </div>
+              </div>
+              <button @click="removeForwardRule(index)"
+                class="absolute top-3 right-3 px-2.5 py-1 bg-red-500 text-white text-xs rounded hover:bg-red-600 transition-colors"
+                x-show="config.forward_rules.length > 0">
+                删除
+              </button>
+            </div>
+          </template>
+        </div>
+
+        <div class="flex gap-3 mb-4">
+          <button @click="updateIpv6()" :disabled="ipv6Updating"
+            class="text-xs px-3 py-1.5 bg-gray-200 hover:bg-gray-300 rounded transition-colors disabled:opacity-50">
+            <span x-show="!ipv6Updating">立即刷新 IPv6</span>
+            <span x-show="ipv6Updating">刷新中...</span>
+          </button>
+        </div>
+
+        <div class="flex gap-3">
+          <button @click="addForwardRule()"
+            class="px-5 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 transition-colors">
+            添加端口转发规则
+          </button>
+          <button @click="saveConfig()" :disabled="saving"
+            class="px-5 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50 transition-colors">
+            <span x-text="saving ? '保存中...' : '保存配置'"></span>
+          </button>
+        </div>
+      </div>
+
+      <!-- ========== 信任IP ========== -->
+      <div x-show="currentNav === 'trust' && !loading">
+        <h1 class="text-2xl font-bold mb-6">信任IP</h1>
+
+        <!-- 访问模式切换 -->
+        <div class="bg-gray-50 border rounded-lg p-5 mb-6">
+          <div class="flex items-center gap-2 mb-3">
+            <button @click="config.access_mode = 'lan'"
+              :class="config.access_mode === 'lan' ? 'bg-black text-white' : 'bg-gray-200 text-gray-600'"
+              class="px-4 py-2 rounded text-sm font-medium transition-colors">LAN 模式</button>
+            <button @click="config.access_mode = 'trusted'"
+              :class="config.access_mode === 'trusted' ? 'bg-black text-white' : 'bg-gray-200 text-gray-600'"
+              class="px-4 py-2 rounded text-sm font-medium transition-colors">信任IP 模式</button>
+          </div>
+          <p class="text-xs text-gray-500"
+            x-text="config.access_mode === 'lan' ? '内网所有设备可直接访问服务端口，无需敲门' : '仅配置的信任IP可免敲门访问，其他内网设备需敲门认证'"></p>
+        </div>
+
+        <!-- 信任IP 模式警告 -->
+        <div x-show="config.access_mode === 'trusted'" x-transition class="mb-4 px-4 py-3 bg-red-50 border border-red-300 rounded-lg">
+          <p class="text-sm text-red-700 font-medium">⚠️ 注意：信任IP模式下，只有信任IP可以访问本管理界面！</p>
+          <p class="text-xs text-red-600 mt-1">请务必确认信任IP填写正确，保存后如果当前设备IP不在列表中，将立即无法访问此页面。</p>
+        </div>
+
+        <!-- 信任IP 输入框（仅信任IP模式显示） -->
+        <div x-show="config.access_mode === 'trusted'" x-transition class="bg-gray-50 border rounded-lg p-5 mb-6 space-y-4">
+          <p class="text-sm text-gray-500">信任IP可以直接访问所有服务，无需敲门。</p>
+          <div>
+            <label class="block text-sm font-medium mb-1">信任 IPv4 地址</label>
+            <input type="text" x-model="config.trusted_ip4" placeholder="192.168.4.229"
+              class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+          </div>
+          <div>
+            <label class="block text-sm font-medium mb-1">信任 IPv6 地址</label>
+            <input type="text" x-model="config.trusted_ip6" placeholder="fd93:86bb:a142:0:e9d:92ff:fe87:fd28"
+              class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+          </div>
+          <!-- 内网服务端口 -->
+          <div>
+            <label class="block text-sm font-medium mb-1">默认放行端口</label>
+            <input type="text" x-model="config.lan_allowed_ports" placeholder="5005, 8080, 80"
+              class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+            <p class="text-xs text-gray-400 mt-1">填写端口号，逗号分隔。这些端口允许内网所有设备无需敲门即可访问路由器自身的服务</p>
+          </div>
+        </div>
+        <button @click="config.access_mode === 'trusted' && !confirm('⚠️ 保存后，只有信任IP（' + (config.trusted_ip4 || config.trusted_ip6 || '未设置') + '）可以访问此管理页面，其他设备将被拒绝访问。确定继续？') ? null : saveConfig()" :disabled="saving"
+          class="px-5 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50 transition-colors">
+          <span x-text="saving ? '保存中...' : '保存配置'"></span>
+        </button>
+      </div>
+
+      <!-- ========== 日志开关 ========== -->
+      <div x-show="currentNav === 'logs' && !loading">
+        <h1 class="text-2xl font-bold mb-6">日志开关</h1>
+        <div class="bg-gray-50 border rounded-lg p-5 mb-6 space-y-6">
+          <div class="flex items-center justify-between">
+            <div>
+              <label class="text-sm font-medium">IPv6 WAN↔LAN 日志</label>
+              <p class="text-xs text-gray-500">记录 IPv6 WAN 与 LAN 之间的流量</p>
+            </div>
+            <button @click="config.ipv6_wan_lan_log = !config.ipv6_wan_lan_log"
+              :class="config.ipv6_wan_lan_log ? 'bg-black' : 'bg-gray-300'"
+              class="relative w-11 h-6 rounded-full transition-colors flex-shrink-0">
+              <span :class="config.ipv6_wan_lan_log ? 'translate-x-5' : 'translate-x-0.5'"
+                class="absolute top-0.5 left-0 w-5 h-5 bg-white rounded-full shadow transition-transform"></span>
+            </button>
+          </div>
+          <div class="flex items-center justify-between">
+            <div>
+              <label class="text-sm font-medium">WAN 丢弃日志</label>
+              <p class="text-xs text-gray-500">记录 WAN 接口被丢弃的包</p>
+            </div>
+            <button @click="config.wan_drop_log = !config.wan_drop_log"
+              :class="config.wan_drop_log ? 'bg-black' : 'bg-gray-300'"
+              class="relative w-11 h-6 rounded-full transition-colors flex-shrink-0">
+              <span :class="config.wan_drop_log ? 'translate-x-5' : 'translate-x-0.5'"
+                class="absolute top-0.5 left-0 w-5 h-5 bg-white rounded-full shadow transition-transform"></span>
+            </button>
+          </div>
+          <div class="flex items-center justify-between">
+            <div>
+              <label class="text-sm font-medium">LAN 丢弃日志</label>
+              <p class="text-xs text-gray-500">记录 LAN 接口被丢弃的包</p>
+            </div>
+            <button @click="config.lan_drop_log = !config.lan_drop_log"
+              :class="config.lan_drop_log ? 'bg-black' : 'bg-gray-300'"
+              class="relative w-11 h-6 rounded-full transition-colors flex-shrink-0">
+              <span :class="config.lan_drop_log ? 'translate-x-5' : 'translate-x-0.5'"
+                class="absolute top-0.5 left-0 w-5 h-5 bg-white rounded-full shadow transition-transform"></span>
+            </button>
+          </div>
+          <div class="flex items-center justify-between">
+            <div>
+              <label class="text-sm font-medium">转发链日志</label>
+              <p class="text-xs text-gray-500">记录 IPv4/IPv6 端口转发和拒绝的流量日志</p>
+            </div>
+            <button @click="config.forward_log = !config.forward_log"
+              :class="config.forward_log ? 'bg-black' : 'bg-gray-300'"
+              class="relative w-11 h-6 rounded-full transition-colors flex-shrink-0">
+              <span :class="config.forward_log ? 'translate-x-5' : 'translate-x-0.5'"
+                class="absolute top-0.5 left-0 w-5 h-5 bg-white rounded-full shadow transition-transform"></span>
+            </button>
+          </div>
+          <div class="flex items-center justify-between">
+            <div>
+              <label class="text-sm font-medium">白名单访问日志</label>
+              <p class="text-xs text-gray-500">记录白名单 IP 访问开放端口的连接日志（IPv4/IPv6）</p>
+            </div>
+            <button @click="config.whitelist_access_log = !config.whitelist_access_log"
+              :class="config.whitelist_access_log ? 'bg-black' : 'bg-gray-300'"
+              class="relative w-11 h-6 rounded-full transition-colors flex-shrink-0">
+              <span :class="config.whitelist_access_log ? 'translate-x-5' : 'translate-x-0.5'"
+                class="absolute top-0.5 left-0 w-5 h-5 bg-white rounded-full shadow transition-transform"></span>
+            </button>
+          </div>
+        </div>
+        <button @click="saveConfig()" :disabled="saving"
+          class="px-5 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50 transition-colors">
+          <span x-text="saving ? '保存中...' : '保存配置'"></span>
+        </button>
+        <!-- 日志远程转发 -->
+        <div class="border-t pt-6 mt-6">
+          <h2 class="text-lg font-semibold mb-4">日志远程转发 (logd)</h2>
+          <p class="text-xs text-gray-500 mb-4">配置后路由器系统日志将自动转发到指定服务器，配合日志服务（如群晖 Log Center）使用</p>
+          <div class="bg-gray-50 border rounded-lg p-5 space-y-4">
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div>
+                <label class="block text-sm font-medium mb-1">目标 IP</label>
+                <input type="text" x-model="logdConfig.log_ip" placeholder="192.168.4.226"
+                  class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+              </div>
+              <div>
+                <label class="block text-sm font-medium mb-1">端口</label>
+                <input type="number" x-model="logdConfig.log_port" placeholder="514" min="1" max="65535"
+                  class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+              </div>
+              <div>
+                <label class="block text-sm font-medium mb-1">协议</label>
+                <select x-model="logdConfig.log_proto"
+                  class="w-full border rounded px-3 py-2 text-sm bg-white focus:outline-none focus:border-black">
+                  <option value="tcp">TCP</option>
+                  <option value="udp">UDP</option>
+                </select>
+              </div>
+            </div>
+            <p class="text-xs text-gray-400">将 IP 留空并保存可清除转发配置</p>
+          </div>
+          <button @click="saveLogdConfig()" :disabled="logdConfig.saving"
+            class="mt-4 px-5 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50 transition-colors">
+            <span x-text="logdConfig.saving ? '保存中...' : '保存转发配置'"></span>
+          </button>
+        </div>
+      </div>
+
+      <!-- ========== 国外IP拦截 ========== -->
+      <div x-show="currentNav === 'foreign' && !loading">
+        <h1 class="text-2xl font-bold mb-6">国外IP拦截</h1>
+        <div class="bg-gray-50 border rounded-lg p-5 mb-6 space-y-4">
+          <div>
+            <div class="flex items-center justify-between">
+              <div>
+                <label class="text-sm font-medium">国外IP拦截</label>
+                <p class="text-xs text-gray-500">拦截非中国IP的WAN访问，需先安装中国IP集合</p>
+              </div>
+              <button @click="config.china_ip_block = !config.china_ip_block"
+                :class="config.china_ip_block ? 'bg-black' : 'bg-gray-300'"
+                class="relative w-11 h-6 rounded-full transition-colors flex-shrink-0">
+                <span :class="config.china_ip_block ? 'translate-x-5' : 'translate-x-0.5'"
+                  class="absolute top-0.5 left-0 w-5 h-5 bg-white rounded-full shadow transition-transform"></span>
+              </button>
+            </div>
+            <div x-show="config.china_ip_block" x-transition class="mt-2">
+              <div class="flex gap-2 flex-wrap">
+                <button @click="installChinaIps()" :disabled="chinaIpsInstalling"
+                  class="text-xs px-3 py-1.5 bg-gray-200 hover:bg-gray-300 rounded transition-colors disabled:opacity-50">
+                  <span x-show="!chinaIpsInstalling">安装/更新中国IP集合</span>
+                  <span x-show="chinaIpsInstalling">安装中...</span>
+                </button>
+                <button @click="updateChinaIps()" :disabled="chinaIpsUpdating"
+                  class="text-xs px-3 py-1.5 bg-gray-200 hover:bg-gray-300 rounded transition-colors disabled:opacity-50">
+                  <span x-show="!chinaIpsUpdating">立即刷新中国IP</span>
+                  <span x-show="chinaIpsUpdating">刷新中...</span>
+                </button>
+              </div>
+            </div>
+          </div>
+          <div class="flex items-center justify-between">
+            <div>
+              <label class="text-sm font-medium">境外 IP 拦截日志</label>
+              <p class="text-xs text-gray-500">记录非中国IP的访问尝试</p>
+            </div>
+            <button @click="config.foreign_scan_log = !config.foreign_scan_log"
+              :class="config.foreign_scan_log ? 'bg-black' : 'bg-gray-300'"
+              class="relative w-11 h-6 rounded-full transition-colors flex-shrink-0">
+              <span :class="config.foreign_scan_log ? 'translate-x-5' : 'translate-x-0.5'"
+                class="absolute top-0.5 left-0 w-5 h-5 bg-white rounded-full shadow transition-transform"></span>
+            </button>
+          </div>
+        </div>
+        <button @click="saveConfig()" :disabled="saving"
+          class="px-5 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50 transition-colors">
+          <span x-text="saving ? '保存中...' : '保存配置'"></span>
+        </button>
+      </div>
+
+      <!-- ========== DDNS ========== -->
+      <div x-show="currentNav === 'ddns' && !loading">
+        <h1 class="text-2xl font-bold mb-6">DDNS 管理</h1>
+
+        <!-- 子标签 -->
+        <div class="flex gap-2 mb-6">
+          <button @click="ddnsTab = 'general'; if (!ddns.loaded) loadDdns();"
+            :class="ddnsTab === 'general' ? 'bg-black text-white' : 'bg-gray-200 text-gray-600'"
+            class="px-4 py-2 rounded text-sm font-medium transition-colors">通用 DDNS</button>
+          <button @click="ddnsTab = 'aliyun'; loadAliyunStatus();"
+            :class="ddnsTab === 'aliyun' ? 'bg-black text-white' : 'bg-gray-200 text-gray-600'"
+            class="px-4 py-2 rounded text-sm font-medium transition-colors">阿里云 DDNS</button>
+        </div>
+        <!-- ===== 通用 DDNS ===== -->
+        <div x-show="ddnsTab === 'general'">
+          <div class="flex items-center justify-between mb-6">
+            <div></div>
+            <div class="flex gap-3">
+              <button @click="addDdnsService()"
+                x-show="ddns.editingIndex === null"
+                class="px-4 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 transition-colors">
+                添加记录
+              </button>
+              <button @click="restartDdns()"
+                class="px-4 py-2 border border-black rounded text-sm hover:bg-gray-50 transition-colors">
+                重启服务
+              </button>
+              <button @click="showDdnsStatus()"
+                class="px-4 py-2 border border-black rounded text-sm hover:bg-gray-50 transition-colors">
+                查看状态
+              </button>
+            </div>
+          </div>
+
+          <!-- 空状态 -->
+          <div x-show="ddns.services.length === 0 && ddns.editingIndex === null" class="bg-gray-50 border rounded-lg p-8 text-center">
+            <p class="text-gray-500">暂无DDNS记录</p>
+            <button @click="addDdnsService()" class="mt-3 text-sm text-black underline hover:text-gray-600">添加第一条记录</button>
+          </div>
+
+          <!-- 记录列表 -->
+          <div class="space-y-4 mb-6">
+            <template x-for="(service, index) in ddns.services" :key="index">
+              <div>
+
+              <!-- 只读卡片 -->
+              <div x-show="ddns.editingIndex !== index" class="bg-gray-50 border rounded-lg p-5">
+                <div class="flex items-center justify-between mb-3">
+                  <div class="flex items-center gap-3">
+                    <button @click="service.enabled = !service.enabled; saveDdns()"
+                      :class="service.enabled ? 'bg-black' : 'bg-gray-300'"
+                      class="relative w-11 h-6 rounded-full transition-colors flex-shrink-0">
+                      <span :class="service.enabled ? 'translate-x-5' : 'translate-x-0.5'"
+                        class="absolute top-0.5 left-0 w-5 h-5 bg-white rounded-full shadow transition-transform"></span>
+                    </button>
+                    <h3 class="font-bold" x-text="getProviderName(service.service_name) + ' / ' + (service.sub_domain || '@') + '.' + (service.main_domain || '(未设置)')"></h3>
+                  </div>
+                  <div class="flex gap-2">
+                    <button @click="editDdnsService(index)"
+                      class="px-3 py-1 border border-black rounded text-xs hover:bg-gray-50 transition-colors">
+                      编辑
+                    </button>
+                    <button @click="removeDdnsService(index)"
+                      class="px-3 py-1 bg-red-500 text-white text-xs rounded hover:bg-red-600 transition-colors">
+                      删除
+                    </button>
+                  </div>
+                </div>
+                <div class="grid grid-cols-3 gap-3 text-sm">
+                  <div>
+                    <span class="text-gray-500">IP 类型</span>
+                    <p x-text="service.use_ipv6 ? 'IPv6' : 'IPv4'"></p>
+                  </div>
+                  <div>
+                    <span class="text-gray-500">IPv6 来源</span>
+                    <p x-text="service.use_ipv6 && service.ipv6_source ? getIpv6SourceName(service.ipv6_source) : '-'"></p>
+                  </div>
+                  <div>
+                    <span class="text-gray-500">状态</span>
+                    <p :class="service.enabled ? 'text-green-600' : 'text-gray-400'"
+                       x-text="service.enabled ? '已启用' : '已禁用'"></p>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 编辑表单 -->
+              <div x-show="ddns.editingIndex === index" x-transition class="bg-gray-50 border rounded-lg p-5 space-y-4">
+                <h3 class="font-semibold" x-text="ddns.editingIsNew ? '添加记录' : '编辑记录'"></h3>
+                <div class="flex items-center gap-3 mb-4">
+                  <span class="text-sm text-gray-700">是否开启同步</span>
+                  <button @click="service.enabled = !service.enabled"
+                    :class="service.enabled ? 'bg-black' : 'bg-gray-300'"
+                    class="relative w-11 h-6 rounded-full transition-colors flex-shrink-0">
+                    <span :class="service.enabled ? 'translate-x-5' : 'translate-x-0.5'"
+                      class="absolute top-0.5 left-0 w-5 h-5 bg-white rounded-full shadow transition-transform"></span>
+                  </button>
+                  <input type="text" x-model="service.name"
+                    class="border-b border-transparent hover:border-gray-300 focus:border-black focus:outline-none text-sm font-medium bg-transparent px-1">
+                </div>
+
+                <div class="space-y-4">
+                  <!-- 服务商 -->
+                  <div x-show="ddns.providers.length > 0">
+                    <label class="block text-sm font-medium mb-1">服务商</label>
+                    <select x-model="service.service_name"
+                      class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black bg-white">
+                      <option value="" disabled>请选择</option>
+                      <template x-for="p in ddns.providers" :key="p.id">
+                        <option :value="p.id" x-text="p.name"></option>
+                      </template>
+                    </select>
+                  </div>
+
+                  <!-- 域名 -->
+                  <div class="grid grid-cols-3 gap-4">
+                    <div>
+                      <label class="block text-sm font-medium mb-1">主机记录</label>
+                      <input type="text" x-model="service.sub_domain" placeholder="@ 或 ghost"
+                        class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+                      <p class="text-xs text-gray-400 mt-1">@ 表示解析主域名本身</p>
+                    </div>
+                    <div class="col-span-2">
+                      <label class="block text-sm font-medium mb-1">主域名</label>
+                      <input type="text" x-model="service.main_domain" placeholder="如 example.com"
+                        class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+                    </div>
+                  </div>
+
+                  <!-- Token/Key -->
+                  <div x-show="!service.service_name.includes('cloudflare')">
+                    <label class="block text-sm font-medium mb-1"
+                      x-text="service.service_name.includes('dnspod') ? 'Token ID' :
+                             service.service_name.includes('huaweicloud') ? 'Access Key ID' :
+                             service.service_name.includes('google') ? 'Service Account' :
+                             'Token / Key'"></label>
+                    <input type="text" x-model="service.username"
+                      class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+                  </div>
+
+                  <!-- Secret / API Token -->
+                  <div>
+                    <label class="block text-sm font-medium mb-1"
+                      x-text="service.service_name.includes('cloudflare') ? 'API Token' :
+                             service.service_name.includes('dnspod') ? 'Token Secret' :
+                             service.service_name.includes('huaweicloud') ? 'Secret Access Key' :
+                             service.service_name.includes('google') ? 'Private Key' :
+                             'Secret'"></label>
+                    <input type="password" x-model="service.password"
+                      class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+                  </div>
+
+                  <!-- 网络接口、IPv6开关、IPv6来源、更新间隔 -->
+                  <div class="space-y-3">
+                    <div class="flex items-end gap-4">
+                      <div class="flex-1">
+                        <label class="block text-sm font-medium mb-1">网络接口</label>
+                        <select x-model="service.interface"
+                          class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black bg-white">
+                          <option value="wan">wan</option>
+                          <option value="wan6">wan6</option>
+                        </select>
+                      </div>
+                      <div class="flex items-center gap-2 pb-2">
+                        <button @click="service.use_ipv6 = !service.use_ipv6"
+                          :class="service.use_ipv6 ? 'bg-black' : 'bg-gray-300'"
+                          class="relative w-11 h-6 rounded-full transition-colors flex-shrink-0">
+                          <span :class="service.use_ipv6 ? 'translate-x-5' : 'translate-x-0.5'"
+                            class="absolute top-0.5 left-0 w-5 h-5 bg-white rounded-full shadow transition-transform"></span>
+                        </button>
+                        <span class="text-sm">IPv6</span>
+                      </div>
+                    </div>
+                    <div class="grid grid-cols-2 gap-4">
+                      <div>
+                        <label class="block text-sm font-medium mb-1">IPv6 地址来源</label>
+                        <select x-model="service.ipv6_source"
+                          :disabled="!service.use_ipv6"
+                          class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black bg-white disabled:opacity-40 disabled:cursor-not-allowed">
+                          <option value="">不使用（手动配置）</option>
+                          <template x-for="src in ddns.ipv6Sources" :key="src.id">
+                            <option :value="src.id" x-text="src.name + (ddns.ipv6Addresses[src.id] ? ' (' + ddns.ipv6Addresses[src.id] + ')' : '')"></option>
+                          </template>
+                        </select>
+                      </div>
+                      <div>
+                        <label class="block text-sm font-medium mb-1">更新间隔（分钟）</label>
+                        <input type="number" x-model="service.check_interval" min="1" max="1440" placeholder="10"
+                          class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 表单操作按钮 -->
+                <div class="flex gap-3 pt-2">
+                  <button @click="saveDdnsService(index)" :disabled="saving"
+                    class="px-5 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50 transition-colors">
+                    <span x-text="saving ? '保存中...' : '保存'"></span>
+                  </button>
+                  <button @click="cancelDdnsEdit()"
+                    class="px-5 py-2 border border-black rounded text-sm hover:bg-gray-50 transition-colors">
+                    取消
+                  </button>
+                </div>
+              </div>
+              </div>
+
+            </template>
+          </div>
+
+        </div>
+
+        <!-- ===== 阿里云 DDNS ===== -->
+        <div x-show="ddnsTab === 'aliyun'">
+          <!-- 子标签：初始化配置 / 记录管理 -->
+          <div class="flex gap-2 mb-6">
+            <button @click="aliyunSubTab = 'setup'"
+              :class="aliyunSubTab === 'setup' ? 'bg-gray-900 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'"
+              class="px-3 py-1.5 rounded text-sm font-medium transition-colors">初始化配置</button>
+            <button @click="aliyunSubTab = 'records'; loadAliyunStatus();"
+              :class="aliyunSubTab === 'records' ? 'bg-gray-900 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'"
+              class="px-3 py-1.5 rounded text-sm font-medium transition-colors">记录管理</button>
+          </div>
+
+          <!-- 初始化配置 -->
+          <div x-show="aliyunSubTab === 'setup'" class="space-y-6">
+            <div class="bg-gray-50 border rounded-lg p-5 space-y-4">
+              <div>
+                <label class="block text-sm font-medium mb-1">AccessKey ID</label>
+                <input type="text" x-model="aliyun.accessKeyId" placeholder="LTAI5t..."
+                  class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+              </div>
+              <div>
+                <label class="block text-sm font-medium mb-1">AccessKey Secret</label>
+                <input type="password" x-model="aliyun.accessKeySecret" placeholder="AccessKey Secret"
+                  class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+              </div>
+              <div>
+                <label class="block text-sm font-medium mb-1">域名</label>
+                <input type="text" x-model="aliyun.domain" placeholder="example.com"
+                  class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+                <p class="text-xs text-gray-400 mt-1">请填写主域名（如 baidu.com），不要带子域名前缀（如 mail 或 www）</p>
+              </div>
+              <div class="flex items-center justify-between">
+                <span class="text-sm text-gray-500">安装状态</span>
+                <span :class="aliyun.installed ? 'text-green-600' : 'text-gray-400'"
+                  x-text="aliyun.installed ? '☑ 已安装' : '☐ 未安装'"></span>
+              </div>
+            </div>
+            <button @click="setupAliyun()" :disabled="aliyun.loading"
+              class="px-5 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50 transition-colors">
+              <span x-text="aliyun.loading ? '配置中...' : '安装并配置'"></span>
+            </button>
+          </div>
+
+          <!-- 记录管理 -->
+          <div x-show="aliyunSubTab === 'records'" class="space-y-6">
+            <div class="flex items-center justify-between">
+              <p class="text-sm text-gray-500">管理域名解析记录，启用后将自动更新 IP</p>
+              <button @click="loadAliyunRecords()" :disabled="aliyun.loading"
+                class="px-4 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50 transition-colors">
+                <span x-text="aliyun.loading ? '获取中...' : '获取记录'"></span>
+              </button>
+            </div>
+
+            <div x-show="aliyun.records.length === 0 && !aliyun.loading" class="bg-gray-50 border rounded-lg p-8 text-center">
+              <p class="text-gray-500">暂无记录，请先点击"获取记录"</p>
+            </div>
+
+            <div x-show="aliyun.records.length > 0" class="bg-gray-50 border rounded-lg overflow-hidden">
+              <table class="w-full text-sm">
+                <thead>
+                  <tr class="bg-gray-100 border-b">
+                    <th class="text-left px-4 py-3 font-medium text-gray-600">主机记录</th>
+                    <th class="text-left px-4 py-3 font-medium text-gray-600">类型</th>
+                    <th class="text-left px-4 py-3 font-medium text-gray-600">当前值</th>
+                    <th class="text-left px-4 py-3 font-medium text-gray-600">状态</th>
+                    <th class="text-left px-4 py-3 font-medium text-gray-600">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="(rec, index) in aliyun.records" :key="index">
+                    <tr class="border-b last:border-0">
+                      <td class="px-4 py-3" x-text="rec.RR || rec.rr"></td>
+                      <td class="px-4 py-3" x-text="rec.Type || rec.type"></td>
+                      <td class="px-4 py-3 font-mono text-xs" x-text="rec.Value || rec.value"></td>
+                      <td class="px-4 py-3">
+                        <button @click="toggleAliyunRecord(index)"
+                          :class="getAliyunRecordEnabled(index) ? 'text-green-600' : 'text-gray-400'"
+                          class="text-sm font-medium">
+                          <span x-text="getAliyunRecordEnabled(index) ? '☑ 启用' : '☐ 禁用'"></span>
+                        </button>
+                      </td>
+                      <td class="px-4 py-3">
+                        <!-- AAAA 记录显示 IPv6 来源下拉 -->
+                        <select x-show="(rec.Type || rec.type) === 'AAAA'"
+                          :value="getAliyunRecordIpv6Source(index)"
+                          @change="setAliyunRecordIpv6Source(index, $event.target.value)"
+                          class="border rounded px-2 py-1 text-xs bg-white focus:outline-none focus:border-black">
+                          <template x-for="src in aliyun.ipv6Sources" :key="src.id">
+                            <option :value="src.id" x-text="src.name"></option>
+                          </template>
+                        </select>
+                        <!-- A 记录不显示 -->
+                        <span x-show="(rec.Type || rec.type) === 'A'" class="text-xs text-gray-400">自动</span>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+
+            <button @click="saveAliyunConfig()" :disabled="aliyun.loading"
+              class="px-5 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50 transition-colors">
+              <span x-text="aliyun.loading ? '保存中...' : '保存配置并生成脚本'"></span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ========== 防火墙规则 ========== -->
+      <div x-show="currentNav === 'firewall' && !loading" x-init="loadRules()">
+        <h1 class="text-2xl font-bold mb-6">防火墙规则</h1>
+        <div class="flex items-center justify-between mb-4 flex-wrap gap-3">
+          <div class="flex items-center gap-3">
+            <p class="text-sm text-gray-500">根据当前配置实时生成的 nftables 规则</p>
+            <button @click="loadRules()" class="text-sm text-gray-900 underline hover:text-gray-600 transition-colors">刷新预览</button>
+          </div>
+        </div>
+        <div x-show="rulesLoading" class="text-gray-400 text-center py-8">加载中...</div>
+        <pre x-show="!rulesLoading" class="bg-gray-900 text-green-400 rounded-lg p-4 text-xs font-mono overflow-auto max-h-[70vh] whitespace-pre-wrap leading-relaxed" x-text="rules"></pre>
+      </div>
+
+      <!-- ========== 防火墙状态 ========== -->
+      <div x-show="currentNav === 'firewall-status' && !loading">
+        <h1 class="text-2xl font-bold mb-6">防火墙状态</h1>
+        <div class="bg-gray-50 border rounded-lg p-5 space-y-5">
+          <!-- fw4 -->
+          <div class="flex items-center gap-3">
+            <span class="w-3 h-3 rounded-full inline-block" :class="!fw4Active ? 'bg-green-500' : 'bg-red-500'"></span>
+            <span class="text-sm font-medium">fw4 防火墙</span>
+            <span class="text-sm text-gray-500" x-text="fw4Active ? '运行中（应关闭）' : '已关闭'"></span>
+          </div>
+          <!-- nftables -->
+          <div class="flex items-center gap-3">
+            <span class="w-3 h-3 rounded-full inline-block" :class="nftablesLoaded ? 'bg-green-500' : 'bg-red-500'"></span>
+            <span class="text-sm font-medium">nftables 规则</span>
+            <span class="text-sm text-gray-500" x-text="nftablesLoaded ? '已加载' : '未加载'"></span>
+          </div>
+          <!-- init 脚本 -->
+          <div class="flex items-center gap-3">
+            <span class="w-3 h-3 rounded-full inline-block" :class="initUpToDate ? 'bg-green-500' : 'bg-red-500'"></span>
+            <span class="text-sm font-medium">init 脚本</span>
+            <span class="text-sm text-gray-500"
+              x-text="initUpToDate ? '存在且启用，版本最新' :
+                     !initExists ? '不存在' :
+                     !initEnabled ? '未启用' :
+                     '版本过旧，需要更新'"></span>
+          </div>
+          <!-- 修复按钮 -->
+          <div class="pt-2">
+            <button @click="repairInitScript()" :disabled="repairing"
+              class="px-5 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50 transition-colors">
+              <span x-text="repairing ? '修复中...' : '修复 init 脚本'"></span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ========== 名单管理 ========== -->
+      <div x-show="currentNav === 'lists'">
+        <h1 class="text-2xl font-bold mb-6">名单管理</h1>
+
+        <!-- 加载状态 -->
+        <div x-show="listsLoading" class="text-center py-12 text-gray-400">加载中...</div>
+
+        <div x-show="!listsLoading" class="space-y-4">
+          <!-- 白名单卡片 -->
+          <div class="bg-gray-50 border rounded-lg p-5">
+            <div class="flex items-center justify-between mb-4">
+              <h2 class="text-lg font-semibold">白名单</h2>
+              <button @click="flushList('whitelist')" :disabled="listsLoading"
+                class="px-4 py-1.5 bg-red-500 text-white text-xs rounded hover:bg-red-600 disabled:opacity-50 transition-colors">
+                全部清空
+              </button>
+            </div>
+            <div class="flex items-center gap-3 mb-4">
+              <input type="text" x-model="listsNewIpWhitelist" @keydown.enter="addToList('whitelist')"
+                placeholder="输入 IP 地址"
+                class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+              <button @click="addToList('whitelist')" :disabled="listsLoading"
+                class="px-5 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50 transition-colors flex-shrink-0">
+                添加
+              </button>
+            </div>
+            <div class="border rounded-lg overflow-hidden">
+              <div x-show="getMergedListIps('whitelist').length === 0" class="text-center py-8 text-gray-400">暂无数据</div>
+              <table x-show="getMergedListIps('whitelist').length > 0" class="w-full text-sm">
+                <thead>
+                  <tr class="bg-gray-100 border-b">
+                    <th class="text-left px-4 py-3 font-medium text-gray-600 w-16">序号</th>
+                    <th class="text-left px-4 py-3 font-medium text-gray-600">IP 地址</th>
+                    <th class="text-left px-4 py-3 font-medium text-gray-600 w-32">剩余时间</th>
+                    <th class="text-right px-4 py-3 font-medium text-gray-600 w-24">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="(item, idx) in getMergedListIps('whitelist')" :key="item.ip">
+                    <tr class="border-b last:border-0">
+                      <td class="px-4 py-2.5 text-gray-400" x-text="idx + 1"></td>
+                      <td class="px-4 py-2.5 font-mono text-sm" x-text="item.ip"></td>
+                      <td class="px-4 py-2.5 text-sm" x-text="formatExpires(item.expires)"></td>
+                      <td class="px-4 py-2.5 text-right">
+                        <button @click="deleteFromList('whitelist', item.ip)"
+                          class="px-2.5 py-1 bg-red-500 text-white text-xs rounded hover:bg-red-600 transition-colors">
+                          删除
+                        </button>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- 黑名单卡片 -->
+          <div class="bg-gray-50 border rounded-lg p-5">
+            <div class="flex items-center justify-between mb-4">
+              <h2 class="text-lg font-semibold">黑名单</h2>
+              <button @click="flushList('blacklist')" :disabled="listsLoading"
+                class="px-4 py-1.5 bg-red-500 text-white text-xs rounded hover:bg-red-600 disabled:opacity-50 transition-colors">
+                全部清空
+              </button>
+            </div>
+            <div class="flex items-center gap-3 mb-4">
+              <input type="text" x-model="listsNewIpBlacklist" @keydown.enter="addToList('blacklist')"
+                placeholder="输入 IP 地址"
+                class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+              <button @click="addToList('blacklist')" :disabled="listsLoading"
+                class="px-5 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50 transition-colors flex-shrink-0">
+                添加
+              </button>
+            </div>
+            <div class="border rounded-lg overflow-hidden">
+              <div x-show="getMergedListIps('blacklist').length === 0" class="text-center py-8 text-gray-400">暂无数据</div>
+              <table x-show="getMergedListIps('blacklist').length > 0" class="w-full text-sm">
+                <thead>
+                  <tr class="bg-gray-100 border-b">
+                    <th class="text-left px-4 py-3 font-medium text-gray-600 w-16">序号</th>
+                    <th class="text-left px-4 py-3 font-medium text-gray-600">IP 地址</th>
+                    <th class="text-left px-4 py-3 font-medium text-gray-600 w-32">剩余时间</th>
+                    <th class="text-right px-4 py-3 font-medium text-gray-600 w-24">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="(item, idx) in getMergedListIps('blacklist')" :key="item.ip">
+                    <tr class="border-b last:border-0">
+                      <td class="px-4 py-2.5 text-gray-400" x-text="idx + 1"></td>
+                      <td class="px-4 py-2.5 font-mono text-sm" x-text="item.ip"></td>
+                      <td class="px-4 py-2.5 text-sm" x-text="formatExpires(item.expires)"></td>
+                      <td class="px-4 py-2.5 text-right">
+                        <button @click="deleteFromList('blacklist', item.ip)"
+                          class="px-2.5 py-1 bg-red-500 text-white text-xs rounded hover:bg-red-600 transition-colors">
+                          删除
+                        </button>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    <!-- ========== 系统日志 ========== -->
+    <div x-show="currentNav === 'syslog'">
+      <h1 class="text-2xl font-bold mb-6">系统日志</h1>
+
+      <!-- 工具栏：刷新 + 搜索 + 每页条数 -->
+      <div class="flex items-center gap-3 mb-4 flex-wrap">
+        <button @click="loadSystemLogs()" :disabled="systemLogs.loading"
+          class="px-4 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50 transition-colors">
+          <span x-text="systemLogs.loading ? '加载中...' : '🔄 刷新'"></span>
+        </button>
+
+        <input type="text" x-model="systemLogs.searchKeyword" @input="applyLogFilter()"
+          placeholder="搜索日志..."
+          class="border rounded px-3 py-2 text-sm focus:outline-none focus:border-black flex-1 min-w-[200px]">
+
+        <select x-model.number="systemLogs.pageSize" @change="systemLogs.currentPage = 1"
+          class="border rounded px-3 py-2 text-sm bg-white focus:outline-none focus:border-black">
+          <option value="50">50 条/页</option>
+          <option value="100">100 条/页</option>
+          <option value="200" selected>200 条/页</option>
+        </select>
+
+        <span class="text-xs text-gray-400" x-text="'共 ' + systemLogs.filteredLogs.length + ' 条'"></span>
+      </div>
+
+      <!-- 主体：左侧来源标签 + 右侧日志列表 -->
+      <div class="flex gap-4">
+        <!-- 左侧来源标签 -->
+        <div class="w-44 flex-shrink-0 space-y-1">
+          <button @click="systemLogs.selectedSource = ''; applyLogFilter();"
+            :class="!systemLogs.selectedSource ? 'bg-black text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'"
+            class="w-full text-left px-3 py-2 rounded text-sm transition-colors">
+            全部 <span class="float-right text-xs opacity-70" x-text="systemLogs.allLogs.length"></span>
+          </button>
+          <template x-for="(count, source) in Object.fromEntries(Object.entries(systemLogs.sources).sort((a,b) => b[1] - a[1]))" :key="source">
+            <button @click="systemLogs.selectedSource = source; applyLogFilter();"
+              :class="systemLogs.selectedSource === source ? 'bg-black text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'"
+              class="w-full text-left px-3 py-2 rounded text-sm transition-colors truncate">
+              <span class="truncate" x-text="source"></span>
+              <span class="float-right text-xs opacity-70" x-text="count"></span>
+            </button>
+          </template>
+        </div>
+
+        <!-- 右侧日志列表 -->
+        <div class="flex-1 min-w-0">
+          <!-- 加载状态 -->
+          <div x-show="systemLogs.loading" class="text-center py-12 text-gray-400">加载中...</div>
+
+          <!-- 空状态 -->
+          <div x-show="!systemLogs.loading && systemLogs.filteredLogs.length === 0" class="text-center py-12 text-gray-400">
+            暂无日志
+          </div>
+
+          <!-- 日志表格 -->
+          <div x-show="!systemLogs.loading && systemLogs.filteredLogs.length > 0" class="border rounded-lg overflow-hidden">
+            <table class="w-full text-xs">
+              <thead>
+                <tr class="bg-gray-50 border-b">
+                  <th class="text-left px-3 py-2 font-medium text-gray-500 w-44">时间</th>
+                  <th class="text-left px-3 py-2 font-medium text-gray-500 w-20">级别</th>
+                  <th class="text-left px-3 py-2 font-medium text-gray-500 w-24">来源</th>
+                  <th class="text-left px-3 py-2 font-medium text-gray-500">消息</th>
+                </tr>
+              </thead>
+              <tbody>
+                <template x-for="log in systemLogs.filteredLogs.slice((systemLogs.currentPage - 1) * systemLogs.pageSize, systemLogs.currentPage * systemLogs.pageSize)" :key="log.timestamp + log.program + log.message">
+                  <tr class="border-b last:border-0 hover:bg-gray-50">
+                    <td class="px-3 py-1.5 text-gray-500 whitespace-nowrap font-mono" x-text="log.timestamp"></td>
+                    <td class="px-3 py-1.5 whitespace-nowrap">
+                      <span class="inline-block px-1.5 py-0.5 rounded text-[10px] font-medium"
+                        :class="{
+                          'bg-red-100 text-red-700': log.level === 'err' || log.level === 'crit' || log.level === 'alert' || log.level === 'emerg',
+                          'bg-amber-100 text-amber-700': log.level === 'warn' || log.level === 'warning',
+                          'bg-blue-100 text-blue-700': log.level === 'info',
+                          'bg-gray-100 text-gray-600': !['err','crit','alert','emerg','warn','warning','info'].includes(log.level)
+                        }"
+                        x-text="log.level"></span>
+                    </td>
+                    <td class="px-3 py-1.5 whitespace-nowrap font-mono" x-text="log.program"></td>
+                    <td class="px-3 py-1.5 break-all" x-text="log.message"></td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+
+          <!-- 分页 -->
+          <div x-show="getLogTotalPages() > 1" class="flex items-center justify-between mt-3 text-sm">
+            <span class="text-gray-400 text-xs"
+              x-text="'第 ' + systemLogs.currentPage + ' / ' + getLogTotalPages() + ' 页'"></span>
+            <div class="flex gap-1">
+              <button @click="goToLogPage(1)" :disabled="systemLogs.currentPage <= 1"
+                class="px-2.5 py-1 border rounded text-xs disabled:opacity-30 hover:bg-gray-50">首页</button>
+              <button @click="goToLogPage(systemLogs.currentPage - 1)" :disabled="systemLogs.currentPage <= 1"
+                class="px-2.5 py-1 border rounded text-xs disabled:opacity-30 hover:bg-gray-50">上一页</button>
+              <button @click="goToLogPage(systemLogs.currentPage + 1)" :disabled="systemLogs.currentPage >= getLogTotalPages()"
+                class="px-2.5 py-1 border rounded text-xs disabled:opacity-30 hover:bg-gray-50">下一页</button>
+              <button @click="goToLogPage(getLogTotalPages())" :disabled="systemLogs.currentPage >= getLogTotalPages()"
+                class="px-2.5 py-1 border rounded text-xs disabled:opacity-30 hover:bg-gray-50">末页</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+      <!-- ========== 功能介绍 ========== -->
+      <div x-show="currentNav === 'intro'">
+        <h1 class="text-2xl font-bold mb-6">功能介绍</h1>
+        <div class="max-w-3xl">
+
+          <h2 class="text-xl font-bold mt-6 mb-3">什么是端口敲门？</h2>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed">想象您的服务器是一栋房子，防火墙是大门，而各种服务（如Web管理后台、SSH）是房子里的房间。</p>
+          <ul class="text-sm text-gray-700 mb-3 ml-4 list-disc space-y-1">
+            <li><strong>传统模式</strong>：大门一直敞开或虚掩，黑客可以全天候尝试撬锁（暴力破解密码、扫描漏洞）。</li>
+            <li><strong>端口敲门</strong>：大门平时紧锁且隐形。只有当您在门外按照<strong>特定的顺序</strong>敲击（例如：先敲1下，再敲2下...），大门才会显形并为您打开。进入后，大门再次自动关闭隐形。</li>
+          </ul>
+
+          <h3 class="text-lg font-bold mt-6 mb-3">我们的方案有什么优势？</h3>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed"><strong>核心优势：让您的服务器在公网"隐身"</strong>，部署本功能后，您的Web管理界面或其他服务端口在公网扫描器看来是"完全关闭"的。</p>
+          <ul class="text-sm text-gray-700 mb-3 ml-4 list-disc space-y-1">
+            <li><strong>防扫描</strong>：常见的端口扫描工具（如Nmap）无法发现您的服务端口，攻击者甚至不知道这里有一台服务器。</li>
+            <li><strong>防暴力破解</strong>：由于端口不响应，黑客的密码爆破工具根本无法连接，攻击在第一步就被阻断。</li>
+            <li><strong>零日漏洞免疫</strong>：即便服务本身存在漏洞，只要端口处于"隐身"状态，外部攻击代码无法触达服务，自然无法利用漏洞。</li>
+          </ul>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed">简单的总结来说，防火墙默认对任何人都不开放，任何人访问服务器，都不会有任何回复，服务器处于<strong>静默状态，IPV6访问无法绕过防火墙</strong>。当你和防火墙对暗号，暗号正确，防火墙给你打开一个你专属的门，这个门只有你能进，其他人依旧<strong>保持静默</strong>，访问不会收到任何回复，但是你可以正常访问。你的web网页将收到保护，不被公网扫描器扫到，不会有人知道你的服务器是否在线。别人的攻击只会打在空气中。</p>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed">PS：如果你设置的门只保持15秒，15秒内连接了ssh。这个时候，时间到了，门关闭了，但是已经保持连接的ssh将会持续连接，不受影响。</p>
+
+          <hr class="my-6 border-gray-200">
+
+          <h2 class="text-xl font-bold mt-6 mb-3">1. 网络接口</h2>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed">网络接口核心为"PPPOE宽带拨号"设置和"路由器网关 IP"。</p>
+          <div class="bg-gray-100 rounded p-3 text-sm my-3 overflow-x-auto font-mono text-gray-600">
+            网络接口<br>
+            ├── PPPoE拨号（开关），只需要直接输入宽带账号和密码即可，接口自动匹配。<br>
+            └── 路由器网关 IP，默认输入的已经是自动匹配过的，只需要核对即可，可以ssh路由器后ifconfig核对信息。
+          </div>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed">完整后需要按3个按钮：1.保存网络配置 2.保存防火墙配置 3.应用规则（右上角），那么整个配置就完整应用了。</p>
+
+          <hr class="my-6 border-gray-200">
+
+          <h2 class="text-xl font-bold mt-6 mb-3">2. 端口敲门</h2>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed">可以手动修改4个端口，需要按照顺序敲门，不然无法通过。敲门代码无格式限制。</p>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed font-medium">端口敲门需要注意的点：</p>
+          <ol class="text-sm text-gray-700 mb-3 ml-4 list-decimal space-y-1">
+            <li>请勿在连接不可信，或者公共WIFI的情况下进行端口敲门。</li>
+            <li>建议手机移动网络，公司可信网络下进行敲门。</li>
+            <li>端口敲门是明文传输的4个端口信息，但是敲门客户端发送的端口敲门会伪装，相对安全。总的来说，主要是敲门客户端的环境是否安全，移动网络和可信公司网络都是安全的。</li>
+            <li>UDP敲门在公网传输一般来说是安全的，信息是难以截取的。</li>
+          </ol>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed">白名单超时设置就是您敲门后，门打开的时间，一般来说，仅连接SSH，只要网络稳定，时间短一点，连接SSH后关闭不影响。但是需要持续访问WEB页面，建议时间长一点，2-5小时，方便您操纵，不用反复敲门。一般来说5小时也是安全的。</p>
+
+          <hr class="my-6 border-gray-200">
+
+          <h2 class="text-xl font-bold mt-6 mb-3">3. 端口转发</h2>
+          <ol class="text-sm text-gray-700 mb-3 ml-4 list-decimal space-y-1">
+            <li>端口转发，来自外网访问的请求，会经过这个转发到内部的服务器上，但是只有敲门成功后的人才可以被转发。</li>
+            <li>需要连接主路由之外的服务器，才在此位置进行配置。如果使用反代管理的功能，端口转发中无需再次配置。</li>
+            <li>TCP端口就是你配置的外部暴露端口，这个端口也对应于内部设备上的端口。比如你从外网访问的12000端口，转发的"目标服务器 IPv4"，那么目标服务器也是12000端口，是对应的。</li>
+            <li>IPV6地址，就是"目标服务器 IPv6"地址，你需要填入他的本地IPV6，或者公网IPV6皆可，一次填入，后续自动更新！无需管理。</li>
+          </ol>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed">点击：1.保存配置  2.应用规则，那么规则就成功应用了。敲门后即可访问这些端口。</p>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed">注意：这个端口是直接转发的，没用HTTPS的反代，建议您在nas上直接配置好https反代到指定端口。HTTP在网络上传输不是很安全。</p>
+          <img src="/assets/image-20260319104747-jbgsgdq.png" class="max-w-full rounded border my-4" alt="群晖反代示例">
+          <p class="text-xs text-gray-500 -mt-2 mb-3">如图群晖示例，反代服务器中配置的HTTPS端口为41831，那么端口转发设置中直接设置41831，那么通过"www.expl.com:41831"即可访问。</p>
+
+          <hr class="my-6 border-gray-200">
+
+          <h2 class="text-xl font-bold mt-6 mb-3">4. 反代管理</h2>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed">基于 Nginx 的反向代理管理，可以将外部请求转发到内网服务，并自动配置 SSL 证书和防火墙规则。</p>
+
+          <h3 class="text-lg font-bold mt-4 mb-2">反代规则</h3>
+          <ul class="text-sm text-gray-700 mb-3 ml-4 list-disc space-y-1">
+            <li><strong>域名</strong>：要代理的域名，需要先在 DNS 服务商将域名解析到路由器的公网 IP。</li>
+            <li><strong>监听端口</strong>：外部访问的端口号（如 443），建议使用高位端口号（如 10000-65535），避免与常用服务端口冲突。</li>
+            <li><strong>目标地址</strong>：内网服务的 IP 和端口（如 192.168.1.100:8080）。</li>
+            <li><strong>目标协议</strong>：内网服务使用的协议（HTTP 或 HTTPS）。</li>
+            <li><strong>公网访问</strong>：开启后，监听端口会自动加入防火墙端口转发规则，通过"保存配置 → 应用规则"流程生效。如果使用当前界面的反代功能，端口转发中无需再次配置。</li>
+            <li><strong>SSL 证书</strong>：可选择已上传或自动申请的证书，启用 HTTPS。</li>
+          </ul>
+
+          <h3 class="text-lg font-bold mt-4 mb-2">SSL 证书</h3>
+          <ul class="text-sm text-gray-700 mb-3 ml-4 list-disc space-y-1">
+            <li><strong>手动上传</strong>：直接上传已有证书（fullchain + privkey）。</li>
+            <li><strong>自动申请</strong>：通过 ACME（Let's Encrypt）自动申请免费证书，支持 DNS 验证，支持阿里云、腾讯云 DNSPod、Cloudflare 等多家 DNS 服务商。（阿里云需要在控制台申请当天的新证书，然后点击"申请证书"，可以自动下载最新证书）</li>
+          </ul>
+
+          <h3 class="text-lg font-bold mt-4 mb-2">全局设置</h3>
+          <ul class="text-sm text-gray-700 mb-3 ml-4 list-disc space-y-1">
+            <li><strong>HTTP→HTTPS 重定向</strong>：80 端口专用功能（此功能尚不成熟，暂时无法使用）。</li>
+            <li><strong>HSTS</strong>：强制 HTTPS 访问，启用后浏览器会自动将 HTTP 请求升级为 HTTPS，正常使用。</li>
+            <li><strong>测试 / 重载</strong>：测试 Nginx 配置语法是否正确，重载使配置生效。</li>
+          </ul>
+
+          <hr class="my-6 border-gray-200">
+
+          <h2 class="text-xl font-bold mt-6 mb-3">5. 信任IP</h2>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed">简介：主要是限制内网设备访问主路由。</p>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed"><strong>LAN模式</strong>：运行内网服务直接访问主路由的LUCI管理界面，当前配置防火墙的WEB管理界面，SSH端口等等，无阻碍。</p>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed"><strong>信任IP模式</strong>：目前只能配置一个，仅允许一个指定IP访问路由器的管理界面，SSH等，设置好了后一定要记住这个IP，其他设备不在这个IP，去设置手动设置这个IP也可以访问，如果忘记IP了，只能重置路由器了，重新配置所有设置了。</p>
+
+          <hr class="my-6 border-gray-200">
+
+          <h2 class="text-xl font-bold mt-6 mb-3">6. 日志开关</h2>
+          <ol class="text-sm text-gray-700 mb-3 ml-4 list-decimal space-y-1">
+            <li>IPv6 WAN↔LAN 日志，记录所有公网访问服务器的通过IPV6和内部设备交互的信息日志。不管内部发起还是外部发起统统记录，日志极多。</li>
+            <li>WAN 丢弃日志：记录来自公网访问者的被拒绝的信息。</li>
+            <li>LAN 丢弃日志：内部设备访问主路由被拒绝的信息。</li>
+            <li>转发链日志：记录从公网发起连接的服务器访问内网设备，被拒绝的日志。</li>
+          </ol>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed">注意：此处日志开关的保存按钮在上方，是"保存配置"。系统日志仅保留最近 5000 条，建议使用日志转发功能，将日志发送到群晖日志中心或其他日志管理服务中进行长期保留。</p>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed">日志远程转发 (logd)，适用于接收日志的应用，比如群晖的日志中心，在群晖的日志中心开启日志接收，然后防护墙管理界面配置好群晖服务器的IP，日志接收端口（一般默认514），协议按照群晖那边的设置，设置了TCP就用TCP，设置了UDP就用UDP，建议UDP，轻量，降低网络和处理占用。</p>
+
+          <hr class="my-6 border-gray-200">
+
+          <h2 class="text-xl font-bold mt-6 mb-3">7. 系统日志</h2>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed">可以直接在管理界面查看日志。其中不同日志标签对应关系：</p>
+          <div class="bg-gray-100 rounded p-3 text-sm my-3 overflow-x-auto space-y-1">
+            <p><code class="bg-gray-200 px-1 rounded">[port1900-drop]</code> 公网扫描端口</p>
+            <p><code class="bg-gray-200 px-1 rounded">[BOTNET-PORT]</code> <code class="bg-gray-200 px-1 rounded">[BOTNET-UDP]</code> 僵尸网络合集</p>
+            <p><code class="bg-gray-200 px-1 rounded">[DHCPv6-FLOOD]</code> 全局DHCPV6防洪水</p>
+            <p><code class="bg-gray-200 px-1 rounded">[FRAG-ATTACK][IPV6-FRAG-ATTACK]</code> 碎片防御</p>
+            <p><code class="bg-gray-200 px-1 rounded">[LAND-ATTACK-IP4]</code> <code class="bg-gray-200 px-1 rounded">[LAND-ATTACK-IP6]</code> LAND攻击</p>
+            <p><code class="bg-gray-200 px-1 rounded">[WAN-SPOOFED-IP6]</code> 内网IPV6通行</p>
+            <p><code class="bg-gray-200 px-1 rounded">[BLACKLIST4]</code> <code class="bg-gray-200 px-1 rounded">[BLACKLIST6]</code> 黑名单拦截</p>
+            <p><code class="bg-gray-200 px-1 rounded">[BLACKLIST4-ADD]</code> <code class="bg-gray-200 px-1 rounded">[BLACKLIST6-ADD]</code> 敲门错误黑名单加入</p>
+            <p><code class="bg-gray-200 px-1 rounded">[WAN-SPOOFED-IP4]</code> <code class="bg-gray-200 px-1 rounded">[SPOOFED-IP6]</code> 伪装IP拦截</p>
+            <p><code class="bg-gray-200 px-1 rounded">[FOREIGN-SCAN]</code> 国外IP拦截</p>
+            <p><code class="bg-gray-200 px-1 rounded">[ICMPV6-SCAN-ACCEPT]</code> ICMPV6通行日志</p>
+            <p><code class="bg-gray-200 px-1 rounded">[WAN-DHCPv6-546/547]</code> DHCPV6通行日志</p>
+            <p><code class="bg-gray-200 px-1 rounded">[I4-ALV-T]</code> <code class="bg-gray-200 px-1 rounded">[I4-ALV-UDP]</code> IPV4敲门成功后授权访问日志，TCP/UDP</p>
+            <p><code class="bg-gray-200 px-1 rounded">[IPv6-WAN-DROP]</code> <code class="bg-gray-200 px-1 rounded">[IPv4-WAN-DROP]</code> 外网访问拒绝日志</p>
+            <p><code class="bg-gray-200 px-1 rounded">[KNOCK4-OK-S1]</code>.... 敲门记录，都是KNOCK开头的</p>
+            <p><code class="bg-gray-200 px-1 rounded">[WAN-KNOCK4-SUCCEED]</code> 从外网敲门，KNOCK带SUCCEED属于敲门成功！</p>
+            <p><code class="bg-gray-200 px-1 rounded">[IPv6-WAN-to-LAN-ATTEMPT]</code> 内外网交IPV6互所有日志，日志极多！</p>
+            <p><code class="bg-gray-200 px-1 rounded">[I6-ALVN-T-1]</code> <code class="bg-gray-200 px-1 rounded">[I6-ALVN-U-1]</code> <code class="bg-gray-200 px-1 rounded">[I4-ALVN-T-1]</code> <code class="bg-gray-200 px-1 rounded">[I4-ALVN-U-1]</code> 配置的端口转发，转发访问成功后的记录</p>
+            <p><code class="bg-gray-200 px-1 rounded">[I6-NDP-DE]</code> 拒绝WAN到LAN的NDP</p>
+            <p><code class="bg-gray-200 px-1 rounded">[I6-DEN-T-1]</code> <code class="bg-gray-200 px-1 rounded">[I6-DEN-U-1]</code> 外网通过端口转发访问内网的拒绝日志</p>
+          </div>
+
+          <hr class="my-6 border-gray-200">
+
+          <h2 class="text-xl font-bold mt-6 mb-3">8. 国外IP拦截</h2>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed">可以直接拦截国外的扫描和攻击，保持静默。</p>
+          <ol class="text-sm text-gray-700 mb-3 ml-4 list-decimal space-y-1">
+            <li>第一步需要点击安装/更新中国IP合集。然后再打开国外IP拦截的开关。</li>
+            <li>点击保存配置就正式生效了。单独打开开关无用。必须要先安装。</li>
+            <li>立即刷新中国IP，可以立即更新中国IP合集。非合集内的直接拒绝。默认是3天自动更新一次，无需管理。</li>
+            <li>开启国外IP访问拦截。</li>
+            <li>测试香港，澳门都会被拦截！如果身处香港澳门，需要手动配置中国IP地址集，或者关闭这个功能，因为服务器默认静默，即便让国外扫也无妨。</li>
+          </ol>
+
+          <hr class="my-6 border-gray-200">
+
+          <h2 class="text-xl font-bold mt-6 mb-3">9. DDNS</h2>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed"><strong>需要注意的点：IPV4敲门只需要更新路由器的公网IPV4到域名即可。但是IPV6敲门，需要分开，敲门敲更新了路由器的IPV6，访问用更新了NAS IPV6的域名。</strong></p>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed">这个只需敲门客户端使用的路由器的域名敲门即可，打开浏览器使用NAS的域名即可。比如敲门使用exp.com，但是浏览器访问使用m.exp.com。</p>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed">目前只测试了阿里云，腾讯云，Cloudflare三个，运行正常。除了阿里云DDNS，其他都在通用DDNS中。</p>
+          <img src="/assets/image-20260319112656-l5ycsml.png" class="max-w-full rounded border my-4" alt="通用DDNS界面">
+
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed font-medium">通用DDNS：</p>
+          <ol class="text-sm text-gray-700 mb-3 ml-4 list-decimal space-y-1">
+            <li>点击添加记录，记录框中左上角有一个开关，这个开关可以手动打开或者关闭同步。</li>
+            <li>添加记录就是新增DDNS更新记录。</li>
+            <li>删除记录，可以删除该框内的记录。</li>
+            <li>IPV6开关和IPV6地址来源是属于联动开关。打开IPV6，下拉框即可选择路由器IPV6地址和端口转发IPV6地址（也就是你需要访问的服务器或者其他设备）。DDNS更新就上传你选择的那个IPV6地址。网络接口一般默认WAN。点击保存配置，即可应用更新。更新间隔不输入默认10分钟。主机记录在DNS服务商的web管理界面可以看，也即是你创建域名那边。一般就是@，WWW，MAIL这类的。</li>
+          </ol>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed">端口转发配置好IPV6 → 根据你在端口转发配置中填入的NAS的IPV6，本地自动更新NAS的IPV6 → 更新的NAS的IPV6联动到DDNS</p>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed">所以IPV6地址相对复杂一点。</p>
+
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed font-medium">阿里云DDNS：</p>
+          <img src="/assets/image-20260319113731-btmnmqo.png" class="max-w-full rounded border my-4" alt="阿里云DDNS配置">
+          <ol class="text-sm text-gray-700 mb-3 ml-4 list-decimal space-y-1">
+            <li>AKID和AKS这两个空就是直接输入你创建的ram中的AKID和AKS信息。域名需要注意：不要输入任何的www. mail.这样的。比如百度：www.baidu.com这样是错的，只输入baidu.com这样的！三个信息输入完毕点击安装并配置。</li>
+            <li>然后看安装状态，显示安装成功！就可以进入记录管理了。</li>
+          </ol>
+          <img src="/assets/image-20260319113813-63y2rcv.png" class="max-w-full rounded border my-4" alt="阿里云记录管理">
+          <ol class="text-sm text-gray-700 mb-3 ml-4 list-decimal space-y-1" start="3">
+            <li>点击获取记录，就可以看到你配置的所有域名了，注意你要同步的DDNS改禁用为启用！然后IPV4不需要选择，IPV6需要选择，选择同步路由器IPV6和NAS IPV6。</li>
+            <li><strong>必点：保存配置并生成脚本！</strong>点击这个后，阿里ddns才正式运行！后期需要修改只需要重新点击获取记录，就可以修改了。</li>
+          </ol>
+
+          <hr class="my-6 border-gray-200">
+
+          <h2 class="text-xl font-bold mt-6 mb-3">10. 防火墙状态</h2>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed">这里可以查看防火墙的运行状态，确保系统安全。</p>
+          <ul class="text-sm text-gray-700 mb-3 ml-4 list-disc space-y-1">
+            <li><strong>fw4 防火墙</strong>：OpenWrt 自带的 fw4 防火墙会与本项目的自定义 nftables 规则冲突。绿点表示 fw4 已关闭，系统安全；红点表示 fw4 仍在运行，需要关闭以避免规则冲突。</li>
+            <li><strong>nftables 规则</strong>：绿点表示自定义防火墙规则已加载，系统受保护；红点表示规则未加载，此时防火墙处于无保护状态，请点击"应用规则"加载。</li>
+            <li><strong>init 脚本</strong>：开机自启脚本，用于在路由器重启后自动关闭 fw4 并加载 nftables 规则。绿点表示脚本已安装且为最新版本，系统会在重启后自动恢复防火墙保护；红点表示脚本未安装、未启用或版本过旧，请点击"修复 init 脚本"按钮。</li>
+          </ul>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed"><strong>注意：</strong>如果重启路由器后 nftables 显示红点（规则未加载），请进入此页面点击"修复 init 脚本"，然后到防火墙规则页面点击"应用规则"即可。</p>
+
+          <hr class="my-6 border-gray-200">
+
+          <h2 class="text-xl font-bold mt-6 mb-3">11. 名单管理</h2>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed">这个很简单了，通过敲门的白名单和黑名单都在里面了。可以手动删除，添加。</p>
+
+          <hr class="my-6 border-gray-200">
+
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed">好了，介绍就到此为止了。接下来给大家两个链接，是配套的敲门客户端~</p>
+          <p class="text-sm text-gray-700 mb-1 leading-relaxed"><strong>WINDOWS</strong>(基于python的exe可执行程序)</p>
+          <p class="text-sm text-gray-700 mb-1 leading-relaxed"><strong>ANDROID</strong>(sh脚本，可以在linux运行)</p>
+          <p class="text-sm text-gray-700 mb-3 leading-relaxed"><strong>IOS</strong>(应用商店现成的)</p>
+
+        </div>
+      </div>
+
+      <!-- ========== 反代管理 ========== -->
+      <div x-show="currentNav === 'reverse-proxy' && !loading">
+        <h1 class="text-2xl font-bold mb-6">反代管理</h1>
+
+        <!-- 子标签 -->
+        <div class="flex gap-2 mb-6">
+          <button @click="rpTab = 'rules'"
+            :class="rpTab === 'rules' ? 'bg-black text-white' : 'bg-gray-200 text-gray-600'"
+            class="px-4 py-2 rounded text-sm font-medium transition-colors">反代规则</button>
+          <button @click="rpTab = 'certs'"
+            :class="rpTab === 'certs' ? 'bg-black text-white' : 'bg-gray-200 text-gray-600'"
+            class="px-4 py-2 rounded text-sm font-medium transition-colors">SSL 证书</button>
+          <button @click="rpTab = 'settings'"
+            :class="rpTab === 'settings' ? 'bg-black text-white' : 'bg-gray-200 text-gray-600'"
+            class="px-4 py-2 rounded text-sm font-medium transition-colors">全局设置</button>
+        </div>
+
+        <!-- ===== 反代规则 ===== -->
+        <div x-show="rpTab === 'rules'">
+          <div class="flex items-center justify-between mb-6">
+            <div class="flex gap-2">
+              <button @click="testNginxConfig()" :disabled="rp.loading"
+                class="px-4 py-2 border border-black rounded text-sm hover:bg-gray-50 disabled:opacity-50 transition-colors">
+                测试配置
+              </button>
+              <button @click="reloadNginx()" :disabled="rp.loading"
+                class="px-4 py-2 border border-black rounded text-sm hover:bg-gray-50 disabled:opacity-50 transition-colors">
+                重载 Nginx
+              </button>
+            </div>
+            <button @click="rpEditingRule = { domain: '', listen_port: 443, target_address: '', target_protocol: 'http', ssl_cert_id: rp.settings.default_cert_id || '', websocket_enabled: true, public_access: false }"
+              class="px-4 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 transition-colors">
+              添加规则
+            </button>
+          </div>
+          <p class="text-xs text-amber-600 mb-4">⚠️ 规则添加/修改完毕后，需点击右上角「应用规则」，防火墙才会放行对应端口，公网方可访问。</p>
+
+          <!-- 编辑/添加表单 -->
+          <div x-show="rpEditingRule" x-transition class="bg-gray-50 border rounded-lg p-5 mb-6 space-y-4">
+            <h3 class="font-semibold" x-text="rpEditingRule._editIndex !== undefined ? '编辑规则' : '添加规则'"></h3>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label class="block text-sm font-medium mb-1">域名</label>
+                <input type="text" x-model="rpEditingRule.domain" placeholder="app.example.com"
+                  class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+              </div>
+              <div>
+                <label class="block text-sm font-medium mb-1">监听端口</label>
+                <input type="number" x-model.number="rpEditingRule.listen_port" placeholder="443" min="1" max="65535"
+                  class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+              </div>
+              <div>
+                <label class="block text-sm font-medium mb-1">目标地址</label>
+                <input type="text" x-model="rpEditingRule.target_address" placeholder="192.168.100.2:5000"
+                  class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+              </div>
+              <div>
+                <label class="block text-sm font-medium mb-1">目标协议</label>
+                <select x-model="rpEditingRule.target_protocol"
+                  class="w-full border rounded px-3 py-2 text-sm bg-white focus:outline-none focus:border-black">
+                  <option value="http">http</option>
+                  <option value="https">https</option>
+                </select>
+              </div>
+              <div>
+                <label class="block text-sm font-medium mb-1">SSL 证书</label>
+                <select x-model="rpEditingRule.ssl_cert_id"
+                  class="w-full border rounded px-3 py-2 text-sm bg-white focus:outline-none focus:border-black">
+                  <option value="">不使用证书</option>
+                  <template x-for="cert in rp.certificates" :key="cert.id || cert.domain">
+                    <option :value="cert.id" x-text="(cert.domain || '') + (cert.days_remaining !== undefined ? ' (' + cert.days_remaining + '天)' : '')"></option>
+                  </template>
+                </select>
+              </div>
+            </div>
+            <div class="flex gap-6">
+              <div class="flex items-center gap-2">
+                <button @click="rpEditingRule.websocket_enabled = !rpEditingRule.websocket_enabled"
+                  :class="rpEditingRule.websocket_enabled ? 'bg-black' : 'bg-gray-300'"
+                  class="relative w-11 h-6 rounded-full transition-colors flex-shrink-0">
+                  <span :class="rpEditingRule.websocket_enabled ? 'translate-x-5' : 'translate-x-0.5'"
+                    class="absolute top-0.5 left-0 w-5 h-5 bg-white rounded-full shadow transition-transform"></span>
+                </button>
+                <span class="text-sm">WebSocket</span>
+              </div>
+              <div class="flex items-center gap-2">
+                <button @click="rpEditingRule.public_access = !rpEditingRule.public_access"
+                  :class="rpEditingRule.public_access ? 'bg-black' : 'bg-gray-300'"
+                  class="relative w-11 h-6 rounded-full transition-colors flex-shrink-0">
+                  <span :class="rpEditingRule.public_access ? 'translate-x-5' : 'translate-x-0.5'"
+                    class="absolute top-0.5 left-0 w-5 h-5 bg-white rounded-full shadow transition-transform"></span>
+                </button>
+                <span class="text-sm">公网访问</span>
+              </div>
+            </div>
+            <div class="flex gap-3">
+              <button @click="saveRpRule()" :disabled="rp.loading"
+                class="px-5 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50 transition-colors">
+                <span x-text="rp.loading ? '保存中...' : '保存'"></span>
+              </button>
+              <button @click="rpEditingRule = null"
+                class="px-5 py-2 border border-black rounded text-sm hover:bg-gray-50 transition-colors">
+                取消
+              </button>
+            </div>
+          </div>
+
+          <!-- 规则卡片列表 -->
+          <div x-show="rp.rules.length === 0 && !rp.loading" class="bg-gray-50 border rounded-lg p-8 text-center">
+            <p class="text-gray-500">暂无反代规则</p>
+          </div>
+          <div class="space-y-4">
+            <template x-for="(rule, index) in rp.rules" :key="index">
+              <div class="bg-gray-50 border rounded-lg p-5">
+                <div class="flex items-center justify-between mb-3">
+                  <h3 class="font-bold" x-text="rule.domain || '(未设置域名)'"></h3>
+                  <div class="flex gap-2">
+                    <button @click="testRpRule(rule)" :disabled="rp.loading"
+                      class="px-3 py-1 border border-black rounded text-xs hover:bg-gray-50 disabled:opacity-50 transition-colors">
+                      测试
+                    </button>
+                    <button @click="editRpRule(index)"
+                      class="px-3 py-1 border border-black rounded text-xs hover:bg-gray-50 transition-colors">
+                      编辑
+                    </button>
+                    <button @click="deleteRpRule(index)"
+                      class="px-3 py-1 bg-red-500 text-white text-xs rounded hover:bg-red-600 transition-colors">
+                      删除
+                    </button>
+                  </div>
+                </div>
+                <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+                  <div>
+                    <span class="text-gray-500">目标</span>
+                    <p x-text="(rule.target_protocol || 'http') + '://' + (rule.target_address || '-')"></p>
+                  </div>
+                  <div>
+                    <span class="text-gray-500">端口</span>
+                    <p x-text="rule.listen_port || '-'"></p>
+                  </div>
+                  <div>
+                    <span class="text-gray-500">WebSocket</span>
+                    <p :class="rule.websocket_enabled ? 'text-green-600' : 'text-gray-400'"
+                       x-text="rule.websocket_enabled ? '已开启' : '已关闭'"></p>
+                  </div>
+                  <div>
+                    <span class="text-gray-500">公网访问</span>
+                    <p :class="rule.public_access ? 'text-green-600' : 'text-gray-400'"
+                       x-text="rule.public_access ? '已开启' : '已关闭'"></p>
+                  </div>
+                </div>
+                <div x-show="rule.certificate_domain" class="mt-2 text-sm">
+                  <span class="text-gray-500">证书：</span>
+                  <span x-text="rule.certificate_domain"></span>
+                  <span x-show="rule.certificate_days_remaining !== undefined"
+                    :class="rule.certificate_days_remaining < 30 ? 'text-red-500' : 'text-gray-600'"
+                    x-text="'（剩余 ' + rule.certificate_days_remaining + ' 天）'"></span>
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
+
+        <!-- ===== SSL 证书 ===== -->
+        <div x-show="rpTab === 'certs'">
+          <!-- 上传证书 -->
+          <div class="bg-gray-50 border rounded-lg p-5 mb-6 space-y-4">
+            <h3 class="font-semibold">上传证书</h3>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div>
+                <label class="block text-sm font-medium mb-1">域名</label>
+                <input type="text" x-model="rpUploadDomain" placeholder="app.example.com"
+                  class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+              </div>
+              <div>
+                <label class="block text-sm font-medium mb-1">证书文件 (.crt/.pem)</label>
+                <input type="file" accept=".crt,.pem" x-ref="rpCertFile"
+                  class="w-full border rounded px-3 py-2 text-sm">
+              </div>
+              <div>
+                <label class="block text-sm font-medium mb-1">私钥文件 (.key/.pem)</label>
+                <input type="file" accept=".key,.pem" x-ref="rpKeyFile"
+                  class="w-full border rounded px-3 py-2 text-sm">
+              </div>
+            </div>
+            <button @click="uploadRpCert()" :disabled="rpUploading"
+              class="px-5 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50 transition-colors">
+              <span x-text="rpUploading ? '上传中...' : '上传证书'"></span>
+            </button>
+          </div>
+
+          <!-- 自动申请 -->
+          <div class="bg-gray-50 border rounded-lg p-5 mb-6 space-y-4">
+            <h3 class="font-semibold">自动申请证书（ACME）</h3>
+            <p class="text-xs text-gray-500">使用 DNS 验证自动申请 Let's Encrypt 证书。申请可能需要 1-2 分钟。</p>
+
+            <div>
+              <label class="block text-sm font-medium mb-1">域名 *</label>
+              <input type="text" x-model="rpRequestDomain" placeholder="app.example.com"
+                class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+            </div>
+
+            <div>
+              <label class="block text-sm font-medium mb-1">DNS 提供商 *</label>
+              <select x-model="rp.selectedDnsProvider" @change="selectDnsProvider($event.target.value)"
+                class="w-full border rounded px-3 py-2 text-sm bg-white focus:outline-none focus:border-black">
+                <option value="">请选择 DNS 提供商</option>
+                <template x-for="p in rp.dnsProviders" :key="p.id">
+                  <option :value="p.id" x-text="(p.has_credentials ? '✅ ' : '') + p.name"></option>
+                </template>
+              </select>
+            </div>
+
+            <!-- 阿里云提示 -->
+            <div x-show="rp.selectedDnsProvider === 'ali'" x-transition
+              class="px-4 py-3 bg-green-50 border border-green-200 rounded-lg text-sm text-green-800">
+              ✅ 自动使用已有阿里云 DDNS 配置，无需额外填写凭证
+            </div>
+
+            <!-- 其他提供商的凭证输入 -->
+            <div x-show="rp.selectedDnsProvider && rp.selectedDnsProvider !== 'ali'" x-transition class="space-y-3">
+              <template x-for="field in (rp.dnsProviders.find(p => p.id === rp.selectedDnsProvider)?.fields || [])" :key="field.key">
+                <div>
+                  <label class="block text-sm font-medium mb-1" x-text="field.label"></label>
+                  <input :type="field.type === 'password' ? 'password' : 'text'"
+                    x-model="rp.dnsCredentials[field.key]"
+                    :placeholder="field.placeholder || ''"
+                    class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+                </div>
+              </template>
+            </div>
+
+            <button @click="requestRpCert()" :disabled="rpUploading || !rp.selectedDnsProvider"
+              class="px-5 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50 transition-colors">
+              <span x-text="rpUploading ? '申请中...' : '申请证书'"></span>
+            </button>
+          </div>
+
+          <!-- 已部署证书 -->
+          <div x-show="rp.certificates.length === 0 && !rp.loading" class="bg-gray-50 border rounded-lg p-8 text-center">
+            <p class="text-gray-500">暂无证书</p>
+          </div>
+          <div x-show="rp.certificates.length > 0">
+            <!-- 标题行 -->
+            <div class="flex items-center justify-between mb-4">
+              <h3 class="font-semibold">已部署证书</h3>
+              <span x-show="getRpDefaultCert()" class="text-sm text-gray-500">
+                默认证书: <span class="font-medium text-gray-700" x-text="getRpDefaultCert().domain"></span>
+              </span>
+            </div>
+            <div class="space-y-4">
+              <template x-for="(cert, index) in rp.certificates" :key="index">
+                <div class="bg-gray-50 border rounded-lg p-5">
+                  <div class="flex items-center justify-between mb-2">
+                    <div class="flex items-center gap-2">
+                      <span x-show="rp.settings.default_cert_id && cert.id == rp.settings.default_cert_id" class="text-lg">⭐</span>
+                      <span x-show="!rp.settings.default_cert_id || cert.id != rp.settings.default_cert_id" class="text-lg opacity-0">☆</span>
+                      <h3 class="font-bold" x-text="cert.domain || '(未知域名)'"></h3>
+                    </div>
+                    <div class="flex gap-2">
+                      <button x-show="!rp.settings.default_cert_id || cert.id != rp.settings.default_cert_id"
+                        @click="setDefaultCert(cert.id)" :disabled="rpUploading"
+                        class="px-3 py-1 border border-black rounded text-xs hover:bg-gray-50 disabled:opacity-50 transition-colors">
+                        设为默认
+                      </button>
+                      <button x-show="cert.source === 'acme'" @click="renewRpCert(cert)" :disabled="rpUploading"
+                        class="px-3 py-1 border border-black rounded text-xs hover:bg-gray-50 disabled:opacity-50 transition-colors">
+                        续期
+                      </button>
+                      <button @click="deleteRpCert(cert)" :disabled="rpUploading"
+                        class="px-3 py-1 bg-red-500 text-white text-xs rounded hover:bg-red-600 disabled:opacity-50 transition-colors">
+                        删除
+                      </button>
+                    </div>
+                  </div>
+                  <div class="text-sm space-y-1">
+                    <p><span class="text-gray-500">来源：</span><span x-text="cert.source === 'acme' ? '自动申请' : '手动上传'"></span><span x-show="cert.source === 'acme' && cert.dns_provider" class="text-gray-400"> (<span x-text="cert.dns_provider"></span>)</span></p>
+                    <p x-show="cert.issuer"><span class="text-gray-500">颁发者：</span><span x-text="cert.issuer"></span></p>
+                    <p><span class="text-gray-500">有效期：</span>
+                      <span x-show="cert.not_before && cert.expires_at" x-text="(cert.not_before || '') + ' ~ ' + (cert.expires_at || '')"></span>
+                      <span x-show="!cert.not_before" x-text="cert.expires_at || '-'"></span>
+                      <span x-show="cert.days_remaining !== undefined"
+                        :class="getRpCertDaysClass(cert.days_remaining)"
+                        x-text="'（剩余 ' + cert.days_remaining + ' 天）'"></span>
+                    </p>
+                    <p><span class="text-gray-500">状态：</span>
+                      <span :class="getRpCertDaysClass(cert.days_remaining)" x-text="getRpCertStatusText(cert.days_remaining)"></span>
+                    </p>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </div>
+        </div>
+
+        <!-- ===== 全局设置 ===== -->
+        <div x-show="rpTab === 'settings'">
+          <div class="bg-gray-50 border rounded-lg p-5 space-y-6 mb-6">
+            <div class="flex items-center justify-between">
+              <div>
+                <label class="text-sm font-medium">HTTP → HTTPS 自动跳转</label>
+                <p class="text-xs text-gray-500">监听 80 端口，将 HTTP 请求 301 重定向到 HTTPS</p>
+              </div>
+              <button @click="rp.settings.http_redirect_enabled = !rp.settings.http_redirect_enabled"
+                :class="rp.settings.http_redirect_enabled ? 'bg-black' : 'bg-gray-300'"
+                class="relative w-11 h-6 rounded-full transition-colors flex-shrink-0">
+                <span :class="rp.settings.http_redirect_enabled ? 'translate-x-5' : 'translate-x-0.5'"
+                  class="absolute top-0.5 left-0 w-5 h-5 bg-white rounded-full shadow transition-transform"></span>
+              </button>
+            </div>
+            <div class="flex items-center justify-between">
+              <div>
+                <label class="text-sm font-medium">HSTS</label>
+                <p class="text-xs text-gray-500">强制浏览器仅使用 HTTPS 访问</p>
+              </div>
+              <button @click="rp.settings.hsts_enabled = !rp.settings.hsts_enabled"
+                :class="rp.settings.hsts_enabled ? 'bg-black' : 'bg-gray-300'"
+                class="relative w-11 h-6 rounded-full transition-colors flex-shrink-0">
+                <span :class="rp.settings.hsts_enabled ? 'translate-x-5' : 'translate-x-0.5'"
+                  class="absolute top-0.5 left-0 w-5 h-5 bg-white rounded-full shadow transition-transform"></span>
+              </button>
+            </div>
+            <div>
+              <label class="block text-sm font-medium mb-1">最低 TLS 版本</label>
+              <select x-model="rp.settings.tls_min_version"
+                class="w-64 border rounded px-3 py-2 text-sm bg-white focus:outline-none focus:border-black">
+                <option value="TLSv1.2">TLSv1.2</option>
+                <option value="TLSv1.3">TLSv1.3</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- Nginx 状态 -->
+          <div class="bg-gray-50 border rounded-lg p-5 space-y-4">
+            <h3 class="font-semibold">Nginx</h3>
+            <div class="flex gap-3">
+              <button @click="testNginxConfig()" :disabled="rp.loading"
+                class="px-4 py-2 border border-black rounded text-sm hover:bg-gray-50 disabled:opacity-50 transition-colors">
+                测试配置
+              </button>
+              <button @click="reloadNginx()" :disabled="rp.loading"
+                class="px-4 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50 transition-colors">
+                重载 Nginx
+              </button>
+            </div>
+          </div>
+
+          <button @click="saveRpSettings()" :disabled="rp.loading"
+            class="mt-6 px-5 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50 transition-colors">
+            <span x-text="rp.loading ? '保存中...' : '保存设置'"></span>
+          </button>
+        </div>
+      </div>
+
+    </main>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
