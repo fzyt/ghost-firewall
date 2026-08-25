@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.bak
+backups/
+docs/
+test_*.py
+check_ip.py
+aliyun-ddns-update.py
+update-china-ips.sh
