@@ -50,6 +50,10 @@ DEFAULT_CONFIG = {
     "lan_allowed_ports": "",
     # 国外IP拦截
     "china_ip_block": False,
+    # DNS 局域网解析
+    "dns_lan_resolver_enabled": False,
+    "dns_lan_servers": ["192.168.100.218"],
+    "dns_lan_log": False,
 }
 
 
@@ -294,6 +298,27 @@ def config_to_variables(config):
             lines.insert(0, f"# IPv6 拒绝规则 {i}")
             ipv6_den_block.append("\n".join(lines))
     variables["IPV6_DEN_RULES_BLOCK"] = "\n\n".join(ipv6_den_block)
+
+    # DNS 局域网解析规则（允许 LAN 客户端通过路由器查询内网 DNS 服务器）
+    if config.get("dns_lan_resolver_enabled", False):
+        dns_lan_servers = config.get("dns_lan_servers", [])
+        if isinstance(dns_lan_servers, str):
+            dns_lan_servers = [s.strip() for s in dns_lan_servers.split(",") if s.strip()]
+        log_part = 'log prefix "[DNS-LAN] " ' if config.get("dns_lan_log", False) else ''
+
+        rules = []
+        for srv in dns_lan_servers:
+            rules.append(
+                f"        iifname $LAN_IF oifname $LAN_IF ip daddr {srv} udp dport 53 \\\n"
+                f"            {log_part}accept comment \"DNS-LAN-to-{srv}\""
+            )
+            rules.append(
+                f"        iifname $LAN_IF oifname $LAN_IF ip daddr {srv} tcp dport 53 \\\n"
+                f"            {log_part}accept comment \"DNS-LAN-to-{srv}\""
+            )
+        variables["DNS_LAN_BLOCK"] = "\n\n".join(rules)
+    else:
+        variables["DNS_LAN_BLOCK"] = ""
 
     return variables
 

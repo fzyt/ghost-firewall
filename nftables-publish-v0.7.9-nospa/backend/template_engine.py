@@ -70,6 +70,7 @@ def generate_rules(variables, log_switches):
     template = template.replace("# IPV6_SETS_BLOCK", variables.get("IPV6_SETS_BLOCK", ""))
     template = template.replace("# IPV6_FWD_RULES_BLOCK", variables.get("IPV6_FWD_RULES_BLOCK", ""))
     template = template.replace("# IPV6_DEN_RULES_BLOCK", variables.get("IPV6_DEN_RULES_BLOCK", ""))
+    template = template.replace("# DNS_LAN_BLOCK", variables.get("DNS_LAN_BLOCK", ""))
 
     # LAN 模式切换 + LAN 自定义放行端口
     access_mode = variables.get("ACCESS_MODE", "trusted")

@@ -9,6 +9,7 @@ function app() {
       { id: 'logs', label: '日志开关' },
       { id: 'syslog', label: '系统日志' },
       { id: 'foreign', label: '国外IP拦截' },
+      { id: 'dns-lan', label: 'DNS 局域网解析', icon: '🌐' },
       { id: 'ddns', label: 'DDNS' },
       { id: 'firewall', label: '防火墙规则' },
       { id: 'firewall-status', label: '防火墙状态', icon: '🛡️' },
@@ -164,6 +165,9 @@ function app() {
         delete data.success;
         this.config = data;
         if (this.config.china_ip_block === undefined) this.config.china_ip_block = false;
+        if (this.config.dns_lan_resolver_enabled === undefined) this.config.dns_lan_resolver_enabled = false;
+        if (!this.config.dns_lan_servers) this.config.dns_lan_servers = ['192.168.100.218'];
+        if (this.config.dns_lan_log === undefined) this.config.dns_lan_log = false;
         if (!this.config.access_mode) this.config.access_mode = 'lan';
         if (!this.config.forward_rules || this.config.forward_rules.length === 0) {
           this.config.forward_rules = [];
@@ -180,6 +184,9 @@ function app() {
         if (!this.config.lan_allowed_ports) this.config.lan_allowed_ports = '';
         if (!this.config.access_mode) this.config.access_mode = 'lan';
         if (!this.config.wan_pppoe) this.config.wan_pppoe = false;
+        if (this.config.dns_lan_resolver_enabled === undefined) this.config.dns_lan_resolver_enabled = false;
+        if (!this.config.dns_lan_servers) this.config.dns_lan_servers = ['192.168.100.218'];
+        if (this.config.dns_lan_log === undefined) this.config.dns_lan_log = false;
       } finally {
         this.loading = false;
       }

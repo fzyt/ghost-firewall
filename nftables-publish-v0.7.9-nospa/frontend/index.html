@@ -509,6 +509,50 @@
         </button>
       </div>
 
+      <!-- ========== DNS 局域网解析 ========== -->
+      <div x-show="currentNav === 'dns-lan' && !loading">
+        <h1 class="text-2xl font-bold mb-6">DNS 局域网解析</h1>
+        <div class="bg-gray-50 border rounded-lg p-5 mb-6 space-y-4">
+          <div class="flex items-center justify-between">
+            <div>
+              <label class="text-sm font-medium">启用 DNS 局域网解析</label>
+              <p class="text-xs text-gray-500">允许 LAN 设备通过路由器查询指定的局域网 DNS 服务器</p>
+            </div>
+            <button @click="config.dns_lan_resolver_enabled = !config.dns_lan_resolver_enabled"
+              :class="config.dns_lan_resolver_enabled ? 'bg-black' : 'bg-gray-300'"
+              class="relative w-11 h-6 rounded-full transition-colors flex-shrink-0">
+              <span :class="config.dns_lan_resolver_enabled ? 'translate-x-5' : 'translate-x-0.5'"
+                class="absolute top-0.5 left-0 w-5 h-5 bg-white rounded-full shadow transition-transform"></span>
+            </button>
+          </div>
+          <div x-show="config.dns_lan_resolver_enabled" x-transition>
+            <label class="text-sm font-medium">DNS 服务器 IP（多个用逗号分隔）</label>
+            <input type="text"
+              :value="(config.dns_lan_servers || []).join(', ')"
+              @input="config.dns_lan_servers = $event.target.value.split(',').map(s => s.trim()).filter(s => s)"
+              placeholder="192.168.100.218, 192.168.100.50"
+              class="mt-1 w-full px-3 py-2 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-black">
+            <p class="text-xs text-gray-400 mt-1">例如：192.168.100.218（do 主机 adguardhome）</p>
+          </div>
+          <div x-show="config.dns_lan_resolver_enabled" x-transition class="flex items-center justify-between">
+            <div>
+              <label class="text-sm font-medium">DNS 局域网解析日志</label>
+              <p class="text-xs text-gray-500">记录 LAN 设备的内网 DNS 查询（调试用）</p>
+            </div>
+            <button @click="config.dns_lan_log = !config.dns_lan_log"
+              :class="config.dns_lan_log ? 'bg-black' : 'bg-gray-300'"
+              class="relative w-11 h-6 rounded-full transition-colors flex-shrink-0">
+              <span :class="config.dns_lan_log ? 'translate-x-5' : 'translate-x-0.5'"
+                class="absolute top-0.5 left-0 w-5 h-5 bg-white rounded-full shadow transition-transform"></span>
+            </button>
+          </div>
+        </div>
+        <button @click="saveConfig()" :disabled="saving"
+          class="px-5 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50 transition-colors">
+          <span x-text="saving ? '保存中...' : '保存配置'"></span>
+        </button>
+      </div>
+
       <!-- ========== DDNS ========== -->
       <div x-show="currentNav === 'ddns' && !loading">
         <h1 class="text-2xl font-bold mb-6">DDNS 管理</h1>
