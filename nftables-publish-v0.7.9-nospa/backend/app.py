@@ -299,6 +299,16 @@ def config_to_variables(config):
             ipv6_den_block.append("\n".join(lines))
     variables["IPV6_DEN_RULES_BLOCK"] = "\n\n".join(ipv6_den_block)
 
+    # IPv6 LAN→WAN DNS 转发规则（仅在 ROUTER_IP6 有值时生成，否则 nft 会因 set 包含空字符串报错）
+    router_ip6 = (config.get("router_ip6") or "").strip()
+    if router_ip6:
+        variables["IPV6_LAN_WAN_DNS_BLOCK"] = (
+            f"        iifname $LAN_IF oifname $WAN_IF meta nfproto ipv6 udp dport 53 ip6 daddr {{ {router_ip6}, 2400:3200::1, 2400:3200:baba::1 }} accept\n"
+            f"        iifname $LAN_IF oifname $WAN_IF meta nfproto ipv6 tcp dport 53 ip6 daddr {{ {router_ip6}, 2400:3200::1, 2400:3200:baba::1 }} accept"
+        )
+    else:
+        variables["IPV6_LAN_WAN_DNS_BLOCK"] = ""
+
     # DNS 局域网解析规则（允许 LAN 客户端通过路由器查询内网 DNS 服务器）
     if config.get("dns_lan_resolver_enabled", False):
         dns_lan_servers = config.get("dns_lan_servers") or []
