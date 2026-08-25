@@ -124,6 +124,9 @@ def generate_rules(variables, log_switches):
 
     # 3. 替换变量（define KEY = value 格式）
     for key, value in variables.items():
+        # 空值保护：保留引号避免 nftables 解析错误（空值也必须是 ""）
+        if value == "":
+            value = '""'
         # 单行匹配
         pattern = rf'define {key}\s*=\s*.+'
         replacement = f'define {key} = {value}'

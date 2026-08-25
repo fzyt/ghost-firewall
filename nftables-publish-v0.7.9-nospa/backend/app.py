@@ -301,7 +301,7 @@ def config_to_variables(config):
 
     # DNS 局域网解析规则（允许 LAN 客户端通过路由器查询内网 DNS 服务器）
     if config.get("dns_lan_resolver_enabled", False):
-        dns_lan_servers = config.get("dns_lan_servers", [])
+        dns_lan_servers = config.get("dns_lan_servers") or []
         if isinstance(dns_lan_servers, str):
             dns_lan_servers = [s.strip() for s in dns_lan_servers.split(",") if s.strip()]
         log_part = 'log prefix "[DNS-LAN] " ' if config.get("dns_lan_log", False) else ''
