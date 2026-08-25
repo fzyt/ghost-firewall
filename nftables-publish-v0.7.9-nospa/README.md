@@ -18,6 +18,7 @@ Ghost Firewall 是一个运行在 OpenWrt 上的轻量防火墙管理工具，�
 | **日志管理** | 各类日志开关 + 远程日志转发（logd） |
 | **系统日志** | 实时查看 nftables 日志 |
 | **国外 IP 拦截** | 自动拦截境外 IP |
+| **DNS 局域网解析** | 允许 LAN 设备通过路由器查询内网 DNS 服务器（如 adguardhome） |
 | **DDNS** | 通用 DDNS + 阿里云 DDNS，多 DNS 服务商，IPv6 来源选择 |
 | **防火墙状态** | nftables 规则实时查看 |
 | **名单管理** | IP 黑白名单 |

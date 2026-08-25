@@ -1,6 +1,6 @@
 # Version: 0.7.7
 from flask import Flask, jsonify, request, send_from_directory
-import os, subprocess, shutil, json, time, re, hmac, hashlib, base64, datetime, uuid
+import os, subprocess, shutil, json, time, re, hmac, hashlib, base64, datetime, uuid, fcntl
 from template_engine import load_template, generate_rules
 
 app = Flask(__name__)
@@ -60,8 +60,19 @@ DEFAULT_CONFIG = {
 def load_config():
     """加载配置，如果不存在则返回默认值"""
     if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, 'r') as f:
-            config = json.load(f)
+        try:
+            with open(CONFIG_PATH, 'r') as f:
+                config = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            # JSON 损坏或读失败：备份损坏文件并返回默认值（避免 Web UI 不可用）
+            try:
+                backup_path = CONFIG_PATH + f'.corrupted.{int(time.time())}'
+                shutil.copy(CONFIG_PATH, backup_path)
+                os.remove(CONFIG_PATH)
+                print(f"[WARNING] 配置损坏已备份: {backup_path} ({e})", flush=True)
+            except Exception:
+                pass
+            return dict(DEFAULT_CONFIG)
         # 合并默认值（防止新增字段丢失）
         result = dict(DEFAULT_CONFIG)
         result.update(config)
@@ -76,8 +87,29 @@ def save_config(config):
     if os.path.exists(CONFIG_PATH):
         shutil.copy(CONFIG_PATH, CONFIG_PATH + '.backup')
     os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-    with open(CONFIG_PATH, 'w') as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
+    # 原子写 + 文件锁：先写临时文件再 rename，避免并发写入导致损坏
+    tmp_path = CONFIG_PATH + '.tmp'
+    lock_path = CONFIG_PATH + '.lock'
+    try:
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            with open(tmp_path, 'w') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, CONFIG_PATH)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+    except Exception:
+        # fcntl 不可用时回退到无锁模式（保留原子写）
+        with open(tmp_path, 'w') as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.path.exists(tmp_path):
+            os.replace(tmp_path, CONFIG_PATH)
 
 
 def _migrate_forward_rules(config):
