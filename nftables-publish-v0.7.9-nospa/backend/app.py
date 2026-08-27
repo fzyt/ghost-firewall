@@ -2284,6 +2284,18 @@ def _sanitize_target_address(addr):
     return addr
 
 
+def _sanitize_name(name):
+    """净化反代规则名称（用于 UI 显示和 nginx 注释）
+    - 去除换行（防 nginx 注释被切断）
+    - 去除 '#'（防 nginx 注释结构被破坏）
+    - 最长 64 字符
+    """
+    if not name:
+        return ''
+    name = str(name).replace('\n', '').replace('\r', '').replace('#', '')
+    return name.strip()[:64]
+
+
 # 反代默认设置
 RP_DEFAULT_SETTINGS = {
     "http_redirect_enabled": True,
@@ -2476,6 +2488,8 @@ def _generate_nginx_conf(rule, cert, settings):
     lines = []
     lines.append(f"# ============================================================")
     lines.append(f"# 反向代理配置: {domain}")
+    if rule.get("name"):
+        lines.append(f"# 名称: {_sanitize_name(rule['name'])}")
     lines.append(f"# 生成时间: {now_str}")
     lines.append(f"# nftables-web-v2 自动生成，请勿手动修改")
     lines.append(f"# ============================================================")
@@ -2811,6 +2825,7 @@ def rp_create_rule():
     new_id = _next_id("rp", [r["id"] for r in rp["rules"]])
     rule = {
         "id": new_id,
+        "name": _sanitize_name(data.get("name", "")),
         "enabled": data.get("enabled", True),
         "domain": domain,
         "listen_port": data.get("listen_port", 443),
@@ -2854,11 +2869,14 @@ def rp_update_rule(rule_id):
     if not data:
         return jsonify({"success": False, "message": "请求体不能为空"}), 400
 
-    updatable = ["enabled", "domain", "listen_port", "target_address", "target_protocol",
+    updatable = ["enabled", "name", "domain", "listen_port", "target_address", "target_protocol",
                  "websocket_enabled", "public_access", "ssl_cert_id"]
     for key in updatable:
         if key in data:
             rule[key] = data[key]
+
+    # 净化 name（仅作 UI 显示和 nginx 注释，去除换行/#）
+    rule["name"] = _sanitize_name(rule.get("name", ""))
 
     # 净化域名和目标地址
     try:

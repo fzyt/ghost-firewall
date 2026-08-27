@@ -1366,7 +1366,7 @@
                 重载 Nginx
               </button>
             </div>
-            <button @click="rpEditingRule = { domain: '', listen_port: 443, target_address: '', target_protocol: 'http', ssl_cert_id: rp.settings.default_cert_id || '', websocket_enabled: true, public_access: false }"
+            <button @click="rpEditingRule = { name: '', domain: '', listen_port: 443, target_address: '', target_protocol: 'http', ssl_cert_id: rp.settings.default_cert_id || '', websocket_enabled: true, public_access: false }"
               class="px-4 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 transition-colors">
               添加规则
             </button>
@@ -1377,6 +1377,12 @@
           <div x-show="rpEditingRule" x-transition class="bg-gray-50 border rounded-lg p-5 mb-6 space-y-4">
             <h3 class="font-semibold" x-text="rpEditingRule._editIndex !== undefined ? '编辑规则' : '添加规则'"></h3>
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label class="block text-sm font-medium mb-1">名称（可选） <span class="text-gray-400 font-normal">用于识别，不超过 64 字</span></label>
+                <input type="text" x-model="rpEditingRule.name" placeholder="例如：群晖 DSM"
+                  maxlength="64"
+                  class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+              </div>
               <div>
                 <label class="block text-sm font-medium mb-1">域名</label>
                 <input type="text" x-model="rpEditingRule.domain" placeholder="app.example.com"
@@ -1451,7 +1457,11 @@
             <template x-for="(rule, index) in rp.rules" :key="index">
               <div class="bg-gray-50 border rounded-lg p-5">
                 <div class="flex items-center justify-between mb-3">
-                  <h3 class="font-bold" x-text="rule.domain || '(未设置域名)'"></h3>
+                  <h3 class="font-bold">
+                    <span x-show="rule.name" x-text="rule.name"></span>
+                    <span x-show="rule.name" class="text-gray-400 font-normal text-sm ml-2" x-text="rule.domain"></span>
+                    <span x-show="!rule.name" x-text="rule.domain || '(未设置域名)'"></span>
+                  </h3>
                   <div class="flex gap-2">
                     <button @click="testRpRule(rule)" :disabled="rp.loading"
                       class="px-3 py-1 border border-black rounded text-xs hover:bg-gray-50 disabled:opacity-50 transition-colors">
