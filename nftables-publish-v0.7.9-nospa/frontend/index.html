@@ -9,6 +9,58 @@
   <link rel="stylesheet" href="styles.css">
 </head>
 <body class="bg-white text-gray-900 min-h-screen">
+
+  <!-- ======================= 登录遮罩（全屏） ======================= -->
+  <div x-show="!auth.authenticated && !auth.checking"
+       x-cloak
+       class="fixed inset-0 z-[100] bg-gray-50 flex items-center justify-center px-4">
+    <div class="bg-white border border-gray-200 rounded-xl shadow-lg p-8 w-full max-w-sm">
+      <div class="text-center mb-6">
+        <div class="inline-flex items-center justify-center w-14 h-14 bg-black text-white rounded-full mb-3">
+          <svg class="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
+          </svg>
+        </div>
+        <h1 class="text-xl font-bold">nftables 防火墙管理</h1>
+        <p class="text-xs text-gray-400 mt-1">
+          <span x-show="auth.loginMode === 'setup'">首次使用，请设置管理员密码</span>
+          <span x-show="auth.loginMode === 'login'">请输入管理员密码登录</span>
+        </p>
+      </div>
+
+      <form @submit.prevent="auth.loginMode === 'setup' ? doSetup() : doLogin()">
+        <input type="password"
+          x-model="auth.loginPassword"
+          placeholder="密码"
+          :disabled="auth.loginLoading"
+          class="w-full border border-gray-300 rounded px-3 py-2.5 mb-3 text-sm focus:outline-none focus:border-black disabled:bg-gray-50"
+          autocomplete="current-password"
+          autofocus />
+        <button type="submit"
+          :disabled="auth.loginLoading || !auth.loginPassword"
+          class="w-full bg-black text-white rounded py-2.5 text-sm font-medium disabled:opacity-50 hover:bg-gray-800 transition-colors">
+          <span x-show="!auth.loginLoading"
+            x-text="auth.loginMode === 'setup' ? '设置并登录' : '登录'"></span>
+          <span x-show="auth.loginLoading">处理中…</span>
+        </button>
+      </form>
+
+      <div x-show="auth.loginError"
+        x-text="auth.loginError"
+        class="mt-4 text-xs text-red-600 text-center bg-red-50 border border-red-200 rounded p-2"></div>
+
+      <p class="mt-6 text-xs text-gray-300 text-center">v0.7.9 · Ghost Firewall</p>
+
+      <!-- HTTP 不安全警告（自签证书模式下，HTTPS 地址栏会显示"不安全"提示而非此 banner） -->
+      <div x-show="window.location.protocol === 'http:'"
+        class="mt-3 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded p-2 text-center">
+        ⚠️ 当前为 HTTP 连接，密码将以明文传输<br>
+        <span class="text-amber-600">建议使用 HTTPS 访问：https://<span x-text="window.location.hostname"></span>:5443</span>
+      </div>
+    </div>
+  </div>
+
   <div x-data="app()" class="flex min-h-screen">
     <!-- 侧边导航 -->
     <aside class="w-56 border-r flex-shrink-0 bg-gray-50 flex flex-col">
@@ -43,6 +95,11 @@
 
       <!-- 右上角应用规则按钮 -->
       <div class="fixed top-6 right-6 z-40 flex items-center gap-2">
+        <button x-show="auth.authenticated"
+          @click="if(confirm('确定退出登录？')) doLogout()"
+          class="px-3 py-2 border border-gray-400 text-gray-600 rounded text-sm hover:bg-gray-50 transition-colors">
+          退出登录
+        </button>
         <span class="text-xs text-gray-400 hidden md:block">先保存配置，再应用规则</span>
         <button @click="if(confirm('确定要恢复到上一次备份的配置吗？')) restoreConfig()"
           class="px-4 py-2 border border-red-500 text-red-600 rounded text-sm hover:bg-red-50 transition-colors">
@@ -930,6 +987,151 @@
         <div x-show="listsLoading" class="text-center py-12 text-gray-400">加载中...</div>
 
         <div x-show="!listsLoading" class="space-y-4">
+
+          <!-- ========== 快速添加（IP 预设） ========== -->
+          <div class="bg-white border rounded-lg p-5">
+            <div class="flex items-center justify-between mb-3">
+              <h2 class="text-lg font-semibold">快速添加（预设标签）</h2>
+              <div class="flex gap-2">
+                <button @click="openPresetModal(null)"
+                  class="px-3 py-1.5 border border-black rounded text-xs hover:bg-gray-50 transition-colors">
+                  + 新增预设
+                </button>
+                <button x-show="ipPresets.length > 0" @click="confirm('管理预设：每个预设可点击加入对应名单。点击 OK 查看详情。')"
+                  class="px-3 py-1.5 border border-gray-300 rounded text-xs text-gray-500 hover:bg-gray-50 transition-colors">
+                  管理
+                </button>
+              </div>
+            </div>
+
+            <div x-show="ipPresets.length === 0" class="text-center py-6 text-xs text-gray-400">
+              暂无预设。点击"新增预设"，填 IP + 标签，下次点击一键加入名单。
+            </div>
+
+            <div x-show="ipPresets.length > 0" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
+              <template x-for="preset in ipPresets" :key="preset.id">
+                <div class="border rounded p-3 flex flex-col gap-2"
+                  :class="preset.is_active ? 'border-green-300 bg-green-50' : 'border-gray-200'">
+                  <div class="flex items-start justify-between">
+                    <div class="min-w-0 flex-1">
+                      <div class="text-sm font-medium truncate" x-text="preset.label"></div>
+                      <div class="text-xs text-gray-500 font-mono truncate" x-text="preset.ip"></div>
+                    </div>
+                    <span class="text-[10px] px-1.5 py-0.5 rounded ml-2 whitespace-nowrap"
+                      :class="preset.type === 'whitelist' ? 'bg-blue-100 text-blue-700' : 'bg-red-100 text-red-700'"
+                      x-text="preset.type === 'whitelist' ? '白' : '黑'"></span>
+                  </div>
+                  <div class="flex items-center justify-between text-[10px] text-gray-400">
+                    <span x-text="preset.auto_expire ? '自动过期' : '永久'"></span>
+                    <span x-show="preset.is_active" class="text-green-600 font-medium">✓ 已加入</span>
+                  </div>
+                  <div class="flex gap-1">
+                    <button @click="applyPreset(preset)" :disabled="presetSavingId === preset.id"
+                      class="flex-1 px-2 py-1 bg-black text-white text-xs rounded hover:bg-gray-800 disabled:opacity-50 transition-colors">
+                      <span x-show="presetSavingId !== preset.id">一键加入</span>
+                      <span x-show="presetSavingId === preset.id">…</span>
+                    </button>
+                    <button @click="openPresetModal(preset)"
+                      class="px-2 py-1 border border-gray-300 text-xs rounded hover:bg-gray-50 transition-colors">编辑</button>
+                    <button @click="deletePreset(preset)"
+                      class="px-2 py-1 border border-red-300 text-red-600 text-xs rounded hover:bg-red-50 transition-colors">删</button>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </div>
+
+          <!-- ========== 最近操作（历史） ========== -->
+          <div class="bg-white border rounded-lg p-5">
+            <div class="flex items-center justify-between mb-3">
+              <h2 class="text-lg font-semibold">最近操作</h2>
+              <button x-show="listHistory.length > 0" @click="clearListHistory()"
+                class="px-3 py-1.5 border border-red-300 text-red-600 rounded text-xs hover:bg-red-50 transition-colors">
+                清空历史
+              </button>
+            </div>
+            <div x-show="listHistory.length === 0" class="text-center py-6 text-xs text-gray-400">
+              暂无历史记录。名单添加/删除后会出现在这里。
+            </div>
+            <div x-show="listHistory.length > 0" class="space-y-1 max-h-64 overflow-y-auto">
+              <template x-for="h in listHistory" :key="h.id">
+                <div class="flex items-center justify-between text-xs py-1.5 px-2 hover:bg-gray-50 rounded">
+                  <div class="flex items-center gap-2 min-w-0 flex-1">
+                    <span class="text-gray-400 font-mono whitespace-nowrap" x-text="h.ts ? h.ts.substring(5, 16).replace('T', ' ') : ''"></span>
+                    <span class="px-1.5 py-0.5 rounded text-[10px]"
+                      :class="h.action === 'add' ? 'bg-green-100 text-green-700' : (h.action === 'delete' ? 'bg-red-100 text-red-700' : 'bg-gray-100 text-gray-600')"
+                      x-text="h.action === 'add' ? '加入' : (h.action === 'delete' ? '删除' : '清空')"></span>
+                    <span class="px-1.5 py-0.5 rounded text-[10px]"
+                      :class="h.type === 'whitelist' ? 'bg-blue-100 text-blue-700' : 'bg-red-100 text-red-700'"
+                      x-text="h.type === 'whitelist' ? '白名单' : '黑名单'"></span>
+                    <span class="font-mono truncate" x-text="h.label || h.ip"></span>
+                    <span x-show="h.ip && h.ip !== '-'" class="text-gray-400 font-mono truncate" x-text="h.ip"></span>
+                  </div>
+                  <button x-show="h.action === 'add' && h.ip && h.ip !== '-'"
+                    @click="listsNewIpWhitelist = (h.type === 'whitelist' ? h.ip : ''); listsNewIpBlacklist = (h.type === 'blacklist' ? h.ip : ''); document.querySelector('#addIpInput')?.focus();"
+                    class="px-2 py-0.5 border border-gray-300 rounded text-[10px] hover:bg-gray-100 transition-colors whitespace-nowrap ml-2">
+                    再加一次
+                    </button>
+                </div>
+              </template>
+            </div>
+          </div>
+
+          <!-- ========== 预设编辑弹窗 ========== -->
+          <div x-show="presetModalOpen" x-cloak
+            class="fixed inset-0 z-50 bg-black bg-opacity-40 flex items-center justify-center px-4"
+            @click.self="closePresetModal()">
+            <div class="bg-white rounded-lg shadow-lg p-6 w-full max-w-md">
+              <h3 class="text-lg font-bold mb-4" x-text="presetEditing && presetEditing.id ? '编辑预设' : '新增预设'"></h3>
+              <div x-show="presetEditing" class="space-y-3">
+                <div>
+                  <label class="text-xs text-gray-500">标签（昵称）</label>
+                  <input type="text" x-model="presetEditing.label" maxlength="64"
+                    placeholder="例如：我的手机、家里 NAS"
+                    class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black" />
+                </div>
+                <div>
+                  <label class="text-xs text-gray-500">IP 地址</label>
+                  <input type="text" x-model="presetEditing.ip"
+                    placeholder="IPv4 或 IPv6，自动检测"
+                    class="w-full border rounded px-3 py-2 text-sm font-mono focus:outline-none focus:border-black" />
+                </div>
+                <div>
+                  <label class="text-xs text-gray-500">类型</label>
+                  <div class="flex gap-2 mt-1">
+                    <label class="flex items-center gap-1 cursor-pointer">
+                      <input type="radio" value="whitelist" x-model="presetEditing.type" />
+                      <span class="text-sm">白名单</span>
+                    </label>
+                    <label class="flex items-center gap-1 cursor-pointer">
+                      <input type="radio" value="blacklist" x-model="presetEditing.type" />
+                      <span class="text-sm">黑名单</span>
+                    </label>
+                  </div>
+                </div>
+                <div>
+                  <label class="flex items-center gap-2 cursor-pointer">
+                    <input type="checkbox" x-model="presetEditing.auto_expire" />
+                    <span class="text-sm">自动过期</span>
+                  </label>
+                  <p class="text-[10px] text-gray-400 mt-1 ml-6">
+                    白名单默认 5h 后自动从 set 移除；黑名单默认 30 天。取消勾选 = 永久。
+                  </p>
+                </div>
+              </div>
+              <div class="flex gap-2 mt-5">
+                <button @click="savePreset()" :disabled="presetSaving"
+                  class="flex-1 px-3 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50">
+                  保存
+                </button>
+                <button @click="closePresetModal()"
+                  class="flex-1 px-3 py-2 border border-gray-300 rounded text-sm hover:bg-gray-50">
+                  取消
+                </button>
+              </div>
+            </div>
+          </div>
+
           <!-- 白名单卡片 -->
           <div class="bg-gray-50 border rounded-lg p-5">
             <div class="flex items-center justify-between mb-4">
@@ -1094,7 +1296,7 @@
                 </tr>
               </thead>
               <tbody>
-                <template x-for="log in systemLogs.filteredLogs.slice((systemLogs.currentPage - 1) * systemLogs.pageSize, systemLogs.currentPage * systemLogs.pageSize)" :key="log.timestamp + log.program + log.message">
+                <template x-for="(log, idx) in currentLogPage" :key="log.timestamp + '_' + idx + '_' + log.program">
                   <tr class="border-b last:border-0 hover:bg-gray-50">
                     <td class="px-3 py-1.5 text-gray-500 whitespace-nowrap font-mono" x-text="log.timestamp"></td>
                     <td class="px-3 py-1.5 whitespace-nowrap">
@@ -1366,7 +1568,7 @@
                 重载 Nginx
               </button>
             </div>
-            <button @click="rpEditingRule = { name: '', domain: '', listen_port: 443, target_address: '', target_protocol: 'http', ssl_cert_id: rp.settings.default_cert_id || '', websocket_enabled: true, public_access: false }"
+            <button @click="rpEditingRule = { name: '', domain: '', listen_port: 443, target_address: '', target_protocol: 'http', ssl_cert_id: rp.settings.default_cert_id || '', websocket_enabled: true, public_access: false, client_max_body_size: '50M' }"
               class="px-4 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 transition-colors">
               添加规则
             </button>
@@ -1415,6 +1617,12 @@
                     <option :value="cert.id" x-text="(cert.domain || '') + (cert.days_remaining !== undefined ? ' (' + cert.days_remaining + '天)' : '')"></option>
                   </template>
                 </select>
+              </div>
+              <div>
+                <label class="block text-sm font-medium mb-1">上传大小上限 <span class="text-gray-400 font-normal">如 50M / 1G / 留空用 nginx 默认 1M</span></label>
+                <input type="text" x-model="rpEditingRule.client_max_body_size" placeholder="50M"
+                  pattern="^\d+[KMG]?$"
+                  class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
               </div>
             </div>
             <div class="flex gap-6">
@@ -1487,15 +1695,19 @@
                     <p x-text="rule.listen_port || '-'"></p>
                   </div>
                   <div>
+                    <span class="text-gray-500">上传上限</span>
+                    <p x-text="rule.client_max_body_size || '默认 1M'"></p>
+                  </div>
+                  <div>
                     <span class="text-gray-500">WebSocket</span>
                     <p :class="rule.websocket_enabled ? 'text-green-600' : 'text-gray-400'"
                        x-text="rule.websocket_enabled ? '已开启' : '已关闭'"></p>
                   </div>
-                  <div>
-                    <span class="text-gray-500">公网访问</span>
-                    <p :class="rule.public_access ? 'text-green-600' : 'text-gray-400'"
-                       x-text="rule.public_access ? '已开启' : '已关闭'"></p>
-                  </div>
+                </div>
+                <div class="mt-2 text-sm" x-show="rule.public_access !== undefined">
+                  <span class="text-gray-500">公网访问：</span>
+                  <span :class="rule.public_access ? 'text-green-600' : 'text-gray-400'"
+                        x-text="rule.public_access ? '已开启' : '已关闭'"></span>
                 </div>
                 <div x-show="rule.certificate_domain" class="mt-2 text-sm">
                   <span class="text-gray-500">证书：</span>
@@ -1615,6 +1827,10 @@
                         class="px-3 py-1 border border-black rounded text-xs hover:bg-gray-50 disabled:opacity-50 transition-colors">
                         续期
                       </button>
+                      <button @click="downloadRpCert(cert)" :disabled="rpUploading"
+                        class="px-3 py-1 border border-black rounded text-xs hover:bg-gray-50 disabled:opacity-50 transition-colors">
+                        下载
+                      </button>
                       <button @click="deleteRpCert(cert)" :disabled="rpUploading"
                         class="px-3 py-1 bg-red-500 text-white text-xs rounded hover:bg-red-600 disabled:opacity-50 transition-colors">
                         删除
@@ -1702,6 +1918,90 @@
 
     </main>
   </div>
+
+  <!-- ======================= dry-run diff 预览弹窗 ======================= -->
+  <div x-show="diffModal.show" x-cloak
+    class="fixed inset-0 z-[200] bg-black bg-opacity-50 flex items-center justify-center px-4">
+    <div class="bg-white rounded-xl shadow-2xl w-full max-w-2xl max-h-[85vh] flex flex-col">
+      <div class="p-5 border-b flex items-center justify-between">
+        <h2 class="text-lg font-bold">配置变更预览</h2>
+        <button @click="cancelSaveConfig()" class="text-gray-400 hover:text-gray-600">✕</button>
+      </div>
+
+      <div class="p-5 overflow-y-auto flex-1">
+        <!-- 加载中 -->
+        <div x-show="diffModal.loading" class="text-center py-12 text-gray-400">
+          正在计算变更…
+        </div>
+
+        <!-- 风险警告（critical/high）-->
+        <div x-show="!diffModal.loading && diffModal.risks && diffModal.risks.length > 0"
+          class="mb-4 space-y-2">
+          <template x-for="risk in diffModal.risks" :key="risk.message">
+            <div :class="{
+              'bg-red-50 border-red-300 text-red-800': risk.level === 'critical',
+              'bg-orange-50 border-orange-300 text-orange-800': risk.level === 'high',
+              'bg-yellow-50 border-yellow-300 text-yellow-800': risk.level === 'medium',
+              'border p-3 rounded text-sm': true
+            }">
+              <span class="font-semibold" x-text="{
+                critical: '🚨 严重：', high: '⚠️ 高风险：', medium: 'ℹ️ 提示：'
+              }[risk.level] || '提示：'"></span>
+              <span x-text="risk.message"></span>
+            </div>
+          </template>
+        </div>
+
+        <!-- diff 摘要 -->
+        <div x-show="!diffModal.loading && diffModal.diff"
+          class="bg-gray-50 border border-gray-200 rounded p-4 mb-4 text-sm">
+          <div class="grid grid-cols-2 gap-2">
+            <div><span class="text-gray-500">旧规则行数：</span><span x-text="diffModal.diff?.old_line_count"></span></div>
+            <div><span class="text-gray-500">新规则行数：</span><span x-text="diffModal.diff?.new_line_count"></span></div>
+            <div class="text-green-700"><span class="text-gray-500">新增：</span><span x-text="diffModal.diff?.added_count"></span> 行</div>
+            <div class="text-red-700"><span class="text-gray-500">删除：</span><span x-text="diffModal.diff?.removed_count"></span> 行</div>
+          </div>
+          <div x-show="!diffModal.diff?.has_changes"
+            class="mt-3 text-gray-500 italic">没有变更。</div>
+        </div>
+
+        <!-- 新增行样例 -->
+        <div x-show="!diffModal.loading && diffModal.diff?.added_sample?.length > 0"
+          class="mb-4">
+          <h3 class="text-sm font-semibold text-green-700 mb-2">新增（前 15 行）：</h3>
+          <pre class="bg-green-50 border border-green-200 rounded p-3 text-xs overflow-x-auto font-mono"><template x-for="line in diffModal.diff?.added_sample || []" :key="line"><div x-text="'+ ' + line"></div></template></pre>
+        </div>
+
+        <!-- 删除行样例 -->
+        <div x-show="!diffModal.loading && diffModal.diff?.removed_sample?.length > 0"
+          class="mb-4">
+          <h3 class="text-sm font-semibold text-red-700 mb-2">删除（前 15 行）：</h3>
+          <pre class="bg-red-50 border border-red-200 rounded p-3 text-xs overflow-x-auto font-mono"><template x-for="line in diffModal.diff?.removed_sample || []" :key="line"><div x-text="'- ' + line"></div></template></pre>
+        </div>
+
+        <!-- 完整新规则（折叠）-->
+        <details x-show="!diffModal.loading && diffModal.newRulesText"
+          class="text-xs text-gray-500">
+          <summary class="cursor-pointer hover:text-gray-700">查看完整新规则（高级）</summary>
+          <pre class="mt-2 bg-gray-900 text-gray-100 rounded p-3 overflow-x-auto font-mono whitespace-pre" x-text="diffModal.newRulesText"></pre>
+        </details>
+      </div>
+
+      <!-- 操作按钮 -->
+      <div class="p-4 border-t flex justify-end gap-3">
+        <button @click="cancelSaveConfig()" :disabled="saving"
+          class="px-5 py-2 border border-gray-300 rounded text-sm hover:bg-gray-50 disabled:opacity-50 transition-colors">
+          取消
+        </button>
+        <button @click="confirmSaveConfig()" :disabled="saving || diffModal.loading"
+          class="px-5 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50 transition-colors">
+          <span x-show="!saving">确认保存</span>
+          <span x-show="saving">保存中…</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
   <script src="app.js"></script>
 </body>
 </html>

@@ -1,5 +1,15 @@
 function app() {
   return {
+    // ======================= 认证状态 =======================
+    auth: {
+      authenticated: false,
+      passwordSet: false,
+      checking: true,         // 初次访问 /api/auth/status 期间为 true
+      loginPassword: '',
+      loginMode: 'login',     // 'login' | 'setup'
+      loginLoading: false,
+      loginError: '',
+    },
     currentNav: 'network',
     navItems: [
       { id: 'network', label: '网络接口' },
@@ -31,6 +41,16 @@ function app() {
     saving: false,
     applying: false,
     toast: { show: false, message: '', type: 'success' },
+
+    // dry-run diff 弹窗
+    diffModal: {
+      show: false,
+      loading: false,
+      diff: null,    // {old_line_count, new_line_count, added_count, removed_count, added_sample, removed_sample, has_changes}
+      risks: [],     // [{level, message}]
+      newRulesText: '',
+      pendingConfig: null,  // 用户确认后要提交的 config
+    },
 
     // 网络配置（OpenWrt /etc/config/network）
     networkConfig: {
@@ -82,6 +102,13 @@ function app() {
     listsLoading: false,
     listsNewIpWhitelist: '',
     listsNewIpBlacklist: '',
+    // IP 预设 + 历史
+    ipPresets: [],
+    listHistory: [],
+    presetModalOpen: false,
+    presetEditing: null,     // {id, label, ip, type, auto_expire} 或 null（新建）
+    presetSaving: false,
+    presetSavingId: null,    // apply 时追踪哪个预设正在执行
 
     // 反代管理
     rpTab: 'rules',
@@ -123,12 +150,106 @@ function app() {
     },
 
     async init() {
+      // 监听全局 401 事件，api.request 在收到 401 时派发
+      window.addEventListener('auth-expired', () => this.handleAuthExpired());
+      window.addEventListener('auth-needs-setup', () => {
+        this.auth.loginMode = 'setup';
+      });
+
+      // 第一步：检查认证状态。未登录时不加载任何业务数据
+      await this.checkAuth();
+      if (!this.auth.authenticated) return;
+
       await this.loadConfig();
       await this.loadNetworkConfig();
       await this.loadInterfaces();
       await this.loadLogdConfig();
       await this.loadFirewallStatus();
       await this.loadDdns();
+    },
+
+    async checkAuth() {
+      try {
+        const data = await api.get('/api/auth/status');
+        this.auth.authenticated = !!data.authenticated;
+        this.auth.passwordSet = !!data.password_set;
+        this.auth.loginMode = data.password_set ? 'login' : 'setup';
+      } catch (e) {
+        // 401 说明未登录（虽然 status 端点本身放行，但保险起见）
+        this.auth.authenticated = false;
+        this.auth.passwordSet = false;
+        this.auth.loginMode = 'setup';
+      } finally {
+        this.auth.checking = false;
+      }
+    },
+
+    async doLogin() {
+      if (!this.auth.loginPassword) {
+        this.auth.loginError = '请输入密码';
+        return;
+      }
+      this.auth.loginLoading = true;
+      this.auth.loginError = '';
+      try {
+        await api.post('/api/auth/login', { password: this.auth.loginPassword });
+        this.auth.authenticated = true;
+        this.auth.loginPassword = '';
+        // 登录成功后加载所有业务数据
+        await this.loadAllData();
+      } catch (e) {
+        this.auth.loginError = e.message || '登录失败';
+      } finally {
+        this.auth.loginLoading = false;
+      }
+    },
+
+    async doSetup() {
+      if (!this.auth.loginPassword || this.auth.loginPassword.length < 4) {
+        this.auth.loginError = '密码长度至少 4 位';
+        return;
+      }
+      this.auth.loginLoading = true;
+      this.auth.loginError = '';
+      try {
+        await api.post('/api/auth/setup', { password: this.auth.loginPassword });
+        this.auth.authenticated = true;
+        this.auth.passwordSet = true;
+        this.auth.loginMode = 'login';
+        this.auth.loginPassword = '';
+        await this.loadAllData();
+      } catch (e) {
+        this.auth.loginError = e.message || '设置失败';
+      } finally {
+        this.auth.loginLoading = false;
+      }
+    },
+
+    async doLogout() {
+      try { await api.post('/api/auth/logout'); } catch (_) {}
+      this.auth.authenticated = false;
+      this.auth.loginPassword = '';
+      // 清空敏感数据避免泄露（下次登录会重新加载）
+      this.config = {};
+      this.rp = { rules: [], certificates: [], settings: {} };
+    },
+
+    handleAuthExpired() {
+      this.auth.authenticated = false;
+      this.auth.loginError = '会话已过期，请重新登录';
+      this.config = {};
+      this.rp = { rules: [], certificates: [], settings: {} };
+    },
+
+    async loadAllData() {
+      // 登录/初始化后批量加载所有数据
+      try { await this.loadConfig(); } catch (_) {}
+      try { await this.loadNetworkConfig(); } catch (_) {}
+      try { await this.loadInterfaces(); } catch (_) {}
+      try { await this.loadLogdConfig(); } catch (_) {}
+      try { await this.loadFirewallStatus(); } catch (_) {}
+      try { await this.loadDdns(); } catch (_) {}
+      try { await this.loadReverseProxy(); } catch (_) {}
     },
 
     async loadLogdConfig() {
@@ -200,15 +321,52 @@ function app() {
         return;
       }
       this.config.whitelist_timeout = timeoutSeconds;
+
+      // dry-run：先调 preview-changes 看 diff + 风险
+      this.diffModal.pendingConfig = { ...this.config };
+      this.diffModal.loading = true;
+      this.diffModal.show = true;
+      this.diffModal.diff = null;
+      this.diffModal.risks = [];
+      this.diffModal.newRulesText = '';
+      try {
+        const data = await api.post('/api/rules/preview-changes',
+          { proposed: this.config });
+        this.diffModal.diff = data.diff;
+        this.diffModal.risks = data.risks || [];
+        this.diffModal.newRulesText = data.new_rules_text || '';
+      } catch (e) {
+        this.diffModal.show = false;
+        this.showToast('预览失败: ' + e.message, 'error');
+        return;
+      } finally {
+        this.diffModal.loading = false;
+      }
+      // 弹窗打开，等用户点"确认保存"或"取消"
+    },
+
+    async confirmSaveConfig() {
+      const cfg = this.diffModal.pendingConfig;
+      if (!cfg) return;
       this.saving = true;
       try {
-        await api.post('/api/config', this.config);
+        await api.post('/api/config', cfg);
         this.showToast('配置已保存', 'success');
+        this.diffModal.show = false;
+        this.diffModal.pendingConfig = null;
       } catch (e) {
         this.showToast('保存失败: ' + e.message, 'error');
       } finally {
         this.saving = false;
       }
+    },
+
+    cancelSaveConfig() {
+      this.diffModal.show = false;
+      this.diffModal.pendingConfig = null;
+      this.diffModal.diff = null;
+      this.diffModal.risks = [];
+      this.showToast('已取消保存', 'info');
     },
 
     async restoreConfig() {
@@ -362,6 +520,14 @@ function app() {
 
     getLogTotalPages() {
       return Math.max(1, Math.ceil(this.systemLogs.filteredLogs.length / this.systemLogs.pageSize));
+    },
+
+    // 当前页日志（getter computed）。避免 x-for 表达式里内联 slice 在 Alpine 3 的
+    // reactivity 时序下出现"页码显示但内容空"的 bug。
+    get currentLogPage() {
+      const start = (this.systemLogs.currentPage - 1) * this.systemLogs.pageSize;
+      const end = start + this.systemLogs.pageSize;
+      return this.systemLogs.filteredLogs.slice(start, end);
     },
 
     goToLogPage(page) {
@@ -613,16 +779,116 @@ function app() {
     async loadLists() {
       this.listsLoading = true;
       try {
-        const [whitelist, blacklist] = await Promise.all([
+        const [whitelist, blacklist, presets, history] = await Promise.all([
           api.get('/api/lists/whitelist'),
-          api.get('/api/lists/blacklist')
+          api.get('/api/lists/blacklist'),
+          api.get('/api/lists/presets').catch(() => ({ presets: [] })),
+          api.get('/api/lists/history?limit=20').catch(() => ({ history: [] })),
         ]);
         this.listsData.whitelist = { ipv4: whitelist.allowed4 || {}, ipv6: whitelist.allowed6 || {} };
         this.listsData.blacklist = { ipv4: blacklist.blacklist4 || {}, ipv6: blacklist.blacklist6 || {} };
+        this.ipPresets = presets.presets || [];
+        this.listHistory = history.history || [];
       } catch (e) {
         this.showToast('加载名单失败: ' + e.message, 'error');
       } finally {
         this.listsLoading = false;
+      }
+    },
+
+    async loadListPresets() {
+      try {
+        const data = await api.get('/api/lists/presets');
+        this.ipPresets = data.presets || [];
+      } catch (e) {
+        console.warn('加载预设失败:', e);
+      }
+    },
+
+    async loadListHistory() {
+      try {
+        const data = await api.get('/api/lists/history?limit=20');
+        this.listHistory = data.history || [];
+      } catch (e) {
+        console.warn('加载历史失败:', e);
+      }
+    },
+
+    openPresetModal(preset) {
+      if (preset) {
+        this.presetEditing = { ...preset };
+      } else {
+        this.presetEditing = { id: '', label: '', ip: '', type: 'whitelist', auto_expire: true };
+      }
+      this.presetModalOpen = true;
+    },
+
+    closePresetModal() {
+      this.presetModalOpen = false;
+      this.presetEditing = null;
+    },
+
+    async savePreset() {
+      const p = this.presetEditing;
+      if (!p || !p.label || !p.ip) {
+        this.showToast('标签和 IP 不能为空', 'error');
+        return;
+      }
+      this.presetSaving = true;
+      try {
+        if (p.id) {
+          await api.put('/api/lists/presets/' + p.id, {
+            label: p.label, ip: p.ip, type: p.type, auto_expire: p.auto_expire,
+          });
+          this.showToast('预设已更新', 'success');
+        } else {
+          await api.post('/api/lists/presets', {
+            label: p.label, ip: p.ip, type: p.type, auto_expire: p.auto_expire,
+          });
+          this.showToast('预设已添加', 'success');
+        }
+        this.closePresetModal();
+        await this.loadListPresets();
+      } catch (e) {
+        this.showToast('保存失败: ' + e.message, 'error');
+      } finally {
+        this.presetSaving = false;
+      }
+    },
+
+    async deletePreset(preset) {
+      if (!confirm('删除预设「' + (preset.label || preset.ip) + '」？\n\n注意：这不会从 nft set 里移除已加入的 IP。')) return;
+      try {
+        await api.delete('/api/lists/presets/' + preset.id);
+        this.showToast('预设已删除', 'success');
+        await this.loadListPresets();
+      } catch (e) {
+        this.showToast('删除失败: ' + e.message, 'error');
+      }
+    },
+
+    async applyPreset(preset) {
+      this.presetSavingId = preset.id;
+      try {
+        await api.post('/api/lists/presets/' + preset.id + '/apply');
+        this.showToast('已加入「' + preset.label + '」', 'success');
+        // 刷新：set 数据 + 预设 active 状态 + 历史
+        await Promise.all([this.loadLists(), this.loadListPresets(), this.loadListHistory()]);
+      } catch (e) {
+        this.showToast('加入失败: ' + e.message, 'error');
+      } finally {
+        this.presetSavingId = null;
+      }
+    },
+
+    async clearListHistory() {
+      if (!confirm('清空名单操作历史？\n\n注意：这不影响 nft set 里当前的 IP。')) return;
+      try {
+        await api.post('/api/lists/history/clear');
+        this.listHistory = [];
+        this.showToast('历史已清空', 'success');
+      } catch (e) {
+        this.showToast('清空失败: ' + e.message, 'error');
       }
     },
 
@@ -879,16 +1145,18 @@ function app() {
     async saveRpRules() {
       this.rp.loading = true;
       try {
-        const rules = this.rp.rules.map(r => {
-          const { _editIndex, ...clean } = r;
-          return clean;
-        });
         // Save rules one by one: existing rules use PUT, new rules use POST
-        for (const rule of rules) {
-          if (rule.id) {
-            await api.put('/api/reverse-proxy/rules/' + rule.id, rule);
+        // 注意：POST 必须回写后端返回的 rule_id 到 rp.rules[i].id，否则下次保存会重复创建
+        for (let i = 0; i < this.rp.rules.length; i++) {
+          const { _editIndex, ...clean } = this.rp.rules[i];
+          if (clean.id) {
+            await api.put('/api/reverse-proxy/rules/' + clean.id, clean);
           } else {
-            await api.post('/api/reverse-proxy/rules', rule);
+            const resp = await api.post('/api/reverse-proxy/rules', clean);
+            // api.request 已解构 {success, message, ...data}，resp 就是 data
+            if (resp && resp.rule_id) {
+              this.rp.rules[i].id = resp.rule_id;  // 同步后端分配的 id
+            }
           }
         }
         this.showToast('反代规则已保存', 'success');
@@ -953,7 +1221,9 @@ function app() {
         const resp = await fetch('/api/reverse-proxy/certificates/upload', { method: 'POST', body: fd });
         const json = await resp.json();
         if (json.success === false) throw new Error(json.message || '上传失败');
-        this.showToast('证书上传成功', 'success');
+        // 后端会在同 domain 已有 manual 证书时自动复用 id，replaced=true 表示"原地续期"
+        const replaced = json.data && json.data.replaced === true;
+        this.showToast(replaced ? '已替换同域名旧证书（引用关系保留）' : '证书上传成功', 'success');
         this.rpUploadDomain = '';
         if (this.$refs.rpCertFile) this.$refs.rpCertFile.value = '';
         if (this.$refs.rpKeyFile) this.$refs.rpKeyFile.value = '';
@@ -1010,7 +1280,64 @@ function app() {
         this.showToast('证书已删除', 'success');
         await this.loadReverseProxy();
       } catch (e) {
+        // 证书被反代规则引用时，后端返回 400 + referenced_by + hint
+        const detail = e.data && e.data.data;
+        if (detail && Array.isArray(detail.referenced_by) && detail.referenced_by.length > 0) {
+          const rules = detail.referenced_by.map(r => r.domain).join(', ');
+          const useForce = confirm(
+            `证书被 ${detail.referenced_by.length} 条反代规则引用（${rules}）。\n\n` +
+            `要先上传一个同域名的新证书，让旧证书的引用自动迁移到新证书吗？\n\n` +
+            `点击「确定」跳转到上传区，点击「取消」自己处理引用关系。`
+          );
+          if (useForce) {
+            this.rpTab = 'certs';
+            this.rpUploadDomain = cert.domain || '';
+            // 滚动到上传区（顶部）
+            const uploadSection = document.querySelector('[x-ref="rpCertFile"]');
+            if (uploadSection) {
+              const card = uploadSection.closest('.bg-gray-50');
+              if (card) card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
+            this.showToast('请上传同域名的新证书（fullchain + privkey），将自动替换旧证书', 'info');
+          }
+          return;
+        }
         this.showToast('删除失败: ' + e.message, 'error');
+      } finally {
+        this.rpUploading = false;
+      }
+    },
+
+    async downloadRpCert(cert) {
+      if (!confirm('将下载 ' + (cert.domain || '') + ' 的证书（含私钥），请妥善保管。\n\n继续？')) return;
+      this.rpUploading = true;
+      try {
+        const resp = await fetch('/api/reverse-proxy/certificates/' + cert.id + '/download');
+        if (!resp.ok) {
+          let msg = '下载失败';
+          try {
+            const j = await resp.json();
+            if (j && j.message) msg = j.message;
+          } catch (_) {}
+          throw new Error(msg);
+        }
+        // 从 Content-Disposition 解析文件名，回退默认
+        let filename = (cert.domain || cert.id) + '.zip';
+        const disp = resp.headers.get('Content-Disposition') || '';
+        const m = disp.match(/filename="?([^"]+)"?/);
+        if (m) filename = m[1];
+        const blob = await resp.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        this.showToast('证书已下载', 'success');
+      } catch (e) {
+        this.showToast('下载失败: ' + e.message, 'error');
       } finally {
         this.rpUploading = false;
       }
@@ -1060,7 +1387,37 @@ function app() {
 
 const api = {
   async request(url, options = {}) {
-    const resp = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...options });
+    let resp;
+    try {
+      resp = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...options });
+    } catch (e) {
+      const err = new Error('网络请求失败: ' + (e.message || e));
+      throw err;
+    }
+
+    // 401 未登录：派发全局事件，前端 Alpine 监听后跳登录页
+    if (resp.status === 401) {
+      let body = null;
+      try { body = await resp.json(); } catch (_) {}
+      window.dispatchEvent(new CustomEvent('auth-expired', { detail: { url } }));
+      const err = new Error((body && body.message) || '未登录');
+      err.code = (body && body.code) || 'AUTH_REQUIRED';
+      err.data = body;
+      err.status = 401;
+      throw err;
+    }
+
+    // 429 限流：提示用户等待
+    if (resp.status === 429) {
+      let body = null;
+      try { body = await resp.json(); } catch (_) {}
+      const retryAfter = resp.headers.get('Retry-After') || '?';
+      const err = new Error((body && body.message) || `操作过于频繁，请 ${retryAfter} 秒后再试`);
+      err.code = (body && body.code) || 'RATE_LIMITED';
+      err.retryAfter = parseInt(retryAfter, 10) || 0;
+      throw err;
+    }
+
     const json = await resp.json();
     if (json.success === false) {
       const err = new Error(json.message || '请求失败');

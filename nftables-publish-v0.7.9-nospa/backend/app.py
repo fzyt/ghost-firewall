@@ -1,11 +1,179 @@
 # Version: 0.7.7
-from flask import Flask, jsonify, request, send_from_directory
-import os, subprocess, shutil, json, time, re, hmac, hashlib, base64, datetime, uuid, fcntl
+from flask import Flask, jsonify, request, send_from_directory, send_file, session
+import os, subprocess, shutil, json, time, re, hmac, hashlib, base64, datetime, uuid, fcntl, io, zipfile, secrets, ssl
 from template_engine import load_template, generate_rules
+
+# ======================= 认证配置 =======================
+AUTH_PASSWORD_FILE = '/etc/nftables/nftables-web-password'
+AUTH_SECRET_FILE = '/etc/nftables/nftables-web-secret'
+AUTH_COOKIE_NAME = 'nftables_web_session'
+AUTH_SESSION_LIFETIME = 12 * 3600   # 12 小时（最长生命周期）
+AUTH_IDLE_TIMEOUT = 3600            # 1 小时无操作自动登出
+PBKDF2_ITERATIONS = 200000
+# 登录失败限流：N 秒内 M 次失败则锁 L 秒
+AUTH_RATE_LIMIT_WINDOW = 300  # 5 分钟
+AUTH_RATE_LIMIT_MAX_FAILS = 5
+AUTH_RATE_LIMIT_LOCKOUT = 900  # 15 分钟
 
 app = Flask(__name__)
 CONFIG_PATH = '/etc/nftables/nftables-web-config.json'
 RULES_PATH = '/etc/nftables.d/99-custom-rules.nft'
+
+
+def _init_app_secret():
+    """读取或生成 Flask SECRET_KEY（持久化到 /etc/nftables/nftables-web-secret）"""
+    try:
+        if os.path.exists(AUTH_SECRET_FILE):
+            with open(AUTH_SECRET_FILE, 'r') as f:
+                key = f.read().strip()
+                if key:
+                    return key
+    except Exception:
+        pass
+    secret = secrets.token_hex(32)
+    try:
+        os.makedirs(os.path.dirname(AUTH_SECRET_FILE), exist_ok=True)
+        with open(AUTH_SECRET_FILE, 'w') as f:
+            f.write(secret)
+        os.chmod(AUTH_SECRET_FILE, 0o600)
+    except Exception:
+        pass
+    return secret
+
+
+app.secret_key = _init_app_secret()
+app.config['SESSION_COOKIE_NAME'] = AUTH_COOKIE_NAME
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['PERMANENT_SESSION_LIFETIME'] = datetime.timedelta(seconds=AUTH_SESSION_LIFETIME)
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+
+
+# ======================= 密码哈希/验证（标准库 pbkdf2） =======================
+def _hash_password(password: str) -> str:
+    """PBKDF2-HMAC-SHA256，200000 轮，无外部依赖"""
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt.encode('utf-8'), PBKDF2_ITERATIONS)
+    return f"pbkdf2_sha256${PBKDF2_ITERATIONS}${salt}${digest.hex()}"
+
+
+def _verify_password(password: str, stored: str) -> bool:
+    try:
+        algo, iters, salt, hash_hex = stored.split('$', 3)
+        if algo != 'pbkdf2_sha256':
+            return False
+        digest = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt.encode('utf-8'), int(iters))
+        return hmac.compare_digest(digest.hex(), hash_hex)
+    except Exception:
+        return False
+
+
+def _password_set() -> bool:
+    return os.path.exists(AUTH_PASSWORD_FILE)
+
+
+def _read_password_hash() -> str:
+    try:
+        with open(AUTH_PASSWORD_FILE, 'r') as f:
+            data = json.load(f)
+        return data.get('hash', '')
+    except Exception:
+        return ''
+
+
+def _write_password_hash(hash_str: str):
+    os.makedirs(os.path.dirname(AUTH_PASSWORD_FILE), exist_ok=True)
+    with open(AUTH_PASSWORD_FILE, 'w') as f:
+        json.dump({'hash': hash_str, 'created_at': datetime.datetime.now().isoformat()}, f)
+    os.chmod(AUTH_PASSWORD_FILE, 0o600)
+
+
+def _is_authenticated() -> bool:
+    return session.get('authenticated') is True
+
+
+# 登录失败计数（IP -> [timestamp, ...]），用于限流
+_failed_logins: dict = {}
+
+
+def _check_rate_limit(ip: str) -> tuple:
+    """检查 IP 是否被限流。返回 (allowed: bool, retry_after: int|None)"""
+    now = time.time()
+    rec = _failed_logins.get(ip, [])
+    # 清理过期记录
+    rec = [t for t in rec if now - t < AUTH_RATE_LIMIT_LOCKOUT]
+    _failed_logins[ip] = rec
+    # 检查窗口内失败次数
+    recent = [t for t in rec if now - t < AUTH_RATE_LIMIT_WINDOW]
+    if len(recent) >= AUTH_RATE_LIMIT_MAX_FAILS:
+        # 计算还需等待多久才能解锁
+        oldest = min(recent)
+        retry_after = int(AUTH_RATE_LIMIT_LOCKOUT - (now - oldest)) + 1
+        return False, retry_after
+    return True, None
+
+
+def _record_login_failure(ip: str):
+    """记录一次登录失败"""
+    _failed_logins.setdefault(ip, []).append(time.time())
+
+
+def _clear_login_failures(ip: str):
+    """登录成功，清空记录"""
+    _failed_logins.pop(ip, None)
+
+
+# 公开路径白名单（无需登录）
+_STATIC_EXTENSIONS = ('js', 'css', 'png', 'jpg', 'jpeg', 'gif', 'svg', 'ico', 'woff', 'woff2', 'ttf', 'map')
+
+
+@app.before_request
+def _require_auth():
+    """全局认证拦截器
+    - 静态资源（带扩展名）直接放行
+    - / 根路径放行（让登录页 HTML 能加载）
+    - /api/auth/* 公开端点放行
+    - 已登录请求：检查 idle 超时
+    - 未登录返回 401
+    """
+    path = request.path
+
+    # 静态资源放行（前端 JS / CSS / 图片 / 字体）
+    last = path.rsplit('/', 1)[-1]
+    if '.' in last and last.rsplit('.', 1)[-1].lower() in _STATIC_EXTENSIONS:
+        return None
+
+    # 根路径放行（前端 SPA 入口，登录页 HTML 在此加载）
+    if path == '/' or path == '':
+        return None
+
+    # 公开认证端点放行
+    if path.startswith('/api/auth/'):
+        return None
+
+    # 已登录：检查 idle 超时
+    if _is_authenticated():
+        last_active = session.get('last_active', 0)
+        if time.time() - last_active > AUTH_IDLE_TIMEOUT:
+            session.clear()
+            return jsonify({'success': False, 'code': 'AUTH_EXPIRED', 'message': '会话过期，请重新登录'}), 401
+        # 更新 last_active（每次请求刷新）
+        session['last_active'] = time.time()
+        return None
+
+    # 未登录：API 返回 401 JSON；其他也返回 401（前端拦截后跳登录）
+    return jsonify({'success': False, 'code': 'AUTH_REQUIRED', 'message': '未登录'}), 401
+
+
+@app.after_request
+def _security_headers(resp):
+    """HTTPS 响应加 HSTS + 通用安全 header"""
+    # HSTS：只在 HTTPS 响应里加（让浏览器记住以后走 HTTPS）
+    if request.is_secure:
+        resp.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    # 通用：禁止 MIME sniffing、限制 referrer
+    resp.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    resp.headers.setdefault('Referrer-Policy', 'same-origin')
+    return resp
 
 # 默认配置
 DEFAULT_CONFIG = {
@@ -405,7 +573,10 @@ def post_config():
     data = request.get_json(silent=True)
     if not data:
         return jsonify({"success": False, "message": "请求体不能为空"}), 400
-    save_config(data)
+    # 修复：merge 到现有配置，避免前端只发部分字段时清空其他配置
+    config = load_config()
+    config.update(data)
+    save_config(config)
     return jsonify({"success": True, "message": "配置已保存"})
 
 
@@ -439,6 +610,110 @@ def preview_rules():
     config = load_config()
     rules = build_rules(config)
     return jsonify({"success": True, "rules": rules})
+
+
+def _diff_nft_rules(old_text: str, new_text: str) -> dict:
+    """对比两份 nft 规则文本，返回 diff 摘要和重要变更行（限 30 条）"""
+    import difflib
+    old_lines = old_text.splitlines()
+    new_lines = new_text.splitlines()
+    diff = list(difflib.unified_diff(old_lines, new_lines, lineterm='', n=0))
+
+    added = [line[1:] for line in diff if line.startswith('+') and not line.startswith('+++')]
+    removed = [line[1:] for line in diff if line.startswith('-') and not line.startswith('---')]
+
+    return {
+        'old_line_count': len(old_lines),
+        'new_line_count': len(new_lines),
+        'added_count': len(added),
+        'removed_count': len(removed),
+        'added_sample': added[:15],   # 至多展示 15 条
+        'removed_sample': removed[:15],
+        'has_changes': len(added) > 0 or len(removed) > 0,
+    }
+
+
+def _detect_risks(old_cfg: dict, new_cfg: dict, requester_ip: str) -> list:
+    """检测可能把用户锁在外面的风险"""
+    risks = []
+    # 1. SSH 端口变化（lan_allowed_ports 或 forward_rules 取消 22）
+    old_lan_ports = set(old_cfg.get('lan_allowed_ports', []) or [])
+    new_lan_ports = set(new_cfg.get('lan_allowed_ports', []) or [])
+    if 22 in old_lan_ports and 22 not in new_lan_ports:
+        risks.append({
+            'level': 'high',
+            'message': 'LAN 允许端口移除了 22（SSH），可能影响远程管理',
+        })
+    # 2. trusted_ip4 移除请求者自己的 IP
+    old_trusted = set(old_cfg.get('trusted_ip4', []) or [])
+    new_trusted = set(new_cfg.get('trusted_ip4', []) or [])
+    if requester_ip and requester_ip in old_trusted and requester_ip not in new_trusted:
+        risks.append({
+            'level': 'critical',
+            'message': f'你的 IP {requester_ip} 不再在 trusted_ip4 白名单！保存后可能立即被锁在外面',
+        })
+    # 3. access_mode 改了
+    old_mode = old_cfg.get('access_mode', 'lan')
+    new_mode = new_cfg.get('access_mode', 'lan')
+    if old_mode != new_mode:
+        risks.append({
+            'level': 'medium',
+            'message': f'访问模式从 {old_mode} 改为 {new_mode}',
+        })
+    return risks
+
+
+@app.route('/api/rules/preview-changes', methods=['POST'])
+def preview_rules_changes():
+    """预览即将保存的 config 变更（不写文件、不应用 nft）
+
+    请求体: {"proposed": {<要修改的 config 字段>}}
+    返回: {
+        success: True,
+        data: {
+            diff: {old/new 行数, added/removed 数和样例, has_changes},
+            risks: [{level, message}, ...],
+            new_rules_text: str,  // 完整的新规则（让用户能复制检查）
+        }
+    }
+    """
+    if not _is_authenticated():
+        return jsonify({'success': False, 'code': 'AUTH_REQUIRED'}), 401
+    data = request.get_json(silent=True) or {}
+    proposed = data.get('proposed', {})
+    if not isinstance(proposed, dict):
+        return jsonify({'success': False, 'message': 'proposed 必须是对象'}), 400
+
+    old_cfg = load_config()
+    new_cfg = dict(old_cfg)
+    new_cfg.update(proposed)
+
+    try:
+        new_rules_text = build_rules(new_cfg)
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'生成规则失败: {e}'}), 400
+
+    # 旧规则文本（从 RULES_PATH 读）
+    old_rules_text = ''
+    if os.path.exists(RULES_PATH):
+        try:
+            with open(RULES_PATH, 'r') as f:
+                old_rules_text = f.read()
+        except Exception:
+            pass
+
+    diff = _diff_nft_rules(old_rules_text, new_rules_text)
+    requester_ip = request.remote_addr or ''
+    risks = _detect_risks(old_cfg, new_cfg, requester_ip)
+
+    return jsonify({
+        'success': True,
+        'data': {
+            'diff': diff,
+            'risks': risks,
+            'new_rules_text': new_rules_text,
+        },
+    })
 
 
 @app.route('/api/rules/save', methods=['POST'])
@@ -2113,6 +2388,84 @@ def set_logd_config():
 
 VALID_SET_NAMES = {"allowed4", "allowed6", "blacklist4", "blacklist6"}
 
+# 历史/预设容量上限
+LIST_HISTORY_MAX = 100
+
+
+def _list_type_from_set(set_name):
+    """从 set_name 推出 list_type: 'whitelist' | 'blacklist'"""
+    if set_name.startswith("allowed"):
+        return "whitelist"
+    if set_name.startswith("blacklist"):
+        return "blacklist"
+    return "unknown"
+
+
+def _detect_ip_version(ip):
+    """返回 4 / 6，非法返回 None（标准库 ipaddress，无外部依赖）"""
+    try:
+        import ipaddress
+        if '/' in ip:  # CIDR 不允许加入 set
+            return None
+        try:
+            ipaddress.IPv4Address(ip)
+            return 4
+        except (ipaddress.AddressValueError, ValueError):
+            pass
+        try:
+            ipaddress.IPv6Address(ip)
+            return 6
+        except (ipaddress.AddressValueError, ValueError):
+            pass
+    except Exception:
+        pass
+    return None
+
+
+def _record_list_history(action, ip, list_type, label='', preset_id=''):
+    """记录名单操作历史。list_type: 'whitelist' / 'blacklist'，action: 'add'/'delete'/'flush'"""
+    config = load_config()
+    history = config.setdefault('list_history', [])
+    entry = {
+        'id': 'h_' + uuid.uuid4().hex[:12],
+        'ts': datetime.datetime.now().isoformat(),
+        'action': action,
+        'ip': ip,
+        'type': list_type,
+        'label': label,
+        'preset_id': preset_id,
+    }
+    history.insert(0, entry)  # 最新的在前
+    config['list_history'] = history[:LIST_HISTORY_MAX]
+    save_config(config)
+
+
+def _next_preset_id(presets):
+    used = {p.get('id', '') for p in presets}
+    for i in range(1, 99999):
+        cid = f"p_{i:04d}"
+        if cid not in used:
+            return cid
+    return "p_" + uuid.uuid4().hex[:8]
+
+
+def _check_ip_in_set(ip, list_type):
+    """实时查询 IP 是否在对应 set 中。返回 bool（找不到 set 时返回 False）"""
+    set_name = ('allowed' if list_type == 'whitelist' else 'blacklist') + (
+        '6' if _detect_ip_version(ip) == 6 else '4'
+    )
+    try:
+        result = subprocess.run(
+            ['nft', 'list', 'set', 'inet', 'fw4', set_name],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return False
+        # 简化匹配：看 IP 字面量是否出现在输出里
+        return (' ' + ip + ' ') in result.stdout or ip in result.stdout.split('elements', 1)[-1]
+    except Exception:
+        return False
+
 
 def _parse_nft_set_output(output):
     """从 nft list set 输出中提取 IP 地址及过期时间，返回 {ip: expires_str|None}"""
@@ -2190,6 +2543,7 @@ def list_add():
         )
         if result.returncode != 0:
             return jsonify({"success": False, "message": f"添加失败: {result.stderr.strip() or result.stdout.strip()}"}), 400
+        _record_list_history('add', ip, _list_type_from_set(set_name))
         return jsonify({"success": True, "message": f"已添加 {ip} 到 {set_name}"})
     except subprocess.TimeoutExpired:
         return jsonify({"success": False, "message": "nft 命令执行超时"}), 400
@@ -2216,6 +2570,7 @@ def list_delete():
         )
         if result.returncode != 0:
             return jsonify({"success": False, "message": f"删除失败: {result.stderr.strip() or result.stdout.strip()}"}), 400
+        _record_list_history('delete', ip, _list_type_from_set(set_name))
         return jsonify({"success": True, "message": f"已从 {set_name} 删除 {ip}"})
     except subprocess.TimeoutExpired:
         return jsonify({"success": False, "message": "nft 命令执行超时"}), 400
@@ -2241,11 +2596,199 @@ def list_flush():
         )
         if result.returncode != 0:
             return jsonify({"success": False, "message": f"清空失败: {result.stderr.strip() or result.stdout.strip()}"}), 400
+        _record_list_history('flush', '-', _list_type_from_set(set_name))
         return jsonify({"success": True, "message": f"已清空 {set_name}"})
     except subprocess.TimeoutExpired:
         return jsonify({"success": False, "message": "nft 命令执行超时"}), 400
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 400
+
+
+# ======================= 名单历史 / IP 预设 =======================
+
+@app.route('/api/lists/presets', methods=['GET'])
+def list_get_presets():
+    """列出所有 IP 预设（每个 preset 附带 is_active：当前是否在 set 里）"""
+    config = load_config()
+    presets = config.get('ip_presets', [])
+    enriched = []
+    for p in presets:
+        item = dict(p)
+        item['is_active'] = _check_ip_in_set(p.get('ip', ''), p.get('type', 'whitelist'))
+        enriched.append(item)
+    return jsonify({'success': True, 'data': {'presets': enriched, 'total': len(enriched)}})
+
+
+@app.route('/api/lists/presets', methods=['POST'])
+def list_create_preset():
+    """新建 IP 预设"""
+    data = request.get_json(silent=True) or {}
+    label = data.get('label', '').strip()
+    ip = data.get('ip', '').strip()
+    list_type = data.get('type', 'whitelist').strip()
+    auto_expire = bool(data.get('auto_expire', True))
+
+    if not label or len(label) > 64:
+        return jsonify({'success': False, 'message': '标签需 1-64 字符'}), 400
+    if not ip or _detect_ip_version(ip) is None:
+        return jsonify({'success': False, 'message': 'IP 地址格式错误'}), 400
+    if list_type not in ('whitelist', 'blacklist'):
+        return jsonify({'success': False, 'message': 'type 只能是 whitelist 或 blacklist'}), 400
+
+    config = load_config()
+    presets = config.setdefault('ip_presets', [])
+    # 同 IP + type 视为重复
+    for p in presets:
+        if p.get('ip') == ip and p.get('type') == list_type:
+            return jsonify({'success': False, 'message': '同 IP+类型的预设已存在'}), 400
+
+    entry = {
+        'id': _next_preset_id(presets),
+        'label': label,
+        'ip': ip,
+        'type': list_type,
+        'auto_expire': auto_expire,
+        'created_at': datetime.datetime.now().isoformat(),
+    }
+    presets.append(entry)
+    save_config(config)
+    return jsonify({'success': True, 'data': {'preset': entry, 'message': '预设已添加'}})
+
+
+@app.route('/api/lists/presets/<preset_id>', methods=['PUT'])
+def list_update_preset(preset_id):
+    """编辑 IP 预设"""
+    data = request.get_json(silent=True) or {}
+    config = load_config()
+    presets = config.get('ip_presets', [])
+    preset = next((p for p in presets if p.get('id') == preset_id), None)
+    if not preset:
+        return jsonify({'success': False, 'message': '预设不存在'}), 404
+
+    if 'label' in data:
+        label = str(data['label']).strip()
+        if not label or len(label) > 64:
+            return jsonify({'success': False, 'message': '标签长度需 1-64 字符'}), 400
+        preset['label'] = label
+    if 'ip' in data:
+        ip = str(data['ip']).strip()
+        if _detect_ip_version(ip) is None:
+            return jsonify({'success': False, 'message': 'IP 地址格式错误'}), 400
+        preset['ip'] = ip
+    if 'type' in data:
+        if data['type'] not in ('whitelist', 'blacklist'):
+            return jsonify({'success': False, 'message': 'type 只能是 whitelist 或 blacklist'}), 400
+        preset['type'] = data['type']
+    if 'auto_expire' in data:
+        preset['auto_expire'] = bool(data['auto_expire'])
+
+    save_config(config)
+    return jsonify({'success': True, 'data': {'preset': preset, 'message': '预设已更新'}})
+
+
+@app.route('/api/lists/presets/<preset_id>', methods=['DELETE'])
+def list_delete_preset(preset_id):
+    """删除 IP 预设（不影响已在 set 里的 IP）"""
+    config = load_config()
+    presets = config.get('ip_presets', [])
+    new_presets = [p for p in presets if p.get('id') != preset_id]
+    if len(new_presets) == len(presets):
+        return jsonify({'success': False, 'message': '预设不存在'}), 404
+    config['ip_presets'] = new_presets
+    save_config(config)
+    return jsonify({'success': True, 'data': {'message': '预设已删除'}})
+
+
+@app.route('/api/lists/presets/<preset_id>/apply', methods=['POST'])
+def list_apply_preset(preset_id):
+    """一键把预设 IP 加入对应 set（不删除现有 set 元素，只追加）"""
+    config = load_config()
+    presets = config.get('ip_presets', [])
+    preset = next((p for p in presets if p.get('id') == preset_id), None)
+    if not preset:
+        return jsonify({'success': False, 'message': '预设不存在'}), 404
+
+    ip = preset.get('ip', '')
+    ip_ver = _detect_ip_version(ip)
+    if ip_ver is None:
+        return jsonify({'success': False, 'message': '预设 IP 格式错误'}), 400
+
+    set_name = ('allowed' if preset['type'] == 'whitelist' else 'blacklist') + (
+        '6' if ip_ver == 6 else '4'
+    )
+
+    # 检测 set 是否支持 timeout（flags 含 timeout 才允许带 timeout 子句）
+    # OpenWrt fw4: allowed4/allowed6 是 'flags dynamic,timeout' 支持；blacklist4/6 是 'flags dynamic' 不支持
+    set_supports_timeout = False
+    try:
+        list_r = subprocess.run(['nft', 'list', 'set', 'inet', 'fw4', set_name],
+                                capture_output=True, text=True, timeout=5)
+        if list_r.returncode == 0:
+            # 从 'flags dynamic,timeout' 或 'flags timeout' 等中判断
+            import re as _re
+            m = _re.search(r'flags\s+([^\n]+)', list_r.stdout)
+            if m and 'timeout' in m.group(1).split(','):
+                set_supports_timeout = True
+    except Exception:
+        pass
+
+    if preset.get('auto_expire', True) and set_supports_timeout:
+        # 白名单默认 5h，黑名单默认 30 天
+        # 注意：OpenWrt 自带 nft 不支持 'timeout <N> s' 的空格 + 单位写法，
+        #       必须用 'timeout <N>s'（无空格、无单位后缀视为秒）
+        timeout_s = 5 * 3600 if preset['type'] == 'whitelist' else 30 * 86400
+        cmd = ['nft', 'add', 'element', 'inet', 'fw4', set_name,
+               '{', ip, 'timeout', f'{timeout_s}s', '}']
+    else:
+        # 不支持 timeout（黑名单 set）或用户选择永久：直接永久写入
+        cmd = ['nft', 'add', 'element', 'inet', 'fw4', set_name,
+               '{', ip, '}']
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode != 0:
+            return jsonify({
+                'success': False,
+                'message': f'添加失败: {result.stderr.strip() or result.stdout.strip()}'
+            }), 400
+    except subprocess.TimeoutExpired:
+        return jsonify({'success': False, 'message': 'nft 命令超时'}), 400
+
+    _record_list_history('add', ip, preset['type'],
+                         label=preset.get('label', ''), preset_id=preset_id)
+    return jsonify({
+        'success': True,
+        'data': {
+            'message': f'已添加 {preset.get("label", ip)} ({ip}) 到 {set_name}',
+            'set_name': set_name,
+        }
+    })
+
+
+@app.route('/api/lists/history', methods=['GET'])
+def list_get_history():
+    """获取名单操作历史（默认 20 条，最多 100）"""
+    config = load_config()
+    try:
+        limit = int(request.args.get('limit', 20))
+    except (TypeError, ValueError):
+        limit = 20
+    limit = max(1, min(limit, 100))
+    history = config.get('list_history', [])[:limit]
+    return jsonify({'success': True, 'data': {
+        'history': history,
+        'total': len(config.get('list_history', [])),
+        'limit': limit,
+    }})
+
+
+@app.route('/api/lists/history/clear', methods=['POST'])
+def list_clear_history():
+    """清空名单历史（不影响 set 里的实际 IP）"""
+    config = load_config()
+    config['list_history'] = []
+    save_config(config)
+    return jsonify({'success': True, 'data': {'message': '历史已清空'}})
 
 
 # ======================= 反向代理模块 =======================
@@ -2254,6 +2797,13 @@ def list_flush():
 ACME_SH_PATH = os.path.expanduser("~/.acme.sh/acme.sh")
 NGINX_SSL_DIR = "/etc/nginx/ssl"
 NGINX_CONF_DIR = "/etc/nginx/conf.d"
+
+# nftables-web 自身服务用证书（自签或导入）
+NFTABLES_WEB_SSL_DIR = os.path.join(NGINX_SSL_DIR, "nftables-web")
+NFTABLES_WEB_CERT = os.path.join(NFTABLES_WEB_SSL_DIR, "fullchain.pem")
+NFTABLES_WEB_KEY = os.path.join(NFTABLES_WEB_SSL_DIR, "privkey.pem")
+# HTTPS 主端口（HTTP 5000 会 301 重定向到这里）
+HTTPS_PORT = int(os.environ.get("NFTABLES_WEB_HTTPS_PORT", "5443"))
 
 # TLS 版本映射
 TLS_VERSION_MAP = {
@@ -2294,6 +2844,21 @@ def _sanitize_name(name):
         return ''
     name = str(name).replace('\n', '').replace('\r', '').replace('#', '')
     return name.strip()[:64]
+
+
+def _sanitize_client_max_body_size(value):
+    """净化 client_max_body_size 值
+    - 空值合法（表示不生成该指令，走 nginx 默认 1M）
+    - 必须匹配 \\d+[KMG]?（如 '50M', '1G', '1024'）
+    """
+    if value is None:
+        return ''
+    value = str(value).strip()
+    if not value:
+        return ''
+    if not re.match(r'^\d+[KMG]?$', value):
+        raise ValueError(f"无效的 client_max_body_size: '{value}'（必须是数字，可选后缀 K/M/G，例如 50M）")
+    return value
 
 
 # 反代默认设置
@@ -2528,7 +3093,14 @@ def _generate_nginx_conf(rule, cert, settings):
         lines.append("")
     lines.append("    server_tokens off;")
     lines.append("")
+    # 客户端请求体大小上限（每个 location 单独配，缺省时走 nginx 默认 1M）
+    cmbs = _sanitize_client_max_body_size(rule.get("client_max_body_size", ""))
+    if cmbs:
+        lines.append(f"    client_max_body_size {cmbs};")
+        lines.append("")
     lines.append("    location / {")
+    if cmbs:
+        lines.append(f"        client_max_body_size {cmbs};")
     lines.append(f"        proxy_pass {protocol}://{target};")
     lines.append("")
     lines.append("        proxy_set_header Host $http_host;")
@@ -2821,23 +3393,53 @@ def rp_create_rule():
     cert = _find_rp_cert(rp, cert_id)
     if not cert:
         return jsonify({"success": False, "message": "指定的证书不存在"}), 400
+    # 净化 client_max_body_size
+    try:
+        cmbs = _sanitize_client_max_body_size(data.get("client_max_body_size", ""))
+    except ValueError as e:
+        return jsonify({"success": False, "message": str(e)}), 400
     now_iso = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S+08:00")
-    new_id = _next_id("rp", [r["id"] for r in rp["rules"]])
-    rule = {
-        "id": new_id,
-        "name": _sanitize_name(data.get("name", "")),
-        "enabled": data.get("enabled", True),
-        "domain": domain,
-        "listen_port": data.get("listen_port", 443),
-        "target_address": target,
-        "target_protocol": data.get("target_protocol", "http"),
-        "websocket_enabled": data.get("websocket_enabled", True),
-        "public_access": data.get("public_access", False),
-        "ssl_cert_id": cert_id,
-        "created_at": now_iso,
-        "updated_at": now_iso,
-    }
-    rp["rules"].append(rule)
+    # 同 domain 已存在规则时，视为"更新"而非新建（防止重试/重复保存产生重复规则）
+    existing = next((r for r in rp["rules"] if r.get("domain") == domain), None)
+    if existing:
+        new_id = existing["id"]
+        rule = {
+            **existing,
+            "name": _sanitize_name(data.get("name", "")) or existing.get("name", ""),
+            "enabled": data.get("enabled", existing.get("enabled", True)),
+            "domain": domain,
+            "listen_port": data.get("listen_port", existing.get("listen_port", 443)),
+            "target_address": target,
+            "target_protocol": data.get("target_protocol", existing.get("target_protocol", "http")),
+            "websocket_enabled": data.get("websocket_enabled", existing.get("websocket_enabled", True)),
+            "public_access": data.get("public_access", existing.get("public_access", False)),
+            "ssl_cert_id": cert_id,
+            "client_max_body_size": cmbs,
+            "updated_at": now_iso,
+        }
+        # 就地更新
+        idx = rp["rules"].index(existing)
+        rp["rules"][idx] = rule
+        replaced = True
+    else:
+        new_id = _next_id("rp", [r["id"] for r in rp["rules"]])
+        rule = {
+            "id": new_id,
+            "name": _sanitize_name(data.get("name", "")),
+            "enabled": data.get("enabled", True),
+            "domain": domain,
+            "listen_port": data.get("listen_port", 443),
+            "target_address": target,
+            "target_protocol": data.get("target_protocol", "http"),
+            "websocket_enabled": data.get("websocket_enabled", True),
+            "public_access": data.get("public_access", False),
+            "ssl_cert_id": cert_id,
+            "client_max_body_size": cmbs,
+            "created_at": now_iso,
+            "updated_at": now_iso,
+        }
+        rp["rules"].append(rule)
+        replaced = False
     _save_rp_config(config)
 
     # 生成 nginx 配置并重载
@@ -2856,7 +3458,7 @@ def rp_create_rule():
     except Exception:
         pass
 
-    return jsonify({"success": True, "data": {"rule_id": new_id, "message": "反代规则创建成功", "nginx_reloaded": True}})
+    return jsonify({"success": True, "data": {"rule_id": new_id, "replaced": replaced, "message": "反代规则已更新（同 domain 已有规则）" if replaced else "反代规则创建成功", "nginx_reloaded": True}})
 
 
 @app.route('/api/reverse-proxy/rules/<rule_id>', methods=['PUT'])
@@ -2870,13 +3472,19 @@ def rp_update_rule(rule_id):
         return jsonify({"success": False, "message": "请求体不能为空"}), 400
 
     updatable = ["enabled", "name", "domain", "listen_port", "target_address", "target_protocol",
-                 "websocket_enabled", "public_access", "ssl_cert_id"]
+                 "websocket_enabled", "public_access", "ssl_cert_id", "client_max_body_size"]
     for key in updatable:
         if key in data:
             rule[key] = data[key]
 
     # 净化 name（仅作 UI 显示和 nginx 注释，去除换行/#）
     rule["name"] = _sanitize_name(rule.get("name", ""))
+
+    # 净化 client_max_body_size（空值合法，否则必须匹配 \\d+[KMG]?）
+    try:
+        rule["client_max_body_size"] = _sanitize_client_max_body_size(rule.get("client_max_body_size", ""))
+    except ValueError as e:
+        return jsonify({"success": False, "message": str(e)}), 400
 
     # 净化域名和目标地址
     try:
@@ -3059,22 +3667,139 @@ def rp_upload_cert():
 
     expires_at, days = _get_cert_expiry(fullchain_path)
     now_iso = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S+08:00")
-    new_id = _next_id("cert", [c["id"] for c in rp.get("certificates", [])])
-    cert_entry = {
-        "id": new_id,
-        "domain": domain,
-        "source": "manual",
-        "cert_path": fullchain_path,
-        "key_path": key_path,
-        "expires_at": expires_at,
-        "days_remaining": days,
-        "auto_renew": False,
-        "dns_provider": "",
-        "created_at": now_iso,
-    }
-    rp["certificates"].append(cert_entry)
+
+    # 同 domain 已存在 manual 证书时，视为"重新上传/续期"：
+    # 复用旧 id 和 created_at，替换 entry 内容（保留反代规则的引用关系）
+    existing_manual = None
+    for c in rp.get("certificates", []):
+        if c.get("domain") == domain and c.get("source") == "manual":
+            existing_manual = c
+            break
+
+    if existing_manual:
+        new_id = existing_manual["id"]
+        cert_entry = {
+            **existing_manual,
+            "cert_path": fullchain_path,
+            "key_path": key_path,
+            "expires_at": expires_at,
+            "days_remaining": days,
+        }
+        rp["certificates"] = [cert_entry if c["id"] == new_id else c
+                              for c in rp["certificates"]]
+        replaced = True
+    else:
+        new_id = _next_id("cert", [c["id"] for c in rp.get("certificates", [])])
+        cert_entry = {
+            "id": new_id,
+            "domain": domain,
+            "source": "manual",
+            "cert_path": fullchain_path,
+            "key_path": key_path,
+            "expires_at": expires_at,
+            "days_remaining": days,
+            "auto_renew": False,
+            "dns_provider": "",
+            "created_at": now_iso,
+        }
+        rp["certificates"].append(cert_entry)
+        replaced = False
+
     _save_rp_config(config)
-    return jsonify({"success": True, "data": {"cert_id": new_id, "domain": domain, "cert_path": fullchain_path, "key_path": key_path, "expires_at": expires_at, "message": "证书上传成功"}})
+    msg = "证书已重新上传（替换同域名旧证书）" if replaced else "证书上传成功"
+    return jsonify({"success": True, "data": {"cert_id": new_id, "domain": domain, "cert_path": fullchain_path, "key_path": key_path, "expires_at": expires_at, "replaced": replaced, "message": msg}})
+
+
+@app.route('/api/reverse-proxy/certificates/<cert_id>/download', methods=['GET'])
+def rp_download_cert(cert_id):
+    """打包下载证书（fullchain + key），前端需先 confirm 警告私钥风险"""
+    config, rp = _get_rp_config()
+    cert = _find_rp_cert(rp, cert_id)
+    if not cert:
+        return jsonify({"success": False, "message": "证书不存在"}), 404
+
+    cert_path = cert.get("cert_path", "")
+    key_path = cert.get("key_path", "")
+    if not cert_path or not os.path.exists(cert_path):
+        return jsonify({"success": False, "message": "证书文件不存在"}), 404
+    if not key_path or not os.path.exists(key_path):
+        return jsonify({"success": False, "message": "私钥文件不存在"}), 404
+
+    domain = _sanitize_domain(cert.get("domain", cert_id))
+    mem = io.BytesIO()
+    try:
+        with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as z:
+            z.write(cert_path, f"{domain}-fullchain.pem")
+            z.write(key_path, f"{domain}-privkey.pem")
+    except OSError as e:
+        return jsonify({"success": False, "message": f"打包失败: {e}"}), 500
+
+    mem.seek(0)
+    return send_file(
+        mem,
+        as_attachment=True,
+        download_name=f"{domain}.zip",
+        mimetype="application/zip",
+    )
+
+
+@app.route('/api/reverse-proxy/certificates/<cert_id>/reupload', methods=['POST'])
+def rp_reupload_cert(cert_id):
+    """手动证书的"续期"：覆盖文件 + 刷新 expires_at，保留 cert id 和引用关系"""
+    config, rp = _get_rp_config()
+    cert = _find_rp_cert(rp, cert_id)
+    if not cert:
+        return jsonify({"success": False, "message": "证书不存在"}), 404
+    if cert.get("source") != "manual":
+        return jsonify({"success": False, "message": "仅手动证书支持 reupload，ACME 证书请用 /renew"}), 400
+
+    cert_file = request.files.get("cert_file")
+    key_file = request.files.get("key_file")
+    if not cert_file or not key_file:
+        return jsonify({"success": False, "message": "cert_file, key_file 不能为空"}), 400
+
+    cert_path = cert.get("cert_path", "")
+    key_path = cert.get("key_path", "")
+    if not cert_path or not key_path:
+        return jsonify({"success": False, "message": "证书路径配置异常"}), 500
+
+    try:
+        cert_file.save(cert_path)
+        key_file.save(key_path)
+        os.chmod(key_path, 0o600)
+    except OSError as e:
+        return jsonify({"success": False, "message": f"写入文件失败: {e}"}), 500
+
+    expires_at, days = _get_cert_expiry(cert_path)
+    cert["expires_at"] = expires_at
+    cert["days_remaining"] = days
+    _save_rp_config(config)
+
+    # 重新部署所有反代规则（刷新 nginx 配置 + reload）
+    try:
+        _deploy_all_rules(config)
+    except Exception as e:
+        # 文件已更新，配置已保存，reload 失败不影响主流程
+        return jsonify({
+            "success": True,
+            "data": {
+                "cert_id": cert_id,
+                "expires_at": expires_at,
+                "days_remaining": days,
+                "message": f"证书已重新上传，但 nginx reload 失败: {e}",
+            },
+        }), 200
+
+    return jsonify({
+        "success": True,
+        "data": {
+            "cert_id": cert_id,
+            "domain": cert.get("domain", ""),
+            "expires_at": expires_at,
+            "days_remaining": days,
+            "message": "证书已重新上传并刷新 nginx",
+        },
+    })
 
 
 @app.route('/api/reverse-proxy/certificates/request', methods=['POST'])
@@ -3167,20 +3892,56 @@ def rp_delete_cert(cert_id):
     cert = _find_rp_cert(rp, cert_id)
     if not cert:
         return jsonify({"success": False, "message": "证书不存在"}), 404
-    # 检查是否被规则引用
-    for r in rp.get("rules", []):
-        if r.get("ssl_cert_id") == cert_id:
-            return jsonify({"success": False, "message": f"证书被规则 {r['id']} ({r['domain']}) 引用，请先删除关联规则"}), 400
 
-    # 删除证书文件
+    # 检查是否被规则引用
+    referenced_by = [r for r in rp.get("rules", []) if r.get("ssl_cert_id") == cert_id]
+
+    if referenced_by:
+        # 默认拒绝删除，提示用户传 force=true&replace_cert_id=... 强制迁移
+        force = request.args.get("force", "false").lower() == "true"
+        replace_with = request.args.get("replace_cert_id", "").strip()
+        if not (force and replace_with):
+            return jsonify({
+                "success": False,
+                "message": f"证书被 {len(referenced_by)} 条规则引用，无法直接删除",
+                "data": {
+                    "referenced_by": [{"rule_id": r["id"], "domain": r["domain"]} for r in referenced_by],
+                    "hint": "如需迁移引用并删除，传 ?force=true&replace_cert_id=<新证书id>"
+                }
+            }), 400
+
+        # 验证替换目标证书存在且域名一致
+        new_cert = _find_rp_cert(rp, replace_with)
+        if not new_cert:
+            return jsonify({"success": False, "message": "替换目标证书不存在"}), 400
+        if new_cert.get("domain") != cert.get("domain"):
+            return jsonify({"success": False, "message": "替换证书的域名必须与原证书一致"}), 400
+
+        # 迁移引用关系
+        for r in rp["rules"]:
+            if r.get("ssl_cert_id") == cert_id:
+                r["ssl_cert_id"] = replace_with
+
+    # 删除证书文件前，先检查同目录下是否还有别的 cert_entry 在用
+    # 防止误删共享文件（例如 ACME 续期后原 auto 证书和新 manual 证书指向同目录）
     domain = _sanitize_domain(cert.get("domain", ""))
     cert_dir = os.path.join(NGINX_SSL_DIR, domain)
-    if os.path.isdir(cert_dir):
-        shutil.rmtree(cert_dir)
+    other_uses_same_dir = [
+        c for c in rp.get("certificates", [])
+        if c["id"] != cert_id
+        and c.get("cert_path", "")
+        and os.path.dirname(c.get("cert_path", "")) == cert_dir
+    ]
+
+    if not other_uses_same_dir and os.path.isdir(cert_dir):
+        try:
+            shutil.rmtree(cert_dir)
+        except OSError as e:
+            return jsonify({"success": False, "message": f"删除证书文件失败: {e}"}), 500
 
     rp["certificates"] = [c for c in rp["certificates"] if c["id"] != cert_id]
     _save_rp_config(config)
-    return jsonify({"success": True, "data": {"message": "证书已删除"}})
+    return jsonify({"success": True, "data": {"message": "证书已删除", "migrated_rules": len(referenced_by) if referenced_by else 0}})
 
 
 # ======================= nginx 管理 API =======================
@@ -3252,5 +4013,275 @@ def rp_set_default_cert(cert_id):
     return jsonify({"success": True, "data": {"message": "默认证书已设置", "default_cert_id": cert_id}})
 
 
+# ======================= 认证 API =======================
+
+@app.route('/api/auth/status', methods=['GET'])
+def auth_status():
+    """返回当前登录状态和系统是否已初始化密码"""
+    return jsonify({
+        'success': True,
+        'data': {
+            'authenticated': _is_authenticated(),
+            'password_set': _password_set(),
+        }
+    })
+
+
+@app.route('/api/auth/login', methods=['POST'])
+def auth_login():
+    # 限流检查
+    ip = request.remote_addr or 'unknown'
+    allowed, retry_after = _check_rate_limit(ip)
+    if not allowed:
+        resp = jsonify({
+            'success': False,
+            'code': 'RATE_LIMITED',
+            'message': f'登录失败次数过多，请 {retry_after} 秒后再试',
+        })
+        resp.status_code = 429
+        resp.headers['Retry-After'] = str(retry_after)
+        return resp
+
+    data = request.get_json(silent=True) or {}
+    pw = data.get('password', '')
+    if not pw:
+        return jsonify({'success': False, 'message': '密码不能为空'}), 400
+    if not _password_set():
+        return jsonify({'success': False, 'message': '系统尚未设置密码，请先初始化', 'code': 'NEED_SETUP'}), 400
+    if not _verify_password(pw, _read_password_hash()):
+        _record_login_failure(ip)
+        return jsonify({'success': False, 'message': '密码错误'}), 401
+    _clear_login_failures(ip)
+    session.clear()
+    session['authenticated'] = True
+    session.permanent = True
+    session['last_active'] = time.time()
+    return jsonify({'success': True, 'data': {'message': '登录成功'}})
+
+
+@app.route('/api/auth/logout', methods=['POST'])
+def auth_logout():
+    session.clear()
+    return jsonify({'success': True, 'data': {'message': '已退出'}})
+
+
+@app.route('/api/auth/setup', methods=['POST'])
+def auth_setup():
+    """首次设置密码（要求当前无密码文件存在）"""
+    # setup 也加限流（防止恶意用户抢占 setup 流程）
+    ip = request.remote_addr or 'unknown'
+    allowed, retry_after = _check_rate_limit(ip)
+    if not allowed:
+        resp = jsonify({
+            'success': False,
+            'code': 'RATE_LIMITED',
+            'message': f'操作过于频繁，请 {retry_after} 秒后再试',
+        })
+        resp.status_code = 429
+        resp.headers['Retry-After'] = str(retry_after)
+        return resp
+
+    if _password_set():
+        return jsonify({'success': False, 'message': '密码已设置，请用 /login 登录', 'code': 'ALREADY_SET'}), 400
+    data = request.get_json(silent=True) or {}
+    pw = data.get('password', '')
+    if not pw or len(pw) < 4:
+        return jsonify({'success': False, 'message': '密码长度至少 4 位'}), 400
+    if len(pw) > 128:
+        return jsonify({'success': False, 'message': '密码长度不能超过 128 位'}), 400
+    _write_password_hash(_hash_password(pw))
+    _clear_login_failures(ip)
+    session.clear()
+    session['authenticated'] = True
+    session.permanent = True
+    session['last_active'] = time.time()
+    return jsonify({'success': True, 'data': {'message': '密码设置成功，已自动登录'}})
+
+
+@app.route('/api/auth/change-password', methods=['POST'])
+def auth_change_password():
+    """已登录用户修改密码"""
+    if not _is_authenticated():
+        return jsonify({'success': False, 'message': '未登录'}), 401
+    data = request.get_json(silent=True) or {}
+    old_pw = data.get('old_password', '')
+    new_pw = data.get('new_password', '')
+    if not old_pw or not new_pw:
+        return jsonify({'success': False, 'message': 'old_password 和 new_password 不能为空'}), 400
+    if len(new_pw) < 4 or len(new_pw) > 128:
+        return jsonify({'success': False, 'message': '新密码长度需 4-128 位'}), 400
+    if not _verify_password(old_pw, _read_password_hash()):
+        return jsonify({'success': False, 'message': '旧密码错误'}), 401
+    _write_password_hash(_hash_password(new_pw))
+    return jsonify({'success': True, 'data': {'message': '密码已修改'}})
+
+
+def _pick_reverse_proxy_cert():
+    """扫描反代证书目录，挑一个有效期 ≥30 天的证书用作 HTTPS 服务证书。
+
+    返回 (cert_path, key_path) 或 None。
+    优先选择剩余天数最多的证书（避免选到快过期的）。
+    排除 nftables-web 自签目录（避免循环复用自签证书）。
+    """
+    if not os.path.isdir(NGINX_SSL_DIR):
+        return None
+    candidates = []
+    try:
+        for domain in os.listdir(NGINX_SSL_DIR):
+            if domain == os.path.basename(NFTABLES_WEB_SSL_DIR):
+                continue  # 排除自签证书目录
+            fullchain = os.path.join(NGINX_SSL_DIR, domain, "fullchain.pem")
+            privkey = os.path.join(NGINX_SSL_DIR, domain, "privkey.pem")
+            if not (os.path.isfile(fullchain) and os.path.isfile(privkey)):
+                continue
+            try:
+                _exp, days = _get_cert_expiry(fullchain)
+                if days >= 30:
+                    candidates.append((days, fullchain, privkey, domain))
+            except Exception:
+                continue
+    except Exception:
+        return None
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)  # 取剩余天数最多的
+    _, fullchain, privkey, domain = candidates[0]
+    print(f"[INFO] 使用反代证书 {fullchain} (domain={domain}, 剩余 {candidates[0][0]} 天)", flush=True)
+    return fullchain, privkey
+
+
+def _ensure_self_signed_cert():
+    """如果自签证书不存在或快过期，则生成新的。
+
+    自签证书 CN/SAN 用 router_ip4（或 hostname fallback），让浏览器接受时警告清晰。
+    """
+    need_generate = True
+    if os.path.exists(NFTABLES_WEB_CERT) and os.path.exists(NFTABLES_WEB_KEY):
+        try:
+            expires_at, days = _get_cert_expiry(NFTABLES_WEB_CERT)
+            if expires_at and days > 30:
+                need_generate = False
+        except Exception:
+            pass
+
+    if need_generate:
+        # 选 CN：优先 router_ip4，否则 hostname
+        cn = 'nftables-web.local'
+        try:
+            cfg = load_config()
+            ip = (cfg.get('router_ip4') or '').strip()
+            if ip:
+                cn = ip
+        except Exception:
+            pass
+        os.makedirs(NFTABLES_WEB_SSL_DIR, exist_ok=True)
+        try:
+            subprocess.run([
+                'openssl', 'req', '-x509', '-newkey', 'rsa:2048',
+                '-keyout', NFTABLES_WEB_KEY,
+                '-out', NFTABLES_WEB_CERT,
+                '-days', '3650', '-nodes',
+                '-subj', f'/CN={cn}',
+                '-addext', f'subjectAltName=IP:{cn},DNS:{cn}',
+            ], check=True, capture_output=True, text=True, timeout=30)
+            os.chmod(NFTABLES_WEB_KEY, 0o600)
+            os.chmod(NFTABLES_WEB_CERT, 0o644)
+            print(f"[INFO] 已生成自签证书 (CN={cn}) 有效期 10 年", flush=True)
+            return NFTABLES_WEB_CERT, NFTABLES_WEB_KEY
+        except Exception as e:
+            print(f"[WARNING] 自签证书生成失败：{e}", flush=True)
+            return None
+    return NFTABLES_WEB_CERT, NFTABLES_WEB_KEY
+
+
+def _ensure_https_cert():
+    """优先复用反代证书，否则自签。两者都失败返回 None（拒绝启动明文 HTTP）。"""
+    rp_cert = _pick_reverse_proxy_cert()
+    if rp_cert:
+        return rp_cert
+    print("[INFO] 反代证书目录无可用证书，回退到自签证书", flush=True)
+    return _ensure_self_signed_cert()
+
+
+def _build_ssl_context(cert_files):
+    """构造 werkzeug SSL context"""
+    if not cert_files:
+        return None
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert_files[0], cert_files[1])
+        return ctx
+    except Exception as e:
+        print(f"[WARNING] SSL context 构造失败：{e}", flush=True)
+        return None
+
+
+def _start_servers():
+    """启双端口服务：HTTP 5000（重定向） + HTTPS 5443（主服务）。
+
+    启动前置条件：必须有可用证书（反代证书优先，否则自签）。
+    两者都失败 → 拒绝启动（密码绝不明文传输）。
+    """
+    import sys as _sys
+    from werkzeug.serving import make_server
+    import threading
+
+    cert_files = _ensure_https_cert()
+    ssl_ctx = _build_ssl_context(cert_files)
+
+    if not ssl_ctx:
+        print("[FATAL] HTTPS 证书不可用，拒绝启动（避免密码明文传输）。", flush=True)
+        print("        请检查：", flush=True)
+        print("        1. /etc/nginx/ssl/<domain>/ 下是否有有效反代证书（≥30 天有效期）", flush=True)
+        print("        2. 或确认 openssl 可用，以便生成自签证书", flush=True)
+        _sys.exit(1)
+
+    debug = os.environ.get('FLASK_DEBUG', '0') == '1'
+
+    # 重定向用的 host：启动时锁定到 router_ip4（防 Host Header 注入）
+    redirect_host = 'localhost'
+    try:
+        cfg = load_config()
+        ip = (cfg.get('router_ip4') or '').strip()
+        if ip:
+            redirect_host = ip
+    except Exception:
+        pass
+
+    # 双端口模式
+    def _http_redirect_app(environ, start_response):
+        path = environ.get('PATH_INFO', '/') or '/'
+        qs = environ.get('QUERY_STRING', '')
+        # host 用配置里的（避免 HTTP_HOST header 注入）
+        url = f"https://{redirect_host}:{HTTPS_PORT}{path}"
+        if qs:
+            url = f"{url}?{qs}"
+        start_response('301 Moved Permanently', [
+            ('Location', url),
+            ('Content-Length', '0'),
+            ('Strict-Transport-Security', 'max-age=31536000; includeSubDomains'),
+        ])
+        return [b'']
+
+    http_server = make_server('0.0.0.0', 5000, _http_redirect_app, threaded=True)
+    https_server = make_server('0.0.0.0', HTTPS_PORT, app, ssl_context=ssl_ctx, threaded=True)
+
+    print(f" * HTTP 重定向  : http://0.0.0.0:5000  -> https://{redirect_host}:{HTTPS_PORT}", flush=True)
+    print(f" * HTTPS 主服务  : https://0.0.0.0:{HTTPS_PORT}  (证书: {cert_files[0]})", flush=True)
+    print(f" * Cookie Secure : False（兼容 HTTP 重定向流程）", flush=True)
+
+    # 后台线程跑 HTTP redirect
+    t = threading.Thread(target=http_server.serve_forever, daemon=True)
+    t.start()
+
+    try:
+        https_server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        http_server.shutdown()
+        https_server.shutdown()
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, threaded=True, debug=os.environ.get('FLASK_DEBUG', '0') == '1')
+    _start_servers()

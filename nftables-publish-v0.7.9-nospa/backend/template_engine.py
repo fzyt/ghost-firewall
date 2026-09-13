@@ -125,8 +125,26 @@ def generate_rules(variables, log_switches):
 
     # 3. 替换变量（define KEY = value 格式）
     for key, value in variables.items():
+        # 列表类型：转 nftables 集合语法 { elem1, elem2, ... }
+        # 例: ["192.168.1.1", "192.168.1.2"] → { 192.168.1.1, 192.168.1.2 }
+        if isinstance(value, list):
+            # 空列表 / 全是空字符串：跳过替换，保留模板的原始占位符
+            non_empty = [e for e in value if str(e).strip()]
+            if not non_empty:
+                continue
+            elements = []
+            for elem in non_empty:
+                if isinstance(elem, str):
+                    # 数字字符串保持原样，否则加引号
+                    if elem.isdigit():
+                        elements.append(elem)
+                    else:
+                        elements.append(f'"{elem}"')
+                else:
+                    elements.append(str(elem))
+            value = '{ ' + ', '.join(elements) + ' }'
         # 空值保护：保留引号避免 nftables 解析错误（空值也必须是 ""）
-        if value == "":
+        elif value == "":
             value = '""'
         # 单行匹配
         pattern = rf'define {key}\s*=\s*.+'
