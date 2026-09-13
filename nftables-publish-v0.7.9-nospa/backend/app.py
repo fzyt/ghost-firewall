@@ -46,6 +46,8 @@ app.config['SESSION_COOKIE_NAME'] = AUTH_COOKIE_NAME
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['PERMANENT_SESSION_LIFETIME'] = datetime.timedelta(seconds=AUTH_SESSION_LIFETIME)
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+# 上传大小限制：证书 < 10KB，反代规则配置几百字节；16MB 富余足够
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB
 
 
 # ======================= 密码哈希/验证（标准库 pbkdf2） =======================
@@ -93,10 +95,29 @@ def _is_authenticated() -> bool:
 
 # 登录失败计数（IP -> [timestamp, ...]），用于限流
 _failed_logins: dict = {}
+_MAX_FAILED_LOGINS_IPS = 50000  # IP 数硬上限（防恶意创建大量 IP 条目撑爆内存）
+_request_counter = 0  # 用于触发定期 GC
+
+
+def _gc_failed_logins():
+    """清理过期的 _failed_logins 记录（防内存泄漏）"""
+    now = time.time()
+    empty_ips = []
+    for ip, rec in _failed_logins.items():
+        rec[:] = [t for t in rec if now - t < AUTH_RATE_LIMIT_LOCKOUT]
+        if not rec:
+            empty_ips.append(ip)
+    for ip in empty_ips:
+        _failed_logins.pop(ip, None)
 
 
 def _check_rate_limit(ip: str) -> tuple:
     """检查 IP 是否被限流。返回 (allowed: bool, retry_after: int|None)"""
+    global _request_counter
+    _request_counter += 1
+    # 每 100 次请求全局清理一次过期 IP（防止 _failed_logins 内存泄漏）
+    if _request_counter % 100 == 0:
+        _gc_failed_logins()
     now = time.time()
     rec = _failed_logins.get(ip, [])
     # 清理过期记录
@@ -114,6 +135,10 @@ def _check_rate_limit(ip: str) -> tuple:
 
 def _record_login_failure(ip: str):
     """记录一次登录失败"""
+    # IP 数硬上限（防止恶意创建大量 IP 条目撑爆内存）
+    if ip not in _failed_logins and len(_failed_logins) >= _MAX_FAILED_LOGINS_IPS:
+        print(f"[WARNING] _failed_logins 已达上限 {_MAX_FAILED_LOGINS_IPS}，拒绝记录 {ip}", flush=True)
+        return
     _failed_logins.setdefault(ip, []).append(time.time())
 
 
@@ -129,6 +154,8 @@ _STATIC_EXTENSIONS = ('js', 'css', 'png', 'jpg', 'jpeg', 'gif', 'svg', 'ico', 'w
 @app.before_request
 def _require_auth():
     """全局认证拦截器
+    - Content-Length 超 MAX_CONTENT_LENGTH 直接 413（在认证前，避免上传大文件撑爆内存）
+    - IPv6 客户端直接拒绝（管理界面只支持 IPv4 访问）
     - 静态资源（带扩展名）直接放行
     - / 根路径放行（让登录页 HTML 能加载）
     - /api/auth/* 公开端点放行
@@ -136,6 +163,21 @@ def _require_auth():
     - 未登录返回 401
     """
     path = request.path
+    client_ip = request.remote_addr or ''
+
+    # Content-Length 上限检查（认证前拦截大请求体）
+    max_cl = app.config.get('MAX_CONTENT_LENGTH')
+    if max_cl:
+        try:
+            cl = int(request.headers.get('Content-Length') or 0)
+            if cl > max_cl:
+                return jsonify({'success': False, 'code': 'PAYLOAD_TOO_LARGE', 'message': f'请求体超过 {max_cl} 字节'}), 413
+        except (ValueError, TypeError):
+            pass
+
+    # IPv6 客户端直接拒绝（管理界面只支持 IPv4）
+    if ':' in client_ip:
+        return jsonify({'success': False, 'code': 'IPV6_NOT_ALLOWED', 'message': '管理界面仅支持 IPv4 访问'}), 403
 
     # 静态资源放行（前端 JS / CSS / 图片 / 字体）
     last = path.rsplit('/', 1)[-1]
@@ -173,6 +215,17 @@ def _security_headers(resp):
     # 通用：禁止 MIME sniffing、限制 referrer
     resp.headers.setdefault('X-Content-Type-Options', 'nosniff')
     resp.headers.setdefault('Referrer-Policy', 'same-origin')
+    # CSP：内网单页面应用，限制脚本和样式只允许 self + unsafe-inline（兼容 Alpine.js inline event）
+    resp.headers.setdefault('Content-Security-Policy', (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "font-src 'self' data:; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'"
+    ))
     return resp
 
 # 默认配置
@@ -270,14 +323,20 @@ def save_config(config):
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
-    except Exception:
-        # fcntl 不可用时回退到无锁模式（保留原子写）
-        with open(tmp_path, 'w') as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
-        if os.path.exists(tmp_path):
-            os.replace(tmp_path, CONFIG_PATH)
+    except Exception as e:
+        # fcntl 不可用或锁失败：记录日志后回退到无锁模式（保留原子写）
+        print(f"[WARNING] save_config 加锁失败（{type(e).__name__}: {e}），回退到无锁模式", flush=True)
+        try:
+            with open(tmp_path, 'w') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            if os.path.exists(tmp_path):
+                os.replace(tmp_path, CONFIG_PATH)
+        except Exception as e2:
+            # 真正写失败：必须抛出，不能吞错（否则用户看不到保存失败）
+            print(f"[ERROR] save_config 写入失败: {type(e2).__name__}: {e2}", flush=True)
+            raise
 
 
 def _migrate_forward_rules(config):
@@ -2828,9 +2887,32 @@ def _sanitize_domain(domain):
 
 
 def _sanitize_target_address(addr):
-    """校验目标地址格式（IP:port 或 domain:port）"""
-    if not re.match(r'^[a-zA-Z0-9.\-:]+:[0-9]+$', addr):
-        raise ValueError(f"无效目标地址: {addr}")
+    """校验目标地址格式（IPv4:port 或 domain:port）
+    - IPv4：每段 0-255
+    - domain：复用 _sanitize_domain 校验规则（a-z 0-9 - .）
+    - port：1-65535
+    """
+    if not isinstance(addr, str) or not addr or ':' not in addr:
+        raise ValueError(f"无效目标地址（缺端口）: {addr!r}")
+    host, port_str = addr.rsplit(':', 1)
+    # 校验端口：1-65535
+    try:
+        port = int(port_str)
+    except ValueError:
+        raise ValueError(f"无效目标地址（端口非数字）: {addr!r}")
+    if port < 1 or port > 65535:
+        raise ValueError(f"无效目标地址（端口越界 1-65535）: {addr!r}")
+    # 校验 host：非空
+    if not host:
+        raise ValueError(f"无效目标地址（host 为空）: {addr!r}")
+    # IPv4？
+    if re.match(r'^\d+\.\d+\.\d+\.\d+$', host):
+        parts = host.split('.')
+        if len(parts) == 4 and all(0 <= int(p) <= 255 for p in parts):
+            return addr
+        raise ValueError(f"无效目标地址（IPv4 段数或越界）: {addr!r}")
+    # domain：复用 _sanitize_domain 严格校验
+    _sanitize_domain(host)
     return addr
 
 
@@ -4101,6 +4183,13 @@ def auth_setup():
 @app.route('/api/auth/change-password', methods=['POST'])
 def auth_change_password():
     """已登录用户修改密码"""
+    # 限流：和登录失败共用同一套限制（防暴力枚举旧密码）
+    client_ip = request.remote_addr or 'unknown'
+    allowed, retry_after = _check_rate_limit(client_ip)
+    if not allowed:
+        resp = jsonify({'success': False, 'code': 'RATE_LIMITED', 'message': '尝试次数过多，请稍后再试'})
+        resp.headers['Retry-After'] = str(retry_after or 60)
+        return resp, 429
     if not _is_authenticated():
         return jsonify({'success': False, 'message': '未登录'}), 401
     data = request.get_json(silent=True) or {}
@@ -4111,8 +4200,11 @@ def auth_change_password():
     if len(new_pw) < 4 or len(new_pw) > 128:
         return jsonify({'success': False, 'message': '新密码长度需 4-128 位'}), 400
     if not _verify_password(old_pw, _read_password_hash()):
+        # 旧密码错误也记录失败（防暴力枚举）
+        _record_login_failure(client_ip)
         return jsonify({'success': False, 'message': '旧密码错误'}), 401
     _write_password_hash(_hash_password(new_pw))
+    _clear_login_failures(client_ip)  # 修改成功清掉该 IP 的失败记录
     return jsonify({'success': True, 'data': {'message': '密码已修改'}})
 
 
