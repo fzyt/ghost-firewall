@@ -4295,6 +4295,105 @@ def _ensure_https_cert():
     return _ensure_self_signed_cert()
 
 
+def _ruleset_is_empty():
+    """检查我们维护的 inet fw4 表是否还活着（nft list table inet fw4）。"""
+    res = subprocess.run(['nft', 'list', 'table', 'inet', 'fw4'],
+                         capture_output=True, text=True, timeout=5)
+    return res.returncode != 0
+
+
+def _apply_basic_lockdown():
+    """兜底防火墙：WAN block / LAN allow / 必要服务端口放行。
+    只在主规则 + 备份都不可用时使用，保证路由器至少有基本保护。
+    """
+    try:
+        web_port = HTTPS_PORT
+    except NameError:
+        web_port = 5443
+    ssh_port = 22  # OpenWrt 默认 SSH
+    rules = f'''table inet fw4 {{
+    chain input {{
+        type filter hook input priority 0; policy drop;
+        iifname "lo" accept
+        ct state established,related accept
+        iifname {{ "br-lan", "pppoe-wan" }} tcp dport {{ {ssh_port}, {web_port} }} accept
+        iifname "br-lan" accept
+    }}
+    chain forward {{
+        type filter hook forward priority 0; policy drop;
+        iifname "br-lan" accept
+        oifname "br-lan" ct state established,related accept
+    }}
+    chain output {{
+        type filter hook output priority 0; policy accept;
+    }}
+}}
+'''
+    res = subprocess.run(['nft', '-f', '-'], input=rules,
+                         capture_output=True, text=True, timeout=10)
+    return res.returncode == 0
+
+
+def _auto_recover_ruleset_if_empty():
+    """启动时自动恢复 nftables ruleset（如果被清空）。
+
+    恢复优先级：
+    1. RULES_PATH（上次成功应用的规则；用户配置的最新）
+    2. RULES_PATH.backup（首次 apply 时保存的"应用前"快照）
+    3. basic lockdown（WAN block / LAN allow，兜底保证路由器不裸奔）
+
+    任何一个成功就停止。全部失败也只记录日志，不抛异常（ruleset 空只是
+    "没规则"而非"程序错误"，不应阻止 Web 服务起来）。
+    """
+    if not _ruleset_is_empty():
+        return  # 表存在 → ruleset 健康，无需恢复
+
+    print('[WARN] 启动检测：nftables ruleset 为空（inet fw4 表不存在），尝试自动恢复...', flush=True)
+
+    # 优先级 1：当前规则文件
+    if os.path.exists(RULES_PATH):
+        res = subprocess.run(['nft', '-f', RULES_PATH],
+                             capture_output=True, text=True, timeout=30)
+        if res.returncode == 0:
+            print(f'[INFO] ✅ 已从 {RULES_PATH} 恢复 ruleset', flush=True)
+            return
+        print(f'[WARN] 从 {RULES_PATH} 恢复失败: {(res.stderr or res.stdout)[:200]}', flush=True)
+
+    # 优先级 2：.backup 文件
+    backup_path = RULES_PATH + '.backup'
+    if os.path.exists(backup_path):
+        res = subprocess.run(['nft', '-f', backup_path],
+                             capture_output=True, text=True, timeout=30)
+        if res.returncode == 0:
+            print(f'[INFO] ✅ 已从 {backup_path} 恢复 ruleset', flush=True)
+            return
+        print(f'[WARN] 从 {backup_path} 恢复失败: {(res.stderr or res.stdout)[:200]}', flush=True)
+
+    # 优先级 3：basic lockdown（兜底）
+    if _apply_basic_lockdown():
+        print('[INFO] ✅ 已应用 basic lockdown（WAN block / LAN allow / SSH + Web 放行）', flush=True)
+        return
+
+    print('[ERROR] ❌ 自动恢复全部失败，ruleset 仍为空，请手动检查 nft 服务和规则文件', flush=True)
+
+
+@app.route('/api/rules/health', methods=['GET'])
+def rules_health():
+    """返回当前 nftables ruleset 健康状态（前端可查询/展示）"""
+    if not _is_authenticated():
+        return jsonify({'success': False, 'code': 'AUTH_REQUIRED', 'message': '未登录'}), 401
+    ruleset_loaded = not _ruleset_is_empty()
+    return jsonify({
+        'success': True,
+        'data': {
+            'ruleset_loaded': ruleset_loaded,
+            'rules_file': RULES_PATH,
+            'rules_file_exists': os.path.exists(RULES_PATH),
+            'backup_file_exists': os.path.exists(RULES_PATH + '.backup'),
+        }
+    })
+
+
 def _build_ssl_context(cert_files):
     """构造 werkzeug SSL context"""
     if not cert_files:
@@ -4311,9 +4410,15 @@ def _build_ssl_context(cert_files):
 def _start_servers():
     """启双端口服务：HTTP 5000（重定向） + HTTPS 5443（主服务）。
 
-    启动前置条件：必须有可用证书（反代证书优先，否则自签）。
-    两者都失败 → 拒绝启动（密码绝不明文传输）。
+    启动前置条件：
+    1. 先自动恢复 nftables ruleset（如果被清空，避免带病起服务）
+    2. 必须有可用证书（反代证书优先，否则自签）；都失败 → 拒绝启动
+
+    恢复规则优先级：当前规则文件 > .backup > basic lockdown（WAN block / LAN allow）
     """
+    # ========== 启动时自动恢复 nftables ruleset ==========
+    _auto_recover_ruleset_if_empty()
+
     import sys as _sys
     from werkzeug.serving import make_server
     import threading
