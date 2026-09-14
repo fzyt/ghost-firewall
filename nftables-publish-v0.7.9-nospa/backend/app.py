@@ -4296,15 +4296,59 @@ def _ensure_https_cert():
 
 
 def _ruleset_is_empty():
-    """检查我们维护的 inet fw4 表是否还活着（nft list table inet fw4）。"""
-    res = subprocess.run(['nft', 'list', 'table', 'inet', 'fw4'],
-                         capture_output=True, text=True, timeout=5)
-    return res.returncode != 0
+    """检查我们维护的 inet fw4 表是否还活着（nft list table inet fw4）。
+
+    任何 subprocess 异常都视为"表不存在"（保守处理：宁可误报裸奔触发恢复，
+    也不要漏报裸奔导致路由器真裸奔）。
+    """
+    try:
+        res = subprocess.run(['nft', 'list', 'table', 'inet', 'fw4'],
+                             capture_output=True, text=True, timeout=5)
+        return res.returncode != 0
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        print(f'[WARN] _ruleset_is_empty() 异常，按"表不存在"处理: {e}', flush=True)
+        return True
+
+
+def _try_apply_rules_file(path):
+    """尝试用 nft -f 应用规则文件，返回是否真的生效。
+
+    双重验证（A-3 修复点）：
+      1. nft -f returncode == 0
+      2. _ruleset_is_empty() 返回 False（确认 fw4 表真存在）
+    防止 "nft -f empty.nft" / "nft -f 假文件" 返回 0 但实际表不存在的情况。
+
+    subprocess 异常（A-4 修复点）也返回 False，不抛出：
+      - FileNotFoundError：nft 二进制不存在
+      - TimeoutExpired：nft 卡死
+      - OSError：底层资源错误
+    """
+    try:
+        res = subprocess.run(['nft', '-f', path],
+                             capture_output=True, text=True, timeout=30)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        print(f'[WARN] nft -f {path} 异常: {type(e).__name__}: {e}', flush=True)
+        return False
+
+    if res.returncode != 0:
+        print(f'[WARN] nft -f {path} returncode={res.returncode}, '
+              f'stderr={(res.stderr or res.stdout)[:200]}', flush=True)
+        return False
+
+    # 二次验证：returncode=0 也要确认表真存在
+    if _ruleset_is_empty():
+        print(f'[WARN] nft -f {path} returncode=0 但 fw4 表仍不存在，视为失败', flush=True)
+        return False
+
+    return True
 
 
 def _apply_basic_lockdown():
     """兜底防火墙：WAN block / LAN allow / 必要服务端口放行。
     只在主规则 + 备份都不可用时使用，保证路由器至少有基本保护。
+
+    双重验证：nft -f - returncode=0 且 _ruleset_is_empty() == False。
+    subprocess 异常不抛出，返回 False 让外层回退到下一级（虽然这里已经是最后一级）。
     """
     try:
         web_port = HTTPS_PORT
@@ -4329,9 +4373,24 @@ def _apply_basic_lockdown():
     }}
 }}
 '''
-    res = subprocess.run(['nft', '-f', '-'], input=rules,
-                         capture_output=True, text=True, timeout=10)
-    return res.returncode == 0
+    try:
+        res = subprocess.run(['nft', '-f', '-'], input=rules,
+                             capture_output=True, text=True, timeout=10)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        print(f'[WARN] basic lockdown nft 异常: {type(e).__name__}: {e}', flush=True)
+        return False
+
+    if res.returncode != 0:
+        print(f'[WARN] basic lockdown returncode={res.returncode}, '
+              f'stderr={(res.stderr or res.stdout)[:200]}', flush=True)
+        return False
+
+    # 二次验证
+    if _ruleset_is_empty():
+        print('[WARN] basic lockdown returncode=0 但 fw4 表仍不存在，视为失败', flush=True)
+        return False
+
+    return True
 
 
 def _auto_recover_ruleset_if_empty():
@@ -4342,8 +4401,9 @@ def _auto_recover_ruleset_if_empty():
     2. RULES_PATH.backup（首次 apply 时保存的"应用前"快照）
     3. basic lockdown（WAN block / LAN allow，兜底保证路由器不裸奔）
 
-    任何一个成功就停止。全部失败也只记录日志，不抛异常（ruleset 空只是
-    "没规则"而非"程序错误"，不应阻止 Web 服务起来）。
+    任何一个通过双重验证（nft -f returncode=0 + fw4 表真存在）就停止。
+    全部失败也只记录日志，不抛异常（ruleset 空只是"没规则"而非"程序错误"，
+    不应阻止 Web 服务起来 —— 用户至少还能 SSH 进来手动修）。
     """
     if not _ruleset_is_empty():
         return  # 表存在 → ruleset 健康，无需恢复
@@ -4352,22 +4412,18 @@ def _auto_recover_ruleset_if_empty():
 
     # 优先级 1：当前规则文件
     if os.path.exists(RULES_PATH):
-        res = subprocess.run(['nft', '-f', RULES_PATH],
-                             capture_output=True, text=True, timeout=30)
-        if res.returncode == 0:
+        if _try_apply_rules_file(RULES_PATH):
             print(f'[INFO] ✅ 已从 {RULES_PATH} 恢复 ruleset', flush=True)
             return
-        print(f'[WARN] 从 {RULES_PATH} 恢复失败: {(res.stderr or res.stdout)[:200]}', flush=True)
+        print(f'[WARN] 从 {RULES_PATH} 恢复失败，尝试 backup...', flush=True)
 
     # 优先级 2：.backup 文件
     backup_path = RULES_PATH + '.backup'
     if os.path.exists(backup_path):
-        res = subprocess.run(['nft', '-f', backup_path],
-                             capture_output=True, text=True, timeout=30)
-        if res.returncode == 0:
+        if _try_apply_rules_file(backup_path):
             print(f'[INFO] ✅ 已从 {backup_path} 恢复 ruleset', flush=True)
             return
-        print(f'[WARN] 从 {backup_path} 恢复失败: {(res.stderr or res.stdout)[:200]}', flush=True)
+        print(f'[WARN] 从 {backup_path} 恢复失败，尝试 basic lockdown...', flush=True)
 
     # 优先级 3：basic lockdown（兜底）
     if _apply_basic_lockdown():
