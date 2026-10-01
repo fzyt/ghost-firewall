@@ -350,12 +350,40 @@ function app() {
       if (!cfg) return;
       this.saving = true;
       try {
-        await api.post('/api/config', cfg);
+        // 显式传 confirm=true，让后端知道前端已经看过预览+风险弹窗
+        //（如果还有 critical 风险，后端会放行；普通 medium/high 风险也一并通过这里返回）
+        const resp = await api.post('/api/config', { ...cfg, confirm: true });
         this.showToast('配置已保存', 'success');
         this.diffModal.show = false;
         this.diffModal.pendingConfig = null;
+        // 如果保存路径检测到非 critical 风险，前端可选择提示（暂只用 toast 兜底）
+        const risks = resp && resp.data && resp.data.risks ? resp.data.risks : [];
+        if (risks.length > 0) {
+          const high = risks.filter(r => r.level === 'high');
+          if (high.length > 0) {
+            this.showToast('已保存，但存在风险：' + high[0].message, 'error');
+          }
+        }
       } catch (e) {
-        this.showToast('保存失败: ' + e.message, 'error');
+        // 后端 409 CRITICAL_RISK：再次展示让用户二次确认
+        if (e.code === 'CRITICAL_RISK' && e.data && e.data.data && Array.isArray(e.data.data.risks)) {
+          const detail = e.data.data.risks.map(r => `[${r.level}] ${r.message}`).join('\n');
+          if (!confirm('后端检测到 critical 风险：\n\n' + detail + '\n\n是否仍然保存？')) {
+            this.saving = false;
+            return;
+          }
+          // 用户再次确认，重试
+          try {
+            await api.post('/api/config', { ...cfg, confirm: true });
+            this.showToast('配置已保存', 'success');
+            this.diffModal.show = false;
+            this.diffModal.pendingConfig = null;
+          } catch (e2) {
+            this.showToast('保存失败: ' + e2.message, 'error');
+          }
+        } else {
+          this.showToast('保存失败: ' + e.message, 'error');
+        }
       } finally {
         this.saving = false;
       }

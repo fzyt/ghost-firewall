@@ -44,6 +44,7 @@ def _init_app_secret():
 app.secret_key = _init_app_secret()
 app.config['SESSION_COOKIE_NAME'] = AUTH_COOKIE_NAME
 app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SECURE'] = True   # HTTPS 服务；Secure 标志防止中间人窃取 cookie
 app.config['PERMANENT_SESSION_LIFETIME'] = datetime.timedelta(seconds=AUTH_SESSION_LIFETIME)
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 # 上传大小限制：证书 < 10KB，反代规则配置几百字节；16MB 富余足够
@@ -628,15 +629,40 @@ def get_config():
 
 @app.route('/api/config', methods=['POST'])
 def post_config():
-    """保存配置（不应用）"""
+    """保存配置（不应用）。
+
+    风险拦截（与 /api/rules/preview-changes 共用 _detect_risks）：
+    - critical 级风险（如请求者把自己从 trusted_ip4 中移除）必须显式 confirm=true 才保存
+    - 其他级别风险不阻止保存，但通过 risks 字段告知前端展示警告
+    - 前端正常流程：preview-changes → 弹窗确认 → confirmSaveConfig() 传 confirm:true
+    """
     data = request.get_json(silent=True)
     if not data:
         return jsonify({"success": False, "message": "请求体不能为空"}), 400
-    # 修复：merge 到现有配置，避免前端只发部分字段时清空其他配置
-    config = load_config()
-    config.update(data)
-    save_config(config)
-    return jsonify({"success": True, "message": "配置已保存"})
+
+    # merge 到现有配置，避免前端只发部分字段时清空其他配置
+    old_cfg = load_config()
+    new_cfg = dict(old_cfg)
+    new_cfg.update({k: v for k, v in data.items() if k != 'confirm'})  # confirm 不入配置
+    requester_ip = request.remote_addr or ''
+    risks = _detect_risks(old_cfg, new_cfg, requester_ip)
+    critical_risks = [r for r in risks if r.get('level') == 'critical']
+
+    # critical 风险（如自锁）必须显式确认；绕过前端直接打 API 会被 409 拒绝
+    if critical_risks and not data.get('confirm'):
+        return jsonify({
+            'success': False,
+            'code': 'CRITICAL_RISK',
+            'message': '检测到可能导致自锁的变更，请确认后再保存',
+            'data': {'risks': risks},
+        }), 409
+
+    save_config(new_cfg)
+    return jsonify({
+        'success': True,
+        'message': '配置已保存',
+        'data': {'risks': risks},  # 非 critical 风险通过这里告知前端
+    })
 
 
 @app.route('/api/config/restore', methods=['POST'])
@@ -2595,6 +2621,9 @@ def list_add():
         return jsonify({"success": False, "message": "set_name 和 ip 不能为空"}), 400
     if set_name not in VALID_SET_NAMES:
         return jsonify({"success": False, "message": f"无效的 set_name，允许值: {', '.join(sorted(VALID_SET_NAMES))}"}), 400
+    # 校验 IP 格式（标准库 ipaddress；防止协议层注入和数据合法性问题）
+    if _detect_ip_version(ip) is None:
+        return jsonify({"success": False, "message": f"无效的 IP 地址: {ip!r}（应为单个 IPv4/IPv6，不支持 CIDR）"}), 400
     try:
         result = subprocess.run(
             ['nft', 'add', 'element', 'inet', 'fw4', set_name, '{', ip, '}'],
@@ -2622,6 +2651,9 @@ def list_delete():
         return jsonify({"success": False, "message": "set_name 和 ip 不能为空"}), 400
     if set_name not in VALID_SET_NAMES:
         return jsonify({"success": False, "message": f"无效的 set_name，允许值: {', '.join(sorted(VALID_SET_NAMES))}"}), 400
+    # 校验 IP 格式（与 list_add 保持一致，防止绕过前端校验）
+    if _detect_ip_version(ip) is None:
+        return jsonify({"success": False, "message": f"无效的 IP 地址: {ip!r}（应为单个 IPv4/IPv6，不支持 CIDR）"}), 400
     try:
         result = subprocess.run(
             ['nft', 'delete', 'element', 'inet', 'fw4', set_name, '{', ip, '}'],
@@ -3236,6 +3268,20 @@ def _remove_nginx_conf_file(rule):
     return False
 
 
+def _remove_nginx_conf_by_domain_port(domain, listen_port):
+    """按 domain + listen_port 删除指定 nginx conf 文件（domain 已经过 _sanitize_domain）"""
+    if not domain or not listen_port:
+        return False
+    conf_path = os.path.join(NGINX_CONF_DIR, f"{domain}-{listen_port}.conf")
+    if os.path.exists(conf_path):
+        try:
+            os.remove(conf_path)
+            return True
+        except OSError:
+            return False
+    return False
+
+
 def _nginx_test():
     """测试 nginx 配置，忽略 warn 只检查 error"""
     try:
@@ -3484,13 +3530,17 @@ def rp_create_rule():
     # 同 domain 已存在规则时，视为"更新"而非新建（防止重试/重复保存产生重复规则）
     existing = next((r for r in rp["rules"] if r.get("domain") == domain), None)
     if existing:
+        # 记录旧 listen_port：变化时清理旧 conf（domain 相同所以只需看端口）
+        old_listen_port = existing.get("listen_port")
+        new_listen_port = data.get("listen_port", existing.get("listen_port", 443))
+
         new_id = existing["id"]
         rule = {
             **existing,
             "name": _sanitize_name(data.get("name", "")) or existing.get("name", ""),
             "enabled": data.get("enabled", existing.get("enabled", True)),
             "domain": domain,
-            "listen_port": data.get("listen_port", existing.get("listen_port", 443)),
+            "listen_port": new_listen_port,
             "target_address": target,
             "target_protocol": data.get("target_protocol", existing.get("target_protocol", "http")),
             "websocket_enabled": data.get("websocket_enabled", existing.get("websocket_enabled", True)),
@@ -3503,6 +3553,10 @@ def rp_create_rule():
         idx = rp["rules"].index(existing)
         rp["rules"][idx] = rule
         replaced = True
+
+        # 端口变化：删除旧 conf（否则 nginx 持续加载旧端口配置）
+        if old_listen_port and old_listen_port != new_listen_port:
+            _remove_nginx_conf_by_domain_port(domain, old_listen_port)
     else:
         new_id = _next_id("rp", [r["id"] for r in rp["rules"]])
         rule = {
@@ -3553,6 +3607,10 @@ def rp_update_rule(rule_id):
     if not data:
         return jsonify({"success": False, "message": "请求体不能为空"}), 400
 
+    # 记录旧的 domain / listen_port：变更时清理旧 nginx conf
+    old_domain = rule.get("domain", "")
+    old_listen_port = rule.get("listen_port")
+
     updatable = ["enabled", "name", "domain", "listen_port", "target_address", "target_protocol",
                  "websocket_enabled", "public_access", "ssl_cert_id", "client_max_body_size"]
     for key in updatable:
@@ -3577,6 +3635,11 @@ def rp_update_rule(rule_id):
         rule["target_address"] = _sanitize_target_address(rule["target_address"])
     except ValueError as e:
         return jsonify({"success": False, "message": str(e)}), 400
+
+    # domain 或 listen_port 变化：删除旧 conf 文件
+    new_listen_port = rule.get("listen_port")
+    if old_domain and (old_domain != rule["domain"] or old_listen_port != new_listen_port):
+        _remove_nginx_conf_by_domain_port(_sanitize_domain(old_domain), old_listen_port)
 
     rule["updated_at"] = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S+08:00")
     _save_rp_config(config)
@@ -4171,7 +4234,24 @@ def auth_setup():
         return jsonify({'success': False, 'message': '密码长度至少 4 位'}), 400
     if len(pw) > 128:
         return jsonify({'success': False, 'message': '密码长度不能超过 128 位'}), 400
-    _write_password_hash(_hash_password(pw))
+    try:
+        _write_password_hash(_hash_password(pw))
+    except OSError as e:
+        # 写入时抛错（盘满 / 权限不足 / 临时 IO 错误）也要回滚 session
+        session.clear()
+        return jsonify({
+            'success': False,
+            'code': 'PASSWORD_WRITE_FAILED',
+            'message': f'密码文件写入失败：{e}。请检查磁盘空间和权限后重试',
+        }), 500
+    # 二次校验：写入函数正常返回但文件可能因特殊场景未落盘
+    if not _password_set():
+        session.clear()
+        return jsonify({
+            'success': False,
+            'code': 'PASSWORD_WRITE_FAILED',
+            'message': '密码文件写入失败，请检查磁盘空间和权限后重试',
+        }), 500
     _clear_login_failures(ip)
     session.clear()
     session['authenticated'] = True
@@ -4521,7 +4601,7 @@ def _start_servers():
 
     print(f" * HTTP 重定向  : http://0.0.0.0:5000  -> https://{redirect_host}:{HTTPS_PORT}", flush=True)
     print(f" * HTTPS 主服务  : https://0.0.0.0:{HTTPS_PORT}  (证书: {cert_files[0]})", flush=True)
-    print(f" * Cookie Secure : False（兼容 HTTP 重定向流程）", flush=True)
+    print(f" * Cookie Secure : True（仅 HTTPS 传输，防 cookie 窃取）", flush=True)
 
     # 后台线程跑 HTTP redirect
     t = threading.Thread(target=http_server.serve_forever, daemon=True)
