@@ -712,7 +712,20 @@ def _set_cookies(resp, token: str, device: str, clear: bool = False, raw: bool =
 
 @app.errorhandler(Exception)
 def _on_unhandled(err):
-    """兜底处理器：认证服务里未捕获的异常一律不外泄细节。"""
+    """兜底处理器：认证服务里未捕获的异常一律不外泄细节。
+
+    ⚠️ 重要：HTTPException（404/405/413 等）必须原样放行。
+    它们是「请求本身不合法」，不是「服务内部出错」；统一转成 500 会让
+    前端和 nginx 分不清到底是密码错了还是路径写错了。
+    只有真正未预期的异常才落审计并回 500。
+    """
+    from werkzeug.exceptions import HTTPException
+    if isinstance(err, HTTPException):
+        return jsonify({
+            "success": False,
+            "code": err.name.upper().replace(" ", "_"),
+            "message": err.description,
+        }), err.code
     try:
         audit("unhandled_exception", error=repr(err)[:200])
     except Exception:

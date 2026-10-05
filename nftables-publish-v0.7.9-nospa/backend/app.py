@@ -3801,8 +3801,11 @@ def _get_cert_expiry(cert_path):
         return None, -1
 
 
-def _generate_nginx_conf(rule, cert, settings):
-    """为一条反代规则生成 nginx 配置（Python 字符串拼接）"""
+def _generate_nginx_conf(rule, cert, settings, idx=0):
+    """为一条反代规则生成 nginx 配置（Python 字符串拼接）
+
+    idx：规则序号，用于生成唯一的 ssl session 共享内存区名。
+    """
     domain = _sanitize_domain(rule["domain"])
     listen_port = rule.get("listen_port", 443)
     target = _sanitize_target_address(rule.get("target_address", ""))
@@ -3851,7 +3854,11 @@ def _generate_nginx_conf(rule, cert, settings):
     lines.append("    ssl_prefer_server_ciphers on;")
     lines.append("    ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-GCM-SHA384;")
     lines.append("    ssl_session_timeout 1d;")
-    lines.append("    ssl_session_cache shared:SSL:50m;")
+    # 每条反代规则用带序号的独立共享内存区名。
+    # 原因：nginx 的共享内存区名是全局的，同名不同大小会让**整份配置**加载失败。
+    # OpenWrt 的 LuCI 已声明 shared:SSL:32k，这里若再用 shared:SSL:50m，
+    # nginx 会 [emerg] 拒绝加载，表现是「反代端口一个都起不来」而非明确报错。
+    lines.append(f"    ssl_session_cache shared:SSLRP{idx}:10m;")
     lines.append("    ssl_session_tickets off;")
     lines.append("")
     if hsts:
@@ -3909,11 +3916,15 @@ def _is_managed_conf(conf_path):
         return False
 
 
-def _write_nginx_conf_file(rule, cert, settings):
-    """生成并写入 nginx 配置文件，返回配置文件路径"""
+def _write_nginx_conf_file(rule, cert, settings, idx=0):
+    """生成并写入 nginx 配置文件，返回配置文件路径
+
+    idx 是该规则在列表中的序号，用来生成唯一的 ssl session 共享内存区名
+    （见 _generate_nginx_conf 里的说明：区名全局唯一，撞名会让整份配置挂掉）。
+    """
     domain = _sanitize_domain(rule["domain"])
     listen_port = rule.get("listen_port", 443)
-    conf_content = _generate_nginx_conf(rule, cert, settings)
+    conf_content = _generate_nginx_conf(rule, cert, settings, idx)
     conf_path = os.path.join(NGINX_CONF_DIR, f"{domain}-{listen_port}.conf")
     os.makedirs(NGINX_CONF_DIR, exist_ok=True)
     with open(conf_path, "w") as f:
@@ -3951,6 +3962,11 @@ def _remove_nginx_conf_by_domain_port(domain, listen_port):
 
 GATEWAY_CONF_NAME = "00-nftables-web-gateway.conf"
 GATEWAY_CONF_MARKER = "# Managed by nftables-web-v2 auth gateway"
+# 网关专用 SSL 会话缓存区。名字必须与机器上其它 server 块（如 OpenWrt LuCI 的
+# shared:SSL:32k）不同 —— nginx 共享内存区名全局唯一，同名不同大小会让整份配置
+# 加载失败，表现为「网关端口起不来」而不是任何明确报错。
+GATEWAY_SSL_ZONE = "SSLGATEWAY"
+GATEWAY_SSL_CACHE_SIZE = "10m"
 
 
 def _gateway_services(config):
@@ -4061,7 +4077,10 @@ def _generate_gateway_nginx_conf(config):
     L.append(f"    ssl_protocols {tls_protos};")
     L.append("    ssl_prefer_server_ciphers on;")
     L.append("    ssl_session_timeout 1d;")
-    L.append("    ssl_session_cache shared:SSL:50m;")
+    # 共享内存区名在 nginx 里是全局的：同名但大小不同会直接 [emerg] 拒绝加载整份配置。
+    # OpenWrt 的 LuCI 已经声明了 shared:SSL:32k，这里若再用 shared:SSL:50m 就冲突。
+    # 用独立的区名彻底避开与其他 server 块的碰撞。
+    L.append(f"    ssl_session_cache shared:{GATEWAY_SSL_ZONE}:{GATEWAY_SSL_CACHE_SIZE};")
     L.append("    ssl_session_tickets off;")
     L.append("")
     L.append("    access_log /var/log/nginx/nftables-web-gateway.access.log nftgw;")
@@ -4483,7 +4502,7 @@ def _deploy_all_rules(config=None):
             _remove_nginx_conf_file(rule)
             continue
         cert = certs.get(rule.get("ssl_cert_id", ""))
-        _write_nginx_conf_file(rule, cert, settings)
+        _write_nginx_conf_file(rule, cert, settings, i)
 
     # 测试并重载；测试失败必须回滚，不能只报错留下坏配置
     ok, msg = _nginx_test()
@@ -5230,7 +5249,12 @@ def rp_nginx_preview(rule_id):
         return jsonify({"success": False, "message": "规则不存在"}), 404
     cert = _find_rp_cert(rp, rule.get("ssl_cert_id", ""))
     settings = rp.get("settings", RP_DEFAULT_SETTINGS)
-    conf_content = _generate_nginx_conf(rule, cert, settings)
+    # 预览要和实际部署生成一样的内容，所以这里要算出该规则的真实序号
+    try:
+        idx = rp["rules"].index(rule) + 1
+    except ValueError:
+        idx = 0
+    conf_content = _generate_nginx_conf(rule, cert, settings, idx)
     conf_path = os.path.join(NGINX_CONF_DIR, f"{rule['domain']}.conf")
     return jsonify({"success": True, "data": {"config_content": conf_content, "config_path": conf_path}})
 
