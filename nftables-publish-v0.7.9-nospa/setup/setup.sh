@@ -55,6 +55,29 @@ pkg_install() {
     done
 }
 
+# ============================================================
+# nginx 能力自检（v0.8.0 网关的硬前置）
+# ============================================================
+# 认证网关的每个公网请求都要经 auth_request 转发给认证服务核对 token。
+# 缺这个模块不是「降级」，是网关必然 500 —— 所以这里不做 warn+skip，
+# 直接 die：让装完的人立刻知道，而不是部署完才发现网关不通。
+check_nginx_modules() {
+    if ! command -v nginx >/dev/null 2>&1; then
+        die "nginx 未安装成功 —— 网关无法工作，请检查网络后重试"
+    fi
+
+    if ! nginx -V 2>&1 | grep -q "http_auth_request_module"; then
+        die "当前 nginx 缺少 auth_request 模块（多半装的是 nginx-ssl），而 v0.8.0 认证网关强依赖它。请安装 nginx-full：opkg install nginx-full"
+    fi
+
+    if ! nginx -V 2>&1 | grep -q "http_realip_module"; then
+        # 缺 realip 不致命（只影响日志里客户端 IP 的还原），不阻断安装
+        warn "nginx 缺少 realip 模块，网关访问日志里的客户端 IP 可能显示为代理地址"
+    fi
+
+    ok "✅ nginx 模块自检通过（auth_request 就绪）"
+}
+
 pkg_update() {
     case "$PKG_MANAGER" in
         opkg) opkg update ;;
@@ -206,9 +229,15 @@ install_deps() {
         ddns-scripts-cloudflare ddns-scripts-dnspod \
         ddns-scripts-noip ddns-scripts-nsupdate \
         ddns-scripts-godaddy ddns-scripts-namecheap \
-        nginx-ssl \
+        nginx-full \
         curl openssl-util socat \
         ca-certificates wget-ssl
+
+    # v0.8.0 的单端口认证网关完全建立在 nginx 的 auth_request 之上：
+    # 每个公网请求都要先问认证服务「这个人有 token 吗」，没有就 401。
+    # OpenWrt 的 nginx-ssl 不含该模块，装它 = 装完看着一切正常，
+    # 一开网关就整片 500。所以这里必须用 nginx-full 并当场验模块。
+    check_nginx_modules
 
     # 安装 Python 依赖（pip）
     if ! python3 -c "import blinker" 2>/dev/null; then
@@ -350,10 +379,59 @@ server {
 }
 SITECONF
 
-    nginx -t 2>/dev/null && {
+    # OpenWrt 上真正被 nginx 跑起来的是 uci.conf（procd 从 uci.conf.template
+    # + UCI 配置生成到 /var/lib/nginx/uci.conf，/etc/nginx/uci.conf 是它的软链），
+    # 它并不被 /etc/nginx/nginx.conf include。只 `nginx -t` 校验 nginx.conf
+    # 等于校验了一份没人跑的配置，真出语法错时这里照样「通过」。
+    #
+    # ⚠️ 必须传软链路径 /etc/nginx/uci.conf，不能传 /var/lib/nginx/uci.conf。
+    # nginx 解析配置里的相对 include 时，用的是 -c 参数的**字面目录**做 prefix，
+    # uci.conf 第 21 行的 `include mime.types;` 因此会去 /etc/nginx/ 找。
+    # 传 realpath 会报 "open() /var/lib/nginx/mime.types failed" 而假报语法错误。
+    # （已实测：软链路径 exit 0，realpath 路径 exit 1）
+    if nginx -t >/dev/null 2>&1; then
         /etc/init.d/nginx restart 2>/dev/null || true
-        ok "✅ nginx 站点配置完成（面板直连 5443，反代在面板内配置）"
-    } || warn "❌ nginx 配置语法错误，请手动检查"
+        # restart 会重新生成 uci.conf，这时才校验真正生效的那份
+        if [ -f /etc/nginx/uci.conf ]; then
+            if nginx -t -c /etc/nginx/uci.conf >/dev/null 2>&1; then
+                ok "✅ nginx 配置校验通过（面板直连 5443，反代在面板内配置）"
+            else
+                warn "❌ 运行时配置 /etc/nginx/uci.conf 有语法错误，请执行: nginx -t -c /etc/nginx/uci.conf"
+            fi
+        else
+            ok "✅ nginx 配置校验通过（面板直连 5443，反代在面板内配置）"
+        fi
+    else
+        warn "❌ nginx 配置语法错误，请手动检查（未重启 nginx）"
+    fi
+
+    # 80/443 被 uhttpd 占着是 OpenWrt 常态。网关默认 8443 不会撞，
+    # 但用户把公网端口自定义成 443 时，nginx 会因 bind 失败进入崩溃循环。
+    # 这里不自动停 uhttpd（停了会失去 LuCI 管理界面，得由用户自己决定），
+    # 只把这件事在安装阶段就讲清楚。
+    warn_port_conflicts
+}
+
+# ============================================================
+# 80/443 端口占用提示
+# ============================================================
+warn_port_conflicts() {
+    command -v netstat >/dev/null 2>&1 || return 0
+
+    local busy=""
+    for p in 80 443; do
+        if netstat -tln 2>/dev/null | grep -qE ":${p}[[:space:]].*LISTEN"; then
+            busy="${busy} ${p}"
+        fi
+    done
+
+    if [ -n "$busy" ]; then
+        info "注意：端口${busy} 已被其他服务占用（通常是 uhttpd / LuCI）。"
+        info "  · 网关默认端口 8443，不受影响，可直接使用；"
+        info "  · 若你打算把公网端口改成 443，必须先自行处理占用者，例如："
+        info "      /etc/init.d/uhttpd disable && /etc/init.d/uhttpd stop"
+        info "    （这会关闭 LuCI 管理界面，请确认你还留着 SSH 或其他管理入口。）"
+    fi
 }
 
 # ============================================================

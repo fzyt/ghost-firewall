@@ -38,13 +38,19 @@
 | python3-light | python3-light | python3-light | 精简版 |
 | python3-requests | python3-requests | python3-requests | HTTP 库 |
 | python3-flask | python3-flask | python3-flask | Web 框架 |
-| nginx-ssl | nginx-ssl | nginx-ssl | 反向代理 + SSL |
+| nginx-full | nginx-full | nginx-full | 反向代理 + SSL + `auth_request`（**认证网关硬依赖**） |
 | curl | curl | curl | HTTP 工具 |
 | openssl-util | openssl-util | openssl-util | SSL 工具 |
 | socat | socat | socat | 端口转发 |
 | ca-certificates | ca-certificates | ca-certificates | CA 证书 |
 | wget-ssl | wget-ssl | wget-ssl | 下载工具 |
 | blinker | `pip3 install blinker` | `pip3 install blinker` | Flask 依赖（apk 需额外安装 python3-pip） |
+
+> ⚠️ **必须用 `nginx-full`，不能用 `nginx-ssl`。** v0.8.0 的单端口认证网关
+> 每个公网请求都要经 `auth_request` 子请求向认证服务核对 token，而 OpenWrt 的
+> `nginx-ssl` **不含**该模块 —— 装它不会报错，但一开网关就整片 500。
+> `setup.sh` 装完会当场校验 `nginx -V` 是否带 `http_auth_request_module`，
+> 缺了直接中止安装并提示重装，不会 warn+skip 放过去。
 
 ### 可选依赖
 

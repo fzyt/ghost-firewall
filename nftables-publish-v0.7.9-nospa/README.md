@@ -81,9 +81,13 @@ frontend/
 
 - **ddns-scripts-namecheap**：OpenWrt 25.x 仓库中暂无此包，Namecheap DDNS 功能暂不可用
 - **OpenWrt 25.x**：包管理器从 opkg 切换到 apk，setup.sh 已做兼容处理
-- **认证网关前端未完成**：v0.8.0 网关后端已就绪，但登录页/门户页尚未实现，
-  当前只能通过 `POST /api/gateway/config` 配置。`gateway_enabled` 默认关闭
 - **Linux 部署**：已预留 `deploy_mode=linux_gateway`（只重建自有表，不清空宿主机
   ruleset），但接口名、端口敲门（NAT 源 IP 下失效）、WAN IP 获取等完整适配尚未实现
-- **未验证 OpenWrt 的 nginx 是否带 `auth_request` 模块**，标准构建一般都有，
-  但必须在路由器上实测
+- **日志页未重构**：面板侧访问/认证/指纹日志已落盘（JSONL），但日志页面仍沿用
+  旧版，指纹展示尚未并入；防火墙包日志的 `log_size` 调大与远程转发也未做
+- **真实公网未穿透验证**：公网分支目前靠 `X-Test-IP` 头模拟来源判定，判定逻辑
+  已验证正确，但真实运营商网络、封端口、真实公网 IP 下的行为未验
+- **nginx 必须 `nginx-full`**：认证网关依赖 `auth_request` 模块，OpenWrt 的
+  `nginx-ssl` 不含该模块（装完不报错，一开网关整片 500）。已在
+  `192.168.100.224`（OpenWrt 24.10.0）实测：`nginx-full 1.26.3` 具备
+  `auth_request` / `realip`，`setup.sh` 装完会当场校验
