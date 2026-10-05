@@ -4,6 +4,9 @@ __pycache__/
 backups/
 docs/
 test_*.py
+# 例外：tests/ 下的是随代码走的正式回归测试，必须纳入版本管理
+#（认证网关的 fail-closed 保障靠它，改代码后必须能重跑）
+!tests/test_*.py
 check_ip.py
 aliyun-ddns-update.py
 update-china-ips.sh

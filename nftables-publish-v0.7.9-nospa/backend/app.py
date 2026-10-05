@@ -19,6 +19,10 @@ app = Flask(__name__)
 CONFIG_PATH = '/etc/nftables/nftables-web-config.json'
 RULES_PATH = '/etc/nftables.d/99-custom-rules.nft'
 
+# 面板 HTTPS 端口（仅 LAN 可达，防火墙侧由 lan_allowed_ports 放行）。
+# 定义在文件顶部：validate_config() 要用它做「网关端口不能占用面板端口」的交叉校验。
+HTTPS_PORT = int(os.environ.get("NFTABLES_WEB_HTTPS_PORT", "5443"))
+
 
 def _init_app_secret():
     """读取或生成 Flask SECRET_KEY（持久化到 /etc/nftables/nftables-web-secret）"""
@@ -280,6 +284,24 @@ DEFAULT_CONFIG = {
     "dns_lan_resolver_enabled": False,
     "dns_lan_servers": ["192.168.100.218"],
     "dns_lan_log": False,
+    # ── v0.8.0 新增：部署模式 + 认证网关 ──────────────────────────
+    # 部署模式。openwrt = 路由器本机（fw4 被接管，默认）。
+    # linux_gateway = 普通 Linux 主机，前面有主路由做端口映射。
+    #   该模式下 nftables 不会 flush 全局 ruleset，只接管自己的 table，
+    #   且端口敲门机制失效（NAT 后源 IP 是主路由地址），需靠认证网关兜底。
+    "deploy_mode": "openwrt",
+    # 认证网关总开关。默认关 —— 灰度期间不影响现有访问，出问题关掉即回滚。
+    "gateway_enabled": False,
+    # 公网入口端口。可自定义（含家宽常用的非 443 高位端口），不写死。
+    "gateway_port": 8443,
+    # 进程 B（认证 API）的本地监听端口。只绑 127.0.0.1，绝不对外。
+    "auth_api_port": 8444,
+    # 滑动窗口秒数：每次成功访问刷新。30 分钟 = 1800。
+    "auth_session_timeout": 1800,
+    # 绝对上限秒数：无论多活跃，到点强制重登。0 = 不启用。
+    "auth_absolute_timeout": 0,
+    # LAN 来源是否免认证。True = 认证只保护公网这一面（默认，符合「内网可信」）。
+    "auth_lan_bypass": True,
 }
 
 
@@ -574,6 +596,90 @@ def validate_config(cfg):
                     f'改用反代访问该服务。'
                 )
 
+    # ------------------------------------------------------------------
+    # v0.8.0：部署模式 + 认证网关配置校验
+    # ------------------------------------------------------------------
+    mode = str(cfg.get('deploy_mode', 'openwrt') or 'openwrt').strip()
+    if mode not in ('openwrt', 'linux_gateway'):
+        errs.append(
+            f"deploy_mode 非法: {mode!r}（合法值 openwrt | linux_gateway）"
+        )
+
+    if cfg.get('gateway_enabled'):
+        gw_port = cfg.get('gateway_port', 8443)
+        api_port = cfg.get('auth_api_port', 8444)
+
+        if not _is_port(gw_port):
+            errs.append(f"gateway_port 非法: {gw_port!r}（需为 1-65535 的整数）")
+        if not _is_port(api_port):
+            errs.append(f"auth_api_port 非法: {api_port!r}（需为 1-65535 的整数）")
+
+        if _is_port(gw_port) and _is_port(api_port) and int(gw_port) == int(api_port):
+            errs.append(
+                f"gateway_port 与 auth_api_port 冲突：都是 {gw_port}。"
+                f"网关端口是公网入口，认证 API 只监听 127.0.0.1，两者必须不同。"
+            )
+        if _is_port(gw_port) and int(gw_port) == int(HTTPS_PORT):
+            errs.append(
+                f"gateway_port 不能是 {HTTPS_PORT} —— 那是面板自己的 HTTPS 端口。"
+                f"启用网关后面板仍需在 LAN 上可达，两者端口不能相同。"
+            )
+
+        for key, lo, hi in (('auth_session_timeout', 60, 86400),
+                            ('auth_absolute_timeout', 0, 604800)):
+            v = cfg.get(key, 0)
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                errs.append(f'{key} 必须是数字，当前为 {v!r}')
+            elif not (lo <= v <= hi):
+                errs.append(f'{key} 越界：{v}（合法范围 {lo}-{hi}）')
+
+        abs_to = cfg.get('auth_absolute_timeout', 0)
+        sl_to = cfg.get('auth_session_timeout', 1800)
+        if (isinstance(abs_to, (int, float)) and isinstance(sl_to, (int, float))
+                and 0 < abs_to < sl_to):
+            errs.append(
+                f"auth_absolute_timeout({abs_to}) 小于 auth_session_timeout({sl_to})，"
+                f"绝对上限永远不会生效。请调大前者或调小后者。"
+            )
+
+    # ------------------------------------------------------------------
+    # v0.8.0：单端口网关的 path 前缀
+    #
+    # 认证网关把所有服务收敛到一个端口，靠 URL 路径前缀区分，
+    # 所以前缀必须唯一、合法、且不与网关自身的内部端点冲突。
+    # ------------------------------------------------------------------
+    seen_prefixes: dict = {}
+    rp_cfg_v = cfg.get('reverse_proxy')
+    if isinstance(rp_cfg_v, dict) and isinstance(rp_cfg_v.get('rules'), list):
+        for i, r in enumerate(rp_cfg_v['rules'], 1):
+            if not isinstance(r, dict):
+                continue
+            raw_prefix = r.get('path_prefix', '')
+            if raw_prefix in (None, ''):
+                continue
+            norm = _safe_path_prefix(raw_prefix)
+            if norm is None:
+                errs.append(
+                    f'reverse_proxy.rules[{i}].path_prefix 非法: {raw_prefix!r}'
+                    f'（需形如 /nas，只允许字母数字和 - _ /，且不能含 ..）'
+                )
+                continue
+            if not r.get('enabled'):
+                continue
+            if norm in _RESERVED_GATEWAY_PREFIXES:
+                errs.append(
+                    f'reverse_proxy.rules[{i}].path_prefix {norm!r} 与网关内部端点冲突，'
+                    f'请换一个（保留前缀: {", ".join(sorted(_RESERVED_GATEWAY_PREFIXES))}）'
+                )
+                continue
+            if norm in seen_prefixes:
+                errs.append(
+                    f'reverse_proxy.rules[{i}].path_prefix {norm!r} 与规则 '
+                    f'{seen_prefixes[norm]} 重复。网关靠路径区分服务，前缀必须唯一。'
+                )
+                continue
+            seen_prefixes[norm] = i
+
     return errs
 
 
@@ -613,6 +719,47 @@ def _safe_ip(v, version=None, default=""):
     return s if (s and _valid_ip(s, version)) else default
 
 
+def _safe_cidr(v, default=""):
+    """网段白名单校验。非法回落 default。
+
+    必须单独一个函数：_safe_ip 只认单个 IP，喂进来 '192.168.100.0/24'
+    会被判非法并静默回落 —— 那正好把「仅内网可达」的放行范围悄悄放大。
+    """
+    s = str(v or '').strip()
+    if not s:
+        return default
+    try:
+        return str(ipaddress.ip_network(s, strict=False))
+    except (ValueError, TypeError):
+        return default
+
+
+# 网关内部端点占用的路径前缀，服务前缀不得与之冲突
+_RESERVED_GATEWAY_PREFIXES = frozenset({"/_auth", "/auth"})
+
+_RE_PATH_PREFIX = re.compile(r"^/[A-Za-z0-9][A-Za-z0-9_\-/]*$")
+
+
+def _safe_path_prefix(v):
+    """把 path 前缀规整成规范形式；非法返回 None。
+
+    规则：必须以 / 开头、以 / 结尾或以字母数字结尾；只允许字母数字与 - _ /；
+    拒绝 .. 与连续 //（防路径穿越与 nginx location 前缀歧义）。
+    末尾斜杠统一去掉（nginx location 匹配时 /nas 与 /nas/ 等价）。
+    """
+    s = str(v or '').strip()
+    if not s:
+        return None
+    if '..' in s or '//' in s:
+        return None
+    if not _RE_PATH_PREFIX.match(s):
+        return None
+    s = s.rstrip('/')
+    if not s or s == '/':
+        return None
+    return s
+
+
 def config_to_variables(config):
     """将 web 配置转换为模板变量"""
     config = _migrate_forward_rules(config)
@@ -639,13 +786,21 @@ def config_to_variables(config):
     rp_rules = rp_cfg.get("rules")
     if not isinstance(rp_rules, list):
         rp_rules = []
-    for rule in rp_rules:
-        if not isinstance(rule, dict):
-            continue
-        if rule.get("enabled") and rule.get("public_access"):
-            port = str(rule.get("listen_port", ""))
-            if _is_port(port):
-                all_tcp.add(int(port))
+    if config.get("gateway_enabled"):
+        # 单端口网关模式：所有 public 服务共用 gateway_port 走认证，
+        # 所以 WAN 白名单只需要放行这一个端口 —— 公网暴露面从「N 个反代端口」
+        # 收敛成 1 个。只有确实存在「已启用 + public_access + 配了 path 前缀」
+        # 的服务时才放行，免得开着一个没人用的公网端口。
+        if any(r.get("public_access") for r, _p, _pr, _h, _tp in _gateway_services(config)):
+            all_tcp.add(_safe_port(config.get("gateway_port"), 8443))
+    else:
+        for rule in rp_rules:
+            if not isinstance(rule, dict):
+                continue
+            if rule.get("enabled") and rule.get("public_access"):
+                port = str(rule.get("listen_port", ""))
+                if _is_port(port):
+                    all_tcp.add(int(port))
 
     # 生成端口集合定义（直接带 elements；集合里是 int，join 前统一转 str）
     tcp_elems = ", ".join(str(p) for p in sorted(all_tcp)) if all_tcp else ""
@@ -679,6 +834,11 @@ def config_to_variables(config):
         "TRUSTED_IP6": _safe_ip(config.get("trusted_ip6", ""), 6, "fd93:86bb:a142:0:e9d:92ff:fe87:fd28"),
         "ACCESS_MODE": config.get("access_mode") if config.get("access_mode") in ("lan", "trusted") else "trusted",
         "CHINA_IP_BLOCK": "true" if config.get("china_ip_block", True) else "false",
+        # 决定 ruleset 前导块：openwrt 接管整机 / linux_gateway 只重建自有表。
+        # 非法值一律按 openwrt 处理 —— 宁可行为等同现状，也不要意外不清表。
+        "DEPLOY_MODE": (config.get("deploy_mode")
+                        if config.get("deploy_mode") == "linux_gateway"
+                        else "openwrt"),
     }
 
     # LAN 自定义放行端口规则
@@ -3377,8 +3537,8 @@ NGINX_CONF_DIR = "/etc/nginx/conf.d"
 NFTABLES_WEB_SSL_DIR = os.path.join(NGINX_SSL_DIR, "nftables-web")
 NFTABLES_WEB_CERT = os.path.join(NFTABLES_WEB_SSL_DIR, "fullchain.pem")
 NFTABLES_WEB_KEY = os.path.join(NFTABLES_WEB_SSL_DIR, "privkey.pem")
-# HTTPS 主端口（HTTP 5000 会 301 重定向到这里）
-HTTPS_PORT = int(os.environ.get("NFTABLES_WEB_HTTPS_PORT", "5443"))
+
+# 注：面板 HTTPS 端口 HTTPS_PORT 已提到文件顶部定义（validate_config 需要它做端口交叉校验）
 
 # TLS 版本映射
 TLS_VERSION_MAP = {
@@ -3789,6 +3949,315 @@ def _remove_nginx_conf_by_domain_port(domain, listen_port):
     return False
 
 
+GATEWAY_CONF_NAME = "00-nftables-web-gateway.conf"
+GATEWAY_CONF_MARKER = "# Managed by nftables-web-v2 auth gateway"
+
+
+def _gateway_services(config):
+    """取出参与网关分发的服务列表（已启用 + 有合法 path 前缀）。
+
+    返回 [(rule, prefix, protocol, host, port), ...]，越界的配置在这里被丢掉，
+    保证生成的 nginx 配置里只可能出现经过净化的值。
+    """
+    rp = config.get("reverse_proxy")
+    rules = rp.get("rules") if isinstance(rp, dict) else None
+    out = []
+    for r in (rules or []):
+        if not isinstance(r, dict) or not r.get("enabled"):
+            continue
+        prefix = _safe_path_prefix(r.get("path_prefix", ""))
+        if not prefix or prefix in _RESERVED_GATEWAY_PREFIXES:
+            continue
+        protocol, addr = "http", str(r.get("target_address", "") or "").strip()
+        if not addr:
+            continue
+        if "://" in addr:
+            protocol, _, addr = addr.partition("://")
+            protocol = protocol.lower()
+        if protocol not in ("http", "https"):
+            continue
+        host, _, port = addr.rpartition(":")
+        host, port = host.strip(), port.strip()
+        if not host or not _is_port(port):
+            continue
+        if not (_RE_IFACE.match(host) or _valid_ip(host, 6) or _valid_ip(host, 4)):
+            continue
+        out.append((r, prefix, protocol, host, int(port)))
+    out.sort(key=lambda x: x[1])
+    return out
+
+
+def _generate_gateway_nginx_conf(config):
+    """生成单端口认证网关的 nginx 配置。
+
+    结构：
+      /_auth      internal，只给 auth_request 用，外部无法直接访问
+      /auth/*     认证端点（登录/登出/状态/门户），浏览器直接访问
+      /           门户页（转发到认证服务的 /auth/portal）
+      /<prefix>/  每个服务一个 location
+        · public_access=true  → 所有来源可达，但必须过 auth_request
+        · public_access=false → 只放行 LAN 网段，直接 deny 其他来源
+
+    为什么 public_access=false 不用认证层拦：认证层只管「有没有 token」，
+    管不了「从哪来」。一个 WAN 用户登录后照样能摸到这个服务。
+    来源限制必须在 nginx 里用 allow/deny 落地，才是真的只对内网开放。
+
+    注意：log_format 必须在 http 上下文里定义。conf.d/*.conf 正是被
+    include 进 http 的，所以放在文件顶部是合法的。
+    """
+    if not config.get("gateway_enabled"):
+        return None
+
+    port = _safe_port(config.get("gateway_port"), 8443)
+    api_port = _safe_port(config.get("auth_api_port"), 8444)
+    services = _gateway_services(config)
+    settings = {}
+    rp = config.get("reverse_proxy")
+    if isinstance(rp, dict) and isinstance(rp.get("settings"), dict):
+        settings = rp["settings"]
+
+    cert_id = str(settings.get("default_cert_id", "") or "")
+    certs = {c.get("id"): c for c in (rp.get("certificates") or [])
+             if isinstance(c, dict)}
+    chosen = certs.get(cert_id)
+    if not chosen:
+        # 回落到面板自签/自带证书
+        cert_path, key_path = NFTABLES_WEB_CERT, NFTABLES_WEB_KEY
+    else:
+        cert_path = chosen.get("cert_path", "")
+        key_path = chosen.get("key_path", "")
+
+    lan_cidr = _safe_cidr(config.get("lan_subnet4"), "192.168.0.0/16")
+    tls_min = settings.get("tls_min_version", "TLSv1.2")
+    tls_protos = TLS_VERSION_MAP.get(tls_min, "TLSv1.2 TLSv1.3")
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    L = []
+    L.append(GATEWAY_CONF_MARKER)
+    L.append(f"# 认证网关：单端口 {port}，{len(services)} 个服务按 path 前缀分发")
+    L.append(f"# 生成时间: {now_str}")
+    L.append("# 请勿手动修改 —— 面板会在保存配置时重新生成本文件")
+    L.append("")
+
+    # 访问日志：现状是项目生成的 nginx conf 里一条 access_log 都没有，
+    # 设备识别、审计、异常检测全都依赖这一条，是整个方案的地基。
+    # 记 $uri 而不是 $request_uri：后者带查询串，容易把敏感参数写进日志。
+    L.append("log_format nftgw '$time_iso8601 $remote_addr $request_method '")
+    L.append("                '$status $body_bytes_sent rt=$request_time '")
+    L.append("                'host=\"$host\" uri=\"$uri\" '")
+    L.append("                'ua=\"$http_user_agent\" ref=\"$http_referer\" '")
+    L.append("                'auth_user=\"$auth_user\" auth_dev=\"$auth_device\"';")
+    L.append("")
+
+    L.append("server {")
+    L.append(f"    listen {port} ssl;")
+    L.append(f"    listen [::]:{port} ssl;")
+    L.append("    http2 on;")
+    L.append("    server_tokens off;")
+    L.append("")
+    L.append("    # SSL")
+    L.append(f"    ssl_certificate {cert_path};")
+    L.append(f"    ssl_certificate_key {key_path};")
+    L.append(f"    ssl_protocols {tls_protos};")
+    L.append("    ssl_prefer_server_ciphers on;")
+    L.append("    ssl_session_timeout 1d;")
+    L.append("    ssl_session_cache shared:SSL:50m;")
+    L.append("    ssl_session_tickets off;")
+    L.append("")
+    L.append("    access_log /var/log/nginx/nftables-web-gateway.access.log nftgw;")
+    L.append("    error_log  /var/log/nginx/nftables-web-gateway.error.log warn;")
+    L.append("")
+
+    # ── 认证子请求入口 ──────────────────────────────────────────
+    # internal = 外部无法直接访问 /_auth，只能由 nginx 内部发起。
+    L.append("    # 认证子请求：仅供 auth_request 调用，外部无法直接访问")
+    L.append("    location = /_auth {")
+    L.append("        internal;")
+    L.append(f"        proxy_pass http://127.0.0.1:{api_port}/auth/verify;")
+    L.append("        proxy_pass_request_body off;")
+    L.append("        proxy_set_header Content-Length \"\";")
+    L.append("        proxy_set_header Cookie $http_cookie;")
+    L.append("        proxy_set_header Authorization $http_authorization;")
+    L.append("        # 认证服务只听 127.0.0.1，remote_addr 永远是本机，")
+    L.append("        # 判断「是否内网来源」必须靠这里透传的真实客户端 IP。")
+    L.append("        proxy_set_header X-Real-IP $remote_addr;")
+    L.append("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
+    L.append("        proxy_set_header X-Original-URI $request_uri;")
+    L.append("        proxy_read_timeout 10s;")
+    L.append("    }")
+    L.append("")
+
+    # ── 认证端点（浏览器直连） ──────────────────────────────────
+    L.append("    # 认证端点：登录 / 登出 / 状态 / 门户数据")
+    L.append("    location /auth/ {")
+    L.append(f"        proxy_pass http://127.0.0.1:{api_port};")
+    L.append("        proxy_set_header X-Real-IP $remote_addr;")
+    L.append("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
+    L.append("        proxy_set_header X-Original-URI $request_uri;")
+    L.append("        proxy_set_header Host $host;")
+    L.append("    }")
+    L.append("")
+
+    # ── 门户页 ──────────────────────────────────────────────────
+    L.append("    # 门户页：登录后展示可访问的服务列表")
+    L.append("    location = / {")
+    L.append(f"        proxy_pass http://127.0.0.1:{api_port}/auth/portal;")
+    L.append("        proxy_set_header X-Real-IP $remote_addr;")
+    L.append("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
+    L.append("        proxy_set_header Host $host;")
+    L.append("        # 门户是内网入口，不该被搜索引擎收录")
+    L.append("        add_header X-Robots-Tag \"noindex, nofollow\" always;")
+    L.append("    }")
+    L.append("")
+
+    # ── 各服务 location ─────────────────────────────────────────
+    for rule, prefix, protocol, host, tport in services:
+        name = _sanitize_name(rule.get("name") or prefix)
+        L.append(f"    # ---- {name} ----")
+        L.append(f"    location {prefix}/ {{")
+        L.append(f"        proxy_pass {protocol}://{host}:{tport}/;")
+        L.append("        proxy_set_header Host $http_host;")
+        L.append("        proxy_set_header X-Real-IP $remote_addr;")
+        L.append("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
+        L.append("        proxy_set_header X-Forwarded-Proto $scheme;")
+        L.append("        proxy_set_header X-Forwarded-Host $host;")
+        L.append("        proxy_set_header X-Forwarded-Port $server_port;")
+        L.append("        proxy_set_header X-Auth-User $auth_user;")
+        L.append("        proxy_set_header X-Auth-Device $auth_device;")
+
+        if rule.get("public_access"):
+            # 公网可达 → 无条件要求认证
+            L.append("        # public_access=true：所有来源可达，但必须先过认证")
+            L.append("        auth_request /_auth;")
+            L.append("        error_page 401 = @to_login;")
+            L.append("        auth_request_set $auth_user $upstream_http_x_auth_user;")
+            L.append("        auth_request_set $auth_device $upstream_http_x_auth_device;")
+        else:
+            # 仅内网 → 按来源地址拦截，不进认证
+            L.append(f"        # public_access=false：仅内网 {lan_cidr} 可达，公网直连被拒")
+            L.append(f"        allow {lan_cidr};")
+            L.append("        allow ::1;")
+            L.append("        deny all;")
+            L.append("        auth_request_set $auth_user \"lan\";")
+            L.append("        auth_request_set $auth_device $cookie_gw_device;")
+
+        # 认证服务不可达时的 fail-closed 行为：
+        # auth_request 拿不到上游 → nginx 自己返回 5xx，不会放行。
+        L.append("        proxy_read_timeout 300s;")
+        L.append("        proxy_send_timeout 300s;")
+        L.append("        proxy_buffering off;")
+        L.append("        proxy_request_buffering off;")
+        if rule.get("websocket_enabled", True):
+            L.append("        proxy_http_version 1.1;")
+            L.append("        proxy_set_header Upgrade $http_upgrade;")
+            L.append("        proxy_set_header Connection \"upgrade\";")
+        else:
+            L.append("        proxy_http_version 1.1;")
+        L.append("        client_max_body_size 0;   # 反代内网服务，不限上传体积")
+        L.append("    }")
+        L.append("")
+
+    # ── 跳登录 ──────────────────────────────────────────────────
+    # 端口必须显式带上：nginx 变量 $host 只含主机名、不含端口，
+    # 而本项目的网关端口按设计就是自定义高位端口（家宽常用非 443）。
+    # 漏掉端口会把用户甩到 443 去 —— 要么打不开，要么撞上别的服务。
+    # 这里用配置里的 port 而非 $http_host：后者是客户端可控的 Host 头，
+    # 拼进重定向就是 Host Header 注入。$host 经 nginx 校验，相对安全。
+    if port == 443:
+        L.append("    location @to_login {")
+        L.append("        return 302 https://$host/auth/login?next=$request_uri;")
+        L.append("    }")
+    else:
+        L.append(f"    location @to_login {{")
+        L.append(f"        return 302 https://$host:{port}/auth/login?next=$request_uri;")
+        L.append("    }")
+    L.append("")
+    L.append("    location = /favicon.ico { return 204; }")
+    L.append("}")
+    L.append("")
+
+    return "\n".join(L)
+
+
+def _deploy_gateway_nginx(config=None):
+    """生成并启用网关 nginx 配置。返回 (ok, message)。
+
+    与 _deploy_all_rules 同样的安全约束：部署前整目录快照，
+    `nginx -t` 失败时整体回滚，避免留下「新配置全错 + 旧配置全没」的状态。
+    网关关掉时是删除本面板的网关配置文件（不碰别人的）。
+    """
+    if config is None:
+        config = load_config()
+    conf_path = os.path.join(NGINX_CONF_DIR, GATEWAY_CONF_NAME)
+    enabled = bool(config.get("gateway_enabled"))
+
+    content = _generate_gateway_nginx_conf(config) if enabled else None
+    if enabled and not content:
+        return False, "网关已启用，但没有可分发的服务（需要已启用且配置了 path 前缀的反代规则）"
+
+    backup_dir = NGINX_CONF_DIR + '.gwdeploybak'
+    shutil.rmtree(backup_dir, ignore_errors=True)
+    have_backup = False
+    if os.path.isdir(NGINX_CONF_DIR):
+        try:
+            shutil.copytree(NGINX_CONF_DIR, backup_dir)
+            have_backup = True
+        except OSError as e:
+            print(f'[WARN] 网关配置快照失败: {e}', flush=True)
+
+    def _undo(msg):
+        shutil.rmtree(backup_dir, ignore_errors=True)
+        if not have_backup:
+            # 没有历史可回滚，如实说明，不谎称已回滚
+            return False, f"{msg}（无可回滚的历史配置）"
+        try:
+            shutil.rmtree(NGINX_CONF_DIR, ignore_errors=True)
+            shutil.copytree(backup_dir, NGINX_CONF_DIR)
+            subprocess.run(['/etc/init.d/nginx', 'reload'],
+                           capture_output=True, text=True, timeout=10)
+        except Exception as e:
+            return False, f"{msg}（回滚也失败，请手工检查 {NGINX_CONF_DIR}: {e}）"
+        return False, f"{msg}（已回滚 nginx 配置）"
+
+    try:
+        os.makedirs(NGINX_CONF_DIR, exist_ok=True)
+        if enabled:
+            tmp = conf_path + '.tmp'
+            with open(tmp, 'w') as f:
+                f.write(content)
+            ok, msg = _nginx_test()
+            if not ok:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                return _undo(f"网关配置校验失败：{msg}")
+            os.replace(tmp, conf_path)
+        else:
+            # 只删自己那个文件
+            if os.path.exists(conf_path):
+                try:
+                    with open(conf_path) as f:
+                        if f.readline().strip() == GATEWAY_CONF_MARKER:
+                            os.remove(conf_path)
+                except OSError as e:
+                    return False, f"删除网关配置失败：{e}"
+
+        ok, msg = _nginx_test()
+        if not ok:
+            return _undo(f"nginx -t 失败：{msg}")
+
+        subprocess.run(['/etc/init.d/nginx', 'reload'],
+                       capture_output=True, text=True, timeout=15)
+        shutil.rmtree(backup_dir, ignore_errors=True)
+        if enabled:
+            n = len(_gateway_services(config))
+            return True, f"认证网关已启用：端口 {config.get('gateway_port')}，{n} 个服务"
+        return True, "认证网关已停用，配置已移除"
+    except Exception as e:
+        return _undo(f"部署网关配置异常：{e}")
+
+
 def _nginx_test():
     """测试 nginx 配置，忽略 warn 只检查 error"""
     try:
@@ -4022,7 +4491,116 @@ def _deploy_all_rules(config=None):
         return _rollback(f"nginx 配置语法错误，未重载: {msg}")
     shutil.rmtree(backup_dir, ignore_errors=True)
     ok, msg = _nginx_reload()
+
+    # 认证网关配置跟着一起下发（只增删本面板自己的网关文件）。
+    # 网关失败不影响已成功的反代部署，但要如实带上原因返回给调用方 ——
+    # 静默吞掉会导致「以为网关开了其实没开」。
+    gw_ok, gw_msg = _deploy_gateway_nginx(config)
+    if not gw_ok:
+        return ok, f"{msg}；但认证网关未生效：{gw_msg}"
     return ok, msg
+
+
+# ======================= 认证网关 API =======================
+#
+# 前端页面（门户/登录/指纹）还没做，但后端必须先可管：
+# 否则「网关到底开没开、开着几个服务」只能靠翻配置文件，不符合可运维的要求。
+
+@app.route('/api/gateway/status', methods=['GET'])
+def gateway_status():
+    config = load_config()
+    services = _gateway_services(config)
+    gw_port = _safe_port(config.get("gateway_port"), 8443)
+    api_port = _safe_port(config.get("auth_api_port"), 8444)
+
+    # 探测认证服务（进程 B）是否真的在跑
+    auth_alive = False
+    auth_msg = ""
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{api_port}/auth/health", method="GET")
+        with urllib.request.urlopen(req, timeout=3) as r:
+            auth_alive = (r.status == 200)
+    except Exception as e:
+        auth_msg = f"{type(e).__name__}: {e}"[:120]
+
+    return jsonify({
+        "success": True,
+        "data": {
+            "enabled": bool(config.get("gateway_enabled")),
+            "gateway_port": gw_port,
+            "auth_api_port": api_port,
+            "auth_alive": auth_alive,
+            "auth_error": auth_msg,
+            "public_url": f"https://<你的域名或公网IP>:{gw_port}/" if config.get("gateway_enabled") else None,
+            "session_timeout": _int_or(config.get("auth_session_timeout"), 1800),
+            "absolute_timeout": _int_or(config.get("auth_absolute_timeout"), 0),
+            "lan_bypass": bool(config.get("auth_lan_bypass", True)),
+            "services": [
+                {
+                    "name": str(r.get("name") or p.lstrip("/"))[:64],
+                    "path": p,
+                    "public": bool(r.get("public_access")),
+                    "url": f"/{p}/",
+                }
+                for r, p, _pr, _h, _tp in services
+            ],
+            "nginx_conf": os.path.join(NGINX_CONF_DIR, GATEWAY_CONF_NAME)
+                           if config.get("gateway_enabled") else None,
+        }
+    })
+
+
+def _int_or(v, default):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+@app.route('/api/gateway/config', methods=['POST'])
+def gateway_set_config():
+    """更新网关相关配置项并下发。字段全部走 validate_config，非法一律 400。"""
+    config = load_config()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"success": False, "message": "请求体必须是 JSON 对象"}), 400
+
+    allowed = {
+        "gateway_enabled", "gateway_port", "auth_api_port",
+        "auth_session_timeout", "auth_absolute_timeout", "auth_lan_bypass",
+        "deploy_mode",
+    }
+    new_cfg = dict(config)
+    changed = []
+    for k, v in data.items():
+        if k not in allowed:
+            return jsonify({"success": False,
+                            "message": f"不支持的字段 {k!r}（可改: {', '.join(sorted(allowed))}）"}), 400
+        if isinstance(v, bool) or (k.endswith(("_port", "_timeout")) and not isinstance(v, (int, float))):
+            return jsonify({"success": False, "message": f"{k} 类型非法: {v!r}"}), 400
+        new_cfg[k] = v
+        changed.append(k)
+
+    errs = validate_config(new_cfg)
+    if errs:
+        return jsonify({"success": False, "message": "；".join(errs),
+                        "errors": errs}), 400
+
+    save_config(new_cfg)
+    deploy_ok, deploy_msg = _deploy_gateway_nginx(new_cfg)
+    if not deploy_ok:
+        return jsonify({"success": False, "message": f"配置已保存但网关部署失败：{deploy_msg}"}), 500
+
+    # 改的是防火墙侧要放行的端口，必须同步 nftables，否则「配好了但公网连不上」
+    fw_ok, fw_msg = _apply_ruleset(new_cfg)
+    if not fw_ok:
+        return jsonify({"success": False,
+                        "message": f"网关配置已下发，但防火墙放行更新失败：{fw_msg}"}), 500
+
+    return jsonify({"success": True,
+                    "data": {"changed": changed, "message": deploy_msg}})
 
 
 # ======================= 反代规则 API =======================
@@ -5100,20 +5678,23 @@ def _build_ssl_context(cert_files):
 
 
 def _start_servers():
-    """启双端口服务：HTTP 5000（重定向） + HTTPS 5443（主服务）。
+    """启动单端口 HTTPS 面板服务（默认 5443，仅 LAN 可达）。
 
     启动前置条件：
     1. 先自动恢复 nftables ruleset（如果被清空，避免带病起服务）
     2. 必须有可用证书（反代证书优先，否则自签）；都失败 → 拒绝启动
 
     恢复规则优先级：当前规则文件 > .backup > basic lockdown（WAN block / LAN allow）
+
+    注：v0.8.0 起移除了原先的 HTTP 5000 跳转器 —— 它在 10-01 那轮
+    把 lan_allowed_ports 从 5000 改成 5443 之后已被防火墙 policy drop
+    拦住，实际从未可达，属于死代码。对外只保留 HTTPS 5443 一个入口。
     """
     # ========== 启动时自动恢复 nftables ruleset ==========
     _auto_recover_ruleset_if_empty()
 
     import sys as _sys
     from werkzeug.serving import make_server
-    import threading
 
     cert_files = _ensure_https_cert()
     ssl_ctx = _build_ssl_context(cert_files)
@@ -5127,48 +5708,21 @@ def _start_servers():
 
     debug = os.environ.get('FLASK_DEBUG', '0') == '1'
 
-    # 重定向用的 host：启动时锁定到 router_ip4（防 Host Header 注入）
-    redirect_host = 'localhost'
-    try:
-        cfg = load_config()
-        ip = (cfg.get('router_ip4') or '').strip()
-        if ip:
-            redirect_host = ip
-    except Exception:
-        pass
-
-    # 双端口模式
-    def _http_redirect_app(environ, start_response):
-        path = environ.get('PATH_INFO', '/') or '/'
-        qs = environ.get('QUERY_STRING', '')
-        # host 用配置里的（避免 HTTP_HOST header 注入）
-        url = f"https://{redirect_host}:{HTTPS_PORT}{path}"
-        if qs:
-            url = f"{url}?{qs}"
-        start_response('301 Moved Permanently', [
-            ('Location', url),
-            ('Content-Length', '0'),
-            ('Strict-Transport-Security', 'max-age=31536000; includeSubDomains'),
-        ])
-        return [b'']
-
-    http_server = make_server('0.0.0.0', 5000, _http_redirect_app, threaded=True)
+    # 单端口模式：面板本体 HTTPS。
+    # 监听 0.0.0.0 是既有行为，安全边界由防火墙承担 ——
+    # lan_allowed_ports 生成的 `iifname $LAN_IF tcp dport { ... 5443 } accept`
+    # 是唯一放行路径，WAN 侧 input_wan 链没有 5443，policy drop 直接吃掉。
     https_server = make_server('0.0.0.0', HTTPS_PORT, app, ssl_context=ssl_ctx, threaded=True)
 
-    print(f" * HTTP 重定向  : http://0.0.0.0:5000  -> https://{redirect_host}:{HTTPS_PORT}", flush=True)
     print(f" * HTTPS 主服务  : https://0.0.0.0:{HTTPS_PORT}  (证书: {cert_files[0]})", flush=True)
+    print(f" * 访问范围      : 仅 LAN（公网入口由独立网关端口承担，见 gateway_port 配置）", flush=True)
     print(f" * Cookie Secure : True（仅 HTTPS 传输，防 cookie 窃取）", flush=True)
-
-    # 后台线程跑 HTTP redirect
-    t = threading.Thread(target=http_server.serve_forever, daemon=True)
-    t.start()
 
     try:
         https_server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        http_server.shutdown()
         https_server.shutdown()
 
 

@@ -2,14 +2,26 @@
 
 > 基于 OpenWrt 的防火墙 Web 管理面板
 
-**版本：** v0.7.9.1
+**版本：** v0.8.0
 
 Ghost Firewall 是一个运行在 OpenWrt 上的轻量防火墙管理工具，通过 Web 界面管理 nftables 规则，提供端口敲门、端口转发、DDNS、反向代理等功能。
+
+## 访问入口
+
+| 入口 | 地址 | 暴露面 | 用途 |
+|------|------|--------|------|
+| 管理面板 | `https://<路由器IP>:5443` | **仅局域网** | nftables 规则、反代配置、DDNS、日志 |
+| 认证网关 | `https://<域名或公网IP>:<自定义端口>/` | 可映射公网 | 单端口访问所有服务，公网需认证 |
+| 认证服务 | `127.0.0.1:8444` | **本机专属** | 网关的认证后端，公网不可达 |
+
+> v0.8.0 起面板不再有任何公网入口。原先的 HTTP 5000 跳转器已删除
+> （它自 0.7.9.1 起就被防火墙 `policy drop` 拦住、从未可达，属于死代码）。
 
 ## 功能一览
 
 | 模块 | 说明 |
 |------|------|
+| **认证网关** | 单端口汇聚所有服务，按路径前缀区分，公网访问需认证（v0.8.0+） |
 | **网络接口** | PPPoE 拨号、路由器网关 IP 管理 |
 | **端口敲门** | 自定义 4 端口敲门序列，白名单 IP，超时设置 |
 | **端口转发** | TCP/UDP 转发，IPv4/IPv6 双栈支持 |
@@ -32,7 +44,8 @@ wget -O /tmp/setup.sh https://raw.githubusercontent.com/fzyt/ghost-firewall/main
 sh /tmp/setup.sh
 ```
 
-脚本自动安装所有依赖（python3、flask、nftables-json、nginx 等）。安装后访问 `http://路由器IP:5000`，首次启动会自动生成随机端口敲门序列。
+脚本自动安装所有依赖（python3、flask、nftables-json、nginx 等）。安装后访问
+`https://路由器IP:5443`，首次启动会自动生成随机端口敲门序列。
 
 > `ddns-scripts-namecheap` 在部分 OpenWrt 版本中不存在，不影响其他功能。
 
@@ -45,22 +58,32 @@ sh /tmp/setup.sh --force
 ## 项目结构
 
 ```
-nftables-web-v2/
-├── setup/setup.sh           # 一键安装脚本
-├── backend/
-│   ├── app.py              # 后端主程序
-│   ├── template_engine.py  # 模板引擎
-│   ├── nftables-web.init   # OpenWrt init 服务脚本
-│   └── templates/
-│       └── nftables.conf   # nftables 规则模板
-└── frontend/
-    ├── index.html          # 前端入口
-    ├── app.js              # 前端逻辑
-    ├── styles.css          # 样式
-    └── assets/             # 静态资源（JS 库、截图等）
+nftables-publish-v0.7.9-nospa/
+├── setup/
+│   ├── setup.sh                  # 一键安装脚本
+│   └── knock-*.sh|.py|.ps1       # 端口敲门客户端（LAN / WAN）
+└── backend/
+    ├── app.py                    # 进程 A：管理面板（5443，仅 LAN）
+    ├── auth_gateway.py           # 进程 B：认证 API（127.0.0.1）
+    ├── template_engine.py        # 模板引擎
+    ├── nftables-web.init         # 面板 init 脚本
+    ├── nftables-web-auth.init    # 认证服务 init 脚本
+    └── templates/
+        └── nftables.conf         # nftables 规则模板
+frontend/
+├── index.html                    # 面板前端
+├── app.js                        # 面板逻辑
+├── styles.css                    # 样式
+└── assets/                       # 静态资源
+```
 
 ## 已知限制
 
 - **ddns-scripts-namecheap**：OpenWrt 25.x 仓库中暂无此包，Namecheap DDNS 功能暂不可用
 - **OpenWrt 25.x**：包管理器从 opkg 切换到 apk，setup.sh 已做兼容处理
-```
+- **认证网关前端未完成**：v0.8.0 网关后端已就绪，但登录页/门户页尚未实现，
+  当前只能通过 `POST /api/gateway/config` 配置。`gateway_enabled` 默认关闭
+- **Linux 部署**：已预留 `deploy_mode=linux_gateway`（只重建自有表，不清空宿主机
+  ruleset），但接口名、端口敲门（NAT 源 IP 下失效）、WAN IP 获取等完整适配尚未实现
+- **未验证 OpenWrt 的 nginx 是否带 `auth_request` 模块**，标准构建一般都有，
+  但必须在路由器上实测

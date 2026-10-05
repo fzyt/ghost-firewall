@@ -1,0 +1,105 @@
+#!/bin/sh /etc/rc.common
+# 认证网关服务（进程 B）
+#
+# 职责：只提供 /auth/* 认证端点，监听 127.0.0.1，公网完全不可达。
+# 公网入口由 nginx（gateway_port）承担，通过 auth_request 调用本服务。
+#
+# 与面板（进程 A，5443）的关系：两个独立进程、两个独立 init 服务。
+# 刻意不合并 —— 面板崩了不该带走认证，认证崩了面板仍能在 LAN 上修问题。
+# 本服务不 import app.py，只读同一份 config.json。
+
+START=98
+STOP=11
+
+APP_DIR="/opt/nftables-web-v2/backend"
+AUTH_LOG="/var/log/nftables-web-auth-gateway.log"
+PID_FILE="/var/run/nftables-web-auth.pid"
+
+# 监听地址写死 127.0.0.1，不要改成 0.0.0.0。
+# auth_gateway.py 启动时会检查 AUTH_BIND_HOST，绑到非回环地址直接退出。
+AUTH_BIND_HOST="127.0.0.1"
+
+get_port() {
+    # 从配置里读认证端口，读不到就用默认 8444
+    local port="8444"
+    if [ -f /etc/nftables/nftables-web-config.json ]; then
+        local p
+        p=$(jsonfilter -e '$.auth_api_port' /etc/nftables/nftables-web-config.json 2>/dev/null)
+        case "$p" in
+            ''|*[!0-9]*) : ;;
+            *) port="$p" ;;
+        esac
+    fi
+    echo "$port"
+}
+
+start() {
+    if [ ! -f "$APP_DIR/auth_gateway.py" ]; then
+        echo "nftables-web-auth: 找不到 $APP_DIR/auth_gateway.py，未安装或版本过旧"
+        return 1
+    fi
+
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        echo "nftables-web-auth is already running (PID $(cat "$PID_FILE"))"
+        return 0
+    fi
+
+    local port
+    port=$(get_port)
+
+    echo "Starting nftables-web-auth on 127.0.0.1:$port ..."
+    cd "$APP_DIR" || return 1
+    AUTH_BIND_HOST="$AUTH_BIND_HOST" AUTH_API_PORT="$port" \
+        python3 auth_gateway.py >>"$AUTH_LOG" 2>&1 &
+    echo $! > "$PID_FILE"
+    sleep 1
+
+    if kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        echo "Started nftables-web-auth (PID $(cat "$PID_FILE"))"
+        # 认证服务必须能起来，否则 nginx 的 auth_request 会全部 502，
+        # 公网入口等于全断。这里失败要说清楚，不要静默。
+        return 0
+    fi
+
+    rm -f "$PID_FILE"
+    echo "nftables-web-auth 启动失败，日志见 $AUTH_LOG"
+    tail -n 20 "$AUTH_LOG" 2>/dev/null
+    return 1
+}
+
+stop() {
+    if [ -f "$PID_FILE" ]; then
+        local pid
+        pid=$(cat "$PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "Stopping nftables-web-auth (PID $pid)..."
+            kill "$pid"
+            # 给一点时间优雅退出，auth_gateway 每次响应都会落审计日志
+            local i=0
+            while [ $i -lt 20 ] && kill -0 "$pid" 2>/dev/null; do
+                sleep 0.1 2>/dev/null || sleep 1
+                i=$((i + 1))
+            done
+            kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+        fi
+        rm -f "$PID_FILE"
+        echo "Stopped"
+    else
+        echo "nftables-web-auth is not running"
+    fi
+}
+
+status() {
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        echo "nftables-web-auth is running (PID $(cat "$PID_FILE"))"
+        return 0
+    fi
+    echo "nftables-web-auth is not running"
+    return 1
+}
+
+restart() {
+    stop
+    sleep 1
+    start
+}

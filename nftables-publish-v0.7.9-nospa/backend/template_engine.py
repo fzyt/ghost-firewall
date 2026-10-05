@@ -66,6 +66,25 @@ def generate_rules(variables, log_switches):
         )
 
     # 2. 替换动态规则块（IPv6 集合、转发、拒绝规则，需在 FORWARD/NAT 之前）
+    # RULESET_PREAMBLE 决定「清空到什么程度」，由 deploy_mode 决定：
+    #   openwrt       → flush ruleset：接管整机规则集（项目核心设计，见审查记录 N-1）
+    #   linux_gateway → flush table inet fw4：只重建本项目自己的表，
+    #                   绝不碰宿主机上 Docker / 管理员自建的其他规则
+    # 默认走 openwrt 分支：即使变量缺失也不会退化成「不清理」导致重复应用失败。
+    deploy_mode = variables.get("DEPLOY_MODE", "openwrt")
+    if deploy_mode == "linux_gateway":
+        preamble = (
+            "# deploy_mode=linux_gateway: 仅重建本项目自己的表，\n"
+            "# 不清空宿主机全局 ruleset（否则会连带清掉 Docker 等其他规则）\n"
+            "flush table inet fw4"
+        )
+    else:
+        preamble = (
+            "# deploy_mode=openwrt: 接管整机规则集，fw4 已被本项目停用\n"
+            "flush ruleset"
+        )
+    template = template.replace("# RULESET_PREAMBLE", preamble)
+
     template = template.replace("# PORT_SETS_BLOCK", variables.get("PORT_SETS_BLOCK", ""))
     template = template.replace("# IPV6_SETS_BLOCK", variables.get("IPV6_SETS_BLOCK", ""))
     template = template.replace("# IPV6_FWD_RULES_BLOCK", variables.get("IPV6_FWD_RULES_BLOCK", ""))

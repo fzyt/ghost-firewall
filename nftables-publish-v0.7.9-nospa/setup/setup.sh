@@ -332,11 +332,12 @@ NGINX
     fi
 
     # 默认不写 nginx 站点配置。原因：
-    #  1. 后端自带 5000 -> 5443 的 301 跳转器，已经覆盖「输 http 自动跳 https」的需求；
+    #  1. 面板本体直连 HTTPS 5443，自带证书，不经过 nginx；
     #  2. 这里写的 `listen 80 default_server` 会抢占 80 端口的默认站点，
     #     和面板自己管理的反代规则（面板也监听 80）冲突，nginx 会因
     #     duplicate default server 起不来；
-    #  3. proxy_pass 指向 5000 只是跳转到 5443，多一跳没有意义。
+    #  3. v0.8.0 已移除后端的 HTTP 5000 跳转器（它自 10-01 起就被
+    #     防火墙 policy drop 拦住，实际不可达），没有需要被 proxy_pass 的目标。
     # 反代站点请在面板「反向代理」里配置，由面板自己生成 /etc/nginx/conf.d/*.conf。
     cat > "$site_conf" <<'SITECONF'
 # Managed by nftables-web-v2 setup.sh
@@ -505,8 +506,9 @@ init_config() {
     #   access_mode      只有 "lan"（LAN 全放行）和 "trusted"（LAN 默认丢包）两个合法值。
     #                     早前这里写的是 "knock"，一个从未实现的模式，会让模板走 trusted
     #                     分支，装完 LAN 默认全丢包，除白名单外谁都打不开面板。
-    #   lan_allowed_ports 放行后端真实监听的 HTTPS 端口 5443，不是 5000
-    #                     （5000 只是 301 跳转器，见 backend/app.py 的 _http_redirect_app）。
+    #   lan_allowed_ports 放行面板真实监听的 HTTPS 端口 5443。
+    #                     v0.8.0 已删除后端的 5000 跳转器（它自 10-01 起就被
+    #                     policy drop 拦住，从未可达），面板现在只有 5443 一个入口。
     #   trusted_ip4/6     用数组形式，与后端 _ip_set() 兼容。
     cat > "$CONFIG_FILE" <<EOF
 {
@@ -550,7 +552,7 @@ EOF
     chmod 600 "$CONFIG_FILE"
     ok "✅ 配置文件已生成: ${CONFIG_FILE}"
     echo -e "${YELLOW}  访问地址: https://${router_ip4}:5443  （HTTPS，自签证书需手动信任）${NC}"
-    echo -e "${YELLOW}  提示: http://${router_ip4}:5000 会自动 301 跳到上面的地址${NC}"
+    echo -e "${YELLOW}  注意: 面板仅局域网可达，公网入口尚未启用${NC}"
     echo -e "${YELLOW}  安全模式: 端口敲门（${k1}-${k2}-${k3}-${k4}）${NC}"
     echo -e "${YELLOW}  请登录后修改敲门端口！${NC}"
 }

@@ -174,7 +174,7 @@ setup.sh 自动完成以下步骤：
 
 | 用途 | 地址/路径 |
 |------|----------|
-| 管理界面 | http://`<路由器IP>`:5000 |
+| 管理界面 | https://`<路由器IP>`:5443 （仅局域网可达） |
 | 配置文件 | `/etc/nftables/nftables-web-config.json` |
 | 安装目录 | `/opt/nftables-web-v2/` |
 | nftables 配置 | `/etc/nftables.conf` |
