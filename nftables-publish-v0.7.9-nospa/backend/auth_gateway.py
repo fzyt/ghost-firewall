@@ -42,7 +42,7 @@ import time
 
 import fcntl
 
-from flask import Flask, Response, jsonify, request
+from flask import (Flask, Response, jsonify, request, send_from_directory)
 
 # ══════════════════════════════════════════════════════════════════════
 # 路径与常量（全部可用环境变量覆盖，便于沙箱测试）
@@ -74,6 +74,13 @@ COOKIE_DEVICE = "gw_device"
 
 HEADER_FINGERPRINT = "X-Device-Fingerprint"
 HEADER_ORIG_SVC = "X-Original-URI"
+
+# 前端静态资源（登录页 / 门户页 / 指纹脚本）。自包含，不引外链。
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+STATIC_ALLOWED = frozenset({
+    "base.css", "fingerprint.js", "login.html", "login.js",
+    "portal.html", "portal.js",
+})
 
 # 网关内部端点占用的前缀（与 app.py 的 _RESERVED_GATEWAY_PREFIXES 保持一致）
 RESERVED_PREFIXES = ("/_auth", "/auth")
@@ -458,6 +465,56 @@ def fingerprint() -> str:
 def health():
     """存活探针。注意：只回进程状态，不代表认证可用。"""
     return jsonify({"ok": True, "service": "auth-gateway"})
+
+
+@app.route("/auth/static/<path:filename>")
+def static_files(filename):
+    """登录页 / 门户页的静态资源。
+
+    走白名单而不是 send_from_directory 的通配：即使 basename 校验
+    出现意外，白名单也让「能读到的文件集合」是固定且可审计的。
+    """
+    if filename not in STATIC_ALLOWED:
+        return jsonify({"success": False, "code": "NOT_FOUND"}), 404
+    resp = send_from_directory(STATIC_DIR, filename)
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    return resp
+
+
+@app.route("/")
+def portal_page():
+    """门户页。真正的数据由 /auth/portal 以 JSON 提供。"""
+    resp = send_from_directory(STATIC_DIR, "portal.html")
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["X-Robots-Tag"] = "noindex, nofollow"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    # 门户页自己只发同源请求；CSP 收紧到 'self'，
+    # 连内联脚本都禁掉（页面用的是外部 .js 文件）。
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'none'; script-src 'self'; style-src 'self'; "
+        "img-src 'self' data:; connect-src 'self'; "
+        "form-action 'none'; frame-ancestors 'none'; base-uri 'none'"
+    )
+    return resp
+
+
+@app.route("/auth/login", methods=["GET"])
+def auth_login_page():
+    """登录页本身。
+
+    与 POST /auth/login 同路径不同方法。这里不校验登录态 ——
+    未登录本来就该看到登录页；已登录的情况由前端 JS 探测后自动跳走。
+    """
+    resp = send_from_directory(STATIC_DIR, "login.html")
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["X-Robots-Tag"] = "noindex, nofollow"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'none'; script-src 'self'; style-src 'self'; "
+        "connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+    )
+    return resp
 
 
 @app.route("/auth/status", methods=["GET"])

@@ -590,6 +590,24 @@ setup_service() {
         fi
     fi
 
+    # ── 认证服务（进程 B，v0.8.0+）────────────────────────────
+    # 独立进程、独立 init、独立配置，只监听 127.0.0.1。
+    # 没装起来不会影响面板，但网关会因此 502 —— 所以要显式提示。
+    local auth_init="${INSTALL_DIR}/backend/nftables-web-auth.init"
+    local auth_initd="/etc/init.d/nftables-web-auth"
+    if [ -f "$auth_init" ]; then
+        cp -f "$auth_init" "$auth_initd"
+        chmod 755 "$auth_initd"
+        /etc/init.d/nftables-web-auth enable 2>/dev/null
+        if /etc/init.d/nftables-web-auth restart >/dev/null 2>&1; then
+            ok "认证服务已启动（127.0.0.1，公网不可达）"
+        else
+            warn "❌ 认证服务启动失败 —— 网关将全部 502，请检查 /var/log/nftables-web-auth-gateway.log"
+        fi
+    else
+        warn "未找到 auth.init，跳过认证服务安装"
+    fi
+
     /etc/init.d/nftables-web enable 2>/dev/null && ok "开机自启已启用"
     /etc/init.d/nftables-web restart 2>/dev/null && ok "✅ 服务已启动" || warn "❌ 服务启动失败，请检查日志"
 }

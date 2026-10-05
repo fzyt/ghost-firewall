@@ -1,0 +1,222 @@
+/* 认证门户共用样式 —— 自包含，不引外部字体/CDN
+ * 理由：网关可能被部署在隔离网络里，外链资源既拖慢首屏又引入
+ * 「第三方被劫持就能改登录页」的攻击面。 */
+
+:root {
+  --bg: #0b0d10;
+  --card: #15181d;
+  --card-2: #1c2027;
+  --line: #2a2f37;
+  --fg: #e8eaed;
+  --fg-dim: #9aa0a8;
+  --accent: #3b82f6;
+  --ok: #22c55e;
+  --warn: #f59e0b;
+  --err: #ef4444;
+  --radius: 12px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -webkit-text-size-adjust: 100%;
+}
+
+body.centered {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+/* ── 登录卡片 ─────────────────────────────────────────── */
+
+.card {
+  width: 100%;
+  max-width: 380px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 28px 24px 20px;
+}
+
+.brand { text-align: center; margin-bottom: 22px; }
+
+.logo {
+  width: 44px; height: 44px;
+  margin: 0 auto 12px;
+  border-radius: 11px;
+  background: linear-gradient(135deg, var(--accent), #1d4ed8);
+  position: relative;
+}
+.logo::after {
+  content: "";
+  position: absolute; inset: 13px;
+  border: 2px solid rgba(255,255,255,.92);
+  border-radius: 3px;
+  border-bottom-color: transparent;
+  border-right-color: transparent;
+  transform: rotate(-45deg);
+}
+
+.brand h1 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: .2px; }
+.brand .sub { margin: 4px 0 0; font-size: 13px; color: var(--fg-dim); }
+
+/* ── 表单 ─────────────────────────────────────────────── */
+
+.field { display: block; margin-bottom: 14px; }
+.field span {
+  display: block;
+  font-size: 13px;
+  color: var(--fg-dim);
+  margin-bottom: 6px;
+}
+
+input[type="password"], input[type="text"] {
+  width: 100%;
+  padding: 11px 12px;
+  background: var(--card-2);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: var(--fg);
+  font-size: 16px;              /* iOS 上小于 16px 会触发聚焦缩放 */
+  outline: none;
+  transition: border-color .15s, box-shadow .15s;
+}
+input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(59,130,246,.18);
+}
+
+button.primary {
+  width: 100%;
+  padding: 11px 12px;
+  background: var(--accent);
+  color: #fff;
+  border: 0;
+  border-radius: 9px;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background .15s, opacity .15s;
+}
+button.primary:hover:not(:disabled) { background: #2f6fe0; }
+button.primary:disabled { opacity: .6; cursor: default; }
+
+/* ── 提示条 ───────────────────────────────────────────── */
+
+.msg {
+  margin: 0 0 12px;
+  padding: 9px 11px;
+  border-radius: 8px;
+  font-size: 13.5px;
+  background: var(--card-2);
+  border: 1px solid var(--line);
+  color: var(--fg-dim);
+}
+.msg.err  { color: #fca5a5; border-color: #7f1d1d; background: #2a1414; }
+.msg.warn { color: #fcd34d; border-color: #78350f; background: #2a1f10; }
+.msg.ok   { color: #86efac; border-color: #14532d; background: #12251a; }
+
+.foot { margin: 16px 0 0; text-align: center; font-size: 12px; color: var(--fg-dim); }
+.device { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }
+
+/* ── 门户页 ───────────────────────────────────────────── */
+
+.portal { max-width: 880px; margin: 0 auto; padding: 24px 18px 48px; }
+
+.p-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding-bottom: 16px;
+  margin-bottom: 20px;
+  border-bottom: 1px solid var(--line);
+}
+.p-title h1 { margin: 0; font-size: 20px; font-weight: 600; }
+.p-title p { margin: 4px 0 0; font-size: 13px; color: var(--fg-dim); }
+.p-actions { display: flex; align-items: center; gap: 8px; }
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  font-size: 12.5px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+}
+.pill b { color: var(--fg); font-weight: 600; }
+.pill.low b { color: var(--warn); }
+.pill.crit b { color: var(--err); }
+
+.ghost {
+  padding: 6px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--fg-dim);
+  font-size: 13px;
+  cursor: pointer;
+}
+.ghost:hover { color: var(--fg); border-color: #3a4149; }
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 12px;
+}
+
+.tile {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 16px;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  background: var(--card);
+  text-decoration: none;
+  color: inherit;
+  transition: border-color .15s, transform .1s, background .15s;
+}
+.tile:hover { border-color: #3f4750; background: var(--card-2); transform: translateY(-1px); }
+.tile:active { transform: none; }
+
+.tile .ico { font-size: 20px; line-height: 1; }
+.tile .nm { font-size: 15px; font-weight: 600; }
+.tile .pt { font-size: 12px; color: var(--fg-dim); font-family: ui-monospace, Menlo, monospace; }
+
+.tag {
+  align-self: flex-start;
+  margin-top: 2px;
+  padding: 2px 7px;
+  border-radius: 5px;
+  font-size: 11px;
+  border: 1px solid var(--line);
+  color: var(--fg-dim);
+}
+.tag.pub { color: #93c5fd; border-color: #1e3a5f; background: #12203a; }
+.tag.lan { color: #a7f3d0; border-color: #14532d; background: #10231a; }
+
+.empty {
+  padding: 40px 20px;
+  text-align: center;
+  color: var(--fg-dim);
+  font-size: 14px;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+}

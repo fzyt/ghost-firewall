@@ -4118,9 +4118,11 @@ def _generate_gateway_nginx_conf(config):
     L.append("")
 
     # ── 门户页 ──────────────────────────────────────────────────
+    # 转发到认证服务的根路径（那里返回门户 HTML）。
+    # 不要转 /auth/portal —— 那是给页面调用的 JSON 接口。
     L.append("    # 门户页：登录后展示可访问的服务列表")
     L.append("    location = / {")
-    L.append(f"        proxy_pass http://127.0.0.1:{api_port}/auth/portal;")
+    L.append(f"        proxy_pass http://127.0.0.1:{api_port};")
     L.append("        proxy_set_header X-Real-IP $remote_addr;")
     L.append("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
     L.append("        proxy_set_header Host $host;")

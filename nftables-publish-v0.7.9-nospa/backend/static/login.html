@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<title>登录 · Ghost Firewall</title>
+<link rel="stylesheet" href="/auth/static/base.css">
+</head>
+<body class="centered">
+
+<div class="card">
+  <div class="brand">
+    <div class="logo" aria-hidden="true"></div>
+    <h1>Ghost Firewall</h1>
+    <p class="sub">统一认证门户</p>
+  </div>
+
+  <form id="form" autocomplete="on" novalidate>
+    <label class="field">
+      <span>访问密码</span>
+      <input id="pw" type="password" name="password" autocomplete="current-password"
+             inputmode="text" autocapitalize="off" autocorrect="off" spellcheck="false"
+             required autofocus>
+    </label>
+
+    <div id="msg" class="msg" hidden></div>
+
+    <button id="submit" type="submit" class="primary">进入</button>
+  </form>
+
+  <p class="foot"><span id="device" class="device">正在识别设备…</span></p>
+</div>
+
+<script src="/auth/static/fingerprint.js"></script>
+<script src="/auth/static/login.js"></script>
+</body>
+</html>
