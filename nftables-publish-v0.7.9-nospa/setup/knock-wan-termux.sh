@@ -31,7 +31,7 @@
 #   ② 命令行参数覆盖（不改脚本也能用）
 #       knock-wan-termux.sh -h router.example.com                     # 公网域名（DDNS）
 #       knock-wan-termux.sh -h 1.2.3.4 -p 1234,5678,9012,3456         # 显式 4 个端口
-#       knock-wan-termux.sh --api http://router.example.com:5000/api/config  # 从后端拉
+#       knock-wan-termux.sh --api http://192.168.4.1:5443/api/knock-info  # 内网从后端拉端口
 #       knock-wan-termux.sh --mimic ntp -i 0.5                         # 用 NTP 风格 payload，0.5s 步间
 #       knock-wan-termux.sh --mimic tls --noise 2                      # TLS ClientHello + 2 个噪音包
 #       knock-wan-termux.sh --mode lan                                 # 切到 LAN 模式（无 rate limit）
@@ -40,7 +40,7 @@
 #   ③ 编辑脚本头部「🔧 快速配置区」，改完保存直接执行
 #       KNOCK_HOST=""             # 例: "1.2.3.4"（路由器 WAN IP / DDNS）
 #       KNOCK_DOMAIN=""           # 例: "router.example.com"
-#       KNOCK_API=""              # 例: "http://router.example.com:5000/api/config"
+#       KNOCK_API=""              # 例: "http://192.168.4.1:5443/api/knock-info"（仅内网可访问）
 #       KNOCK_PORTS="1234,5678,9012,3456"
 #       KNOCK_MIMIC="ntp"         # none|random|ntp|dns|tls|stun|wireguard
 #       KNOCK_NOISE=2
@@ -93,11 +93,11 @@ KNOCK_MODE="wan"
 # 三选一（按优先级从高到低）：
 #   1. KNOCK_HOST  : 直连 IP（最稳，不依赖 DNS；WAN 时填路由器公网 IP/DDNS）
 #   2. KNOCK_DOMAIN: 域名（DDNS 友好，自动解析 A 记录）
-#   3. KNOCK_API   : 从 nftables-web 后端自动拉（最省心，但需后端支持 GET /api/config）
+#   3. KNOCK_API   : 从后端 GET /api/knock-info 拉端口（仅内网可访问，公网会返 403）
 # 留空表示「禁用此项」，从其余来源 / 命令行参数取值。
 KNOCK_HOST=""                                          # WAN 例: "1.2.3.4"；LAN 例: "192.168.4.1"
 KNOCK_DOMAIN=""                                        # 例: "router.example.com" / "home.duckdns.org"
-KNOCK_API=""                                           # 例: "http://router.example.com:5000/api/config"
+KNOCK_API=""                                           # 例: "http://192.168.4.1:5443/api/knock-info"（仅内网）
 
 # --- 4 个敲门端口（必须与路由器 nftables-web 后端配置完全一致）---
 KNOCK_PORTS="1234,5678,9012,3456"                      # 逗号分隔，正好 4 个
@@ -190,29 +190,43 @@ fi
 
 # ============ 从 API 拉配置 ============
 # 优先级（高 → 低）：命令行 -h > KNOCK_API > KNOCK_HOST > KNOCK_DOMAIN
+#
+# 注意端点是 /api/knock-info，不是 /api/config：
+#   - /api/config 在全局鉴权后面，匿名调用必返 401，这个功能从来没能工作过；
+#   - /api/knock-info 只返回 4 个敲门端口，且仅允许内网访问（公网返 403）。
 if [ -n "$API_URL" ] && [ -z "$HOST" ]; then
     info "从 $API_URL 拉取配置..."
     if ! CONFIG_JSON="$("$PY_BIN" - "$API_URL" <<'PYEOF' 2>/dev/null
 import json, sys, urllib.request, urllib.error
 url = sys.argv[1]
 try:
-    req = urllib.request.Request(url, headers={"User-Agent": "knock-lan-termux/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "knock-wan-termux/1.0"})
     with urllib.request.urlopen(req, timeout=5) as r:
         data = json.load(r)
-    cfg = data.get("config", data) if isinstance(data, dict) else {}
+    cfg = data.get("data", data) if isinstance(data, dict) else {}
+    if not cfg.get("knock_ports"):
+        sys.stderr.write("响应里没有 knock_ports（端点不对或未登录）\n")
+        sys.exit(1)
     print(cfg.get("router_ip4", ""))
-    print(",".join(str(cfg.get(f"knock{i}_port", i)) for i in (1, 2, 3, 4)))
+    print(cfg["knock_ports_str"] if cfg.get("knock_ports_str")
+          else ",".join(str(p) for p in cfg["knock_ports"]))
 except Exception as e:
     sys.stderr.write(f"拉取失败: {e}\n")
     sys.exit(1)
 PYEOF
     )"; then
-        err "API 拉取失败，请用 -h/-p 显式指定"
+        err "API 拉取失败。该端点仅内网可访问；公网敲门请用 -h/-p 显式指定"
         exit 1
     fi
     HOST="$(echo "$CONFIG_JSON" | sed -n '1p')"
     PORTS="$(echo "$CONFIG_JSON" | sed -n '2p')"
     info "拉取成功: host=$HOST ports=$PORTS"
+    # router_ip4 是内网地址，WAN 模式下拿到它毫无意义，早点报错比敲错目标好
+    if [ "$MODE" = "wan" ] && [ -n "$HOST" ]; then
+        warn "从 API 拿到的是内网地址（$HOST），WAN 模式无法使用"
+        warn "请用 -h <公网IP或DDNS域名> 显式指定目标，端口沿用刚拉到的 $PORTS"
+        exit 1
+    fi
 fi
 
 # ============ HOST 兜底：配置区 KNOCK_HOST → KNOCK_DOMAIN 解析 ============
@@ -338,18 +352,23 @@ if [ "$DRY_RUN" -eq 1 ]; then
 fi
 
 # 透传所有参数到 Python
-HOST="$HOST" \
-PORTS="$PORTS" \
-INTERVAL="$INTERVAL" \
-JITTER="$JITTER" \
-MIMIC="$MIMIC" \
-NOISE="$NOISE" \
-NOISE_PORTS="$NOISE_PORTS" \
-MODE="$MODE" \
-DRY_RUN="$DRY_RUN" \
-QUIET="$QUIET" \
-    "$PY_BIN" "$PY_KERNEL"
-RC=$?
+# 注意：脚本开头开了 `set -e`。`VAR=... cmd` 单独一行失败会直接把脚本带退出，
+# 下面那句 RC=$? 根本执行不到，case 分支就成了死代码。必须用 if/else 显式接返回码。
+if HOST="$HOST" \
+    PORTS="$PORTS" \
+    INTERVAL="$INTERVAL" \
+    JITTER="$JITTER" \
+    MIMIC="$MIMIC" \
+    NOISE="$NOISE" \
+    NOISE_PORTS="$NOISE_PORTS" \
+    MODE="$MODE" \
+    DRY_RUN="$DRY_RUN" \
+    QUIET="$QUIET" \
+    "$PY_BIN" "$PY_KERNEL"; then
+    RC=0
+else
+    RC=$?
+fi
 
 case $RC in
     0) info "4 步敲门已发送" ;;

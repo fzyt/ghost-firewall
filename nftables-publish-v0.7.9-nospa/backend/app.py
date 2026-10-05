@@ -1,6 +1,6 @@
-# Version: 0.7.7
+# Version: 0.7.9.1
 from flask import Flask, jsonify, request, send_from_directory, send_file, session
-import os, subprocess, shutil, json, time, re, hmac, hashlib, base64, datetime, uuid, fcntl, io, zipfile, secrets, ssl
+import os, subprocess, shutil, json, time, re, hmac, hashlib, base64, datetime, uuid, fcntl, io, zipfile, secrets, ssl, ipaddress
 from template_engine import load_template, generate_rules
 
 # ======================= 认证配置 =======================
@@ -193,6 +193,10 @@ def _require_auth():
     if path.startswith('/api/auth/'):
         return None
 
+    # 敲门信息端点：自己内部做 LAN 校验（不放在这里放行，避免误开放到公网）
+    if path == '/api/knock-info':
+        return None
+
     # 已登录：检查 idle 超时
     if _is_authenticated():
         last_active = session.get('last_active', 0)
@@ -355,8 +359,21 @@ def _migrate_forward_rules(config):
     # 确保 forward_rules 存在且每个规则有 target_ipv6 字段
     if "forward_rules" not in config:
         config["forward_rules"] = []
-    for rule in config["forward_rules"]:
-        rule.setdefault("target_ipv6", "")
+    # 配置文件被手工改坏时 forward_rules 可能是字符串或含非 dict 元素。
+    # 本函数在任何校验之前就会执行，这里不兜住的话 build_rules 会直接抛
+    # AttributeError，导致「预览规则 / 应用规则」两个核心接口全部不可用。
+    if not isinstance(config["forward_rules"], list):
+        print("[WARNING] forward_rules 类型非法，已重置为空列表", flush=True)
+        config["forward_rules"] = []
+    else:
+        cleaned = []
+        for rule in config["forward_rules"]:
+            if isinstance(rule, dict):
+                rule.setdefault("target_ipv6", "")
+                cleaned.append(rule)
+            else:
+                print(f"[WARNING] forward_rules 含非对象元素，已丢弃: {type(rule).__name__}", flush=True)
+        config["forward_rules"] = cleaned
     return config
 
 
@@ -394,34 +411,245 @@ def _auto_detect_network():
         pass
     return result
 
+# ======================= 配置校验 =======================
+# 所有会拼进 nft 规则模板的字段都必须先过白名单校验，否则可以注入任意 nft 指令。
+# 典型：whitelist_timeout 传 "1s; delete table inet fw4; #" 会被原样拼进规则，
+# 且 delete table 是合法 nft 语法，nft -c 语法预检也拦不住。
+_RE_IFACE = re.compile(r'^[A-Za-z0-9_.-]{1,32}$')
+
+
+def _is_port(v):
+    s = str(v).strip()
+    if not s.isdigit() or len(s) > 5:
+        return False
+    n = int(s)
+    return 1 <= n <= 65535
+
+
+def _valid_ip(v, version=None):
+    """合法 IPv4/IPv6 返回 True（version=4/6 时强制指定版本）"""
+    try:
+        addr = ipaddress.ip_address(str(v).strip())
+    except ValueError:
+        return False
+    if version == 4:
+        return addr.version == 4
+    if version == 6:
+        return addr.version == 6
+    return True
+
+
+def _split_ports(v):
+    """把逗号/中文逗号/空格分隔的端口串归一化为 int 列表；非法则抛 ValueError"""
+    raw = v if isinstance(v, list) else str(v or '').replace('，', ',').split(',')
+    out = []
+    for item in raw:
+        s = str(item).strip()
+        if not s:
+            continue
+        if not _is_port(s):
+            raise ValueError(f'端口非法: {s!r}（只允许 1-65535 的数字）')
+        out.append(int(s))
+    return out
+
+
+def validate_config(cfg):
+    """校验配置中所有会进入 nft 规则的字段，返回错误列表（空列表 = 通过）"""
+    errs = []
+
+    for key in ('wan_if', 'lan_if'):
+        v = str(cfg.get(key, '') or '')
+        if v and not _RE_IFACE.match(v):
+            errs.append(f'{key} 接口名非法: {v!r}（只允许字母数字及 _ . -，最长 32）')
+
+    for key, ver, optional in (('router_ip4', 4, False), ('trusted_ip4', 4, False),
+                               ('router_ip6', 6, True), ('trusted_ip6', 6, True)):
+        raw = cfg.get(key)
+        # trusted_ip4/trusted_ip6 历史上有字符串和数组两种写法（setup.sh 写的是数组），
+        # 这里必须都接受，否则老装机升级后每次保存配置都会被判 400
+        if isinstance(raw, (list, tuple, set)):
+            items = [str(x).strip() for x in raw if str(x).strip()]
+            if not items and not optional:
+                errs.append(f'{key} 不能为空')
+            for it in items:
+                if not _valid_ip(it, ver):
+                    errs.append(f'{key} IPv{ver} 地址非法: {it!r}')
+            continue
+        v = str(raw or '').strip()
+        if not v:
+            if not optional:
+                errs.append(f'{key} 不能为空')
+            continue
+        if not _valid_ip(v, ver):
+            errs.append(f'{key} IPv{ver} 地址非法: {v!r}')
+
+    for key in ('knock1_port', 'knock2_port', 'knock3_port', 'knock4_port'):
+        if key in cfg and not _is_port(cfg[key]):
+            errs.append(f'{key} 端口非法: {cfg[key]!r}（只允许 1-65535）')
+
+    try:
+        _split_ports(cfg.get('lan_allowed_ports', ''))
+    except ValueError as e:
+        errs.append(f'lan_allowed_ports {e}')
+
+    wt = cfg.get('whitelist_timeout')
+    if wt is not None and str(wt).strip() != '' and not str(wt).strip().isdigit():
+        errs.append(f'whitelist_timeout 非法: {wt!r}（只允许非负整数秒）')
+
+    for s in (cfg.get('dns_lan_servers') or []):
+        if not _valid_ip(s):
+            errs.append(f'dns_lan_servers 含非法 IP: {s!r}')
+
+    rules = cfg.get('forward_rules')
+    if rules is not None and not isinstance(rules, list):
+        errs.append('forward_rules 必须是数组')
+    elif isinstance(rules, list):
+        for i, r in enumerate(rules, 1):
+            if not isinstance(r, dict):
+                errs.append(f'forward_rules[{i}] 必须是对象')
+                continue
+            tgt = str(r.get('target_ip', '') or '').strip()
+            if not _valid_ip(tgt):
+                errs.append(f'forward_rules[{i}].target_ip 非法: {tgt!r}')
+            for pk in ('tcp_ports', 'udp_ports'):
+                if pk in r:
+                    try:
+                        _split_ports(r[pk])
+                    except ValueError as e:
+                        errs.append(f'forward_rules[{i}].{pk} {e}')
+
+    rp = cfg.get('reverse_proxy')
+    if rp is not None and not isinstance(rp, dict):
+        errs.append('reverse_proxy 必须是对象')
+    elif isinstance(rp, dict):
+        rrs = rp.get('rules')
+        if rrs is not None and not isinstance(rrs, list):
+            errs.append('reverse_proxy.rules 必须是数组')
+        elif isinstance(rrs, list):
+            for i, r in enumerate(rrs, 1):
+                if not isinstance(r, dict):
+                    errs.append(f'reverse_proxy.rules[{i}] 必须是对象')
+                    continue
+                lp = str(r.get('listen_port', '') or '').strip()
+                if lp and not _is_port(lp):
+                    errs.append(f'reverse_proxy.rules[{i}].listen_port 非法: {lp!r}')
+
+    # ------------------------------------------------------------------
+    # 交叉检查：端口转发是否暴露了「已由反代承载认证」的服务
+    #
+    # 端口转发走 nftables DNAT（见 build_rules 里的 `dnat to {target_ip}`），
+    # 是纯网络层的哑管道，不经过 nginx、不参与 auth_request。
+    # 而 DNAT 不改写端口，所以公网端口 P 会落到 (target_ip, P)。
+    # 若这个组合正好是某条已启用反代规则的后端地址，那条认证路径就被旁路了：
+    # 敲门成功的 IP 可以直接访问该端口，完全不需要登录。
+    # ------------------------------------------------------------------
+    rp_targets = set()
+    rp = cfg.get('reverse_proxy')
+    if isinstance(rp, dict) and isinstance(rp.get('rules'), list):
+        for r in rp['rules']:
+            if not isinstance(r, dict) or not r.get('enabled'):
+                continue
+            host, _, port = str(r.get('target_address', '')).rpartition(':')
+            if host and _is_port(port):
+                rp_targets.add((host.strip(), int(port)))
+
+    if rp_targets and isinstance(cfg.get('forward_rules'), list):
+        for i, r in enumerate(cfg.get('forward_rules') or [], 1):
+            if not isinstance(r, dict):
+                continue
+            tgt = str(r.get('target_ip', '') or '').strip()
+            if not tgt:
+                continue
+            try:
+                exposed = {(tgt, p) for key in ('tcp_ports', 'udp_ports')
+                           for p in _safe_ports(r.get(key, ''))}
+            except Exception:
+                continue
+            for host, port in sorted(exposed & rp_targets):
+                errs.append(
+                    f'forward_rules[{i}]（端口 {port} → {tgt}）会绕过认证：'
+                    f'{tgt}:{port} 已有已启用的反代规则承载该服务，'
+                    f'端口转发走 nftables DNAT、不经过 nginx 的认证层，'
+                    f'会形成一条免登录的公网入口。建议删掉这条转发，'
+                    f'改用反代访问该服务。'
+                )
+
+    return errs
+
+
+def _safe_ports(v):
+    """config_to_variables 用：非法端口直接丢弃，保证生成的规则里只可能出现合法端口号"""
+    try:
+        return _split_ports(v)
+    except ValueError:
+        return []
+
+
+def _safe_port(v, default):
+    """单个端口强制转型，非法回落默认值"""
+    return int(v) if _is_port(v) else default
+
+
+def _safe_iface(v, default):
+    """接口名强制白名单，非法回落默认值（防 nft 语法注入）"""
+    s = str(v or '').strip()
+    return s if _RE_IFACE.match(s) else default
+
+
+def _safe_ip(v, version=None, default=""):
+    """config_to_variables 用：非法 IP 回落到默认值，保证生成的规则里不出现裸字符串。
+
+    接受字符串和数组两种写法（setup.sh 写的是数组）；数组取第一个合法项。
+    注意：绝不能在数组形态下静默回落 default —— 那会把用户真实的信任 IP
+    悄悄换成硬编码的 192.168.4.229，属于「拒绝服务 + 意外授权」。
+    """
+    if isinstance(v, (list, tuple, set)):
+        for item in v:
+            s = str(item).strip()
+            if s and _valid_ip(s, version):
+                return s
+        return default
+    s = str(v or '').strip()
+    return s if (s and _valid_ip(s, version)) else default
+
+
 def config_to_variables(config):
     """将 web 配置转换为模板变量"""
     config = _migrate_forward_rules(config)
     forward_rules = config.get("forward_rules", [])
 
     # 合并所有规则的端口（用于 WAN 链白名单放行）
+    # 全部经过 _safe_ports / _is_port 过滤：非法端口直接丢弃，
+    # 保证生成的 nft 规则里只可能出现合法端口号，堵死规则注入
     all_tcp = set()
     all_udp = set()
     for rule in forward_rules:
-        for p in rule.get("tcp_ports", "").split(","):
-            p = p.strip()
-            if p:
-                all_tcp.add(p)
-        for p in rule.get("udp_ports", "").split(","):
-            p = p.strip()
-            if p:
-                all_udp.add(p)
+        if not isinstance(rule, dict):
+            continue
+        for p in _safe_ports(rule.get("tcp_ports", "")):
+            all_tcp.add(p)
+        for p in _safe_ports(rule.get("udp_ports", "")):
+            all_udp.add(p)
 
     # 反代公网端口
-    for rule in config.get("reverse_proxy", {}).get("rules", []):
+    # reverse_proxy 被手工改坏时可能是字符串/列表，这里兜住避免 build_rules 崩掉
+    rp_cfg = config.get("reverse_proxy")
+    if not isinstance(rp_cfg, dict):
+        rp_cfg = {}
+    rp_rules = rp_cfg.get("rules")
+    if not isinstance(rp_rules, list):
+        rp_rules = []
+    for rule in rp_rules:
+        if not isinstance(rule, dict):
+            continue
         if rule.get("enabled") and rule.get("public_access"):
             port = str(rule.get("listen_port", ""))
-            if port:
-                all_tcp.add(port)
+            if _is_port(port):
+                all_tcp.add(int(port))
 
-    # 生成端口集合定义（直接带 elements）
-    tcp_elems = ", ".join(sorted(all_tcp)) if all_tcp else ""
-    udp_elems = ", ".join(sorted(all_udp)) if all_udp else ""
+    # 生成端口集合定义（直接带 elements；集合里是 int，join 前统一转 str）
+    tcp_elems = ", ".join(str(p) for p in sorted(all_tcp)) if all_tcp else ""
+    udp_elems = ", ".join(str(p) for p in sorted(all_udp)) if all_udp else ""
     port_sets_block = "    set tcp_services {\n        type inet_service;\n        flags interval;\n"
     if tcp_elems:
         port_sets_block += f"        elements = {{ {tcp_elems} }}\n"
@@ -434,33 +662,30 @@ def config_to_variables(config):
     detected = _auto_detect_network()
 
     variables = {
-        "WAN_IF": f'"{config.get("wan_if", "pppoe-wan")}"',
-        "LAN_IF": f'"{config.get("lan_if", "br-lan")}"',
-        "ROUTER_IP4": config.get("router_ip4", "192.168.4.1"),
-        "ROUTER_IP6": config.get("router_ip6", ""),
+        "WAN_IF": f'"{_safe_iface(config.get("wan_if"), "pppoe-wan")}"',
+        "LAN_IF": f'"{_safe_iface(config.get("lan_if"), "br-lan")}"',
+        "ROUTER_IP4": _safe_ip(config.get("router_ip4", ""), 4, "192.168.4.1"),
+        "ROUTER_IP6": _safe_ip(config.get("router_ip6", ""), 6, ""),
         "LAN_SUBNET4": detected.get("LAN_SUBNET4", "192.168.4.0/24"),
         "LAN_BROADCAST4": detected.get("LAN_BROADCAST4", "192.168.4.255"),
         "ULA_PREFIX6": detected.get("ULA_PREFIX6", "fd93:86bb:a142::/60"),
         "WAN_PREFIX6": detected.get("WAN_PREFIX6", "240e:390:4944:b191::/64"),
-        "KNOCK1_PORT": str(config.get("knock1_port", 1)),
-        "KNOCK2_PORT": str(config.get("knock2_port", 2)),
-        "KNOCK3_PORT": str(config.get("knock3_port", 3)),
-        "KNOCK4_PORT": str(config.get("knock4_port", 4)),
+        "KNOCK1_PORT": str(_safe_port(config.get("knock1_port", 1), 1)),
+        "KNOCK2_PORT": str(_safe_port(config.get("knock2_port", 2), 2)),
+        "KNOCK3_PORT": str(_safe_port(config.get("knock3_port", 3), 3)),
+        "KNOCK4_PORT": str(_safe_port(config.get("knock4_port", 4), 4)),
         "PORT_SETS_BLOCK": port_sets_block,
-        "TRUSTED_IP4": config.get("trusted_ip4", "192.168.4.229"),
-        "TRUSTED_IP6": config.get("trusted_ip6", "fd93:86bb:a142:0:e9d:92ff:fe87:fd28"),
-        "ACCESS_MODE": config.get("access_mode", "trusted"),
+        "TRUSTED_IP4": _safe_ip(config.get("trusted_ip4", ""), 4, "192.168.4.229"),
+        "TRUSTED_IP6": _safe_ip(config.get("trusted_ip6", ""), 6, "fd93:86bb:a142:0:e9d:92ff:fe87:fd28"),
+        "ACCESS_MODE": config.get("access_mode") if config.get("access_mode") in ("lan", "trusted") else "trusted",
         "CHINA_IP_BLOCK": "true" if config.get("china_ip_block", True) else "false",
     }
 
     # LAN 自定义放行端口规则
-    lan_allowed = config.get("lan_allowed_ports", "")
-    if isinstance(lan_allowed, list):
-        lan_ports = [str(p).strip() for p in lan_allowed if str(p).strip()]
-    else:
-        lan_ports = [p.strip() for p in str(lan_allowed).replace("，", ",").split(",") if p.strip()]
+    lan_ports = _safe_ports(config.get("lan_allowed_ports", ""))
     if lan_ports:
-        variables["LAN_ALLOWED_RULES"] = "        iifname $LAN_IF tcp dport { " + ", ".join(lan_ports) + " } accept"
+        variables["LAN_ALLOWED_RULES"] = ("        iifname $LAN_IF tcp dport { "
+                                          + ", ".join(str(p) for p in lan_ports) + " } accept")
     else:
         variables["LAN_ALLOWED_RULES"] = ""
 
@@ -469,12 +694,17 @@ def config_to_variables(config):
     nat_block = []
     forward_log = config.get("forward_log", False)
     for i, rule in enumerate(forward_rules, 1):
-        target_ip = rule.get("target_ip", "")
-        tcp_ports = [p.strip() for p in rule.get("tcp_ports", "").split(",") if p.strip()]
-        udp_ports = [p.strip() for p in rule.get("udp_ports", "").split(",") if p.strip()]
+        if not isinstance(rule, dict):
+            continue
+        # target_ip 直接进 ip daddr / dnat to，也进注释行，非法一律回落丢弃整条规则
+        target_ip = _safe_ip(rule.get("target_ip", ""), 4, "")
+        tcp_ports = _safe_ports(rule.get("tcp_ports", ""))
+        udp_ports = _safe_ports(rule.get("udp_ports", ""))
+        if not target_ip or not (tcp_ports or udp_ports):
+            continue
 
-        tcp_set_str = "{ " + ", ".join(tcp_ports) + " }" if tcp_ports else ""
-        udp_set_str = "{ " + ", ".join(udp_ports) + " }" if udp_ports else ""
+        tcp_set_str = "{ " + ", ".join(str(p) for p in tcp_ports) + " }" if tcp_ports else ""
+        udp_set_str = "{ " + ", ".join(str(p) for p in udp_ports) + " }" if udp_ports else ""
 
         # 转发链规则
         fwd_lines = [f"# 端口转发规则 {i}: -> {target_ip}"]
@@ -482,14 +712,14 @@ def config_to_variables(config):
             tcp_log_part = f'log prefix "[I4-ALVN-T-{i}] " ' if forward_log else ''
             fwd_lines.append(
                 f"        iifname $WAN_IF meta nfproto ipv4 oifname $LAN_IF \\\n"
-                f"            ip saddr @allowed4 ip daddr {target_ip} tcp dport {{ {', '.join(tcp_ports)} }} \\\n"
+                f"            ip saddr @allowed4 ip daddr {target_ip} tcp dport {tcp_set_str} \\\n"
                 f"            {tcp_log_part}accept"
             )
         if udp_ports:
             udp_log_part = f'log prefix "[I4-ALVN-U-{i}] " ' if forward_log else ''
             fwd_lines.append(
                 f"        iifname $WAN_IF meta nfproto ipv4 oifname $LAN_IF \\\n"
-                f"            ip saddr @allowed4 ip daddr {target_ip} udp dport {{ {', '.join(udp_ports)} }} \\\n"
+                f"            ip saddr @allowed4 ip daddr {target_ip} udp dport {udp_set_str} \\\n"
                 f"            {udp_log_part}accept"
             )
         forward_block.append("\n".join(fwd_lines))
@@ -514,10 +744,14 @@ def config_to_variables(config):
     # IPv6 转发规则（每个规则独立，指向对应的 @nas_ip6_{i}）
     ipv6_fwd_block = []
     for i, rule in enumerate(forward_rules, 1):
-        tcp_ports = [p.strip() for p in rule.get("tcp_ports", "").split(",") if p.strip()]
-        udp_ports = [p.strip() for p in rule.get("udp_ports", "").split(",") if p.strip()]
-        tcp_set_str = "{ " + ", ".join(tcp_ports) + " }" if tcp_ports else ""
-        udp_set_str = "{ " + ", ".join(udp_ports) + " }" if udp_ports else ""
+        if not isinstance(rule, dict):
+            continue
+        tcp_ports = _safe_ports(rule.get("tcp_ports", ""))
+        udp_ports = _safe_ports(rule.get("udp_ports", ""))
+        if not (tcp_ports or udp_ports):
+            continue
+        tcp_set_str = "{ " + ", ".join(str(p) for p in tcp_ports) + " }" if tcp_ports else ""
+        udp_set_str = "{ " + ", ".join(str(p) for p in udp_ports) + " }" if udp_ports else ""
         log_part = 'log prefix "[I6-ALVN-T-' + str(i) + '] " ' if forward_log else ''
 
         lines = [f"# IPv6 转发规则 {i}"]
@@ -542,10 +776,14 @@ def config_to_variables(config):
     # IPv6 拒绝规则（每个规则独立）
     ipv6_den_block = []
     for i, rule in enumerate(forward_rules, 1):
-        tcp_ports = [p.strip() for p in rule.get("tcp_ports", "").split(",") if p.strip()]
-        udp_ports = [p.strip() for p in rule.get("udp_ports", "").split(",") if p.strip()]
-        tcp_set_str = "{ " + ", ".join(tcp_ports) + " }" if tcp_ports else ""
-        udp_set_str = "{ " + ", ".join(udp_ports) + " }" if udp_ports else ""
+        if not isinstance(rule, dict):
+            continue
+        tcp_ports = _safe_ports(rule.get("tcp_ports", ""))
+        udp_ports = _safe_ports(rule.get("udp_ports", ""))
+        if not (tcp_ports or udp_ports):
+            continue
+        tcp_set_str = "{ " + ", ".join(str(p) for p in tcp_ports) + " }" if tcp_ports else ""
+        udp_set_str = "{ " + ", ".join(str(p) for p in udp_ports) + " }" if udp_ports else ""
         log_part = 'log prefix "[I6-DEN-T-' + str(i) + '] " ' if forward_log else ''
 
         lines = []
@@ -578,6 +816,9 @@ def config_to_variables(config):
 
         rules = []
         for srv in dns_lan_servers:
+            # srv 直接进 ip daddr 和 comment 字符串，非法 IP 必须丢弃
+            if not _valid_ip(srv, 4):
+                continue
             rules.append(
                 f"        iifname $LAN_IF oifname $LAN_IF ip daddr {srv} udp dport 53 \\\n"
                 f"            {log_part}accept comment \"DNS-LAN-to-{srv}\""
@@ -623,8 +864,62 @@ def serve_static(filename):
 def get_config():
     """获取当前配置"""
     config = load_config()
-    config["success"] = True
-    return jsonify(config)
+    # 不要往 config 本体里塞 success 键：这份 dict 会被前端原样回传 POST，
+    # 一旦污染就会把 success 写进磁盘配置
+    return jsonify(dict(config, success=True))
+
+
+def _client_is_lan(client_ip):
+    """判断请求方是否来自内网（依据 config 里的 lan_subnet4，其次用自动检测结果）"""
+    if not client_ip or ':' in client_ip:
+        return False
+    try:
+        addr = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return False
+    candidates = []
+    cfg = load_config()
+    for src in (cfg.get('lan_subnet4'), _auto_detect_network().get('LAN_SUBNET4')):
+        try:
+            if src:
+                candidates.append(ipaddress.ip_network(str(src), strict=False))
+        except ValueError:
+            continue
+    return any(addr in net for net in candidates)
+
+
+@app.route('/api/knock-info', methods=['GET'])
+def get_knock_info():
+    """供 LAN 内客户端（knock-lan.sh / Termux 脚本）读取敲门端口。
+
+    为什么需要这个端点：
+    - 原脚本用 `GET /api/config` 拉配置，但该端点在全局鉴权后面，未登录必返 401，
+      该功能实际上从来没工作过；
+    - 而且 /api/config 会泄露整个防火墙配置，绝不能匿名开放。
+
+    安全约束：
+    - 只允许来自内网的请求，公网调用一律 403；
+    - 只返回 4 个敲门端口，不返回任何其他配置。
+      敲门端口序列就是「密钥」，一旦从公网可读，端口敲门就失去意义，
+      所以 WAN 场景必须由用户在 LAN 上查看后手工填进客户端脚本。
+    """
+    client_ip = request.remote_addr or ''
+    if not _client_is_lan(client_ip):
+        return jsonify({
+            'success': False,
+            'code': 'LAN_ONLY',
+            'message': '该端点仅允许内网访问。公网场景请在局域网内查看端口后手工配置客户端。',
+        }), 403
+    cfg = load_config()
+    ports = [int(_safe_port(cfg.get(f'knock{i}_port', i), i)) for i in (1, 2, 3, 4)]
+    return jsonify({
+        'success': True,
+        'data': {
+            'knock_ports': ports,
+            'knock_ports_str': ",".join(str(p) for p in ports),
+            'router_ip4': _safe_ip(cfg.get('router_ip4', ''), 4, ""),
+        },
+    })
 
 
 @app.route('/api/config', methods=['POST'])
@@ -642,8 +937,21 @@ def post_config():
 
     # merge 到现有配置，避免前端只发部分字段时清空其他配置
     old_cfg = load_config()
+    incoming = {k: v for k, v in data.items() if k != 'confirm'}  # confirm 不入配置
     new_cfg = dict(old_cfg)
-    new_cfg.update({k: v for k, v in data.items() if k != 'confirm'})  # confirm 不入配置
+    new_cfg.update(incoming)
+
+    # 字段白名单校验：会进 nft 规则的字段必须合法，
+    # 否则可注入任意 nft 指令（如 whitelist_timeout="1s; delete table inet fw4; #"）
+    errs = validate_config(new_cfg)
+    if errs:
+        return jsonify({
+            'success': False,
+            'code': 'INVALID_CONFIG',
+            'message': '配置校验失败，未保存',
+            'errors': errs,
+        }), 400
+
     requester_ip = request.remote_addr or ''
     risks = _detect_risks(old_cfg, new_cfg, requester_ip)
     critical_risks = [r for r in risks if r.get('level') == 'critical']
@@ -657,7 +965,11 @@ def post_config():
             'data': {'risks': risks},
         }), 409
 
-    save_config(new_cfg)
+    try:
+        save_config(new_cfg)
+    except OSError as e:
+        # 磁盘满 / 权限不足时 save_config 会抛出，不能让异常冒泡成 500 裸栈
+        return jsonify({'success': False, 'message': f'配置保存失败: {e}'}), 500
     return jsonify({
         'success': True,
         'message': '配置已保存',
@@ -683,8 +995,12 @@ def build_rules(config):
     variables = config_to_variables(config)
     log_switches = config_to_log_switches(config)
     rules = generate_rules(variables, log_switches)
+    # 白名单超时强制非负整数：这里是 rules.replace() 字符串拼接，
+    # 任意非数字内容都会被原样写进 nft 规则（可注入 delete table 等指令）
     whitelist_timeout = config.get("whitelist_timeout", 18000)
-    timeout_str = f"timeout {whitelist_timeout}s"
+    if not str(whitelist_timeout).strip().isdigit():
+        whitelist_timeout = 18000
+    timeout_str = f"timeout {int(whitelist_timeout)}s"
     rules = rules.replace("timeout 5h", timeout_str)
     return rules
 
@@ -718,20 +1034,45 @@ def _diff_nft_rules(old_text: str, new_text: str) -> dict:
     }
 
 
+def _ip_set(v):
+    """把 trusted_ip4（单串/逗号串/列表）归一化成 IPv4 集合。
+
+    必须显式切分：直接 set("192.168.100.2") 会把字符串拆成
+    {'1','9','6','2','.','8','0'}，导致自锁告警恒不触发。
+    """
+    if v is None:
+        return set()
+    if isinstance(v, str):
+        parts = [p.strip() for p in v.replace('，', ',').split(',')]
+    elif isinstance(v, (list, tuple, set)):
+        parts = [str(p).strip() for p in v]
+    else:
+        parts = [str(v).strip()]
+    return {p for p in parts if p and _valid_ip(p, 4)}
+
+
+def _port_set(v):
+    """把 lan_allowed_ports（逗号串/列表）归一化成端口整数集合"""
+    try:
+        return set(_split_ports(v))
+    except ValueError:
+        return set()
+
+
 def _detect_risks(old_cfg: dict, new_cfg: dict, requester_ip: str) -> list:
     """检测可能把用户锁在外面的风险"""
     risks = []
-    # 1. SSH 端口变化（lan_allowed_ports 或 forward_rules 取消 22）
-    old_lan_ports = set(old_cfg.get('lan_allowed_ports', []) or [])
-    new_lan_ports = set(new_cfg.get('lan_allowed_ports', []) or [])
+    # 1. SSH 端口变化（lan_allowed_ports 取消 22）
+    old_lan_ports = _port_set(old_cfg.get('lan_allowed_ports', []))
+    new_lan_ports = _port_set(new_cfg.get('lan_allowed_ports', []))
     if 22 in old_lan_ports and 22 not in new_lan_ports:
         risks.append({
             'level': 'high',
             'message': 'LAN 允许端口移除了 22（SSH），可能影响远程管理',
         })
     # 2. trusted_ip4 移除请求者自己的 IP
-    old_trusted = set(old_cfg.get('trusted_ip4', []) or [])
-    new_trusted = set(new_cfg.get('trusted_ip4', []) or [])
+    old_trusted = _ip_set(old_cfg.get('trusted_ip4', []))
+    new_trusted = _ip_set(new_cfg.get('trusted_ip4', []))
     if requester_ip and requester_ip in old_trusted and requester_ip not in new_trusted:
         risks.append({
             'level': 'critical',
@@ -744,6 +1085,16 @@ def _detect_risks(old_cfg: dict, new_cfg: dict, requester_ip: str) -> list:
         risks.append({
             'level': 'medium',
             'message': f'访问模式从 {old_mode} 改为 {new_mode}',
+        })
+    # 4. 切到 trusted 模式但请求者自己不在白名单 —— 信任模式下非白名单流量全丢，
+    #    等同于自锁。只在「模式真正切到 trusted」的那一刻报，
+    #    否则留在 trusted 模式下改别的字段时每次保存都误报。
+    if (new_mode == 'trusted' and old_mode != 'trusted'
+            and requester_ip and requester_ip not in new_trusted):
+        risks.append({
+            'level': 'critical',
+            'message': f'切到 trusted（信任）模式后内网默认全丢弃，而你的 IP {requester_ip} '
+                       f'不在 trusted_ip4 白名单里，保存后会被防火墙拦住',
         })
     return risks
 
@@ -1146,6 +1497,7 @@ def restart_network():
     """重启网络服务"""
     try:
         config = load_config()
+        # 先把规则落盘（供 init 脚本开机兜底），再重启网络
         rules = build_rules(config)
         os.makedirs(os.path.dirname(RULES_PATH), exist_ok=True)
         with open(RULES_PATH, 'w') as f:
@@ -1153,7 +1505,14 @@ def restart_network():
         subprocess.run(['/etc/init.d/network', 'restart'], capture_output=True, text=True, timeout=30)
         # 等待网络接口恢复（阻塞 5s 是可接受的，因为后续需要加载 nft 规则）
         time.sleep(5)
-        subprocess.run(['nft', '-f', RULES_PATH], capture_output=True, text=True, timeout=30)
+        # 必须检查 nft -f 返回码：原来不管成败都返回 success，
+        # 规则没装上时用户以为重启成功，实际防火墙处于空档
+        res = subprocess.run(['nft', '-f', RULES_PATH], capture_output=True, text=True, timeout=30)
+        if res.returncode != 0:
+            _state, state_msg = _restore_lastgood_rules()
+            return jsonify({"success": False, "message":
+                            f"网络已重启，但 nft 规则加载失败，{state_msg}："
+                            f"{res.stderr or res.stdout}"}), 500
         return jsonify({"success": True, "message": "网络已重启，防火墙规则已重新应用"})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
@@ -1220,77 +1579,187 @@ def repair_init_script():
         return jsonify({"success": False, "message": str(e)}), 500
 
 
-@app.route('/api/rules/apply', methods=['POST'])
-def apply_rules():
-    """保存规则并执行 nft -f"""
-    config = load_config()
+def _restore_lastgood_rules():
+    """回滚：恢复上一版自定义规则文件并重新加载。
+
+    自定义规则集以 `flush ruleset` 开头、完全接管规则表，因此不能用 fw4 回滚
+    （fw4 会重新生成 table inet fw4 并与自定义规则冲突）。正确做法是恢复上一版
+    自定义规则；连上一版都不可用时退到 _apply_basic_lockdown() 的最小防护。
+
+    返回 (state, message)。**state 必须如实反映实际结果**，因为调用方要把它
+    映射成给用户看的文案：曾经把「恢复上一版」和「套用最小兜底」压成一个 bool，
+    导致最坏情况（fw4 已停、新规则没装上、兜底也没装上 = 路由器裸奔）
+    被描述成「已启用最小兜底防护」，用户据此以为安全了。
+      'lastgood' —— 已恢复到上一版自定义规则
+      'lockdown' —— 只套用了最小兜底（端口转发/敲门等规则全丢）
+      'failed'   —— 什么都没恢复，路由器当前可能无任何防火墙
+    """
+    backup = RULES_PATH + '.lastgood'
+    if os.path.exists(backup):
+        try:
+            os.replace(backup, RULES_PATH)
+            res = subprocess.run(['nft', '-f', RULES_PATH],
+                                 capture_output=True, text=True, timeout=30)
+            if res.returncode == 0 and not _ruleset_is_empty():
+                print('[OK] 已回滚到上一版自定义规则', flush=True)
+                return 'lastgood', '已回滚到上一版规则'
+        except Exception as e:
+            print(f'[WARN] 回滚上一版规则失败: {type(e).__name__}: {e}', flush=True)
+    if _apply_basic_lockdown():
+        print('[WARN] 无可用历史规则，已套用最小兜底防护（端口转发/敲门规则未生效）', flush=True)
+        return 'lockdown', ('无历史规则可回滚，已套用最小兜底防护；'
+                            '端口转发/敲门等规则当前未生效，请尽快重新应用')
+    print('[ERROR] 回滚失败：无历史规则且最小兜底也未生效，路由器当前可能无防火墙', flush=True)
+    return 'failed', ('回滚失败：无历史规则且最小兜底也未生效，'
+                      '路由器当前可能处于无防火墙状态，请立即通过 SSH 手工执行 '
+                      'nft -f /etc/nftables.d/99-custom-rules.nft')
+
+
+def _apply_ruleset(config):
+    """把 config 生成成规则并安全加载。返回 (ok, message)。
+
+    流程：生成 -> 写临时文件 -> `nft -c` 语法预检 -> 原子替换 -> 停 fw4 ->
+    `nft -f` -> 失败则回滚到上一版（再失败退到最小兜底防护）。
+
+    反代规则增删改和 /api/rules/apply 共用本函数，
+    避免出现「某条路径跳过了校验和回滚」的不一致。
+    """
     rules = build_rules(config)
-
-    # 写入文件
     os.makedirs(os.path.dirname(RULES_PATH), exist_ok=True)
-    with open(RULES_PATH, 'w') as f:
-        f.write(rules)
 
-    # 先校验规则语法（nft -c 只检查不执行）
     # 确保 include 所需的文件存在（避免因文件缺失导致校验失败）
     if config.get("china_ip_block", False):
         os.makedirs('/etc/nftables', exist_ok=True)
         if not os.path.exists('/etc/nftables/china-ips.nft'):
             open('/etc/nftables/china-ips.nft', 'w').close()
-    check = subprocess.run(['nft', '-c', '-f', RULES_PATH],
-                           capture_output=True, text=True, timeout=10)
+
+    # 1. 先写临时文件做语法预检（nft -c 只检查不执行），校验通过才落到正式路径
+    tmp_path = RULES_PATH + '.tmp'
+    with open(tmp_path, 'w') as f:
+        f.write(rules)
+    try:
+        check = subprocess.run(['nft', '-c', '-f', tmp_path],
+                               capture_output=True, text=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        _unlink_quiet(tmp_path)
+        return False, "nft 语法校验超时，未应用"
+    except (FileNotFoundError, OSError) as e:
+        _unlink_quiet(tmp_path)
+        return False, f"无法执行 nft 命令: {e}"
     if check.returncode != 0:
-        return jsonify({"success": False, "message": f"规则语法错误，未应用: {check.stderr or check.stdout}"}), 400
+        _unlink_quiet(tmp_path)
+        return False, f"规则语法错误，未应用: {check.stderr or check.stdout}"
 
-    # 校验通过，先备份旧规则文件
-    if os.path.exists(RULES_PATH + '.backup'):
-        pass  # 已有备份，不覆盖
-    elif os.path.exists('/etc/nftables.d/99-custom-rules.nft.backup'):
-        pass
-    else:
-        # 首次应用前备份当前 nftables 规则集
+    # 2. 备份当前落盘版本（供 nft -f 失败时回滚），再原子替换
+    lastgood = RULES_PATH + '.lastgood'
+    had_old = os.path.exists(RULES_PATH)
+    if had_old:
         try:
-            subprocess.run(['nft', 'list', 'ruleset'], capture_output=True, timeout=5,
-                           stdout=open('/etc/nftables.d/99-custom-rules.nft.backup', 'w'))
-        except Exception:
-            pass
+            shutil.copy(RULES_PATH, lastgood)
+        except OSError as e:
+            print(f'[WARN] 备份旧规则失败: {e}', flush=True)
+            had_old = False
+    os.replace(tmp_path, RULES_PATH)
 
-    # 确保 fw4 已停止
-    subprocess.run(['/etc/init.d/firewall', 'stop'],
-                   capture_output=True, text=True, timeout=5)
+    # 3. 首次应用前额外备份一次完整 ruleset（仅当两个 backup 都不存在时）
+    if not os.path.exists(RULES_PATH + '.backup') \
+            and not os.path.exists('/etc/nftables.d/99-custom-rules.nft.backup'):
+        try:
+            # 注意：stdout= 与 capture_output=True 互斥，同时传会抛
+            # TypeError("stdout and stderr arguments may not be used with
+            # capture_output")，导致这份备份从来就没成功写过
+            with open('/etc/nftables.d/99-custom-rules.nft.backup', 'w') as bf:
+                r = subprocess.run(['nft', 'list', 'ruleset'], stdout=bf,
+                                   stderr=subprocess.PIPE, timeout=5)
+            if r.returncode != 0:
+                print(f'[WARN] 备份完整 ruleset 返回码非 0: {r.returncode}', flush=True)
+        except Exception as e:
+            print(f'[WARN] 备份完整 ruleset 失败: {e}', flush=True)
 
-    # 执行 nft -f
-    result = subprocess.run(
-        ['nft', '-f', RULES_PATH],
-        capture_output=True, text=True, timeout=30
-    )
-    if result.returncode != 0:
-        return jsonify({"success": False, "message": f"nft -f 失败: {result.stderr or result.stdout}"}), 500
+    # 4. 确保 fw4 已停止
+    # 兜住异常：/etc/init.d/firewall 不存在（fw4 未安装 / 非 OpenWrt 系统）时
+    # 不应让整个规则应用崩掉 —— 自有规则集本来就不依赖 fw4 才能加载
+    try:
+        subprocess.run(['/etc/init.d/firewall', 'stop'],
+                       capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as e:
+        print(f'[WARN] 停止 fw4 失败（继续按自有规则加载）: {type(e).__name__}: {e}',
+              flush=True)
 
-    # 应用成功后，静默确保 IPv6 自动更新 cron 已安装
+    # 5. 执行 nft -f；失败必须回滚，绝不能把路由器留在「fw4 已停 + 规则没装」的空档
+    try:
+        result = subprocess.run(['nft', '-f', RULES_PATH],
+                                capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        result = None
+    if result is None or result.returncode != 0:
+        if not had_old:
+            _unlink_quiet(RULES_PATH)
+        state, state_msg = _restore_lastgood_rules()
+        detail = (result.stderr or result.stdout) if result is not None else "nft -f 超时"
+        return False, f"nft -f 失败，{state_msg}：{detail}"
+
+    # 6. 应用成功后，静默确保 IPv6 自动更新 cron 已安装
     try:
         _ensure_ipv6_cron()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f'[WARN] 安装 IPv6 cron 失败: {e}', flush=True)
+    return True, "规则已应用"
 
-    return jsonify({"success": True, "message": "规则已应用"})
+
+@app.route('/api/rules/apply', methods=['POST'])
+def apply_rules():
+    """保存规则并执行 nft -f（先校验后写盘，失败自动回滚）"""
+    ok, message = _apply_ruleset(load_config())
+    if not ok:
+        # 语法类问题算客户端错误，其余算服务端错误
+        code = 400 if ("语法" in message or "超时" in message) else 500
+        return jsonify({"success": False, "message": message}), code
+    return jsonify({"success": True, "message": message})
+
+
+# IPv6 自动更新脚本：安装路径与 cron 频率必须全局唯一。
+# 原来 _ensure_ipv6_cron 用 */10、install_ipv6_cron 用 0 * * * *，
+# 且各自只删「完全等于自己那行」的条目，两边都跑过就会留下重复 cron。
+IPV6_SCRIPT_PATH = '/opt/nftables-web/update-ipv6.sh'
+IPV6_CRON_ENTRY = f'*/10 * * * * {IPV6_SCRIPT_PATH}'
+
+
+def _upsert_cron_for(script_path, cron_entry):
+    """把某个脚本的 cron 条目写成唯一一条：先按脚本路径删掉所有历史条目再追加。
+
+    返回 (ok, message)。按「脚本路径」而不是「整行」去重，
+    这样即使历史上装了不同频率的条目也能收敛成一条。
+    """
+    try:
+        result = subprocess.run(['crontab', '-l'], capture_output=True, text=True, timeout=10)
+        lines = result.stdout.splitlines() if result.returncode == 0 else []
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as e:
+        return False, f"读取 crontab 失败: {e}"
+    lines = [ln for ln in lines if script_path not in ln]
+    if cron_entry:
+        lines.append(cron_entry)
+    try:
+        proc = subprocess.run(['crontab', '-'], input='\n'.join(lines) + '\n',
+                              capture_output=True, text=True, timeout=10)
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as e:
+        return False, f"写入 crontab 失败: {e}"
+    if proc.returncode != 0:
+        return False, f"crontab 更新失败: {(proc.stderr or proc.stdout).strip()}"
+    return True, "crontab 已更新"
 
 
 def _ensure_ipv6_cron():
     """静默确保 IPv6 自动更新脚本和 crontab 已就绪（幂等）"""
-    script_path = '/opt/nftables-web/update-ipv6.sh'
-    os.makedirs(os.path.dirname(script_path), exist_ok=True)
-    with open(script_path, 'w') as f:
+    os.makedirs(os.path.dirname(IPV6_SCRIPT_PATH), exist_ok=True)
+    with open(IPV6_SCRIPT_PATH, 'w') as f:
         f.write(IPV6_CRON_SCRIPT)
-    os.chmod(script_path, 0o755)
+    os.chmod(IPV6_SCRIPT_PATH, 0o755)
 
-    cron_entry = '*/10 * * * * /opt/nftables-web/update-ipv6.sh'
-    result = subprocess.run(['crontab', '-l'], capture_output=True, text=True, timeout=10)
-    existing = result.stdout.splitlines()
-    if cron_entry not in existing:
-        existing.append(cron_entry)
-        subprocess.run(['crontab', '-'], input='\n'.join(existing) + '\n',
-                       capture_output=True, text=True, timeout=10)
+    ok, msg = _upsert_cron_for(IPV6_SCRIPT_PATH, IPV6_CRON_ENTRY)
+    if not ok:
+        print(f'[WARN] IPv6 cron 配置失败: {msg}', flush=True)
+    return ok
 
 
 # === IPv6 辅助函数和 API ===
@@ -1449,27 +1918,19 @@ def get_ipv6_script():
 def install_ipv6_cron():
     """安装 IPv6 自动更新脚本到 crontab"""
     try:
-        script_path = '/opt/nftables-web/update-ipv6.sh'
-        os.makedirs(os.path.dirname(script_path), exist_ok=True)
-
-        with open(script_path, 'w') as f:
+        os.makedirs(os.path.dirname(IPV6_SCRIPT_PATH), exist_ok=True)
+        with open(IPV6_SCRIPT_PATH, 'w') as f:
             f.write(IPV6_CRON_SCRIPT)
-        os.chmod(script_path, 0o755)
+        os.chmod(IPV6_SCRIPT_PATH, 0o755)
 
-        # 检查 crontab 中是否已有该条目
-        cron_entry = '0 * * * * /opt/nftables-web/update-ipv6.sh'
-        result = subprocess.run(['crontab', '-l'], capture_output=True, text=True, timeout=10)
-        existing = result.stdout.splitlines()
-        if cron_entry not in existing:
-            existing.append(cron_entry)
-            proc = subprocess.run(['crontab', '-'], input='\n'.join(existing) + '\n',
-                                  capture_output=True, text=True, timeout=10)
-            if proc.returncode != 0:
-                return jsonify({"success": False, "message": f"crontab 更新失败: {proc.stderr}"}), 500
+        # 与 _ensure_ipv6_cron 共用同一条目并按脚本路径去重，不会装出重复 cron
+        ok, msg = _upsert_cron_for(IPV6_SCRIPT_PATH, IPV6_CRON_ENTRY)
+        if not ok:
+            return jsonify({"success": False, "message": f"crontab 更新失败: {msg}"}), 500
 
         return jsonify({
             "success": True,
-            "message": f"脚本已安装到 {script_path}，crontab 已配置每小时执行",
+            "message": f"脚本已安装到 {IPV6_SCRIPT_PATH}，crontab 已配置每 10 分钟执行",
         })
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
@@ -1707,9 +2168,17 @@ def _parse_ddns_config():
 
 
 def _uci_set(key, value):
-    """执行 uci set，值用双引号包裹，特殊字符已转义"""
-    safe_val = value.replace('\\', '\\\\').replace('"', '\\"') if value else ''
-    return subprocess.run(['uci', '-q', 'set', f'{key}={safe_val}'],
+    """执行 uci set，值用双引号包裹，特殊字符已转义
+
+    必须剥掉换行：值里带 \n 会被 uci 当成新的一条指令，
+    造成 UCI 配置注入（domain/param_opt 等用户字段未过滤）。
+    """
+    if value is None:
+        safe_val = ''
+    else:
+        safe_val = str(value).replace('\n', ' ').replace('\r', ' ')
+        safe_val = safe_val.replace('\\', '\\\\').replace('"', '\\"')
+    return subprocess.run(['uci', '-q', 'set', f'{key}="{safe_val}"'],
                           capture_output=True, text=True, timeout=10)
 
 
@@ -1832,14 +2301,15 @@ def save_ddns_config():
             if 'cloudflare' in svc.get('service_name', ''):
                 svc_username = 'Bearer'
             _uci_set(f'ddns.{uci_name}.username', svc_username)
-            # 密码：如果包含掩码标记则从缓存还原原始密码
+            # 密码：如果包含掩码标记则从缓存还原原始密码。
+            # 注意：这里绝对不能用 continue —— 密码只是 20 个字段之一，
+            # continue 会连带跳过后面 interface/ip_source/ip_script/use_ipv6/
+            # param_enc/check_interval/dns_server 等全部配置，
+            # 造成「接口返回保存成功但该条 DDNS 记录配置残缺、静默不更新」。
             pwd = svc.get('password', '')
             if '****' in str(pwd):
                 cached_pwd = password_cache.get(uci_name, '')
-                if cached_pwd:
-                    pwd = cached_pwd
-                else:
-                    continue  # 缓存也没有，跳过不写入
+                pwd = cached_pwd if cached_pwd else ''   # 取不到就留空，不中断循环
             _uci_set(f'ddns.{uci_name}.password', pwd)
             _uci_set(f'ddns.{uci_name}.interface', svc.get('interface', 'wan'))
             ipv6_source = svc.get('ipv6_source', '')
@@ -2054,28 +2524,36 @@ except Exception as e:
 
 
 def _manage_ddns_cron(config):
-    """管理 DDNS 自动更新的 cron 条目"""
+    """管理 DDNS 自动更新的 cron 条目，返回 (ok, message)"""
     cron_entry = "*/10 * * * * /opt/nftables-web-v2/aliyun-ddns-update.py"
     has_enabled = any(rec.get("enabled") for rec in config.get("records", []))
-    
-    # 读取当前 crontab
+
+    # 读取当前 crontab（crontab -l 在无 crontab 时返回非 0，属正常情况）
     try:
         result = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=10)
-        current_crontab = result.stdout
+        current_crontab = result.stdout if result.returncode == 0 else ""
     except Exception:
         current_crontab = ""
-    
+
     # 删除旧的 DDNS cron 条目
     lines = [line for line in current_crontab.splitlines()
              if "aliyun-ddns-update.py" not in line]
-    
+
     # 如果有启用的记录，追加新条目
     if has_enabled:
         lines.append(cron_entry)
-    
+
     # 写回 crontab
     new_crontab = "\n".join(lines) + ("\n" if lines else "")
-    proc = subprocess.run(["crontab", "-"], input=new_crontab, text=True, capture_output=True, timeout=10)
+    try:
+        proc = subprocess.run(["crontab", "-"], input=new_crontab, text=True,
+                              capture_output=True, timeout=10)
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as e:
+        return False, f"crontab 命令执行失败: {e}"
+    # 必须检查返回码：原来忽略失败，导致自动更新静默不生效
+    if proc.returncode != 0:
+        return False, f"crontab 写入失败: {(proc.stderr or proc.stdout).strip()}"
+    return True, "crontab 已更新"
 
 
 def _aliyun_sign(params, access_key_secret, method="GET"):
@@ -2279,8 +2757,11 @@ def aliyun_ddns_save():
     # 生成自动更新脚本
     _generate_ddns_update_script()
 
-    # 管理 cron 条目
-    _manage_ddns_cron(data)
+    # 管理 cron 条目（失败要如实告知，否则自动更新静默不生效）
+    cron_ok, cron_msg = _manage_ddns_cron(existing)
+    if not cron_ok:
+        return jsonify({"success": False,
+                        "message": f"配置已保存，但自动更新 cron 配置失败：{cron_msg}"}), 500
 
     return jsonify({"success": True, "message": "配置已保存"})
 
@@ -2546,8 +3027,11 @@ def _check_ip_in_set(ip, list_type):
         )
         if result.returncode != 0:
             return False
-        # 简化匹配：看 IP 字面量是否出现在输出里
-        return (' ' + ip + ' ') in result.stdout or ip in result.stdout.split('elements', 1)[-1]
+        # 复用 _parse_nft_set_output 做精确匹配。
+        # 原先用 `ip in stdout.split('elements',1)[-1]` 子串判断，
+        # 会让 1.2.3.4 误匹配 11.2.3.45 / 1.2.3.400，
+        # 且 'elements' 不存在时 [-1] 取整段输出导致必然误判。
+        return ip in _parse_nft_set_output(result.stdout)
     except Exception:
         return False
 
@@ -3078,9 +3562,17 @@ def _get_dns_credentials(rp, provider_id):
 def _get_rp_config():
     """获取 reverse_proxy 配置段，确保结构完整"""
     config = load_config()
-    rp = config.setdefault("reverse_proxy", {})
-    rp.setdefault("rules", [])
-    rp.setdefault("certificates", [])
+    # 配置文件被手工改坏时 reverse_proxy 可能不是 dict，
+    # setdefault 不会纠正已存在的错误类型，必须显式校验
+    rp = config.get("reverse_proxy")
+    if not isinstance(rp, dict):
+        print("[WARNING] reverse_proxy 结构非法，已重置", flush=True)
+        rp = {}
+        config["reverse_proxy"] = rp
+    if not isinstance(rp.get("rules"), list):
+        rp["rules"] = []
+    if not isinstance(rp.get("certificates"), list):
+        rp["certificates"] = []
     rp.setdefault("settings", dict(RP_DEFAULT_SETTINGS))
     return config, rp
 
@@ -3245,6 +3737,18 @@ def _generate_nginx_conf(rule, cert, settings):
     return "\n".join(lines)
 
 
+RP_CONF_MARKER = '# Managed by nftables-web-v2 reverse proxy panel'
+
+
+def _is_managed_conf(conf_path):
+    """判断某个 nginx conf 是否由本面板生成（只认文件头标记）"""
+    try:
+        with open(conf_path, 'r', errors='ignore') as f:
+            return f.readline().strip() == RP_CONF_MARKER
+    except OSError:
+        return False
+
+
 def _write_nginx_conf_file(rule, cert, settings):
     """生成并写入 nginx 配置文件，返回配置文件路径"""
     domain = _sanitize_domain(rule["domain"])
@@ -3253,6 +3757,9 @@ def _write_nginx_conf_file(rule, cert, settings):
     conf_path = os.path.join(NGINX_CONF_DIR, f"{domain}-{listen_port}.conf")
     os.makedirs(NGINX_CONF_DIR, exist_ok=True)
     with open(conf_path, "w") as f:
+        # 写入归属标记：_deploy_all_rules 据此判断哪些 conf 归本面板管，
+        # 避免误删用户自己放在 conf.d 下的站点配置
+        f.write(RP_CONF_MARKER + "\n")
         f.write(conf_content)
     return conf_path
 
@@ -3430,7 +3937,14 @@ def _acme_renew(domain, dns_provider="ali", dns_credentials=None):
 
 
 def _deploy_all_rules(config=None):
-    """重新生成所有已启用规则的 nginx 配置并重载 nginx"""
+    """重新生成所有已启用规则的 nginx 配置并重载 nginx
+
+    两点安全约束：
+    1. 只删除「属于本面板」的 conf（规则名匹配 或 文件头有本面板标记），
+       用户自己放在 conf.d 下的站点配置一律不动。
+    2. 部署前整目录快照，`nginx -t` 失败时整体回滚，
+       避免磁盘上留下「旧的全删了 + 新的全错」的状态。
+    """
     if config is None:
         config = load_config()
     rp = config.get("reverse_proxy", {})
@@ -3438,20 +3952,61 @@ def _deploy_all_rules(config=None):
     certs = {c["id"]: c for c in rp.get("certificates", [])}
     settings = rp.get("settings", RP_DEFAULT_SETTINGS)
 
-    # 先清理不再存在的域名的配置文件
-    # 构建当前所有启用规则的文件名集合
+    # 部署前整目录快照（仅在已有内容时），供 nginx -t 失败时回滚
+    backup_dir = NGINX_CONF_DIR + '.deploybak'
+    shutil.rmtree(backup_dir, ignore_errors=True)
+    if os.path.isdir(NGINX_CONF_DIR):
+        try:
+            shutil.copytree(NGINX_CONF_DIR, backup_dir)
+        except OSError as e:
+            print(f'[WARN] nginx conf 目录快照失败: {e}', flush=True)
+            backup_dir = None
+    else:
+        backup_dir = None
+
+    def _rollback(msg):
+        shutil.rmtree(backup_dir, ignore_errors=True)
+        if backup_dir is None or not os.path.isdir(backup_dir):
+            # 首次部署：conf.d 原本就不存在，没有可回滚的历史状态。
+            # 此时「回滚」无从谈起，如实说明，不要谎称已回滚。
+            return False, f"{msg}（首次部署，无历史配置可回滚；新配置已写入磁盘但 nginx 未重载）"
+        try:
+            shutil.rmtree(NGINX_CONF_DIR, ignore_errors=True)
+            shutil.copytree(backup_dir, NGINX_CONF_DIR)
+            subprocess.run(['/etc/init.d/nginx', 'reload'],
+                           capture_output=True, text=True, timeout=10)
+        except Exception as e:
+            print(f'[WARN] nginx conf 回滚失败: {e}', flush=True)
+            shutil.rmtree(backup_dir, ignore_errors=True)
+            return False, f"{msg}（回滚 nginx 配置也失败，请手工检查 {NGINX_CONF_DIR}）"
+        shutil.rmtree(backup_dir, ignore_errors=True)
+        return False, f"{msg}（已回滚 nginx 配置，nginx 仍运行原配置）"
+
+    # 清理不再启用的域名配置文件 —— 只碰属于本面板的
     active_conf_files = set()
+    managed_names = set()
     for rule in rules:
-        if rule.get("enabled"):
+        try:
             d = _sanitize_domain(rule["domain"])
-            p = rule.get("listen_port", 443)
+        except ValueError:
+            continue
+        p = rule.get("listen_port", 443)
+        managed_names.add(f"{d}-{p}.conf")
+        if rule.get("enabled"):
             active_conf_files.add(f"{d}-{p}.conf")
 
     if os.path.isdir(NGINX_CONF_DIR):
         for fname in os.listdir(NGINX_CONF_DIR):
-            if fname.endswith(".conf"):
-                if fname not in active_conf_files:
-                    os.remove(os.path.join(NGINX_CONF_DIR, fname))
+            if not fname.endswith(".conf"):
+                continue
+            full = os.path.join(NGINX_CONF_DIR, fname)
+            # 归属判定：文件名属于本面板某条规则，或文件头带本面板标记
+            is_mine = fname in managed_names or _is_managed_conf(full)
+            if is_mine and fname not in active_conf_files:
+                try:
+                    os.remove(full)
+                except OSError as e:
+                    print(f'[WARN] 删除 nginx 配置失败 {fname}: {e}', flush=True)
 
     # 生成所有启用规则的配置
     for rule in rules:
@@ -3461,10 +4016,11 @@ def _deploy_all_rules(config=None):
         cert = certs.get(rule.get("ssl_cert_id", ""))
         _write_nginx_conf_file(rule, cert, settings)
 
-    # 测试并重载
+    # 测试并重载；测试失败必须回滚，不能只报错留下坏配置
     ok, msg = _nginx_test()
     if not ok:
-        return False, msg
+        return _rollback(f"nginx 配置语法错误，未重载: {msg}")
+    shutil.rmtree(backup_dir, ignore_errors=True)
     ok, msg = _nginx_reload()
     return ok, msg
 
@@ -3485,7 +4041,10 @@ def rp_get_rules():
             "ssl_cert_domain": cert.get("domain", "") if cert else "",
             "ssl_expires_at": expires_at,
             "ssl_days_remaining": days,
-            "nginx_config_path": os.path.join(NGINX_CONF_DIR, f"{r['domain']}.conf"),
+            # 实际文件名带 listen_port 后缀，必须与 _write_nginx_conf_file 一致
+            "nginx_config_path": os.path.join(
+                NGINX_CONF_DIR,
+                f"{_sanitize_domain(r['domain'])}-{r.get('listen_port', 443)}.conf"),
         })
     return jsonify({"success": True, "data": {"rules": rules_out, "total": len(rules_out)}})
 
@@ -3583,16 +4142,10 @@ def rp_create_rule():
     if not deploy_ok:
         return jsonify({"success": False, "message": f"规则已保存但 nginx 重载失败: {deploy_msg}"}), 500
 
-    # 更新防火墙
-    try:
-        variables = config_to_variables(config)
-        template = load_template(variables)
-        rules_content = generate_rules(template)
-        with open(RULES_PATH, 'w') as f:
-            f.write(rules_content)
-        subprocess.run(["nft", "-f", RULES_PATH], capture_output=True, text=True, timeout=10)
-    except Exception:
-        pass
+    # 更新防火墙（走统一的安全流程：语法预检 + 原子写盘 + 失败回滚）
+    fw_ok, fw_msg = _apply_ruleset(config)
+    if not fw_ok:
+        return jsonify({"success": False, "message": fw_msg}), 500
 
     return jsonify({"success": True, "data": {"rule_id": new_id, "replaced": replaced, "message": "反代规则已更新（同 domain 已有规则）" if replaced else "反代规则创建成功", "nginx_reloaded": True}})
 
@@ -3648,16 +4201,10 @@ def rp_update_rule(rule_id):
     if not deploy_ok:
         return jsonify({"success": False, "message": f"规则已更新但 nginx 重载失败: {deploy_msg}"}), 500
 
-    # 更新防火墙
-    try:
-        variables = config_to_variables(config)
-        template = load_template(variables)
-        rules_content = generate_rules(template)
-        with open(RULES_PATH, 'w') as f:
-            f.write(rules_content)
-        subprocess.run(["nft", "-f", RULES_PATH], capture_output=True, text=True, timeout=10)
-    except Exception:
-        pass
+    # 更新防火墙（走统一的安全流程：语法预检 + 原子写盘 + 失败回滚）
+    fw_ok, fw_msg = _apply_ruleset(config)
+    if not fw_ok:
+        return jsonify({"success": False, "message": fw_msg}), 500
 
     return jsonify({"success": True, "data": {"message": "反代规则已更新", "nginx_reloaded": True}})
 
@@ -3673,16 +4220,10 @@ def rp_delete_rule(rule_id):
     _remove_nginx_conf_file(rule)
     deploy_ok, deploy_msg = _deploy_all_rules(config)
 
-    # 更新防火墙
-    try:
-        variables = config_to_variables(config)
-        template = load_template(variables)
-        rules_content = generate_rules(template)
-        with open(RULES_PATH, 'w') as f:
-            f.write(rules_content)
-        subprocess.run(["nft", "-f", RULES_PATH], capture_output=True, text=True, timeout=10)
-    except Exception:
-        pass
+    # 更新防火墙（走统一的安全流程：语法预检 + 原子写盘 + 失败回滚）
+    fw_ok, fw_msg = _apply_ruleset(config)
+    if not fw_ok:
+        return jsonify({"success": False, "message": fw_msg}), 500
 
     return jsonify({"success": True, "data": {"message": "反代规则已删除", "nginx_reloaded": deploy_ok}})
 
@@ -4285,7 +4826,13 @@ def auth_change_password():
         return jsonify({'success': False, 'message': '旧密码错误'}), 401
     _write_password_hash(_hash_password(new_pw))
     _clear_login_failures(client_ip)  # 修改成功清掉该 IP 的失败记录
-    return jsonify({'success': True, 'data': {'message': '密码已修改'}})
+    # 改完密码必须清掉当前会话：session 里只标记了 authenticated=True，
+    # 不清的话改密码后所有设备上的旧会话仍然有效，等于没改。
+    session.clear()
+    return jsonify({'success': True, 'data': {
+        'message': '密码已修改，请重新登录',
+        'reauth': True,
+    }})
 
 
 def _pick_reverse_proxy_cert():
@@ -4423,8 +4970,16 @@ def _try_apply_rules_file(path):
     return True
 
 
+def _unlink_quiet(path):
+    """删除文件，忽略不存在/权限等异常（清理临时文件用）"""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 def _apply_basic_lockdown():
-    """兜底防火墙：WAN block / LAN allow / 必要服务端口放行。
+    """兜底防火墙：WAN block / LAN allow / LAN 侧必要服务端口放行。
     只在主规则 + 备份都不可用时使用，保证路由器至少有基本保护。
 
     双重验证：nft -f - returncode=0 且 _ruleset_is_empty() == False。
@@ -4440,7 +4995,8 @@ def _apply_basic_lockdown():
         type filter hook input priority 0; policy drop;
         iifname "lo" accept
         ct state established,related accept
-        iifname {{ "br-lan", "pppoe-wan" }} tcp dport {{ {ssh_port}, {web_port} }} accept
+        # SSH / 面板只允许从 LAN 侧访问，绝不在 WAN 侧放行管理端口
+        iifname "br-lan" tcp dport {{ {ssh_port}, {web_port} }} accept
         iifname "br-lan" accept
     }}
     chain forward {{

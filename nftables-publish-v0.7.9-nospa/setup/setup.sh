@@ -11,7 +11,7 @@ set -e
 # ============================================================
 # 变量定义
 # ============================================================
-VERSION="0.7.9"
+VERSION="0.7.9.1"
 PROJECT_NAME="nftables-web-v2"
 INSTALL_DIR="/opt/nftables-web-v2"
 CONFIG_DIR="/etc/nftables"
@@ -331,56 +331,27 @@ NGINX
         fi
     fi
 
+    # 默认不写 nginx 站点配置。原因：
+    #  1. 后端自带 5000 -> 5443 的 301 跳转器，已经覆盖「输 http 自动跳 https」的需求；
+    #  2. 这里写的 `listen 80 default_server` 会抢占 80 端口的默认站点，
+    #     和面板自己管理的反代规则（面板也监听 80）冲突，nginx 会因
+    #     duplicate default server 起不来；
+    #  3. proxy_pass 指向 5000 只是跳转到 5443，多一跳没有意义。
+    # 反代站点请在面板「反向代理」里配置，由面板自己生成 /etc/nginx/conf.d/*.conf。
     cat > "$site_conf" <<'SITECONF'
 # Managed by nftables-web-v2 setup.sh
-# 反向代理到 nftables-web-v2 后端
-
+# 面板本身不需要 nginx 站点；反代请在 Web 面板「反向代理」中配置。
+# 本文件保留为空 server 块以避免 nginx 缺少默认站点报错。
 server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
+    listen 127.0.0.1:8080;
     server_name _;
-
-    # 禁止访问隐藏文件
-    location ~ /\. {
-        deny all;
-        access_log off;
-        log_not_found off;
-    }
-
-    location / {
-        proxy_pass http://127.0.0.1:5000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
+    return 404;
 }
-
-# HTTPS server（证书就绪后取消注释）
-# server {
-#     listen 443 ssl default_server;
-#     listen [::]:443 ssl default_server;
-#     server_name _;
-#
-#     ssl_certificate     /etc/nginx/ssl/fullchain.pem;
-#     ssl_certificate_key /etc/nginx/ssl/key.pem;
-#     ssl_protocols       TLSv1.2 TLSv1.3;
-#     ssl_ciphers         HIGH:!aNULL:!MD5;
-#     ssl_prefer_server_ciphers on;
-#
-#     location / {
-#         proxy_pass http://127.0.0.1:5000;
-#         proxy_set_header Host $host;
-#         proxy_set_header X-Real-IP $remote_addr;
-#         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-#         proxy_set_header X-Forwarded-Proto $scheme;
-#     }
-# }
 SITECONF
 
     nginx -t 2>/dev/null && {
         /etc/init.d/nginx restart 2>/dev/null || true
-        ok "✅ nginx 配置完成"
+        ok "✅ nginx 站点配置完成（面板直连 5443，反代在面板内配置）"
     } || warn "❌ nginx 配置语法错误，请手动检查"
 }
 
@@ -525,6 +496,18 @@ init_config() {
     local k3=$((RANDOM % 50000 + 10000))
     local k4=$((RANDOM % 50000 + 10000))
 
+    # 注意：下面的 heredoc 是未加引号的 <<EOF（需要 ${} 展开），
+    # 所以 heredoc 内部绝对不能出现 # 注释行 —— 它们会被原样写进 JSON 文件，
+    # 导致配置变成非法 JSON；load_config() 会判定损坏、删掉原文件并静默回退
+    # DEFAULT_CONFIG（敲门端口退回 1/2/3/4、trusted_ip4 变成错的值）。
+    # 需要解释的字段请写在这里（heredoc 之外）。
+    #
+    #   access_mode      只有 "lan"（LAN 全放行）和 "trusted"（LAN 默认丢包）两个合法值。
+    #                     早前这里写的是 "knock"，一个从未实现的模式，会让模板走 trusted
+    #                     分支，装完 LAN 默认全丢包，除白名单外谁都打不开面板。
+    #   lan_allowed_ports 放行后端真实监听的 HTTPS 端口 5443，不是 5000
+    #                     （5000 只是 301 跳转器，见 backend/app.py 的 _http_redirect_app）。
+    #   trusted_ip4/6     用数组形式，与后端 _ip_set() 兼容。
     cat > "$CONFIG_FILE" <<EOF
 {
     "wan_if": "${WAN_IFACE}",
@@ -548,8 +531,8 @@ init_config() {
     "lan_broadcast4": "${broadcast4}",
     "ula_prefix6": "${ula_prefix6}",
     "wan_prefix6": "${wan_prefix6}",
-    "access_mode": "knock",
-    "lan_allowed_ports": [22, 5000],
+    "access_mode": "lan",
+    "lan_allowed_ports": [22, 5443],
     "china_ip_block": false,
     "reverse_proxy": {
         "rules": [],
@@ -566,7 +549,8 @@ EOF
 
     chmod 600 "$CONFIG_FILE"
     ok "✅ 配置文件已生成: ${CONFIG_FILE}"
-    echo -e "${YELLOW}  访问地址: http://${router_ip4}:5000${NC}"
+    echo -e "${YELLOW}  访问地址: https://${router_ip4}:5443  （HTTPS，自签证书需手动信任）${NC}"
+    echo -e "${YELLOW}  提示: http://${router_ip4}:5000 会自动 301 跳到上面的地址${NC}"
     echo -e "${YELLOW}  安全模式: 端口敲门（${k1}-${k2}-${k3}-${k4}）${NC}"
     echo -e "${YELLOW}  请登录后修改敲门端口！${NC}"
 }
@@ -638,19 +622,26 @@ setup_nftables() {
     cat > "$NFTABLES_CONF" <<NFT
 #!/usr/sbin/nft -f
 
-# nftables-web-v2 基础配置
+# nftables-web-v2 引导配置
 # 由 setup.sh 自动生成
-
-flush ruleset
+#
+# 这是一份「安装过渡期兜底」规则，不是最终防火墙：
+# 装好之后由 /etc/nftables.d/99-custom-rules.nft（面板生成）接管整表。
+#
+# 两条硬约束，改动前务必理解：
+# 1. 绝不能写 \`flush ruleset\` —— 会清空 fw4 正在生效的 table inet fw4，
+#    造成装机瞬间路由器无防火墙。
+# 2. 绝不能出现无 \`iifname\` 限制的 \`dport ... accept\` —— 那样等于把
+#    SSH(22) 和管理面板对公网全开，与本项目「端口敲门才能放行」的设计矛盾。
 
 define LAN_IFACE = ${LAN_IFACE}
 define WAN_IFACE = ${WAN_IFACE}
 
 table inet filter {
-    # 服务端口集合
+    # 服务端口集合（仅供排查参考，input 链不按此放行 WAN 流量）
     set tcp_services {
         type inet_service
-        elements = { 22, 80, 443, 5000 }
+        elements = { 22, 5443 }
     }
 
     set udp_services {
@@ -671,14 +662,12 @@ table inet filter {
         ip protocol icmp accept
         ip6 nexthdr icmpv6 accept
 
-        # 允许 LAN
+        # 允许 LAN（含 LAN 侧的 SSH 22 / 面板 5443 / DHCP / DNS）
         iifname \$LAN_IFACE accept
 
-        # 允许指定 TCP 服务
-        tcp dport @tcp_services accept
-
-        # 允许指定 UDP 服务
-        udp dport @udp_services accept
+        # 注意：这里刻意不写 \`tcp dport @tcp_services accept\`。
+        # LAN 已由上一行全放行，这条规则唯一的作用就是把 22/5443 暴露到 WAN。
+        # WAN 侧只保留 established/related，公网服务一律由面板的敲门规则处理。
 
         # 记录并丢弃其他
         log prefix "[nftables DROP] " drop
@@ -711,11 +700,18 @@ table nat {
 NFT
 
     chmod 644 "$NFTABLES_CONF"
-    ok "nftables 配置已生成: ${NFTABLES_CONF}"
+    ok "nftables 引导配置已生成: ${NFTABLES_CONF}"
 
-    # 尝试加载规则
-    nft -f "$NFTABLES_CONF" 2>/dev/null && ok "✅ nftables 规则已加载" \
-        || warn "❌ nftables 规则加载失败，请手动检查配置（接口名称可能需要调整）"
+    # 尝试加载规则（用 -c 先预检语法，避免半截规则生效）
+    if nft -c -f "$NFTABLES_CONF" 2>/dev/null; then
+        if nft -f "$NFTABLES_CONF" 2>/dev/null; then
+            ok "✅ nftables 引导规则已加载"
+        else
+            warn "❌ nftables 引导规则加载失败，fw4 仍在生效（未受影响）"
+        fi
+    else
+        warn "❌ 引导规则语法错误，已跳过加载，fw4 仍正常生效"
+    fi
 }
 
 # ============================================================
@@ -730,7 +726,7 @@ show_summary() {
     echo -e "${GREEN}========================================${NC}"
     echo -e "${GREEN}  ${PROJECT_NAME} 安装完成！${NC}"
     echo -e "${GREEN}========================================${NC}"
-    echo -e "  访问地址: ${BLUE}http://${ip}:5000${NC}"
+    echo -e "  访问地址: ${BLUE}https://${ip}:5443${NC}（自签证书需手动信任）"
     echo -e "  版本:     v${VERSION}"
     echo -e "  配置文件: ${CONFIG_FILE}"
     echo ""

@@ -72,7 +72,7 @@ Termux 不需要 root —— 客户端 UDP `sendto` 不需要特权。
 KNOCK_MODE="wan"                          # lan | wan（默认 wan）
 KNOCK_HOST=""                             # 例: "1.2.3.4"（路由器 WAN IP 或 DDNS A 记录）
 KNOCK_DOMAIN=""                           # 或填域名，例: "router.example.com"
-KNOCK_API=""                              # 或从后端拉，例: "http://router.example.com:5000/api/config"
+KNOCK_API=""                              # 从后端拉，例: "http://192.168.4.1:5443/api/knock-info"（仅内网可访问）
 KNOCK_PORTS="1234,5678,9012,3456"         # 4 个端口，逗号分隔
 KNOCK_MIMIC="tls"                         # WAN 推荐 tls|stun|ntp
 KNOCK_NOISE=2                             # 每步之间几个噪音包
@@ -97,8 +97,8 @@ knock-wan-termux.sh -h router.example.com
 # 显式 4 端口
 knock-wan-termux.sh -h 1.2.3.4 -p 1234,5678,9012,3456
 
-# 从 nftables-web 后端自动拉配置（需要 Web 可达，且后端有 GET /api/config）
-knock-wan-termux.sh --api http://router.example.com:5000/api/config
+# 从后端自动拉敲门端口（GET /api/knock-info，仅局域网内可访问）
+knock-wan-termux.sh --api http://192.168.4.1:5443/api/knock-info
 
 # 用 NTP 风格 payload（payload 看起来像 NTP 客户端探活）
 knock-wan-termux.sh -h 1.2.3.4 --mimic ntp

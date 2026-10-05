@@ -147,8 +147,10 @@ def generate_rules(variables, log_switches):
         elif value == "":
             value = '""'
         # 单行匹配
+        # 用 lambda 传 replacement：re.sub 会把 replacement 里的 \1 \g<name> \ 当作
+        # 替换指令解析，变量值里只要有一个反斜杠就会抛 re.error 让整个规则生成失败。
         pattern = rf'define {key}\s*=\s*.+'
-        replacement = f'define {key} = {value}'
-        template = re.sub(pattern, replacement, template)
+        new_line = f'define {key} = {value}'
+        template = re.sub(pattern, lambda _m, _n=new_line: _n, template)
 
     return template
