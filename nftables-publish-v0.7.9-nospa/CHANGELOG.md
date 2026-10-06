@@ -85,6 +85,22 @@ nginx   系统自带          网关    自定义高位端口（默认 8443）
   `handleAuthExpired()` 清空 `config`/`rp` 并提示「会话已过期」——用户还没输密码
   就被告知会话过期。守卫放在方法内（同时覆盖 x-init 与「刷新预览」两个入口），
   并在 `loadAllData()` 里补一次，登录后仍自动加载
+- **认证端点默认开放，收敛为白名单（P1，公网攻击面）**。网关配置里写的是
+  `location /auth/`，这是**前缀匹配**，会把认证服务下所有 `/auth/*` 一并暴露到公网，
+  其中包括：
+  - `/auth/verify` —— 只应由 `location = /_auth` 以 `auth_request` 子请求方式内部调用
+    （该 location 自带 `internal;`，本不该有任何外部入口）。外部可达等于给了
+    攻击者一个可以反复重放的 token 校验入口
+  - `/auth/health` —— 探活端点，外部可达泄露服务存在与内部状态
+  认证服务以后每加一个 `/auth/*` 端点都会被这个前缀匹配默认带出去，属于典型的
+  「默认开放」。改为**逐个精确列举**公网必需的 5 个端点（`/auth/login`、
+  `/auth/logout`、`/auth/status`、`/auth/portal`、`/auth/static/`），其余
+  `/auth/*` 一律 `return 404`。实测 `/auth/verify`、`/auth/health`、
+  `/auth/config` 均由 200 变 404，功能无损（门户 13/13 仍全过）
+
+  另外核对了认证服务是否有设置类信息外泄：9 个端点的返回字段只有
+  `authenticated / code / device_id / expires_in / fp / message / ok / remaining /
+  services / user / via`，全为会话与服务列表，没有任何端点把配置或密钥序列化给客户端
 - **DDNS 配置全部字段被写坏，DDNS 起不来（P1）**。`_uci_set()` 用**双引号**包裹值
   （`uci set key="250"`），而 uci 会把双引号当成值的一部分存进文件，于是
   `uci get` 读回来是 `"250"`。ddns-scripts 里的 `$((ddns_loglines + 1))` 直接报

@@ -4156,13 +4156,41 @@ def _generate_gateway_nginx_conf(config):
     L.append("")
 
     # ── 认证端点（浏览器直连） ──────────────────────────────────
-    L.append("    # 认证端点：登录 / 登出 / 状态 / 门户数据")
-    L.append("    location /auth/ {")
+    #
+    # 公网只需要这 5 个端点，必须逐个精确列举，绝不能图省事写成
+    # `location /auth/` —— 那是**前缀匹配**，会把认证服务下所有 /auth/* 一并
+    # 暴露出去，其中包括：
+    #   /auth/verify  仅供上面的 location = /_auth 以 auth_request 方式内部调用
+    #                  （它自带 internal; 保护），本不该有任何外部入口
+    #   /auth/health  探活端点，外部可达等于泄露服务存在与内部状态
+    # 认证服务里任何新加的 /auth/* 端点都会默认被这个前缀匹配带出去 ——
+    # 属于典型的「默认开放」，所以改成白名单式精确列举。
+    L.append("    # 认证端点：只暴露登录/登出/状态/门户数据/静态资源，其余一律 404")
+    for _ep, _comment in (("/auth/login", "登录页 GET + 登录提交 POST"),
+                          ("/auth/logout", "登出"),
+                          ("/auth/status", "会话状态"),
+                          ("/auth/portal", "门户服务列表（需已认证）")):
+        L.append(f"    # {_comment}")
+        L.append(f"    location = {_ep} {{")
+        L.append(f"        proxy_pass http://127.0.0.1:{api_port}{_ep};")
+        L.append("        proxy_set_header X-Real-IP $remote_addr;")
+        L.append("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
+        L.append("        proxy_set_header X-Original-URI $request_uri;")
+        L.append("        proxy_set_header Host $host;")
+        L.append("    }")
+        L.append("")
+
+    L.append("    # 认证页面的 CSS/JS（白名单文件，见 auth_gateway.STATIC_ALLOWED）")
+    L.append("    location /auth/static/ {")
     L.append(f"        proxy_pass http://127.0.0.1:{api_port};")
     L.append("        proxy_set_header X-Real-IP $remote_addr;")
-    L.append("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
-    L.append("        proxy_set_header X-Original-URI $request_uri;")
     L.append("        proxy_set_header Host $host;")
+    L.append("    }")
+    L.append("")
+
+    L.append("    # 其余 /auth/* 一律不认：verify / health 等内部端点到此为止")
+    L.append("    location /auth/ {")
+    L.append("        return 404;")
     L.append("    }")
     L.append("")
 
