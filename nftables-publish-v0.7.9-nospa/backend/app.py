@@ -1437,10 +1437,18 @@ def update_uci_wan_config(path, data):
     new_lines = []
     has_pppoe = data.get('wan_pppoe', False)
     wan_device = sanitize_uci_value(data.get('wan_device', ''))
-    # 始终自动检测 WAN 设备（比前端传值更可靠）
+    # 检测 WAN 设备：只认"不在 LAN 桥成员里"的物理网卡。
+    #
+    # ⚠️ 这里原本有个会造成失联的兜底：检测不到就 `wan_device = 'eth0'`。
+    # 但 eth0 恰恰是 br-lan 的唯一从属端口（上面的检测正是为了把它排除掉），
+    # 兜底等于把 WAN 强行绑到 br-lan 的网卡上 → 桥塌掉 → 整机失联。
+    # 2026-10-06 实测踩中：x86 单网卡 OpenWrt 上点「PPPoE 拨号」+「保存网络
+    # 配置」+「重启网络」，设备当场 ARP FAILED，Proxmox 未开带外口，无法远程恢复。
+    # 检测不到独立 WAN 网卡就必须拒绝，绝不能猜一个设备名写进配置。
+    detected = False
+    lan_ports = set()          # 提到 try 外：异常路径下也要能报出"哪些卡被 LAN 占了"
     try:
         import subprocess as _sp
-        lan_ports = set()
         with open(path, 'r') as f:
             for line in f:
                 if 'list ports' in line:
@@ -1452,13 +1460,22 @@ def update_uci_wan_config(path, data):
         for name in r.stdout.strip().split():
             if (name.startswith('eth') or name.startswith('ens') or name.startswith('enp')) and name not in lan_ports:
                 wan_device = name
+                detected = True
                 break
     except Exception:
         pass
-    if not wan_device:
-        wan_device = 'eth0'
+    if not detected:
+        lan_desc = ', '.join(sorted(lan_ports)) if lan_ports else '未知'
+        raise ValueError(
+            f"未检测到独立的 WAN 网卡（已占用于 LAN 桥的设备：{lan_desc}）。"
+            f"本机只有一张物理网卡，无法同时做 LAN 和 PPPoE WAN —— "
+            f"继续写入会让 WAN 抢走 LAN 的网卡，导致设备失联。"
+            f"请先在 OpenWrt 里划出第二张网卡专供 WAN，或改用其它上网方式。"
+        )
     pppoe_username = sanitize_uci_value(data.get('wan_pppoe_username', ''))
     pppoe_password = sanitize_uci_value(data.get('wan_pppoe_password', ''))
+    if not pppoe_username:
+        raise ValueError("PPPoE 拨号需要填写宽带账号（当前为空），已中止保存以免写出不可用的配置。")
     shutil.copy(path, path + '.backup')
 
     # 保存 wan6 块内容，以便切换回非 PPPoE 时恢复
@@ -1658,6 +1675,11 @@ def save_network_config():
                     web_config['router_ip4'] = new_ip
                     save_config(web_config)
         return jsonify({"success": True, "message": "网络配置已保存（需重启网络生效）"})
+    except ValueError as e:
+        # 配置本身不合法（例如单网卡机器上要求开 PPPoE）属于客户端问题，
+        # 走 400 + 明确 code，别混进 500 让前端只显示一句"保存失败"，
+        # 用户根本不知道是自己这台机器没有第二张网卡。
+        return jsonify({"success": False, "code": "INVALID_NETWORK", "message": str(e)}), 400
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 
@@ -2338,17 +2360,34 @@ def _parse_ddns_config():
 
 
 def _uci_set(key, value):
-    """执行 uci set，值用双引号包裹，特殊字符已转义
+    """执行 uci set。
 
-    必须剥掉换行：值里带 \n 会被 uci 当成新的一条指令，
-    造成 UCI 配置注入（domain/param_opt 等用户字段未过滤）。
+    值**完全不要加引号** —— uci 自己按第一个 `=` 分割并处理转义，
+    手动加引号反而会把它当成值的一部分。
+
+    2026-10-06 在 .224 上逐条实测（括号内是 `uci get` 的读回结果）：
+        set k=250            → 250        ✅
+        set k=%F %R          → %F %R      ✅（含空格也没问题）
+        set k=三重双引号pw   → 原样保留    ✅（ddns 密码的写法）
+        set k=it's           → it's       ✅
+        set k=a=b / a\\b / a;b → 原样保留   ✅
+    而加引号的写法会出事：
+        set k="250"          → "250"      ❌ 引号进了值
+        set k='%F %R'        → 双重包裹   ❌
+    前者会让 ddns-scripts 的 $((ddns_loglines + 1)) 报 arithmetic syntax error，
+    DDNS 永远起不来。
+
+    必须剥掉换行：值里带换行会被 uci 当成新的一条指令，
+    造成 UCI 配置注入（domain/param_opt 等用户字段未过滤）。其余字符
+    （引号、等号、分号、反斜杠）实测都由 uci 正确处理，不需要我们转义。
+
+    注意：本函数的文档字符串里刻意不写三连引号序列，否则会提前闭合 docstring。
     """
     if value is None:
         safe_val = ''
     else:
         safe_val = str(value).replace('\n', ' ').replace('\r', ' ')
-        safe_val = safe_val.replace('\\', '\\\\').replace('"', '\\"')
-    return subprocess.run(['uci', '-q', 'set', f'{key}="{safe_val}"'],
+    return subprocess.run(['uci', '-q', 'set', f'{key}={safe_val}'],
                           capture_output=True, text=True, timeout=10)
 
 

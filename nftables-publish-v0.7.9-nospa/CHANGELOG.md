@@ -61,6 +61,50 @@ nginx   系统自带          网关    自定义高位端口（默认 8443）
 
 ### 修复
 
+- **面板 CSP 补 `'unsafe-eval'`（P0，面板在浏览器里完全不可用）**。Alpine.js 不预编译
+  `x-data` / `@click` / `x-show` 表达式，而是运行时用 `new Function()` 现场编译。
+  原 CSP 为 `script-src 'self' 'unsafe-inline'`，缺 `unsafe-eval` 时浏览器直接抛
+  `Refused to evaluate a string as JavaScript`，Alpine 整个起不来 → 所有 `x-show`
+  失效 → 模态框遮罩常驻 → 连登录按钮都点不动。curl 级验收查不到这一层，
+  必须真实浏览器才能发现。认证门户是自写原生 JS 不需要 eval，那两页保持 `'self'`
+- **`diffModal` 与登录遮罩游离在 `x-data` 容器外（P0）**。两者父级是 `BODY` 而非
+  `x-data` 根，Alpine 不初始化它们 → `x-show` 永远不生效。此前被 `x-cloak` 掩盖，
+  cloak 一失效就暴露：登录成功后遮罩不消失、diffModal 永久盖屏。已移进容器
+- **`x-show` 保护的控件内部仍对 null 求值（P1）**。`x-show` 只管显隐，Alpine 初始化
+  时照样对内层 `x-model` 求值。`presetEditing`（5 处）与 `rpEditingRule`（10 处）
+  初始为 null → 每次开页面必抛 `Cannot read properties of null`。改用
+  `<template x-if>` 包裹，不满足就不渲染
+- **`checkAuth()` 读错一层导致登录死循环（P1）**。后端 `/api/auth/status` 返回
+  `{success, data:{...}}`（与其它端点一致的双层结构），`api.request` 只剥最外层，
+  直接读 `data.authenticated` 恒为 undefined → `password_set` 读成 false →
+  误判 `loginMode='setup'`。已设密码的面板首次打开显示「首次使用，请设置管理员密码」，
+  提交后后端 400「密码已设置，请用 /login 登录」，**死循环且无法自愈**。
+  改为兼容双层/扁平两种风格
+- **`x-init` 无视 `x-show`（P1）**。Alpine 的 `x-init` 不管 `x-show` 是否为 true 都执行，
+  页面一加载就调 `/api/rules/preview` → 401 → 派发 `auth-expired` →
+  `handleAuthExpired()` 清空 `config`/`rp` 并提示「会话已过期」——用户还没输密码
+  就被告知会话过期。守卫放在方法内（同时覆盖 x-init 与「刷新预览」两个入口），
+  并在 `loadAllData()` 里补一次，登录后仍自动加载
+- **DDNS 配置全部字段被写坏，DDNS 起不来（P1）**。`_uci_set()` 用**双引号**包裹值
+  （`uci set key="250"`），而 uci 会把双引号当成值的一部分存进文件，于是
+  `uci get` 读回来是 `"250"`。ddns-scripts 里的 `$((ddns_loglines + 1))` 直接报
+  `arithmetic syntax error`，点「重启服务」恒 500；密码里的三重双引号也被转义成
+  一串反斜杠。2026-10-06 在 .224 上逐条实测确认正确写法是**值完全不加引号** ——
+  uci 自己按第一个 `=` 分割并处理转义，含空格 / 单引号 / 等号 / 分号 / 反斜杠 /
+  三重双引号都能原样保留。加引号反而出错。修复后 DDNS 重启 500 → 200
+- **PPPoE 在单网卡机器上会导致整机失联（P0）**。`update_uci_wan_config()` 原本以
+  `wan_device = 'eth0'` 兜底，而 `eth0` 恰恰是 br-lan 的唯一从属端口（设备检测本就是
+  为把它排除掉）—— 兜底等于把 WAN 强行绑到 LAN 的网卡上，桥塌掉即失联。
+  2026-10-06 实测：x86 单网卡 OpenWrt 上点「PPPoE 拨号 → 保存网络配置 → 重启网络」，
+  设备当场 ARP FAILED，且无带外恢复入口。改为**检测不到独立 WAN 网卡就拒绝**，
+  返回 400 + `INVALID_NETWORK` 并说明原因；PPPoE 账号为空也一并拒绝
+- **空值无保护（P2）**。`getRpDefaultCert()` 在证书列表为空时返回 undefined，
+  HTML 直接 `.domain`；`handleAuthExpired()` 重置的 `this.rp` 不含 `dnsProviders`，
+  HTML 直接 `.dnsProviders.find`。均已加保护
+- **启动恢复规则的优先级**。规则文件 `99-custom-rules.nft` 丢失时原先落到 `.backup`
+  —— 那是「首次 apply 之前」的快照，可能比当前配置旧数周。实测因此踩中：backup 里的
+  trusted 白名单没有后来才加进去的管理机 IP，启动恢复把管理员自己的 SSH 和面板
+  一起关在门外。改为规则文件缺失时**优先按当前配置重新生成**，backup 降为第三优先级
 - **删除 HTTP 5000 跳转器**（死代码）。10-01 那轮把 `lan_allowed_ports` 从 5000
   改成 5443 之后，5000 就被防火墙 `policy drop` 拦住、从未可达，
   但代码里还留着并误导文档。对外只保留 HTTPS 5443 一个入口

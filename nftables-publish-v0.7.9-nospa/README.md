@@ -83,6 +83,11 @@ frontend/
 - **OpenWrt 25.x**：包管理器从 opkg 切换到 apk，setup.sh 已做兼容处理
 - **Linux 部署**：已预留 `deploy_mode=linux_gateway`（只重建自有表，不清空宿主机
   ruleset），但接口名、端口敲门（NAT 源 IP 下失效）、WAN IP 获取等完整适配尚未实现
+- **单网卡机器不能开 PPPoE**（已做拦截，见 CHANGELOG）。像 Proxmox 虚拟机这种只有
+  一张物理网卡的设备，`eth0` 已经是 br-lan 的唯一从属端口，再把 WAN 绑上去会让
+  桥塌掉、整机失联。面板会检测不到独立 WAN 网卡并拒绝保存（返回
+  `INVALID_NETWORK`），而不是猜一个网卡名写进配置。要用 PPPoE 得先在 OpenWrt
+  里划出第二张网卡专供 WAN
 - **日志页未重构**：面板侧访问/认证/指纹日志已落盘（JSONL），但日志页面仍沿用
   旧版，指纹展示尚未并入；防火墙包日志的 `log_size` 调大与远程转发也未做
 - **真实公网未穿透验证**：公网分支目前靠 `X-Test-IP` 头模拟来源判定，判定逻辑
@@ -91,3 +96,21 @@ frontend/
   `nginx-ssl` 不含该模块（装完不报错，一开网关整片 500）。已在
   `192.168.100.224`（OpenWrt 24.10.0）实测：`nginx-full 1.26.3` 具备
   `auth_request` / `realip`，`setup.sh` 装完会当场校验
+
+### 浏览器实测
+
+面板前端是 Alpine.js SPA，**必须有真实浏览器才能验证它能不能用**——curl 级别
+的验收完全查不出 Alpine 启动失败、元素被遮罩挡住、登录流程死循环这类问题。
+`tests/run-e2e.sh` 提供三种模式：
+
+```bash
+bash tests/run-e2e.sh setup     # 装 playwright-core + Chromium（装仓库外）
+bash tests/run-e2e.sh probe     # 14 页逐页枚举，与静态清单对账
+bash tests/run-e2e.sh click     # 逐个点击，捕获 JS 异常与 4xx/5xx
+bash tests/run-e2e.sh portal    # 认证门户全链路
+python3 tests/button_audit.py   # 静态全量抽取所有可交互元素（零依赖）
+```
+
+点击权限分三档，**默认只点无副作用的按钮**：`--destructive` 才点删除/清空/应用规则；
+`--allow-network` 才点重启网络/切 PPPoE。最后这档会直接把网络搞挂，开之前务必确认
+有一条带外恢复通道。
