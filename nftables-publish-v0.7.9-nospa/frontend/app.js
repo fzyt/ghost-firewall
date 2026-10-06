@@ -1,5 +1,23 @@
+// 日志级别表。放模块级而不是写进模板表达式 —— 徽章配色和筛选按钮共用一份，
+// 散在两处的话以后加级别一定会漏改一边。
+// err/error、warn/warning 是同义的两个键（OpenWrt 用 err，别的用 error），
+// 都留着，筛选按钮那边会按 label 去重。
+const LOG_LEVELS = [
+  { key: 'emerg',   label: '紧急', cls: 'bg-red-100 text-red-700' },
+  { key: 'alert',   label: '严重', cls: 'bg-red-100 text-red-700' },
+  { key: 'crit',    label: '致命', cls: 'bg-red-100 text-red-700' },
+  { key: 'err',     label: '错误', cls: 'bg-red-100 text-red-700' },
+  { key: 'error',   label: '错误', cls: 'bg-red-100 text-red-700' },
+  { key: 'warn',    label: '警告', cls: 'bg-amber-100 text-amber-700' },
+  { key: 'warning', label: '警告', cls: 'bg-amber-100 text-amber-700' },
+  { key: 'notice',  label: '通知', cls: 'bg-blue-100 text-blue-700' },
+  { key: 'info',    label: '信息', cls: 'bg-blue-100 text-blue-700' },
+  { key: 'debug',   label: '调试', cls: 'bg-gray-100 text-gray-600' },
+];
+
 function app() {
   return {
+    logLevels: LOG_LEVELS,
     // ======================= 认证状态 =======================
     auth: {
       authenticated: false,
@@ -32,6 +50,7 @@ function app() {
       log_ip: '',
       log_port: '514',
       log_proto: 'tcp',
+      log_size: 128,
       loading: false,
       saving: false,
     },
@@ -92,10 +111,14 @@ function app() {
       filteredLogs: [],
       sources: {},
       selectedSource: '',
+      selectedLevels: [],
       searchKeyword: '',
       currentPage: 1,
       pageSize: 200,
       loading: false,
+      buffer: null,
+      unparsed: 0,
+      authMerged: 0,
     },
 
     listsData: { whitelist: { ipv4: [], ipv6: [] }, blacklist: { ipv4: [], ipv6: [] } },
@@ -263,26 +286,70 @@ function app() {
       try { await this.loadRules(); } catch (_) {}
     },
 
+    // 改 log_size 会吃掉多少内存、能多装多少行。
+    // 行长用当前缓冲区实测的平均值兜底（.224 实测 ≈86 字节/行），
+    // 所以这是估算 —— 面板给的是区间，不是准数。
+    //
+    // 这里**返回预格式化好的字符串而不是数字**是有原因的，别改回去：
+    // 模板里曾写成 x-show="pct !== null" + x-text="pct.toFixed(1)"，
+    // 结果 x-show 只管显隐不管求值，mem_total 读不到时 pct 是 null，
+    // 每次进这一页都抛 10 条 "Cannot read properties of null"，
+    // 而且是页面级异常、按钮照样能点，不看控制台根本发现不了。
+    // 把格式化收进方法里，模板就再也碰不到 null。
+    logSizeEstimate(kb) {
+      const kbNum = Number(kb) || 128;
+      const per = this.systemLogs.buffer?.avg_bytes_per_line || 86;
+      const memTotal = this.systemLogs.buffer?.mem_total_kb || 0;
+      const lines = Math.round(kbNum * 1024 / per);
+      const pct = memTotal ? (kbNum / memTotal * 100) : null;
+      return {
+        lines: lines.toLocaleString(),
+        pctText: pct === null ? '' : pct.toFixed(1) + '%',
+        warn: pct !== null && pct > 10,
+      };
+    },
+
     async loadLogdConfig() {
       try {
         const data = await api.get('/api/logd/config');
         this.logdConfig.log_ip = data.log_ip || '';
         this.logdConfig.log_port = data.log_port || '514';
         this.logdConfig.log_proto = data.log_proto || 'tcp';
+        this.logdConfig.log_size = data.log_size || 128;
       } catch (e) {
         console.error('加载logd配置失败:', e);
       }
     },
 
     async saveLogdConfig() {
+      // 保存会重启 log 服务，而重启会把内存环形缓冲清空
+      // （.224 实测 1580 行 → 1 行）。这个副作用以前没有任何提示，
+      // 用户保存完回头发现日志全没了却不知道是谁干的。
+      // 注意只有真改了配置才重启（后端会比对），但事前先问一句最稳妥。
+      if (!confirm(
+        '保存后将重启 log 服务。\n\n' +
+        '重启会清空本机内存里还没转发出去的历史日志。\n' +
+        '（已配置远程转发的日志以远程服务器上保存的为准，不受影响。）\n\n' +
+        '确定继续吗？'
+      )) return;
+
       this.logdConfig.saving = true;
       try {
-        await api.post('/api/logd/config', {
+        // api.request 把 message 解构掉了，这里拿不到后端文案，
+        // 所以按返回的结构化字段自己拼提示
+        const r = await api.post('/api/logd/config', {
           log_ip: this.logdConfig.log_ip,
           log_port: this.logdConfig.log_port,
           log_proto: this.logdConfig.log_proto,
+          log_size: this.logdConfig.log_size,
         });
-        this.showToast('日志转发配置已保存，logd 服务已重启', 'success');
+        if (r.restarted) {
+          this.showToast(
+            `已保存，log 服务已重启（缓冲上限 ${r.log_size}KB）。本机历史日志已清空。`,
+            'warning');
+        } else {
+          this.showToast('配置未变化，log 服务未重启，日志未清空', 'success');
+        }
       } catch (e) {
         this.showToast('保存失败: ' + e.message, 'error');
       } finally {
@@ -526,12 +593,17 @@ function app() {
     async loadSystemLogs() {
       this.systemLogs.loading = true;
       try {
-        const data = await api.get('/api/system/logs?lines=5000');
-        this.systemLogs.allLogs = (data.logs || []).reverse();
+        const data = await api.get('/api/system/logs?lines=20000');
+        // 后端已经按 epoch 倒序排好了，这里**不要**再 reverse()
+        // （原来那版前端 reverse 是因为后端返回的是 logread 的正序，
+        //  后端改掉之后这行 reverse 会把顺序整个翻反，且没有任何报错）
+        this.systemLogs.allLogs = data.logs || [];
         this.systemLogs.sources = data.sources || {};
+        this.systemLogs.buffer = data.buffer || null;
+        this.systemLogs.unparsed = data.unparsed || 0;
+        this.systemLogs.authMerged = data.auth_merged || 0;
         this.systemLogs.currentPage = 1;
-        this.systemLogs.searchKeyword = '';
-        this.systemLogs.selectedSource = '';
+        // 不清空筛选条件：刷新日志时用户往往正是想继续看刚才筛出来的那批
         this.applyLogFilter();
       } catch (e) {
         this.showToast('加载日志失败: ' + e.message, 'error');
@@ -541,20 +613,128 @@ function app() {
     },
 
     applyLogFilter() {
-      let logs = [...this.systemLogs.allLogs];
-      if (this.systemLogs.selectedSource) {
-        logs = logs.filter(l => l.program === this.systemLogs.selectedSource);
+      const sl = this.systemLogs;
+      const levels = sl.selectedLevels;
+      const kw = (sl.searchKeyword || '').toLowerCase().trim();
+
+      sl.filteredLogs = sl.allLogs.filter(l => {
+        if (sl.selectedSource && l.source !== sl.selectedSource) return false;
+        if (levels.length && !levels.includes(l.level)) return false;
+        if (kw) {
+          // 认证事件的指纹字段也纳入搜索 —— 查审计时最常见的问题是
+          // 「这台设备什么时候来过」，只搜 message 的话 device/fp 永远搜不到。
+          const hay = [l.message, l.source, l.ts, l.level,
+                       l.device, l.fp, l.ip, l.user, l.event, l.uri]
+            .filter(Boolean).join(' ').toLowerCase();
+          if (!hay.includes(kw)) return false;
+        }
+        return true;
+      });
+      sl.currentPage = 1;
+    },
+
+    toggleLogLevel(level) {
+      const a = this.systemLogs.selectedLevels;
+      const i = a.indexOf(level);
+      if (i >= 0) a.splice(i, 1); else a.push(level);
+      this.applyLogFilter();
+    },
+
+    clearLogFilters() {
+      this.systemLogs.selectedSource = '';
+      this.systemLogs.selectedLevels = [];
+      this.systemLogs.searchKeyword = '';
+      this.applyLogFilter();
+    },
+
+    // 各级别计数，给筛选按钮上的角标用
+    get logLevelCounts() {
+      const c = {};
+      for (const l of this.systemLogs.allLogs) {
+        c[l.level] = (c[l.level] || 0) + 1;
       }
-      if (this.systemLogs.searchKeyword) {
-        const kw = this.systemLogs.searchKeyword.toLowerCase();
-        logs = logs.filter(l =>
-          l.message.toLowerCase().includes(kw) ||
-          l.program.toLowerCase().includes(kw) ||
-          l.timestamp.includes(kw)
-        );
+      return c;
+    },
+
+    // 只列出数据里真实出现过的级别，并按 label 去重：
+    // err 和 error 同义，全列出来会出现两个「错误」按钮而其中一个恒为 0。
+    get logLevelsPresent() {
+      const counts = this.logLevelCounts;
+      return LOG_LEVELS
+        .filter(x => counts[x.key])
+        .filter((x, i, arr) => arr.findIndex(y => y.label === x.label) === i)
+        .map(x => ({ ...x, count: counts[x.key] }));
+    },
+
+    levelCls(level) {
+      const hit = LOG_LEVELS.find(x => x.key === level);
+      return hit ? hit.cls : 'bg-gray-100 text-gray-600';
+    },
+
+    levelLabel(level) {
+      const hit = LOG_LEVELS.find(x => x.key === level);
+      return hit ? hit.label : level;
+    },
+
+    // ISO 2026-10-06T18:52:41 → 10-06 18:52:41。
+    // 日志表列宽紧张，全 ISO 太长；完整值放 title 里，鼠标悬停能看全。
+    logTimeShort(iso) {
+      if (!iso || iso.length < 19) return iso || '';
+      return iso.slice(5, 10) + ' ' + iso.slice(11, 19);
+    },
+
+    // 缓冲区水位文案。缓冲写满后 logread 只会返回上限内的内容 ——
+    // 原来 UI 无条件显示"共 N 条"，用户看不出 N 是全量还是被截断了。
+    get logBufferText() {
+      const b = this.systemLogs.buffer;
+      if (!b) return '';
+      if (!b.log_size_kb) return `缓冲区 ${b.total_lines} 行（log_size 未设置）`;
+      const pct = Math.min(100, b.used_pct || 0);
+      return `${b.log_size_kb} KB · 已用 ${pct}% · 约 ${b.total_lines} 行`
+        + ` / 上限约 ${b.est_capacity_lines} 行`;
+    },
+
+    exportLogs(format) {
+      const rows = this.systemLogs.filteredLogs;
+      if (!rows.length) {
+        this.showToast('当前筛选结果为空，没有可导出的内容', 'error');
+        return;
       }
-      this.systemLogs.filteredLogs = logs;
-      this.systemLogs.currentPage = 1;
+
+      const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+      const total = this.systemLogs.allLogs.length;
+      let blob, name;
+
+      if (format === 'json') {
+        blob = new Blob([JSON.stringify(rows, null, 2)],
+                        { type: 'application/json;charset=utf-8' });
+        name = `nftables-logs-${stamp}.json`;
+      } else {
+        // 所有字段加引号、内部引号翻倍：日志消息里逗号和引号都很常见
+        // （DHCPACK 那类），不转义导出的文件在 Excel 里直接串列。
+        const COLS = ['ts', 'level', 'source', 'kind', 'facility', 'pid',
+                      'message', 'event', 'ip', 'user', 'device', 'fp', 'uri'];
+        const q = v => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
+        const csv = [COLS.join(',')]
+          .concat(rows.map(r => COLS.map(c => q(r[c])).join(',')))
+          .join('\r\n');
+        // 前置 BOM：没有它 Excel 会按本地代码页解码，中文全是乱码
+        blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8' });
+        name = `nftables-logs-${stamp}.csv`;
+      }
+
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      // 立刻 revoke 会让部分浏览器下载到空文件，推迟一拍
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+      const scope = rows.length < total ? `（筛选后，共 ${total} 条）` : '';
+      this.showToast(`已导出 ${rows.length} 条${scope}`, 'success');
     },
 
     getLogTotalPages() {

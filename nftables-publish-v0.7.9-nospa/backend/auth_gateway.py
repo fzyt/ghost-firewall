@@ -38,6 +38,7 @@ import ipaddress
 import json
 import os
 import secrets
+import subprocess
 import time
 
 import fcntl
@@ -364,8 +365,51 @@ def _mutate_ratelimit(ip: str, on_fail: bool):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 审计日志（JSONL 落盘）
+# 审计日志（JSONL 落盘 + syslog 转发）
 # ══════════════════════════════════════════════════════════════════════
+
+# 只有低频安全事件才进 syslog。verify_denied / token_refreshed 刻意排除：
+# verify_denied 每个未认证请求都触发，全 WAN 打过来会把远程日志服务器刷爆，
+# 真正该看的那几条反而被埋掉。这两类事件在本地 JSONL 里仍然是全的。
+_SYSLOG_EVENTS = {"login_ok": "info", "logout": "info",
+                  "login_fail": "warn", "lockout": "err"}
+_SYSLOG_TAG = "nftables-web-auth"
+
+
+def _sanitize(value, limit=120):
+    """剥掉控制字符。
+
+    UA / URI 都带客户端可控内容，原样写进 syslog 等于给了日志注入：
+    一个 UA 里塞个换行，就能在远程日志里凭空伪造出一整行「登录成功」。
+    所以非可打印字符一律丢掉，长度也截住。
+    """
+    if not value:
+        return ""
+    return "".join(c for c in str(value) if c.isprintable())[:limit].strip()
+
+
+def _syslog(event: str, rec: dict):
+    """发一条 syslog，让 logd 转发到远程日志服务器。
+
+    本地 JSONL 才是权威记录，syslog 只是给它开一个外送通道，
+    所以任何异常都吞掉 —— 不值得为一条日志冒认证流程的风险。
+    """
+    level = _SYSLOG_EVENTS.get(event)
+    if not level:
+        return
+    parts = [event]
+    for k in ("user", "ip", "device", "fp", "uri", "reason"):
+        v = _sanitize(rec.get(k))
+        if v:
+            parts.append(f"{k}={v}")
+    try:
+        subprocess.run(
+            ["logger", "-t", _SYSLOG_TAG, "-p", f"user.{level}", " ".join(parts)],
+            capture_output=True, timeout=3,
+        )
+    except Exception:
+        pass
+
 
 def audit(event: str, **fields):
     """写审计日志。任何失败都不能影响认证流程本身。"""
@@ -387,6 +431,12 @@ def audit(event: str, **fields):
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         pass   # 审计失败不能反过来阻断认证
+
+    # 放 try 外面：_syslog 自己吞所有异常，这里不该连带影响上面的落盘
+    try:
+        _syslog(event, rec)
+    except Exception:
+        pass
 
 
 # ══════════════════════════════════════════════════════════════════════

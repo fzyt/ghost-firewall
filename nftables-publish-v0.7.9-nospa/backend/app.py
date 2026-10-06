@@ -3014,58 +3014,258 @@ def aliyun_ddns_test():
         return jsonify({"success": False, "message": str(e)}), 500
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 系统日志：logread + 认证审计 → 合并成一条时间线
+# ══════════════════════════════════════════════════════════════════════
+
+# 认证服务落盘的审计日志。路径写死，不接受请求参数 —— 见 _read_audit_events。
+AUTH_AUDIT_LOG = "/var/log/nftables-web-auth.log"
+
+# logread 输出： Tue Oct  6 18:52:41 2026 daemon.err dropbear[615]: Bad password ...
+#
+# 三处刻意的宽松，都是为了「宁可解析得糙，也不要静默丢行」——日志页一旦
+# 悄悄少给几行，用户就没法信它了：
+#   · 星期几和年份都是可选的。OpenWrt 的 logread 会输出星期，但 busybox
+#     syslogd -L 落到文件里的就不一定有，不能把格式差异当成格式错误。
+#   · facility 用 [\w.-]+ 贪婪匹配，再回溯找最后一个点。贪婪只在单个
+#     token 内生效（字符类不含空白），所以 "my.app-name_v2.info" 能正确
+#     拆成 facility=my.app-name_v2 / level=info，而 "daemon.err" 不会
+#     被后面的消息内容带偏。
+#   · 程序名和 pid 整段可选："kernel.crit " 这种没有 "prog:" 结构的
+#     也能收下，而不是整行丢掉。
+_SYSLOG_RE = re.compile(
+    r"^(?:(?P<wday>\w{3})\s+)?(?P<mon>\w{3})\s+(?P<day>\d{1,2})\s+"
+    r"(?P<hms>\d{2}:\d{2}:\d{2})(?:\s+(?P<year>\d{4}))?\s+"
+    r"(?P<fac>[\w.-]+)\.(?P<lvl>[\w-]+)(?:\[\d+\])?\s+"
+    r"(?:(?P<prog>\S+?)(?:\[(?P<pid>\d+)\])?:\s?)?(?P<msg>.*)$"
+)
+
+_MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+           "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+
+# 级别序，数字小的更严重。前端排序/筛选和导出都用它。
+LOG_LEVEL_ORDER = {"emerg": 0, "alert": 1, "crit": 2, "err": 3, "error": 3,
+                   "warn": 4, "warning": 4, "notice": 5, "info": 6, "debug": 7}
+
+AUTH_SOURCE = "nftables-web-auth"
+
+# 认证事件 → 日志级别。
+# 刻意不含 verify_denied / token_refreshed：前者每个未认证请求都会触发，
+# 后者每半个 TTL 一次。它们留在 JSONL 审计里，不进 syslog，
+# 否则远程转发会被刷屏（转发配置见 /api/logd/config）。
+AUTH_EVENT_LEVEL = {
+    "login_ok": "info",
+    "logout": "info",
+    "login_fail": "warn",
+    "lockout": "err",
+}
+AUTH_EVENT_TEXT = {
+    "login_ok": "登录成功",
+    "login_fail": "登录失败",
+    "logout": "登出",
+    "lockout": "来源被锁定",
+}
+
+
+def _mem_total_kb():
+    """物理内存总量（KB）。给日志页算 log_size 占用比例用，读不到就返回 0。"""
+    try:
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1])
+    except (IOError, OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def _log_size_kb():
+    """logd 内存环形缓冲上限（/etc/config/system 的 log_size，单位 KB）。
+
+    logd 在启动时按这个值分配缓冲，运行中改配置不重启服务是不生效的 ——
+    这是 /api/logd/config 保存时必须重启 log 的原因。
+    返回 0 表示未设置，用 logd 自身默认值（OpenWrt 为 128KB）。
+    """
+    try:
+        r = subprocess.run(["uci", "-q", "get", "system.@system[0].log_size"],
+                           capture_output=True, text=True, timeout=10)
+        return int(r.stdout.strip())
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return 0
+
+
+def _iso_from_syslog(m, now_year):
+    """syslog 时间头 → (ISO 字符串, epoch)。解析不出来返回 (None, 0)。"""
+    mon = _MONTHS.get(m.group("mon").lower())
+    if not mon:
+        return None, 0
+    year = int(m.group("year")) if m.group("year") else now_year
+    try:
+        h, mi, sec = (int(x) for x in m.group("hms").split(":"))
+        dt = datetime.datetime(year, mon, int(m.group("day")), h, mi, sec)
+    except (ValueError, TypeError):
+        return None, 0
+    return dt.isoformat(timespec="seconds"), int(dt.timestamp())
+
+
+def _read_audit_events(limit=2000):
+    """读认证服务的 JSONL 审计日志，转成统一日志条目。
+
+    路径**写死**：这里读的是 root 起的文件，路径一旦可由请求控制，
+    就等于给了面板一个任意读文件的洞。
+    单行坏掉就跳过：auth_gateway 的 audit() 被刻意写成「任何失败都不影响
+    认证」，所以它的日志天生可能有半截行，不能因为一行坏就整个失败。
+    """
+    out = []
+    try:
+        with open(AUTH_AUDIT_LOG, "r", errors="replace") as f:
+            raw_lines = f.readlines()
+    except (IOError, OSError):
+        return out          # 文件不存在 = 认证服务没写过 = 正常情况
+
+    for line in (raw_lines[-limit:] if limit else raw_lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+
+        event = str(rec.get("event") or "")[:64]
+        level = AUTH_EVENT_LEVEL.get(event, "info")
+        ts_raw = str(rec.get("ts") or "")
+        try:
+            dt = datetime.datetime.fromisoformat(ts_raw)
+            ts, epoch = dt.isoformat(timespec="seconds"), int(dt.timestamp())
+        except ValueError:
+            ts, epoch = ts_raw, 0
+
+        ip = str(rec.get("ip") or "")[:64]
+        user = str(rec.get("user") or "")[:64]
+        # 消息列给人读，结构化字段单独留给前端做徽章
+        msg = AUTH_EVENT_TEXT.get(event, event)
+        if user:
+            msg += f"  user={user}"
+        if ip:
+            msg += f"  ip={ip}"
+
+        out.append({
+            "ts": ts,
+            "epoch": epoch,
+            "level": level,
+            "source": AUTH_SOURCE,
+            "kind": "auth",
+            "facility": "auth",
+            "pid": "",
+            "message": msg,
+            "event": event,
+            "ip": ip,
+            "user": user,
+            "device": str(rec.get("device") or "")[:64],
+            "fp": str(rec.get("fp") or "")[:64],
+            "ua": str(rec.get("ua") or "")[:200],
+            "uri": str(rec.get("uri") or "")[:200],
+            "reason": str(rec.get("reason") or "")[:120],
+        })
+    return out
+
+
 @app.route("/api/system/logs", methods=["GET"])
 def get_system_logs():
-    """获取系统日志（通过 logread）"""
+    """系统日志 = logread 全量 + 认证审计，合并成一条按时间倒序的时间线。
+
+    2026-10-06 在 .224 上实测后改版，原来那版有三个说不通的地方：
+    1. 固定 `logread -l 5000`，但 log_size 默认才 128KB，环形缓冲写满后
+       logread 实际只返回 1582 行，UI 却照样显示「共 N 条」，让人误以为是全量。
+       现在把水位、已用字节、容量估算一起返回，前端顶部画出来。
+    2. 只读 logread，认证服务的 /var/log/nftables-web-auth.log
+       （login_ok / login_fail / logout，带设备指纹）面板一条都看不到 ——
+       数据一直在采，只是没有出口。
+    3. 时间戳直接透传 syslog 文本（"Tue Oct  6 18:52:41 2026"），
+       排序和筛选都别扭。现在统一成 ISO。
+    """
     try:
-        lines = request.args.get("lines", 5000, type=int)
-        lines = min(max(lines, 1), 5000)
+        lines = request.args.get("lines", 20000, type=int)
+        lines = min(max(lines, 1), 20000)
 
+        # 取全量而不是 logread -l N：水位要按整个缓冲区算，
+        # 而 logread -l N 在缓冲写满时返回的就是全部，再 slice 一次是白费。
         result = subprocess.run(
-            ["logread", "-l", str(lines)],
-            capture_output=True, text=True, timeout=10
+            ["logread"], capture_output=True, text=True, timeout=20
         )
-
         if result.returncode != 0:
             return jsonify({
                 "success": False,
                 "message": result.stderr.strip() or "logread 执行失败"
             }), 500
 
-        log_pattern = re.compile(
-            r"^(\w{3}\s+\w{3}\s+\d+\s+\d+:\d+:\d+\s+\d+)\s+"
-            r"(\w+)\.(\w+)\s+"
-            r"([^\[:]+)"
-            r"(?:\[(\d+)\])?:\s+"
-            r"(.*)$"
-        )
-
-        logs = []
+        raw = result.stdout
+        now_year = datetime.datetime.now().year
+        entries = []
         sources = {}
-        for line in result.stdout.strip().split("\n"):
-            if not line:
+        unparsed = 0
+
+        for line in raw.split("\n"):
+            if not line.strip():
                 continue
-            m = log_pattern.match(line)
-            if m:
-                entry = {
-                    "timestamp": m.group(1),
-                    "facility": m.group(2),
-                    "level": m.group(3),
-                    "program": m.group(4).strip(),
-                    "pid": m.group(5),
-                    "message": m.group(6),
-                }
-                logs.append(entry)
-                program = entry["program"]
-                sources[program] = sources.get(program, 0) + 1
+            m = _SYSLOG_RE.match(line)
+            ts, epoch = _iso_from_syslog(m, now_year) if m else (None, 0)
+            if not ts:
+                # 解析不了的照样计数返回。悄悄少几行，日志页就没法被信任了。
+                unparsed += 1
+                continue
+            prog = (m.group("prog") or "—").strip()
+            entries.append({
+                "ts": ts,
+                "epoch": epoch,
+                "level": m.group("lvl").lower(),
+                "source": prog,
+                "kind": "syslog",
+                "facility": m.group("fac"),
+                "pid": m.group("pid") or "",
+                "message": m.group("msg"),
+            })
+            sources[prog] = sources.get(prog, 0) + 1
+
+        syslog_count = len(entries)
+
+        for e in _read_audit_events():
+            entries.append(e)
+            sources[AUTH_SOURCE] = sources.get(AUTH_SOURCE, 0) + 1
+
+        entries.sort(key=lambda e: e["epoch"], reverse=True)
+        entries = entries[:lines]
+
+        # 水位：真实上限是字节不是行数，实测 ≈86 字节/行，
+        # 所以「还能装多少行」只能按当前平均行长估算，不能当成准数。
+        size_kb = _log_size_kb()
+        total_bytes = len(raw.encode("utf-8", "replace"))
+        total_lines = raw.count("\n")
+        cap_bytes = size_kb * 1024
+        avg_bytes = (total_bytes / total_lines) if total_lines else 0
+        est_lines = int(cap_bytes / avg_bytes) if (cap_bytes and avg_bytes) else 0
 
         sources = dict(sorted(sources.items(), key=lambda x: x[1], reverse=True))
 
         return jsonify({
             "success": True,
-            "total": len(logs),
-            "logs": logs,
+            "total": len(entries),
+            "logs": entries,
             "sources": sources,
+            "buffer": {
+                "log_size_kb": size_kb,
+                "used_bytes": total_bytes,
+                "total_lines": total_lines,
+                "used_pct": round(total_bytes / cap_bytes * 100, 1) if cap_bytes else 0,
+                "est_capacity_lines": est_lines,
+                "avg_bytes_per_line": round(avg_bytes, 1) if avg_bytes else 0,
+                "mem_total_kb": _mem_total_kb(),
+            },
+            "auth_merged": len(entries) - syslog_count if syslog_count else 0,
+            "unparsed": unparsed,
         })
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
@@ -3077,13 +3277,14 @@ import re
 
 @app.route("/api/logd/config", methods=["GET"])
 def get_logd_config():
-    """读取当前 logd 远程日志转发配置"""
+    """读取当前 logd 远程日志转发配置 + 环形缓冲上限"""
     try:
         result = subprocess.run(
             ["uci", "show", "system"], capture_output=True, text=True, timeout=10
         )
         output = result.stdout
-        config = {"success": True, "log_ip": "", "log_port": "", "log_proto": ""}
+        config = {"success": True, "log_ip": "", "log_port": "", "log_proto": "",
+                  "log_size": _log_size_kb()}
         for key, field in [
             ("system.@system[0].log_ip", "log_ip"),
             ("system.@system[0].log_port", "log_port"),
@@ -3097,64 +3298,117 @@ def get_logd_config():
         return jsonify({"success": False, "message": str(e)}), 500
 
 
+# log_size 是 logd 的内存环形缓冲，单位 KB。范围按 OpenWrt 实际能给的范围给：
+# 下限 16（太小几乎记不住东西），上限 8192（再大对家用路由器就是自杀）。
+LOG_SIZE_MIN_KB = 16
+LOG_SIZE_MAX_KB = 8192
+
+
 @app.route("/api/logd/config", methods=["POST"])
 def set_logd_config():
-    """保存并应用 logd 远程日志转发配置"""
+    """保存并应用 logd 配置（远程转发 + 环形缓冲大小）
+
+    ⚠ log_size 只在 logd 启动时读取，改了必须重启 /etc/init.d/log 才生效，
+    而 **重启会清空内存里的环形缓冲**（.224 实测 1580 行 → 1 行）。
+    所以下面只要真的改了任何配置就重启，并如实告诉前端「缓冲已清空」，
+    让 UI 能提示用户 —— 否则用户保存完回头看日志全没了却不知道是谁干的。
+    """
     try:
         data = request.get_json(force=True)
         log_ip = data.get("log_ip", "").strip()
         log_port = data.get("log_port", "").strip()
         log_proto = data.get("log_proto", "").strip()
 
+        # log_size 可选：前端不传就不动它，避免只改转发时误清缓冲
+        raw_size = data.get("log_size", None)
+        new_size = None
+        if raw_size is not None and str(raw_size).strip() != "":
+            try:
+                new_size = int(str(raw_size).strip())
+            except ValueError:
+                return jsonify({"success": False,
+                                "message": "log_size 必须是整数（KB）"}), 400
+            if not (LOG_SIZE_MIN_KB <= new_size <= LOG_SIZE_MAX_KB):
+                return jsonify({"success": False, "message":
+                                f"log_size 需在 {LOG_SIZE_MIN_KB}–{LOG_SIZE_MAX_KB} KB 之间"}), 400
+
         # 如果 log_ip 为空，则删除转发配置
+        fwd_changed = False
         if not log_ip:
             for key in [
                 "system.@system[0].log_ip",
                 "system.@system[0].log_port",
                 "system.@system[0].log_proto",
             ]:
+                r = subprocess.run(
+                    ["uci", "get", key], capture_output=True, text=True, timeout=10
+                )
+                if r.returncode == 0 and r.stdout.strip():
+                    fwd_changed = True
                 subprocess.run(
                     ["uci", "delete", key], capture_output=True, text=True, timeout=10
                 )
-            subprocess.run(["uci", "commit", "system"], timeout=10)
-            subprocess.run(["/etc/init.d/log", "restart"], timeout=10)
-            return jsonify({"success": True, "message": "日志转发配置已清除"})
+        else:
+            # 验证 log_ip：简单 IP 格式
+            ip_pattern = r"^(\d{1,3}\.){3}\d{1,3}$"
+            if not re.match(ip_pattern, log_ip):
+                return jsonify({"success": False, "message": "log_ip 格式无效"}), 400
+            parts = log_ip.split(".")
+            if any(not (0 <= int(p) <= 255) for p in parts):
+                return jsonify({"success": False, "message": "log_ip 格式无效"}), 400
 
-        # 验证 log_ip：简单 IP 格式
-        ip_pattern = r"^(\d{1,3}\.){3}\d{1,3}$"
-        if not re.match(ip_pattern, log_ip):
-            return jsonify({"success": False, "message": "log_ip 格式无效"}), 400
-        parts = log_ip.split(".")
-        if any(not (0 <= int(p) <= 255) for p in parts):
-            return jsonify({"success": False, "message": "log_ip 格式无效"}), 400
+            # 验证 log_port：1-65535
+            if log_port:
+                if not log_port.isdigit() or not (1 <= int(log_port) <= 65535):
+                    return jsonify({"success": False, "message": "log_port 必须是 1-65535 的数字"}), 400
 
-        # 验证 log_port：1-65535
-        if log_port:
-            if not log_port.isdigit() or not (1 <= int(log_port) <= 65535):
-                return jsonify({"success": False, "message": "log_port 必须是 1-65535 的数字"}), 400
+            # 验证 log_proto
+            if log_proto and log_proto not in ("tcp", "udp"):
+                return jsonify({"success": False, "message": "log_proto 只允许 tcp 或 udp"}), 400
 
-        # 验证 log_proto
-        if log_proto and log_proto not in ("tcp", "udp"):
-            return jsonify({"success": False, "message": "log_proto 只允许 tcp 或 udp"}), 400
+            for key, val in [
+                ("system.@system[0].log_ip", log_ip),
+                ("system.@system[0].log_port", log_port),
+                ("system.@system[0].log_proto", log_proto),
+            ]:
+                r = subprocess.run(
+                    ["uci", "-q", "get", key], capture_output=True, text=True, timeout=10
+                )
+                if not (r.returncode == 0 and r.stdout.strip() == val):
+                    fwd_changed = True
+                _uci_set(key, val)
 
-        # uci set
-        subprocess.run(
-            ["uci", "set", f"system.@system[0].log_ip={log_ip}"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if log_port:
-            subprocess.run(
-                ["uci", "set", f"system.@system[0].log_port={log_port}"],
-                capture_output=True, text=True, timeout=10,
-            )
-        if log_proto:
-            subprocess.run(
-                ["uci", "set", f"system.@system[0].log_proto={log_proto}"],
-                capture_output=True, text=True, timeout=10,
-            )
+        size_changed = False
+        if new_size is not None:
+            cur = _log_size_kb()
+            if cur != new_size:
+                _uci_set("system.@system[0].log_size", new_size)
+                size_changed = True
+
         subprocess.run(["uci", "commit", "system"], timeout=10)
-        subprocess.run(["/etc/init.d/log", "restart"], timeout=10)
-        return jsonify({"success": True, "message": "日志转发配置已保存"})
+
+        restarted = False
+        if fwd_changed or size_changed:
+            subprocess.run(["/etc/init.d/log", "restart"], timeout=15)
+            restarted = True
+
+        msgs = []
+        if size_changed:
+            msgs.append(f"log_size 已改为 {new_size}KB")
+        if fwd_changed:
+            msgs.append("转发配置已保存" if log_ip else "转发配置已清除")
+        if restarted:
+            msgs.append("log 服务已重启（内存中的历史日志已清空）")
+        if not msgs:
+            msgs.append("配置未变化，未重启 log 服务")
+
+        return jsonify({
+            "success": True,
+            "message": "；".join(msgs),
+            "restarted": restarted,
+            "buffer_cleared": restarted,
+            "log_size": new_size if new_size is not None else _log_size_kb(),
+        })
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 
