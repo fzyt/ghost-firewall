@@ -225,9 +225,19 @@ def _security_headers(resp):
     resp.headers.setdefault('X-Content-Type-Options', 'nosniff')
     resp.headers.setdefault('Referrer-Policy', 'same-origin')
     # CSP：内网单页面应用，限制脚本和样式只允许 self + unsafe-inline（兼容 Alpine.js inline event）
+    #
+    # ⚠️ 'unsafe-eval' 是 Alpine.js 的硬性要求，删了会让整个面板变成静态页面。
+    # Alpine 不预编译 x-data / @click / x-show 这些表达式字符串，而是在运行时用
+    # new Function() 现场编译。缺 'unsafe-eval' 时浏览器直接抛
+    # "Refused to evaluate a string as JavaScript"，Alpine 起不来 →
+    # 所有 x-show 不生效 → 模态框遮罩常驻 → 连登录按钮都点不动。
+    # 2026-10-06 真实浏览器实测才暴露出来（curl 级验收查不到这一层）。
+    #
+    # 认证门户（backend/static/）是自己写的原生 JS，不需要 eval，那两页的 CSP
+    # 仍保持 'self' 不带 unsafe-eval —— 别把这里的安全收紧误套到门户上。
     resp.headers.setdefault('Content-Security-Policy', (
         "default-src 'self'; "
-        "script-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
         "style-src 'self' 'unsafe-inline'; "
         "img-src 'self' data:; "
         "font-src 'self' data:; "
@@ -5638,8 +5648,9 @@ def _auto_recover_ruleset_if_empty():
 
     恢复优先级：
     1. RULES_PATH（上次成功应用的规则；用户配置的最新）
-    2. RULES_PATH.backup（首次 apply 时保存的"应用前"快照）
-    3. basic lockdown（WAN block / LAN allow，兜底保证路由器不裸奔）
+    2. 按当前配置重新生成（仅当 RULES_PATH 缺失时）
+    3. RULES_PATH.backup（首次 apply 时保存的"应用前"快照）
+    4. basic lockdown（WAN block / LAN allow，兜底保证路由器不裸奔）
 
     任何一个通过双重验证（nft -f returncode=0 + fw4 表真存在）就停止。
     全部失败也只记录日志，不抛异常（ruleset 空只是"没规则"而非"程序错误"，
@@ -5655,9 +5666,27 @@ def _auto_recover_ruleset_if_empty():
         if _try_apply_rules_file(RULES_PATH):
             print(f'[INFO] ✅ 已从 {RULES_PATH} 恢复 ruleset', flush=True)
             return
-        print(f'[WARN] 从 {RULES_PATH} 恢复失败，尝试 backup...', flush=True)
+        print(f'[WARN] 从 {RULES_PATH} 恢复失败，尝试按当前配置重建...', flush=True)
 
-    # 优先级 2：.backup 文件
+    # 优先级 2：按当前配置重新生成
+    #
+    # 这一步必须排在 .backup 之前。.backup 是「首次 apply 之前」的快照，可能比
+    # 当前配置旧好几周。实测踩过（2026-10-06）：规则文件 99-custom-rules.nft 丢失，
+    # 启动恢复落到 9-18 的 backup —— 那份 backup 里的 trusted 白名单没有后来才
+    # 加进去的管理机 IP，于是 input 链 policy drop 把管理员自己的 SSH 和面板
+    # 一起挡在门外，只能从另一台仍在白名单里的机器登进去救。
+    # 「保险丝不能装在电表箱里」：恢复用的规则必须来自当前配置，而不是历史快照。
+    if not os.path.exists(RULES_PATH):
+        try:
+            ok, msg = _apply_ruleset(load_config())
+            if ok:
+                print(f'[INFO] ✅ 规则文件缺失，已按当前配置重新生成并加载: {msg}', flush=True)
+                return
+            print(f'[WARN] 按当前配置重建失败（{msg}），尝试 backup...', flush=True)
+        except Exception as e:
+            print(f'[WARN] 按当前配置重建异常（{e}），尝试 backup...', flush=True)
+
+    # 优先级 3：.backup 文件
     backup_path = RULES_PATH + '.backup'
     if os.path.exists(backup_path):
         if _try_apply_rules_file(backup_path):
@@ -5665,7 +5694,7 @@ def _auto_recover_ruleset_if_empty():
             return
         print(f'[WARN] 从 {backup_path} 恢复失败，尝试 basic lockdown...', flush=True)
 
-    # 优先级 3：basic lockdown（兜底）
+    # 优先级 4：basic lockdown（兜底）
     if _apply_basic_lockdown():
         print('[INFO] ✅ 已应用 basic lockdown（WAN block / LAN allow / SSH + Web 放行）', flush=True)
         return

@@ -171,9 +171,17 @@ function app() {
     async checkAuth() {
       try {
         const data = await api.get('/api/auth/status');
-        this.auth.authenticated = !!data.authenticated;
-        this.auth.passwordSet = !!data.password_set;
-        this.auth.loginMode = data.password_set ? 'login' : 'setup';
+        // 后端 /api/auth/status 返回 {success, data:{...}} 双层结构（与
+        // /api/reverse-proxy/status 等一致），而 api.request 只剥掉最外层的
+        // success/message，直接读 data.authenticated 永远是 undefined。
+        // 后果：password_set 读成 false → loginMode 误判成 'setup' → 已部署的
+        // 面板首次打开显示的是「首次使用，请设置管理员密码」而不是登录框，
+        // 用户输密码提交后后端 400「密码已设置，请用 /login 登录」——死循环。
+        // 兼容双层与扁平两种风格。
+        const d = (data && data.data) || data || {};
+        this.auth.authenticated = !!d.authenticated;
+        this.auth.passwordSet = !!d.password_set;
+        this.auth.loginMode = d.password_set ? 'login' : 'setup';
       } catch (e) {
         // 401 说明未登录（虽然 status 端点本身放行，但保险起见）
         this.auth.authenticated = false;
@@ -250,6 +258,9 @@ function app() {
       try { await this.loadFirewallStatus(); } catch (_) {}
       try { await this.loadDdns(); } catch (_) {}
       try { await this.loadReverseProxy(); } catch (_) {}
+      // 规则预览走的是 x-init，而 x-init 在未登录时就被守卫挡掉了，
+      // 登录后需要在这里补一次，否则进防火墙页看到的是空预览。
+      try { await this.loadRules(); } catch (_) {}
     },
 
     async loadLogdConfig() {
@@ -1021,6 +1032,12 @@ function app() {
     },
 
     async loadRules() {
+      // Alpine 的 x-init 不管 x-show 是否为 true 都会执行，所以未登录时
+      // 页面一加载这里就被调用 → /api/rules/preview 401 → api.request 派发
+      // 全局 auth-expired → handleAuthExpired() 把 config/rp 清空并弹出
+      // 「会话已过期，请重新登录」。用户还没输密码就被告知会话过期。
+      // 守卫放在方法里而不是 x-init 里，这样页面上的「刷新预览」按钮也一并受保护。
+      if (!this.auth.authenticated) return;
       this.rulesLoading = true;
       try {
         const data = await api.get('/api/rules/preview');
@@ -1461,3 +1478,22 @@ const api = {
   put(url, body) { return this.request(url, { method: 'PUT', body: JSON.stringify(body) }); },
   delete(url) { return this.request(url, { method: 'DELETE' }); }
 };
+
+// ============================================================
+// x-cloak 兜底清除
+// ============================================================
+// Alpine 3 自带 x-cloak 指令（alpine.js 里 d("cloak", ...removeAttribute("cloak"))），
+// 配合 styles.css 的 [x-cloak]{display:none!important} 用来防首屏闪烁。
+// 但 3.15.8 实测：该指令没有真的把 x-cloak 属性摘掉，元素上属性一直在。
+// 后果很严重 —— 那条 !important 会把带 x-cloak 的元素永久钉死：
+//   登录遮罩 <div x-show="!auth.authenticated && !auth.checking" x-cloak>
+// 在未登录时表达式为 true、x-show 也没错，却因为 x-cloak 残留而一直 display:none，
+// 用户既看不到登录框、又处于未认证态（接口全部 401）—— 页面直接死锁。
+//
+// 这里在 Alpine 初始化完成后统一清一遍。alpine:initialized 是 Alpine 3 自身保证
+// 会派发的事件；再挂一个 load 兜底，防止个别环境下该事件没派发。
+const _stripCloak = () => {
+  document.querySelectorAll('[x-cloak]').forEach((el) => el.removeAttribute('x-cloak'));
+};
+document.addEventListener('alpine:initialized', _stripCloak);
+window.addEventListener('load', _stripCloak);
