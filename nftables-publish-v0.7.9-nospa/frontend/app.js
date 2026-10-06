@@ -967,6 +967,12 @@ function app() {
     },
 
     async deleteFromList(type, ip) {
+      // 二次确认：名单里的每一项删除按钮都该有。
+      // 原来只有 flushList / deletePreset / deleteRpRule / removeDdnsService 有，
+      // 唯独这个直接就发请求了 —— 白名单里往往是管理机和 NAS 等关键地址，
+      // 手滑删掉一条的后果比删一条 DDNS 记录大得多。
+      const label = type === 'whitelist' ? '白名单' : '黑名单';
+      if (!confirm(`确定从${label}中删除 ${ip} 吗？`)) return;
       try {
         const setName = this.getListSetName(type, ip);
         await api.post('/api/lists/delete', { set_name: setName, ip });
