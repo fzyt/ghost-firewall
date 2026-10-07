@@ -171,6 +171,95 @@ if os.path.exists(LOG):
     check("记录了吊销路径", "logout" in evts or "verify_denied" in evts)
     check("每条都有时间戳和来源", all("ts" in l and "ip" in l for l in lines))
 
+print("\n=== 11. 安全修复回归（Shannon 2026-10-07 + 实测复现）===")
+# 这组全部写成「旧代码上会失败」，避免修复被无意改回去。
+# 每一项都在 .224 上实测复现过，不是推演。
+
+# 11.1 配了 lan_subnet4 就只认它，不能被 is_private 放宽
+print("\n--- 11.1 lan_subnet4 收紧范围（旧代码会误放行）---")
+for ip, should_pass, why in [
+    ("192.168.100.50", True,  "配置网段内，应当放行"),
+    ("192.168.50.5",   False, "私网但不在 192.168.100.0/24，不该放行"),
+    ("10.0.0.5",       False, "私网但不在配置网段，不该放行"),
+    ("172.16.3.4",     False, "私网但不在配置网段，不该放行"),
+    ("8.8.8.8",        False, "公网，本就不该放行"),
+]:
+    r = ag.app.test_client().get("/auth/verify", headers={"X-Real-IP": ip, "Host": HOST})
+    ok = (r.status_code == 200) if should_pass else (r.status_code == 401)
+    check(f"{ip:<15} {'放行' if should_pass else '拒绝'}", ok,
+          f"实际 {r.status_code} — {why}")
+    if should_pass:
+        check(f"{ip:<15} 标记为 lan-bypass", r.headers.get("X-Auth-Via") == "lan-bypass")
+
+# 一个网段都没配时，才允许回落到 RFC1918（保留旧的默认行为）
+_orig_cfg = json.load(open(CFG))
+_saved = dict(_orig_cfg)
+_orig_cfg.pop("lan_subnet4", None)
+_orig_cfg.pop("lan_subnet6", None)
+json.dump(_orig_cfg, open(CFG, "w"), ensure_ascii=False)
+ag._config_cache["mtime"] = None  # 同上
+r = ag.app.test_client().get("/auth/verify", headers={"X-Real-IP": "192.168.50.5", "Host": HOST})
+check("未配网段时仍回落 is_private", r.status_code == 200,
+      f"实际 {r.status_code} — 完全没配网段时不该把行为改掉")
+json.dump(_saved, open(CFG, "w"), ensure_ascii=False)
+
+# 缺省值本身也要钉住：auth_lan_bypass 这个键**整个缺失**时必须要求认证
+# （fail-closed）。主测试配置里总是显式写了 True，不专门测一次的话，
+# 把缺省值改回 True 不会有任何测试失败。
+_c = json.load(open(CFG))
+_saved2 = dict(_c)
+_c.pop("auth_lan_bypass", None)
+json.dump(_c, open(CFG, "w"), ensure_ascii=False)
+ag._config_cache["mtime"] = None  # load_gateway_config 按 mtime 缓存，不清会读到陈旧配置
+r = ag.app.test_client().get("/auth/verify", headers={"X-Real-IP": "192.168.100.50", "Host": HOST})
+check("配置缺失 auth_lan_bypass 时不放行（fail-closed）", r.status_code == 401,
+      f"实际 {r.status_code} — 缺配置时应当要求认证而不是默认免认证")
+json.dump(_saved2, open(CFG, "w"), ensure_ascii=False)
+
+# 11.2 Origin: null 必须按跨站拒绝（旧代码放进白名单放行了）
+print("\n--- 11.2 CSRF：Origin: null 不再放行（旧代码返回 401 走到了密码校验）---")
+def login_with(origin=None, referer=None, ip="203.0.113.7"):
+    h = {"X-Real-IP": ip, "Host": HOST, "Content-Type": "application/json"}
+    if origin is not None: h["Origin"] = origin
+    if referer is not None: h["Referer"] = referer
+    return ag.app.test_client().post("/auth/login", headers=h, json={"password": "x"})
+
+r = login_with(origin="null")
+check("Origin: null → 403", r.status_code == 403, f"实际 {r.status_code}")
+r = login_with(origin="https://evil.example.com")
+check("跨站 Origin → 403", r.status_code == 403, f"实际 {r.status_code}")
+r = login_with(origin=f"https://{HOST}")
+check("同源 Origin → 非 403", r.status_code != 403, f"实际 {r.status_code}")
+r = login_with(referer=f"https://{HOST}/")
+check("同源 Referer（无 Origin）→ 非 403", r.status_code != 403, f"实际 {r.status_code}")
+r = login_with(referer="https://evil.example.com/x")
+check("跨站 Referer → 403", r.status_code == 403, f"实际 {r.status_code}")
+r = login_with()   # curl/脚本：什么都不带
+check("无 Origin 无 Referer → 非 403（脚本仍可用）", r.status_code != 403, f"实际 {r.status_code}")
+
+# 11.3 滑动续期要吊销旧 token（旧代码只签新的，旧的永远有效）
+print("\n--- 11.3 续期吊销旧 token（旧代码让登出对已泄露 token 失效）---")
+# 触发续期的条件是「剩余时间 < 会话 TTL 的一半」= 1800/2 = 900 秒，
+# 所以这里签一张剩余 100 秒的：既仍然有效，又必然落入续期区间。
+old = ag.issue_token("kirito", "dev-rot", 100)
+old_jti = ag.parse_token(old)["jti"]
+check("旧 token 初始有效且未被吊销",
+      ag.parse_token(old) is not None and not ag.is_revoked(old_jti))
+cc = ag.app.test_client()
+cc.set_cookie("gw_token", old, domain=HOST)
+r = cc.get("/auth/verify", headers={"X-Real-IP": "8.8.8.8", "Host": HOST})
+check("带旧 token 请求被接受并触发续期", r.status_code == 200, f"实际 {r.status_code}")
+
+# 注意：parse_token 只验签名与 exp，**不查吊销表**（吊销在 _verify_or_deny 里
+# 单独用 is_revoked 判）。所以不能断言 parse_token(old) is None —— 那测的是
+# 另一件事。要断言的是「旧 token 真的进了吊销表，且真的被拒绝」。
+check("续期后旧 jti 已进吊销表", ag.is_revoked(old_jti),
+      "旧 jti 未被吊销 = 攻击者截获的凭据不会因受害者续期而失效")
+cc2 = ag.app.test_client()
+cc2.set_cookie("gw_token", old, domain=HOST)
+r2 = cc2.get("/auth/verify", headers={"X-Real-IP": "8.8.8.8", "Host": HOST})
+check("续期后旧 token 被 /auth/verify 拒绝", r2.status_code == 401, f"实际 {r2.status_code}")
+
 print("\n" + "="*60)
 print(f"通过 {len(PASS)} / {len(PASS)+len(FAIL)}")
 if FAIL:

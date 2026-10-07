@@ -462,12 +462,27 @@ def client_ip() -> str:
 def is_lan_source(cfg) -> bool:
     """判断来源是否属于内网。判定失败一律判 False（要认证）。
 
-    顺序很重要：**配置里显式指定的网段是权威**，先判它；
-    没配或没命中才回落到 is_private。
-    这样用户可以用 lan_subnet4 收紧范围（只放行真正的 LAN 网段），
-    而不会被 is_private 的宽泛定义意外放宽。
+    **配了 lan_subnet4 / lan_subnet6 就只认它们**，一个都没配才回落到
+    is_private。
+
+    2026-10-07 修复（Shannon 渗透测试 + 实测复现）：原来网段没命中时直接
+    `return addr.is_private`，导致「配了网段等于没配」——
+
+        lan_subnet4 = 192.168.100.0/24 的情况下实测：
+            192.168.100.50 → 200 X-Auth-Via=lan-bypass   正确
+            192.168.50.5   → 200 X-Auth-Via=lan-bypass   不该放行
+            10.0.0.5       → 200 X-Auth-Via=lan-bypass   不该放行
+            172.16.3.4     → 200 X-Auth-Via=lan-bypass   不该放行
+
+    is_private 覆盖整个 RFC1918，于是**任何身处咖啡厅/酒店/公司/邻居 Wi-Fi
+    的访客（源 IP 是私网段）访问公网网关端口时会被直接判定为内网、完全免认证**，
+    直通所有 public_access=true 的服务。本函数原来的 docstring 恰恰写着
+    「用户可以用 lan_subnet4 收紧范围」——那句话当时是假的。
+
+    顺带把 auth_lan_bypass 的缺省值从 True 改成 False：配置缺失时应当
+    要求认证（fail-closed），而不是默认放行。
     """
-    if not cfg.get("auth_lan_bypass", True):
+    if not cfg.get("auth_lan_bypass", False):
         return False
     ip = client_ip()
     if not ip:
@@ -480,16 +495,22 @@ def is_lan_source(cfg) -> bool:
     if addr.is_loopback:
         return True
 
+    subnets = []
     for key in ("lan_subnet4", "lan_subnet6"):
         raw = str(cfg.get(key, "") or "").strip()
         if not raw:
             continue
         try:
-            if addr in ipaddress.ip_network(raw, strict=False):
-                return True
+            subnets.append(ipaddress.ip_network(raw, strict=False))
         except ValueError:
             continue
 
+    # 配了网段 → 只认网段。这才是 lan_subnet4 存在的意义。
+    if subnets:
+        return any(addr in n for n in subnets)
+
+    # 一个都没配才回落。走到这里说明用户压根没限定范围，此时用 RFC1918
+    # 兜底是合理的默认，但这条路径不该在网段已配时被走到（见上方说明）。
     return addr.is_private
 
 
@@ -592,9 +613,24 @@ def auth_login():
 
     # CSRF 缓解：非同源请求直接拒。密码登录是「主动操作」，
     # 跨站表单强制登录可把受害者踢下线并诱导其在伪造站点输入密码。
+    #
+    # Origin: null 不是「没检查」，而是浏览器明确报告「这个请求来自一个
+    # 不透明来源」——沙箱 iframe（sandbox 属性）、data: URL、跨站重定向都会
+    # 产生它。之前把 "null" 放进白名单等于给 CSRF 防护开了一条后门：
+    # 攻击者页面把 /auth/login 塞进沙箱 iframe，就能拿受害者浏览器
+    # 连打 5 次错误密码（5 分钟内），把受害者 IP 锁死 15 分钟，可反复触发。
+    # 实测确认：Origin: null → 401（放行到密码校验），
+    #          Origin: https://evil.example.com → 403（正确拦截）。
+    #
+    # 现在 null 一律按跨站拒绝。不影响正常客户端：不发 Origin 的
+    # curl / 脚本走下面的「Origin 缺失」分支，逻辑没变。
     origin = (request.headers.get("Origin") or "").strip()
     referer = (request.headers.get("Referer") or "").strip()
-    if origin and origin not in ("null",) and _origin_host_mismatch(origin):
+    if origin == "null":
+        audit("login_csrf_blocked", origin="null", referer=referer[:120])
+        return jsonify({"success": False, "code": "BAD_ORIGIN",
+                        "message": "请求来源不被信任"}), 403
+    if origin and _origin_host_mismatch(origin):
         audit("login_csrf_blocked", origin=origin[:120])
         return jsonify({"success": False, "code": "BAD_ORIGIN",
                         "message": "请求来源不被信任"}), 403
@@ -700,6 +736,13 @@ def _verify_or_deny():
 
         # 滑动续期：剩余不足一半才重签，避免每个静态资源都回一个 Set-Cookie
         if exp - now < ttl * TOKEN_REFRESH_RATIO:
+            # 必须先吊销旧 jti 再签新的。否则攻击者截获的旧 token 在受害者
+            # 反复续期期间一直是有效的 —— 更要命的是**登出也救不回来**：
+            # 登出只吊销「当时手上那张」，受害者手里那张是续期后的新 token，
+            # 攻击者那张是更早的、jti 从未被吊销的旧 token。
+            # 结果是「登出」这个本该能一键切断的急停开关对已泄露凭据无效。
+            # （Shannon 渗透测试 finding，实测确认调用链里确实缺这一句。）
+            revoke_jti(payload.get("jti", ""), int(payload.get("exp", 0)))
             new_tok = issue_token(
                 str(payload.get("sub", "kirito")),
                 str(payload.get("dev", "")),
