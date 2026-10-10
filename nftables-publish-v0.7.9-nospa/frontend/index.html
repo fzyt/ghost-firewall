@@ -4,89 +4,127 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>nftables 防火墙管理</title>
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#070910">
+
+  <!-- 字体本地自托管，无 CDN 依赖。预加载两支最关键的：
+       UI 用 Outfit，数据（IP/端口/规则）用 JetBrains Mono。
+       预加载能避免首屏字体闪烁，但只 preload 两支 ——
+       Bold 字重交给浏览器合成，全量 preload 会白白吃掉路由器的 IO。 -->
+  <link rel="preload" href="/assets/fonts/Outfit-Regular.ttf" as="font" type="font/ttf" crossorigin>
+  <link rel="preload" href="/assets/fonts/JetBrainsMono-Regular.ttf" as="font" type="font/ttf" crossorigin>
+
   <script src="/assets/tailwind.js"></script>
   <script defer src="/assets/alpine.js"></script>
+  <script defer src="/fx.js"></script>
   <link rel="stylesheet" href="styles.css">
 </head>
-<body class="bg-white text-gray-900 min-h-screen">
+
+<body class="nf-app">
+
+  <!-- 环境光：两盏跟随指针的光源 + 一层细网格。
+       放在最底层（z-index:0），内容层 z-index:1 压在上面。 -->
+  <div class="nf-ambience" aria-hidden="true">
+    <div class="nf-light"></div>
+    <div class="nf-light nf-light--cool"></div>
+    <div class="nf-light nf-light--drift"></div>
+  </div>
+  <div class="nf-grid" aria-hidden="true"></div>
 
   <!-- ======================= 登录遮罩（全屏） ======================= -->
 
-  <div x-data="app()" class="flex min-h-screen">
+  <div x-data="app()" class="nf-shell">
 
   <div x-show="!auth.authenticated && !auth.checking"
        x-cloak
-       class="fixed inset-0 z-[100] bg-gray-50 flex items-center justify-center px-4">
-    <div class="bg-white border border-gray-200 rounded-xl shadow-lg p-8 w-full max-w-sm">
-      <div class="text-center mb-6">
-        <div class="inline-flex items-center justify-center w-14 h-14 bg-black text-white rounded-full mb-3">
-          <svg class="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+       class="nf-login">
+    <div class="nf-login__card nf-glass nf-spot">
+      <div class="text-center">
+        <div class="nf-login__mark">
+          <svg class="w-7 h-7" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round"
               d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
           </svg>
         </div>
-        <h1 class="text-xl font-bold">nftables 防火墙管理</h1>
-        <p class="text-xs text-gray-400 mt-1">
+        <h1 class="nf-login__title">nftables 防火墙管理</h1>
+        <p class="nf-login__sub">
           <span x-show="auth.loginMode === 'setup'">首次使用，请设置管理员密码</span>
           <span x-show="auth.loginMode === 'login'">请输入管理员密码登录</span>
         </p>
       </div>
 
       <form @submit.prevent="auth.loginMode === 'setup' ? doSetup() : doLogin()">
-        <input type="password"
+        <label class="nf-label" for="nf-login-pw">管理员密码</label>
+        <input id="nf-login-pw" type="password"
           x-model="auth.loginPassword"
-          placeholder="密码"
+          placeholder="输入密码"
           :disabled="auth.loginLoading"
-          class="w-full border border-gray-300 rounded px-3 py-2.5 mb-3 text-sm focus:outline-none focus:border-black disabled:bg-gray-50"
+          class="nf-input nf-mono mb-3"
           autocomplete="current-password"
           autofocus />
         <button type="submit"
           :disabled="auth.loginLoading || !auth.loginPassword"
-          class="w-full bg-black text-white rounded py-2.5 text-sm font-medium disabled:opacity-50 hover:bg-gray-800 transition-colors">
+          class="nf-btn nf-btn--primary nf-btn--magnetic nf-shine w-full py-2.5">
           <span x-show="!auth.loginLoading"
             x-text="auth.loginMode === 'setup' ? '设置并登录' : '登录'"></span>
-          <span x-show="auth.loginLoading">处理中…</span>
+          <span x-show="auth.loginLoading" class="inline-flex items-center gap-2">
+            <span class="nf-spin"></span>处理中…
+          </span>
         </button>
       </form>
 
       <div x-show="auth.loginError"
         x-text="auth.loginError"
-        class="mt-4 text-xs text-red-600 text-center bg-red-50 border border-red-200 rounded p-2"></div>
+        class="nf-alert mt-4 text-center"
+        style="color:var(--nf-danger);border-color:rgba(224,115,111,.35);background:rgba(224,115,111,.09)"></div>
 
-      <p class="mt-6 text-xs text-gray-300 text-center">v0.7.9.1 · Ghost Firewall</p>
+      <p class="nf-login__foot">v0.8.0 · Ghost Firewall</p>
 
       <!-- HTTP 不安全警告（自签证书模式下，HTTPS 地址栏会显示"不安全"提示而非此 banner） -->
       <div x-show="window.location.protocol === 'http:'"
-        class="mt-3 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded p-2 text-center">
-        ⚠️ 当前为 HTTP 连接，密码将以明文传输<br>
-        <span class="text-amber-600">建议使用 HTTPS 访问：https://<span x-text="window.location.hostname"></span>:5443</span>
+        class="nf-alert nf-alert--warn mt-3 text-center">
+        当前为 HTTP 连接，密码将以明文传输<br>
+        <span style="opacity:.8">建议使用 HTTPS 访问：https://<span x-text="window.location.hostname"></span>:5443</span>
       </div>
     </div>
   </div>
     <!-- 侧边导航 -->
-    <aside class="w-56 border-r flex-shrink-0 bg-gray-50 flex flex-col">
-      <div class="p-5 border-b">
-        <h1 class="text-lg font-bold">nftables</h1>
-        <p class="text-xs text-gray-400 mt-1">防火墙管理面板</p>
+    <aside class="nf-sidebar">
+      <div class="nf-brand">
+        <div class="flex items-center gap-3">
+          <div class="nf-brand__mark">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round"
+                d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
+            </svg>
+          </div>
+          <div>
+            <h1 class="nf-brand__title">Ghost Firewall</h1>
+            <p class="nf-brand__sub">nftables 管理面板</p>
+          </div>
+        </div>
       </div>
-      <nav class="flex-1 p-3 space-y-1">
+      <nav class="nf-nav">
         <template x-for="item in navItems" :key="item.id">
           <button @click="currentNav = item.id; if (item.id === 'ddns') loadDdns(); if (item.id === 'syslog') loadSystemLogs(); if (item.id === 'lists') loadLists(); if (item.id === 'firewall-status') loadFirewallStatus(); if (item.id === 'reverse-proxy') loadReverseProxy();"
-            :class="currentNav === item.id ? 'bg-black text-white' : 'text-gray-600 hover:bg-gray-100'"
-            class="w-full text-left px-3 py-2.5 rounded-lg text-sm font-medium transition-colors"
-            x-text="item.label"></button>
+            :class="currentNav === item.id ? 'is-active' : ''"
+            class="nf-navitem">
+            <span class="nf-navitem__dot" aria-hidden="true"></span>
+            <span x-text="item.label"></span>
+          </button>
         </template>
       </nav>
-      <div class="p-4 border-t text-xs text-gray-400">
-        <div x-show="loading" class="flex items-center gap-2">
-          <svg class="animate-spin h-3 w-3" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
-          加载中...
+      <div class="nf-sidebar__foot">
+        <div x-show="loading" style="display:flex;align-items:center;gap:8px">
+          <span class="nf-spin" aria-hidden="true"></span>
+          加载中…
         </div>
+        <span x-show="!loading">仅限内网访问</span>
       </div>
     </aside>
 
     <!-- 主内容区 -->
-    <main class="flex-1 p-8 overflow-auto">
+    <main class="nf-main">
 
       <!-- Toast -->
       <div x-show="toast.show" x-transition
@@ -99,7 +137,7 @@
         x-text="toast.message"></div>
 
       <!-- 右上角应用规则按钮 -->
-      <div class="fixed top-6 right-6 z-40 flex items-center gap-2">
+      <div class="nf-topbar">
         <button x-show="auth.authenticated"
           @click="if(confirm('确定退出登录？')) doLogout()"
           class="px-3 py-2 border border-gray-400 text-gray-600 rounded text-sm hover:bg-gray-50 transition-colors">
@@ -122,7 +160,10 @@
       </div>
 
       <!-- ========== 网络接口 ========== -->
-      <div x-show="currentNav === 'network'">
+      <div class="nf-page" x-show="currentNav === 'network'"
+           x-transition:enter="nfx-enter"
+           x-transition:enter-start="nfx-enter-start"
+           x-transition:enter-end="nfx-enter-end">
         <h1 class="text-2xl font-bold mb-6">网络接口</h1>
 
         <!-- 可用接口显示 -->
@@ -260,7 +301,10 @@
       </div>
 
       <!-- ========== 端口敲门 ========== -->
-      <div x-show="currentNav === 'knock' && !loading">
+      <div class="nf-page" x-show="currentNav === 'knock' && !loading"
+           x-transition:enter="nfx-enter"
+           x-transition:enter-start="nfx-enter-start"
+           x-transition:enter-end="nfx-enter-end">
         <h1 class="text-2xl font-bold mb-6">端口敲门</h1>
         <div class="bg-gray-50 border rounded-lg p-5 mb-6 space-y-4">
           <p class="text-sm text-gray-500">按顺序访问4个端口完成敲门认证。建议使用高端口避免被扫描。</p>
@@ -306,7 +350,10 @@
       </div>
 
       <!-- ========== 端口转发 ========== -->
-      <div x-show="currentNav === 'ports' && !loading">
+      <div class="nf-page" x-show="currentNav === 'ports' && !loading"
+           x-transition:enter="nfx-enter"
+           x-transition:enter-start="nfx-enter-start"
+           x-transition:enter-end="nfx-enter-end">
         <h1 class="text-2xl font-bold mb-6">端口转发</h1>
 
         <div class="space-y-4 mb-6">
@@ -367,7 +414,10 @@
       </div>
 
       <!-- ========== 信任IP ========== -->
-      <div x-show="currentNav === 'trust' && !loading">
+      <div class="nf-page" x-show="currentNav === 'trust' && !loading"
+           x-transition:enter="nfx-enter"
+           x-transition:enter-start="nfx-enter-start"
+           x-transition:enter-end="nfx-enter-end">
         <h1 class="text-2xl font-bold mb-6">信任IP</h1>
 
         <!-- 访问模式切换 -->
@@ -418,7 +468,10 @@
       </div>
 
       <!-- ========== 日志开关 ========== -->
-      <div x-show="currentNav === 'logs' && !loading">
+      <div class="nf-page" x-show="currentNav === 'logs' && !loading"
+           x-transition:enter="nfx-enter"
+           x-transition:enter-start="nfx-enter-start"
+           x-transition:enter-end="nfx-enter-end">
         <h1 class="text-2xl font-bold mb-6">日志开关</h1>
         <div class="bg-gray-50 border rounded-lg p-5 mb-6 space-y-6">
           <div class="flex items-center justify-between">
@@ -564,7 +617,10 @@
       </div>
 
       <!-- ========== 国外IP拦截 ========== -->
-      <div x-show="currentNav === 'foreign' && !loading">
+      <div class="nf-page" x-show="currentNav === 'foreign' && !loading"
+           x-transition:enter="nfx-enter"
+           x-transition:enter-start="nfx-enter-start"
+           x-transition:enter-end="nfx-enter-end">
         <h1 class="text-2xl font-bold mb-6">国外IP拦截</h1>
         <div class="bg-gray-50 border rounded-lg p-5 mb-6 space-y-4">
           <div>
@@ -615,7 +671,10 @@
       </div>
 
       <!-- ========== DNS 局域网解析 ========== -->
-      <div x-show="currentNav === 'dns-lan' && !loading">
+      <div class="nf-page" x-show="currentNav === 'dns-lan' && !loading"
+           x-transition:enter="nfx-enter"
+           x-transition:enter-start="nfx-enter-start"
+           x-transition:enter-end="nfx-enter-end">
         <h1 class="text-2xl font-bold mb-6">DNS 局域网解析</h1>
         <div class="bg-gray-50 border rounded-lg p-5 mb-6 space-y-4">
           <div class="flex items-center justify-between">
@@ -659,7 +718,10 @@
       </div>
 
       <!-- ========== DDNS ========== -->
-      <div x-show="currentNav === 'ddns' && !loading">
+      <div class="nf-page" x-show="currentNav === 'ddns' && !loading"
+           x-transition:enter="nfx-enter"
+           x-transition:enter-start="nfx-enter-start"
+           x-transition:enter-end="nfx-enter-end">
         <h1 class="text-2xl font-bold mb-6">DDNS 管理</h1>
 
         <!-- 子标签 -->
@@ -979,7 +1041,10 @@
       </div>
 
       <!-- ========== 防火墙规则 ========== -->
-      <div x-show="currentNav === 'firewall' && !loading" x-init="loadRules()">
+      <div class="nf-page" x-show="currentNav === 'firewall' && !loading"
+           x-transition:enter="nfx-enter"
+           x-transition:enter-start="nfx-enter-start"
+           x-transition:enter-end="nfx-enter-end" x-init="loadRules()">
         <h1 class="text-2xl font-bold mb-6">防火墙规则</h1>
         <div class="flex items-center justify-between mb-4 flex-wrap gap-3">
           <div class="flex items-center gap-3">
@@ -992,7 +1057,10 @@
       </div>
 
       <!-- ========== 防火墙状态 ========== -->
-      <div x-show="currentNav === 'firewall-status' && !loading">
+      <div class="nf-page" x-show="currentNav === 'firewall-status' && !loading"
+           x-transition:enter="nfx-enter"
+           x-transition:enter-start="nfx-enter-start"
+           x-transition:enter-end="nfx-enter-end">
         <h1 class="text-2xl font-bold mb-6">防火墙状态</h1>
         <div class="bg-gray-50 border rounded-lg p-5 space-y-5">
           <!-- fw4 -->
@@ -1028,7 +1096,10 @@
       </div>
 
       <!-- ========== 名单管理 ========== -->
-      <div x-show="currentNav === 'lists'">
+      <div class="nf-page" x-show="currentNav === 'lists'"
+           x-transition:enter="nfx-enter"
+           x-transition:enter-start="nfx-enter-start"
+           x-transition:enter-end="nfx-enter-end">
         <h1 class="text-2xl font-bold mb-6">名单管理</h1>
 
         <!-- 加载状态 -->
@@ -1288,7 +1359,10 @@
       </div>
 
     <!-- ========== 系统日志 ========== -->
-    <div x-show="currentNav === 'syslog'">
+    <div class="nf-page" x-show="currentNav === 'syslog'"
+           x-transition:enter="nfx-enter"
+           x-transition:enter-start="nfx-enter-start"
+           x-transition:enter-end="nfx-enter-end">
       <h1 class="text-2xl font-bold mb-2">系统日志</h1>
       <p class="text-xs text-gray-500 mb-4">
         系统日志与认证审计合并在同一条时间线上。认证记录带设备指纹，来源标记为
@@ -1464,7 +1538,10 @@
     </div>
 
       <!-- ========== 功能介绍 ========== -->
-      <div x-show="currentNav === 'intro'">
+      <div class="nf-page" x-show="currentNav === 'intro'"
+           x-transition:enter="nfx-enter"
+           x-transition:enter-start="nfx-enter-start"
+           x-transition:enter-end="nfx-enter-end">
         <h1 class="text-2xl font-bold mb-6">功能介绍</h1>
         <div class="max-w-3xl">
 
@@ -1666,7 +1743,10 @@
       </div>
 
       <!-- ========== 反代管理 ========== -->
-      <div x-show="currentNav === 'reverse-proxy' && !loading">
+      <div class="nf-page" x-show="currentNav === 'reverse-proxy' && !loading"
+           x-transition:enter="nfx-enter"
+           x-transition:enter-start="nfx-enter-start"
+           x-transition:enter-end="nfx-enter-end">
         <h1 class="text-2xl font-bold mb-6">反代管理</h1>
 
         <!-- 子标签 -->

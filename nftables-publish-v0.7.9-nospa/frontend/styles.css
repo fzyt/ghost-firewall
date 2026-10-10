@@ -1,13 +1,989 @@
-/* Minimal custom styles - Tailwind handles most */
-body {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+/* ==========================================================================
+   Ghost Firewall — 深空仪表盘设计系统
+   --------------------------------------------------------------------------
+   本文件是唯一的视觉层。styles.css 通过 <link> 在 head 里加载，而 Tailwind
+   Play CDN 会在运行时往 document.head 注入 <style> —— 注入位置不可控，所以
+   这里所有组件类都写成 `body .nf-*`（特异性 0-1-1），稳稳压过任何单类
+   Tailwind 工具类（0-1-0）。不要为了「好看」把它降回 `.nf-*`，那会让
+   bg-white / text-gray-900 这类工具类反过来盖住设计系统。
+
+   性能前提：目标机器是 OpenWrt 路由器（2 核）。所以
+   - 所有动画只动 transform / opacity / 自定义属性，不触发重排
+   - 追光与磁性效果走单一 rAF（fx.js），不是每元素一个监听
+   - 触屏、prefers-reduced-motion、页面隐藏时全部降级
+   ========================================================================== */
+
+/* ---------- 字体（本地自托管，无 CDN 依赖） ---------- */
+@font-face {
+  font-family: 'Outfit';
+  src: url('/assets/fonts/Outfit-Regular.ttf') format('truetype');
+  font-weight: 400; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: 'Outfit';
+  src: url('/assets/fonts/Outfit-Bold.ttf') format('truetype');
+  font-weight: 600 700; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('/assets/fonts/JetBrainsMono-Regular.ttf') format('truetype');
+  font-weight: 400; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('/assets/fonts/JetBrainsMono-Bold.ttf') format('truetype');
+  font-weight: 600 700; font-style: normal; font-display: swap;
 }
 
-/* Alpine 初始化前隐藏 x-cloak 元素。Alpine 3 启动成功后会自行移除该属性。
-   这条规则的价值在兜底：万一 Alpine 因为 CSP / 网络 / 语法问题没起来，
-   x-show 全部失效，此时若没有它，页面里那些 x-show=false 的模态框会
-   变成常驻的全屏遮罩，把整个界面（包括登录框）盖住、点不动任何东西。
-   2026-10-06 实测：缺 'unsafe-eval' 导致 Alpine 启动失败，正是这个现象。 */
-[x-cloak] {
-  display: none !important;
+/* ---------- 设计令牌 ---------- */
+:root {
+  /* 中性底色：刻意不用纯黑。纯黑会让玻璃层失去可折射的底，
+     整块面板会塌成一块死板的深灰。所有层级都在 #070910 之上抬升。 */
+  --nf-void:      #070910;
+  --nf-base:      #0a0d15;
+  --nf-surface:   #10141f;
+  --nf-surface-2: #161b28;
+  --nf-surface-3: #1d2434;
+  --nf-hairline:  rgba(255, 255, 255, .075);
+  --nf-hairline-strong: rgba(255, 255, 255, .13);
+
+  /* 文字：三级，对应标题/正文/弱化 */
+  --nf-text-hi:   #eaeff7;
+  --nf-text-mid:  #a3aec2;
+  --nf-text-lo:   #67728a;
+
+  /* 主色：水绿偏青。刻意避开 AI 紫蓝 —— 走绿向，
+     饱和度压到 57% 以内，在深底上够亮但不刺眼、不荧光。 */
+  --nf-accent:      #4fc9c0;
+  --nf-accent-hi:   #7ce0d6;
+  --nf-accent-lo:   #35a49c;
+  --nf-accent-dim:  rgba(79, 201, 192, .14);
+  --nf-accent-line: rgba(79, 201, 192, .38);
+
+  /* 状态色：与主色拉开寄存器，避免「成功绿」被误读成「主色」
+     success 偏黄绿、danger 偏柔和红、warning 暖琥珀、info 冷钢蓝 */
+  --nf-ok:     #8ec26f;
+  --nf-warn:   #dda44c;
+  --nf-danger: #e0736f;
+  --nf-info:   #7ba3d4;
+
+  /* 玻璃层：blur + saturate 是「磨砂」的关键，缺一个都会变塑料 */
+  --nf-glass-blur: 20px;
+  --nf-glass-sat:  145%;
+  --nf-glass-tint: rgba(255, 255, 255, .05);
+  --nf-glass-tint-2: rgba(255, 255, 255, .015);
+
+  /* 阴影：多层堆叠模拟环境光遮蔽，避免单层硬投影的廉价感 */
+  --nf-shadow-sm: 0 2px 8px -2px rgba(0, 0, 0, .6);
+  --nf-shadow-md: 0 14px 34px -16px rgba(0, 0, 0, .78);
+  --nf-shadow-lg: 0 30px 70px -30px rgba(0, 0, 0, .85);
+  /* inset 顶边高光 —— 这是「玻璃」与「半透明方块」的分界线 */
+  --nf-inset-top: inset 0 1px 0 rgba(255, 255, 255, .10);
+  --nf-inset-bot: inset 0 -1px 0 rgba(0, 0, 0, .40);
+
+  /* 缓动 */
+  --nf-ease:      cubic-bezier(.16, 1, .3, 1);
+  --nf-ease-soft: cubic-bezier(.4, 0, .2, 1);
+  --nf-ease-back: cubic-bezier(.34, 1.56, .64, 1);
+
+  --nf-r-sm: 8px;
+  --nf-r:    12px;
+  --nf-r-lg: 18px;
+  --nf-r-xl: 26px;
+
+  /* fx.js 写入的指针位置，缺省给个中值，避免首帧闪一下 */
+  --nf-px: 50%;
+  --nf-py: 30%;
 }
+
+/* ---------- 基础 ---------- */
+body {
+  background: var(--nf-void);
+  color: var(--nf-text-hi);
+  font-family: 'Outfit', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ==========================================================================
+   环境光层
+   ==========================================================================
+   两盏可移动的「光源」，跟随鼠标（fx.js 写 --lx/--ly，用 rAF 做惯性插值）。
+
+   ⚠ 为什么是移动元素而不是移动渐变中心：
+   radial-gradient 的 `at var(--x)` 改变会触发**重绘**（背景图变了），
+   整屏尺寸的渐变重绘在 2 核 OpenWrt 上非常贵。这里改为把渐变画死在一个
+   固定大小的元素上、只改它的 transform —— 走合成层，GPU 直接搬像素，
+   不重绘。这是这套动效能在路由器上跑得动的关键。
+
+   这盏光是画面的光源来源：没有它，玻璃层没有东西可折射，
+   「磨砂」会退化成半透明色块。
+   ========================================================================== */
+.nf-ambience {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  overflow: hidden;
+  contain: strict;            /* 隔离布局/绘制，防止渐变外溢触发全页重排 */
+}
+
+.nf-light {
+  position: absolute;
+  left: 0; top: 0;
+  width: 78vmax; height: 78vmax;
+  border-radius: 50%;
+  /* 渐变本身只画一次，之后只搬 transform */
+  background: radial-gradient(circle closest-side,
+    rgba(79, 201, 192, .15), rgba(79, 201, 192, .05) 42%, transparent 68%);
+  transform: translate3d(var(--lx, 50vw), var(--ly, 30vh), 0) translate(-50%, -50%);
+  will-change: transform;
+  opacity: 0;
+  transition: opacity .8s var(--nf-ease);
+}
+.nf-light.is-lit { opacity: 1; }
+
+/* 副光源：冷色，比主光源慢半拍、偏移更大，制造纵深 */
+.nf-light--cool {
+  width: 62vmax; height: 62vmax;
+  background: radial-gradient(circle closest-side,
+    rgba(123, 163, 212, .11), transparent 66%);
+}
+
+/* 第三盏：极缓慢漂移的暖色，做呼吸感（常驻微动效，不跟鼠标） */
+.nf-light--drift {
+  width: 70vmax; height: 70vmax;
+  left: auto; right: 0; top: auto; bottom: 0;
+  background: radial-gradient(circle closest-side,
+    rgba(221, 164, 76, .07), transparent 64%);
+  opacity: 1;
+  animation: nf-drift 26s var(--nf-ease-soft) infinite alternate;
+  will-change: transform;
+}
+
+/* ⚠️ 关于这一层的性能，实测数据（2026-10-10，改动前）——先读完再决定要不要动它：
+
+   在无 GPU 的 headless Chromium（SwiftShader 软渲染，.249 4 核）里逐项拆解：
+     基线（全开）              p50 52.1ms ≈ 19fps
+     只关这一层的动画          p50 16.6ms ≈ 60fps   ← 它一个人占 68%
+     只留这一层、隐藏另两盏    p50 42.9ms          ← 确认就是它
+     把它从 70vmax 缩到 46vmax  p50 50.5ms，只省 3%
+
+   最后一条是关键：面积砍掉 57%、耗时只省 3%，说明成本**不是填充率**，
+   而是「每帧合成一个已提升图层」这件事本身。所以这不是渐变画得太重，
+   调尺寸、调模糊半径、调透明度都救不了。
+
+   那为什么还是留着？因为测量环境是软渲染，而实际部署不是：
+   面板是通过 HTTPS 送到**用户自己的浏览器**里渲染的，合成发生在用户机的
+   GPU 上，transform 动画走合成线程，主线程开销接近零。软渲染下的 19fps
+   不代表用户会看到 19fps。
+
+   如果哪天要支持没有硬件加速的环境（远程桌面、部分虚拟机、显卡被拉黑的机器），
+   **正确的做法是直接去掉这一层的 animation**，而不是去调它的尺寸/颜色 ——
+   上面 3% 那个数据已经说明调参没有意义。降级路径已有：prefers-reduced-motion
+   会在下方媒体查询里把它关掉。 */
+
+@keyframes nf-drift {
+  from { transform: translate3d(4%, 4%, 0) scale(1); }
+  to   { transform: translate3d(-5%, -6%, 0) scale(1.16); }
+}
+
+/* 极细网格，给深底一点结构感（纯 CSS 斜线，无图片请求） */
+.nf-grid {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, .017) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, .017) 1px, transparent 1px);
+  background-size: 56px 56px;
+  /* 四周淡出，避免网格线条撞到视口边缘显得生硬 */
+  -webkit-mask-image: radial-gradient(ellipse 90% 70% at 50% 40%, #000 35%, transparent 100%);
+  mask-image: radial-gradient(ellipse 90% 70% at 50% 40%, #000 35%, transparent 100%);
+}
+
+/* ==========================================================================
+   玻璃面基元
+   ========================================================================== */
+body .nf-glass {
+  position: relative;
+  background:
+    linear-gradient(158deg, var(--nf-glass-tint), var(--nf-glass-tint-2));
+  -webkit-backdrop-filter: blur(var(--nf-glass-blur)) saturate(var(--nf-glass-sat));
+  backdrop-filter: blur(var(--nf-glass-blur)) saturate(var(--nf-glass-sat));
+  border: 1px solid var(--nf-hairline);
+  box-shadow: var(--nf-inset-top), var(--nf-inset-bot), var(--nf-shadow-md);
+}
+
+/* ==========================================================================
+   追光（spotlight）
+   --------------------------------------------------------------------------
+   指针进入时在卡片上开一团柔光，光心由 fx.js 写入 --mx/--my。
+   opacity 过渡 0 → 1 而不是位移，所以不触发布局。
+   ========================================================================== */
+body .nf-spot { position: relative; overflow: hidden; }
+body .nf-spot::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: radial-gradient(320px circle at var(--mx, 50%) var(--my, 50%),
+    rgba(79, 201, 192, .16), transparent 68%);
+  opacity: 0;
+  transition: opacity .38s var(--nf-ease);
+  pointer-events: none;
+  z-index: 0;
+}
+body .nf-spot:hover::before { opacity: 1; }
+/* 内容必须压在光斑之上，否则追光会把文字冲淡 */
+body .nf-spot > * { position: relative; z-index: 1; }
+
+/* ==========================================================================
+   闪光（shine sweep）
+   --------------------------------------------------------------------------
+   斜向扫光。translateX 而非 background-position —— 前者走合成层，后者
+   在大面积元素上会引发重绘。
+   ========================================================================== */
+body .nf-shine { position: relative; overflow: hidden; }
+body .nf-shine::after {
+  content: '';
+  position: absolute;
+  top: 0; bottom: 0; left: 0;
+  width: 55%;
+  background: linear-gradient(105deg,
+    transparent 0%,
+    rgba(255, 255, 255, .22) 45%,
+    transparent 90%);
+  transform: translate3d(-140%, 0, 0);
+  transition: transform .78s var(--nf-ease);
+  pointer-events: none;
+  z-index: 2;
+}
+body .nf-shine:hover::after,
+body .nf-shine:focus-visible::after { transform: translate3d(240%, 0, 0); }
+
+/* ==========================================================================
+   应用外壳
+   ========================================================================== */
+body.nf-app {
+  min-height: 100dvh;      /* 不是 h-screen：移动端地址栏收放会裁掉内容 */
+  background: var(--nf-void);
+  position: relative;
+  isolation: isolate;
+}
+
+body .nf-shell {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  min-height: 100dvh;
+}
+
+/* ---------- 侧边栏 ---------- */
+body .nf-sidebar {
+  width: 268px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--nf-hairline);
+  background: linear-gradient(180deg, rgba(16, 20, 31, .82), rgba(10, 13, 21, .92));
+  -webkit-backdrop-filter: blur(16px) saturate(130%);
+  backdrop-filter: blur(16px) saturate(130%);
+}
+
+body .nf-brand { padding: 22px 22px 18px; border-bottom: 1px solid var(--nf-hairline); }
+body .nf-brand__mark {
+  width: 42px; height: 42px;
+  display: grid; place-items: center;
+  border-radius: 13px;
+  color: var(--nf-accent-hi);
+  background: linear-gradient(150deg, rgba(79, 201, 192, .20), rgba(79, 201, 192, .04));
+  border: 1px solid var(--nf-accent-line);
+  box-shadow: var(--nf-inset-top), 0 0 22px -6px rgba(79, 201, 192, .45);
+}
+body .nf-brand__title {
+  font-size: 1.02rem; font-weight: 600; letter-spacing: -.015em;
+  color: var(--nf-text-hi); margin: 0;
+}
+body .nf-brand__sub {
+  font-size: .72rem; color: var(--nf-text-lo); margin: 3px 0 0;
+  letter-spacing: .04em;
+}
+
+body .nf-nav { flex: 1; padding: 14px 12px; overflow-y: auto; }
+body .nf-nav__group {
+  font-size: .66rem; letter-spacing: .13em; text-transform: uppercase;
+  color: var(--nf-text-lo); padding: 14px 10px 7px; font-weight: 600;
+}
+
+/* 导航项 */
+body .nf-navitem {
+  position: relative;
+  width: 100%;
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 12px;
+  border: 0;
+  border-radius: var(--nf-r-sm);
+  background: transparent;
+  color: var(--nf-text-mid);
+  font-family: inherit;
+  font-size: .875rem;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  transition: color .2s var(--nf-ease-soft), background-color .2s var(--nf-ease-soft);
+}
+body .nf-navitem:hover { color: var(--nf-text-hi); background: rgba(255, 255, 255, .045); }
+body .nf-navitem:focus-visible {
+  outline: 2px solid var(--nf-accent);
+  outline-offset: 2px;
+}
+body .nf-navitem.is-active {
+  color: var(--nf-text-hi);
+  background: linear-gradient(96deg, rgba(79, 201, 192, .17), rgba(79, 201, 192, .03));
+  box-shadow: var(--nf-inset-top);
+}
+/* 选中态左侧发光条 —— 唯一的高饱和元素，用来锚定视线 */
+body .nf-navitem.is-active::before {
+  content: '';
+  position: absolute; left: 0; top: 50%;
+  width: 3px; height: 17px;
+  border-radius: 0 3px 3px 0;
+  background: var(--nf-accent);
+  box-shadow: 0 0 12px 1px rgba(79, 201, 192, .75);
+  transform: translateY(-50%);
+}
+body .nf-navitem__dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: currentColor; opacity: .32; flex-shrink: 0;
+  transition: opacity .2s, box-shadow .2s;
+}
+body .nf-navitem.is-active .nf-navitem__dot {
+  opacity: 1;
+  background: var(--nf-accent-hi);
+  box-shadow: 0 0 9px rgba(79, 201, 192, .8);
+}
+
+body .nf-sidebar__foot {
+  padding: 14px 20px;
+  border-top: 1px solid var(--nf-hairline);
+  font-size: .72rem; color: var(--nf-text-lo);
+  display: flex; align-items: center; gap: 8px;
+}
+
+/* 加载指示器：旋转环（不是粒子） */
+body .nf-spin {
+  width: 12px; height: 12px; flex-shrink: 0;
+  border-radius: 50%;
+  border: 1.5px solid rgba(255, 255, 255, .16);
+  border-top-color: var(--nf-accent);
+  animation: nf-spin .7s linear infinite;
+}
+@keyframes nf-spin { to { transform: rotate(360deg); } }
+
+/* ---------- 主内容区 ---------- */
+body .nf-main {
+  flex: 1;
+  min-width: 0;              /* 关键：flex 子项默认 min-width:auto，
+                                长表格会把整页撑出横向滚动条 */
+  padding: 30px 34px 60px;
+  overflow-x: hidden;
+}
+
+body .nf-pagehead { margin-bottom: 22px; }
+body .nf-pagehead__title {
+  font-size: 1.5rem; font-weight: 600; letter-spacing: -.02em;
+  margin: 0; color: var(--nf-text-hi);
+}
+body .nf-pagehead__desc {
+  font-size: .84rem; color: var(--nf-text-lo); margin: 6px 0 0;
+  max-width: 62ch;
+}
+
+/* ==========================================================================
+   页面过场
+   --------------------------------------------------------------------------
+   由 x-transition:enter/enter-start/enter-end 触发。位移 10px + 模糊，
+   时长 380ms（>300ms 会拖沓，<200ms 会被当成闪烁）。
+   ========================================================================== */
+.nfx-enter { transition: opacity .38s var(--nf-ease), transform .38s var(--nf-ease), filter .38s var(--nf-ease); }
+.nfx-enter-start { opacity: 0; transform: translate3d(0, 10px, 0); filter: blur(3px); }
+.nfx-enter-end   { opacity: 1; transform: translate3d(0, 0, 0);    filter: blur(0); }
+
+/* ==========================================================================
+   卡片
+   ========================================================================== */
+body .nf-card {
+  border-radius: var(--nf-r-lg);
+  padding: 20px 22px;
+  margin-bottom: 16px;
+}
+body .nf-card__title {
+  font-size: .95rem; font-weight: 600; letter-spacing: -.01em;
+  margin: 0 0 4px; color: var(--nf-text-hi);
+}
+body .nf-card__hint { font-size: .78rem; color: var(--nf-text-lo); margin: 0 0 16px; }
+
+/* 3D 倾斜由 fx.js 写 --tilt-x/--tilt-y，这里只消费 */
+body .nf-tilt {
+  transform: perspective(800px)
+             rotateX(var(--tilt-x, 0deg))
+             rotateY(var(--tilt-y, 0deg))
+             translate3d(0, 0, 0);
+  transition: transform .42s var(--nf-ease);
+}
+body .nf-tilt:hover { transition: transform .12s linear; }
+
+/* ==========================================================================
+   按钮
+   ========================================================================== */
+body .nf-btn {
+  position: relative;
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  padding: 9px 18px;
+  border-radius: 10px;
+  border: 1px solid var(--nf-hairline-strong);
+  background: rgba(255, 255, 255, .05);
+  color: var(--nf-text-hi);
+  font-family: inherit; font-size: .85rem; font-weight: 500;
+  cursor: pointer;
+  overflow: hidden;
+  box-shadow: var(--nf-inset-top);
+  transition: background-color .2s, border-color .2s, color .2s, transform .12s var(--nf-ease);
+}
+body .nf-btn:hover { background: rgba(255, 255, 255, .085); border-color: rgba(255, 255, 255, .2); }
+body .nf-btn:active { transform: scale(.975); }   /* 触感反馈 */
+body .nf-btn:focus-visible { outline: 2px solid var(--nf-accent); outline-offset: 2px; }
+body .nf-btn:disabled { opacity: .42; cursor: not-allowed; transform: none; }
+
+/* 主按钮：唯一带主色的实心按钮 */
+body .nf-btn--primary {
+  border-color: transparent;
+  background: linear-gradient(140deg, var(--nf-accent-hi), var(--nf-accent-lo));
+  color: #04211f;                       /* 深色文字压在亮青上，对比度约 9:1 */
+  font-weight: 600;
+  box-shadow: var(--nf-inset-top),
+              0 10px 26px -12px rgba(79, 201, 192, .7);
+}
+body .nf-btn--primary:hover {
+  background: linear-gradient(140deg, #8deade, var(--nf-accent));
+  border-color: transparent;
+}
+
+/* 危险按钮：只在描边上用红，不做实心，避免误触的破坏力 */
+body .nf-btn--danger {
+  color: var(--nf-danger);
+  border-color: rgba(224, 115, 111, .34);
+  background: rgba(224, 115, 111, .08);
+}
+body .nf-btn--danger:hover { background: rgba(224, 115, 111, .16); border-color: rgba(224, 115, 111, .55); }
+
+/* 磁性位移由 fx.js 写 --mag-x/--mag-y */
+body .nf-btn--magnetic {
+  transform: translate3d(var(--mag-x, 0px), var(--mag-y, 0px), 0);
+}
+
+/* ==========================================================================
+   表单
+   ========================================================================== */
+body .nf-field { margin-bottom: 14px; }
+body .nf-label {
+  display: block;
+  font-size: .78rem; font-weight: 500;
+  color: var(--nf-text-mid);
+  margin-bottom: 6px;
+}
+body .nf-input, body .nf-select, body .nf-textarea {
+  width: 100%;
+  padding: 9px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--nf-hairline-strong);
+  background: rgba(0, 0, 0, .26);
+  color: var(--nf-text-hi);
+  font-family: inherit; font-size: .86rem;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, .4);
+  transition: border-color .2s, box-shadow .2s, background-color .2s;
+}
+body .nf-input::placeholder, body .nf-textarea::placeholder { color: var(--nf-text-lo); }
+body .nf-input:focus, body .nf-select:focus, body .nf-textarea:focus {
+  outline: none;
+  border-color: var(--nf-accent-line);
+  background: rgba(0, 0, 0, .38);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, .4),
+              0 0 0 3px var(--nf-accent-dim);
+}
+body .nf-input:disabled, body .nf-select:disabled { opacity: .45; cursor: not-allowed; }
+body .nf-select option { background: var(--nf-surface); color: var(--nf-text-hi); }
+
+/* ==========================================================================
+   徽章 / 状态
+   ========================================================================== */
+body .nf-badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: .72rem; font-weight: 500;
+  border: 1px solid var(--nf-hairline-strong);
+  background: rgba(255, 255, 255, .05);
+  color: var(--nf-text-mid);
+}
+body .nf-badge--ok     { color: var(--nf-ok);     border-color: rgba(142, 194, 111, .35); background: rgba(142, 194, 111, .10); }
+body .nf-badge--warn   { color: var(--nf-warn);   border-color: rgba(221, 164, 76, .35);  background: rgba(221, 164, 76, .10); }
+body .nf-badge--danger { color: var(--nf-danger); border-color: rgba(224, 115, 111, .35); background: rgba(224, 115, 111, .10); }
+body .nf-badge--info   { color: var(--nf-info);   border-color: rgba(123, 163, 212, .35); background: rgba(123, 163, 212, .10); }
+body .nf-badge--accent { color: var(--nf-accent-hi); border-color: var(--nf-accent-line); background: var(--nf-accent-dim); }
+
+/* 状态呼吸点 —— 唯一的「无限动效」，且只在活跃状态出现 */
+body .nf-pulse {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: currentColor;
+  animation: nf-pulse 2.1s var(--nf-ease-soft) infinite;
+}
+@keyframes nf-pulse {
+  0%, 100% { opacity: 1;   box-shadow: 0 0 0 0 rgba(255, 255, 255, .28); }
+  50%      { opacity: .55; box-shadow: 0 0 0 5px rgba(255, 255, 255, 0); }
+}
+
+/* ==========================================================================
+   表格
+   ========================================================================== */
+body .nf-table { width: 100%; border-collapse: collapse; font-size: .82rem; }
+body .nf-table th {
+  text-align: left;
+  font-weight: 500; font-size: .72rem;
+  letter-spacing: .06em; text-transform: uppercase;
+  color: var(--nf-text-lo);
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--nf-hairline);
+  white-space: nowrap;
+}
+body .nf-table td {
+  padding: 11px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, .04);
+  color: var(--nf-text-mid);
+  vertical-align: middle;
+}
+body .nf-table tbody tr { transition: background-color .18s; }
+body .nf-table tbody tr:hover { background: rgba(255, 255, 255, .032); }
+body .nf-table td.is-num { font-family: 'JetBrains Mono', monospace; color: var(--nf-text-hi); }
+
+/* ==========================================================================
+   登录页
+   ========================================================================== */
+body .nf-login {
+  position: fixed; inset: 0; z-index: 100;
+  display: grid; place-items: center;
+  padding: 20px;
+  /* 必须有底：登录遮罩下方的面板是照样渲染的（x-show 只控制外壳，不控制内容）。
+     早期版本靠 Tailwind 的 bg-gray-50 提供不透明底，重做时若漏掉这层，
+     面板内容会透上来，登录框和正文叠在一起，既难读也像渲染坏了。 */
+  background: rgba(7, 9, 16, .88);
+  -webkit-backdrop-filter: blur(18px) saturate(120%);
+  backdrop-filter: blur(18px) saturate(120%);
+}
+body .nf-login__card {
+  width: 100%; max-width: 384px;
+  border-radius: var(--nf-r-xl);
+  padding: 34px 32px 28px;
+  animation: nf-rise .7s var(--nf-ease) both;
+}
+@keyframes nf-rise {
+  from { opacity: 0; transform: translate3d(0, 18px, 0) scale(.975); filter: blur(6px); }
+  to   { opacity: 1; transform: translate3d(0, 0, 0) scale(1);       filter: blur(0); }
+}
+body .nf-login__mark {
+  width: 60px; height: 60px;
+  display: grid; place-items: center;
+  margin: 0 auto 16px;
+  border-radius: 19px;
+  color: var(--nf-accent-hi);
+  background: linear-gradient(150deg, rgba(79, 201, 192, .22), rgba(79, 201, 192, .04));
+  border: 1px solid var(--nf-accent-line);
+  box-shadow: var(--nf-inset-top), 0 0 34px -8px rgba(79, 201, 192, .55);
+  animation: nf-mark-breathe 5s var(--nf-ease-soft) infinite alternate;
+}
+@keyframes nf-mark-breathe {
+  from { box-shadow: var(--nf-inset-top), 0 0 26px -10px rgba(79, 201, 192, .45); }
+  to   { box-shadow: var(--nf-inset-top), 0 0 44px -6px  rgba(79, 201, 192, .70); }
+}
+body .nf-login__title {
+  text-align: center; font-size: 1.16rem; font-weight: 600;
+  letter-spacing: -.015em; margin: 0;
+}
+body .nf-login__sub {
+  text-align: center; font-size: .78rem; color: var(--nf-text-lo);
+  margin: 6px 0 24px;
+}
+body .nf-login__foot {
+  text-align: center; font-size: .68rem; color: var(--nf-text-lo);
+  margin-top: 20px; letter-spacing: .05em;
+}
+
+/* ==========================================================================
+   Toast / 模态
+   ========================================================================== */
+body .nf-toast {
+  position: fixed; z-index: 90;
+  top: 22px; right: 22px;
+  max-width: 380px;
+  border-radius: var(--nf-r);
+  padding: 13px 17px;
+  font-size: .84rem;
+  display: flex; align-items: flex-start; gap: 10px;
+}
+body .nf-toast--success { border-color: rgba(142, 194, 111, .38); }
+body .nf-toast--error   { border-color: rgba(224, 115, 111, .42); }
+body .nf-toast--info    { border-color: rgba(123, 163, 212, .38); }
+body .nf-toast--warn    { border-color: rgba(221, 164, 76, .38); }
+
+body .nf-alert {
+  border-radius: var(--nf-r);
+  padding: 11px 14px;
+  font-size: .8rem;
+  border: 1px solid var(--nf-hairline-strong);
+  background: rgba(255, 255, 255, .04);
+  color: var(--nf-text-mid);
+}
+body .nf-alert--warn {
+  color: var(--nf-warn);
+  border-color: rgba(221, 164, 76, .32);
+  background: rgba(221, 164, 76, .08);
+}
+
+/* ==========================================================================
+   降级与响应式
+   ========================================================================== */
+
+/* 窄屏：侧栏收成顶部横条 */
+@media (max-width: 900px) {
+  body .nf-shell { flex-direction: column; }
+  body .nf-sidebar {
+    width: 100%;
+    border-right: 0;
+    border-bottom: 1px solid var(--nf-hairline);
+    max-height: 46dvh;
+  }
+  body .nf-main { padding: 20px 18px 48px; }
+  body .nf-pagehead__title { font-size: 1.28rem; }
+}
+
+/* 触屏没有 hover：关掉追光/闪光，避免留下永久亮斑 */
+@media (hover: none) {
+  body .nf-spot::before { display: none; }
+  body .nf-shine::after  { display: none; }
+  body .nf-btn--magnetic { transform: none; }
+  body .nf-tilt { transform: none; }
+}
+
+/* 用户明确要求减少动效：全部关掉，不是降级播放 */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+    scroll-behavior: auto !important;
+  }
+  body .nf-light--drift { animation: none; }
+  body .nf-spot::before,
+  body .nf-shine::after { display: none; }
+  body .nf-btn--magnetic,
+  body .nf-tilt { transform: none !important; }
+}
+
+/* Alpine 未启动时的兜底（沿用原有约定，不能删） */
+[x-cloak] { display: none !important; }
+
+/* 滚动条：深色主题下默认滚动条是白的，会非常刺眼 */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, .1);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, .2); background-clip: content-box; }
+
+::selection { background: rgba(79, 201, 192, .28); color: var(--nf-text-hi); }
+
+/* ==========================================================================
+   顶部操作条
+   --------------------------------------------------------------------------
+   宽屏：右上角浮动一组按钮。
+   窄屏：**必须变形成真正的顶栏**。原来它一直是 fixed + top-6 right-6，
+   而侧栏在窄屏下会移到顶部，于是这排按钮直接压在品牌标题上
+   （实测截图里「Ghost Firewall」和「退出登录」叠在一起）。
+   改成通栏 + 自身底色，并给侧栏 brand 留出让位高度。
+   ========================================================================== */
+body .nf-topbar {
+  position: fixed;
+  top: 18px; right: 18px;
+  z-index: 40;
+  display: flex; align-items: center; gap: 10px;
+}
+body .nf-topbar > button,
+body .nf-topbar > span {
+  border-radius: 10px;
+  font-family: inherit;
+  font-size: .84rem;
+}
+
+@media (max-width: 900px) {
+  body .nf-topbar {
+    top: 0; left: 0; right: 0;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 10px 14px;
+    background: rgba(7, 9, 16, .86);
+    -webkit-backdrop-filter: blur(14px);
+    backdrop-filter: blur(14px);
+    border-bottom: 1px solid var(--nf-hairline);
+  }
+  body .nf-brand { padding-top: 66px; }
+}
+
+/* ==========================================================================
+   页面容器
+   --------------------------------------------------------------------------
+   页面内容原本是平铺在背景上的（只有 h1 + 一堆表单项）。不给每个页面
+   单独包一层卡片，而是直接把页面容器本身做成玻璃面板：
+   14 个页面各加一个 nf-page 类就够了，零结构改动、零 Alpine 绑定风险。
+   ========================================================================== */
+body .nf-page {
+  position: relative;
+  border-radius: var(--nf-r-xl);
+  padding: 26px 28px 30px;
+  background: linear-gradient(158deg, var(--nf-glass-tint), var(--nf-glass-tint-2));
+  -webkit-backdrop-filter: blur(16px) saturate(135%);
+  backdrop-filter: blur(16px) saturate(135%);
+  border: 1px solid var(--nf-hairline);
+  box-shadow: var(--nf-inset-top), var(--nf-inset-bot), var(--nf-shadow-lg);
+  overflow: hidden;
+}
+
+/* 页面级追光：指针扫过时整个面板亮一下，幅度比卡片小（面更大） */
+body .nf-page::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: radial-gradient(520px circle at var(--mx, 50%) var(--my, 0%),
+    rgba(79, 201, 192, .10), transparent 65%);
+  opacity: 0;
+  transition: opacity .5s var(--nf-ease);
+  pointer-events: none;
+  z-index: 0;
+}
+body .nf-page:hover::before { opacity: 1; }
+body .nf-page > * { position: relative; z-index: 1; }
+
+/* 页面标题 */
+body .nf-page > h1:first-child,
+body .nf-page h1.nf-h1 {
+  font-size: 1.42rem;
+  font-weight: 600;
+  letter-spacing: -.022em;
+  color: var(--nf-text-hi);
+  margin: 0 0 4px;
+}
+body .nf-page > h1:first-child::after {
+  content: '';
+  display: block;
+  width: 34px; height: 2px;
+  margin-top: 10px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, var(--nf-accent), transparent);
+  box-shadow: 0 0 10px rgba(79, 201, 192, .5);
+}
+
+/* 面板内的次级区块（原本是 h2/h3） */
+body .nf-page h2 {
+  font-size: .95rem; font-weight: 600;
+  color: var(--nf-text-hi);
+  margin: 26px 0 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--nf-hairline);
+}
+body .nf-page h3 {
+  font-size: .86rem; font-weight: 600;
+  color: var(--nf-text-mid);
+  margin: 18px 0 9px;
+}
+
+/* 表单行：标签在上、控件在下，控件之间留够呼吸 */
+body .nf-page label.block,
+body .nf-page .mb-3 { margin-bottom: 14px; }
+
+/* ==========================================================================
+   遗留工具类兼容层
+   --------------------------------------------------------------------------
+   为什么需要：面板内部 2000 多行是早于设计系统写的，颜色都写死在
+   Tailwind 工具类里（text-gray-700 / bg-white / bg-black …）。逐个改 HTML
+   是 2000 行 diff，风险远大于收益；所以在这里把这些类映射到设计令牌。
+
+   这是**过渡层**，不是终点：它是明确标注、范围有限、可审计的一层。
+   新写的组件一律用 nf-* 系列，不要再往这里加类。
+
+   全部带 body 前缀（0-1-1）压过 Tailwind 单类（0-1-0）。
+   ========================================================================== */
+
+/* —— 中性文字 —— */
+body .text-gray-900, body .text-gray-700 { color: var(--nf-text-hi); }
+body .text-gray-600, body .text-gray-500 { color: var(--nf-text-mid); }
+body .text-gray-400, body .text-gray-300 { color: var(--nf-text-lo); }
+body .text-white,   body .text-gray-100 { color: var(--nf-text-hi); }
+
+/* —— 语义文字 ——
+   深底上不能沿用 Tailwind 的 -600/-700/-800：那些色值是为白底调的，
+   相对亮度只有 25~45%，放到 #0a0d15 上基本等于隐形。统一提到状态色的
+   亮度。映射必须覆盖全部在用的色阶，少一条就是一个隐形文字。 */
+body .text-red-500, body .text-red-600,
+body .text-red-700, body .text-red-800      { color: var(--nf-danger); }
+body .text-green-400, body .text-green-600,
+body .text-green-700, body .text-green-800 { color: var(--nf-ok); }
+body .text-amber-600, body .text-amber-700,
+body .text-amber-800, body .text-orange-800,
+body .text-yellow-800                       { color: var(--nf-warn); }
+body .text-blue-600, body .text-blue-700,
+body .text-blue-800, body .text-indigo-700  { color: var(--nf-info); }
+body .text-teal-700                         { color: var(--nf-accent); }
+body .text-orange-500                       { color: var(--nf-warn); }
+/* 深底上的「黑色文字链接」会直接消失，链接语义交给主色 */
+body .text-black                            { color: var(--nf-accent); }
+
+/* —— 表面 —— */
+/* bg-black 在本项目里同时是「主按钮」和「开关开启态」，
+   映射到主色渐变对两者都成立：按钮成为强调动作，开关开启一眼可辨。 */
+body .bg-black {
+  background-image: linear-gradient(140deg, var(--nf-accent-hi), var(--nf-accent-lo));
+  background-color: var(--nf-accent);
+  color: #04211f;
+  box-shadow: var(--nf-inset-top), 0 8px 22px -12px rgba(79, 201, 192, .65);
+}
+body .hover\:bg-gray-800:hover {
+  background-image: linear-gradient(140deg, #8deade, var(--nf-accent));
+  background-color: var(--nf-accent-hi);
+  color: #04211f;
+}
+body .bg-white {
+  background-color: rgba(255, 255, 255, .045);
+  background-image: linear-gradient(158deg, var(--nf-glass-tint), var(--nf-glass-tint-2));
+  border: 1px solid var(--nf-hairline);
+  -webkit-backdrop-filter: blur(12px) saturate(130%);
+  backdrop-filter: blur(12px) saturate(130%);
+  box-shadow: var(--nf-inset-top), var(--nf-inset-bot), var(--nf-shadow-sm);
+}
+body .bg-gray-50, body .bg-gray-100 { background-color: rgba(255, 255, 255, .035); }
+body .bg-gray-200, body .bg-gray-300 { background-color: var(--nf-surface-3); }
+body .bg-gray-900                    { background-color: var(--nf-surface); }
+body .hover\:bg-gray-50:hover,
+body .hover\:bg-gray-100:hover       { background-color: rgba(255, 255, 255, .07); }
+body .hover\:bg-gray-200:hover,
+body .hover\:bg-gray-300:hover       { background-color: rgba(255, 255, 255, .11); }
+body .hover\:text-gray-600:hover,
+body .hover\:text-gray-700:hover     { color: var(--nf-text-hi); }
+
+/* —— 边框 —— */
+body .border       { border-color: var(--nf-hairline); }
+body .border-gray-200, body .border-gray-300,
+body .border-gray-400          { border-color: var(--nf-hairline-strong); }
+body .hover\:border-gray-300:hover { border-color: var(--nf-accent-line); }
+body .border-black             { border-color: var(--nf-accent-line); }
+body .ring-black { border-color: var(--nf-accent-line); --tw-ring-color: var(--nf-accent-line); }
+
+/* —— 状态色：把浅色系的 red/green 拉进深色寄存器，
+      否则深底上会出现「刺眼的粉红 + 荧光绿」这种廉价组合 —— */
+/* danger 按钮：白字压 #e0736f 只有 2.65:1（浏览器审计实测），读不清。
+   改成深色文字 —— 与主按钮「亮底 + 深字」同一套方向，面板里按钮文字
+   逻辑从此只有一个，不会再出现「白字浅红底」这种半成品状态。
+   选择器带 .text-white 是为了压过兼容层同级的 body .text-white：
+   两者都是 0-1-1，只靠声明顺序决胜太脆。 */
+body .bg-red-50, body .bg-red-100    { background-color: rgba(224, 115, 111, .10); }
+body .bg-red-500          { background-color: var(--nf-danger); color: #2a0d0c; }
+body .bg-red-500.text-white { color: #2a0d0c; }
+body .hover\:bg-red-600:hover { background-color: #c96460; }
+body .hover\:bg-red-50:hover  { background-color: rgba(224, 115, 111, .18); }
+body .border-red-200, body .border-red-300,
+body .border-red-500          { border-color: rgba(224, 115, 111, .42); }
+
+body .text-green-800{ color: var(--nf-ok); }
+body .text-green-600{ color: var(--nf-ok); }
+body .bg-green-50, body .bg-green-100 { background-color: rgba(142, 194, 111, .10); }
+body .bg-green-500  { background-color: var(--nf-ok); }
+body .border-green-200, body .border-green-300,
+body .border-green-500       { border-color: rgba(142, 194, 111, .40); }
+
+body .text-amber-600, body .text-amber-700 { color: var(--nf-warn); }
+body .bg-amber-50, body .bg-amber-100 { background-color: rgba(221, 164, 76, .10); }
+body .bg-amber-500 { background-color: var(--nf-warn); }
+body .border-amber-200, body .border-yellow-300,
+body .border-orange-300     { border-color: rgba(221, 164, 76, .40); }
+
+/* —— info / teal：Tailwind 的 blue/indigo/teal 在本项目里代表「通知 / 信息」，
+      深底上原样保留会变成浅蓝底色块（浏览器验收实测：网络接口页「可用接口」
+      提示条就是这样一块浅蓝）。统一压成同色 10% 低透明底 —— */
+body .bg-blue-50, body .bg-blue-100,
+body .bg-indigo-100         { background-color: rgba(123, 163, 212, .10); }
+body .border-blue-200       { border-color: rgba(123, 163, 212, .40); }
+body .bg-teal-100           { background-color: rgba(79, 201, 192, .10); }
+body .bg-orange-50, body .bg-yellow-50 { background-color: rgba(221, 164, 76, .10); }
+
+/* Alpine :class 里带透明度修饰的类（index.html:1489 的 bg-blue-50/40），
+   CSS 选择器里斜杠必须转义，否则整条规则不生效。 */
+body .bg-blue-50\/40        { background-color: rgba(123, 163, 212, .10); }
+
+/* —— 表单控件：浏览器默认样式在深底上是灾难（白色内陷框）——
+     input/textarea/select 一律接管 —— */
+body input:not([type="checkbox"]):not([type="radio"]),
+body select,
+body textarea {
+  background-color: rgba(0, 0, 0, .28);
+  border: 1px solid var(--nf-hairline-strong);
+  color: var(--nf-text-hi);
+  border-radius: 9px;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, .4);
+  transition: border-color .2s, box-shadow .2s;
+}
+body input:focus, body select:focus, body textarea:focus {
+  outline: none;
+  border-color: var(--nf-accent-line);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, .4), 0 0 0 3px var(--nf-accent-dim);
+}
+body input::placeholder, body textarea::placeholder { color: var(--nf-text-lo); }
+body select option { background: var(--nf-surface); color: var(--nf-text-hi); }
+body input:disabled, body select:disabled, body textarea:disabled { opacity: .45; }
+
+/* 勾选框 / 单选框：accent-color 一行搞定，比逐个伪元素省事且状态一致 */
+body input[type="checkbox"], body input[type="radio"] {
+  accent-color: var(--nf-accent);
+  width: 15px; height: 15px;
+}
+
+/* —— 阴影：Tailwind 的 shadow-lg 是为白底调的，深底上会糊成一团 —— */
+body .shadow-lg, body .shadow-md, body .shadow { box-shadow: var(--nf-shadow-md); }
+
+/* ==========================================================================
+   等宽工具类 —— 放在文件末尾
+   --------------------------------------------------------------------------
+   ⚠ 位置和写法都是被迫的，别动。
+
+   组件规则一律写成 `body .nf-input`（特异性 0-1-1）来压过 Tailwind 的
+   单类工具类（0-1-0）。如果等宽工具类只用 `.nf-mono`（0-1-0），就会被
+   `body .nf-input` 里的 `font-family: inherit` 吃掉 —— 这正是 2026-10-10
+   浏览器验收实测抓到的 bug：字体文件明明加载成功（network 200、
+   document.fonts.check 为 true），但密码框实际渲染的仍是 Outfit。
+
+   所以这里必须同样带 body 前缀（升到 0-1-1），并且声明在组件规则**之后**，
+   让同特异性下靠后声明胜出。
+   ========================================================================== */
+body .nf-mono,
+body code,
+body kbd,
+body pre {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 焦点可见性统一收口：键盘用户必须能看见自己在哪 */
+:focus-visible { outline: 2px solid var(--nf-accent); outline-offset: 2px; border-radius: 4px; }
