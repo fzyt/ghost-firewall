@@ -316,12 +316,24 @@ DEFAULT_CONFIG = {
 
 
 def load_config():
-    """加载配置，如果不存在则返回默认值"""
+    """加载配置，如果不存在则返回默认值
+
+    配置损坏时**仍然返回默认值**（Web UI 不能因此不可用），但会把损坏原因记到
+    _LAST_LOAD_ERROR，并在 _config_corrupted() 里暴露出来。
+
+    为什么不能只是「返回默认值」：DEFAULT_CONFIG 里写死了别人的网段
+    （trusted_ip4=192.168.100.2、lan_subnet4=192.168.4.0/24、转发到
+    192.168.4.226）。一旦损坏后照常下发规则，就会拿这些值去改真实防火墙，
+    而且接口回报 success: true —— 用户完全无感知。宁可拒绝下发。
+    """
+    global _LAST_LOAD_ERROR
+    _LAST_LOAD_ERROR = None
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, 'r') as f:
                 config = json.load(f)
         except (json.JSONDecodeError, OSError) as e:
+            _LAST_LOAD_ERROR = str(e)
             # JSON 损坏或读失败：备份损坏文件并返回默认值（避免 Web UI 不可用）
             try:
                 backup_path = CONFIG_PATH + f'.corrupted.{int(time.time())}'
@@ -331,12 +343,51 @@ def load_config():
             except Exception:
                 pass
             return dict(DEFAULT_CONFIG)
+        # 顺序很关键：必须**先迁移用户配置，再合并默认值**。
+        # 反过来的话，DEFAULT_CONFIG 自带的 forward_rules 示例会先进来，
+        # 于是 _migrate_forward_rules 里 `"forward_rules" not in config` 恒为
+        # False，迁移成了永远不执行的死代码 —— 旧配置里的
+        # tcp_services/dsm_ip4 被无声丢弃，用户拿到的转而是 DEFAULT 里的
+        # 示例规则 41820,41825 → 192.168.4.226（别人的网段）。
+        config = _migrate_forward_rules(config)
         # 合并默认值（防止新增字段丢失）
         result = dict(DEFAULT_CONFIG)
         result.update(config)
-        result = _migrate_forward_rules(result)
         return result
     return dict(DEFAULT_CONFIG)
+
+
+# 上一次 load_config() 读到的配置是否损坏。None = 正常。
+# 由 load_config 写入，由 _config_corrupted() 读。
+_LAST_LOAD_ERROR = None
+
+
+def _config_corrupted():
+    """最近一次 load_config() 是否读到了损坏的配置。
+
+    返回 (bool, str)：True 时第二个元素是损坏原因。
+    「应用规则 / 预览规则」这类会真正改防火墙的入口必须先问它 —— 用硬编码的
+    DEFAULT_CONFIG 去下发 nft 规则，等于把别人的网段写进真实防火墙。
+    """
+    return (_LAST_LOAD_ERROR is not None, _LAST_LOAD_ERROR or '')
+
+
+# 配置损坏时拒绝下发规则的统一提示
+_CORRUPT_REFUSAL = ('配置文件已损坏（{err}），已拒绝下发规则。'
+                    '请到「功能介绍/配置」页恢复配置，或手工修复 '
+                    '{path} 后重试。损坏副本已另存为 {path}.corrupted.<时间戳>。')
+
+
+def _config_corrupted_response():
+    """损坏配置时给前端的标准应答（None 表示配置正常）"""
+    bad, err = _config_corrupted()
+    if not bad:
+        return None
+    return jsonify({
+        'success': False,
+        'code': 'CONFIG_CORRUPTED',
+        'message': _CORRUPT_REFUSAL.format(err=err, path=CONFIG_PATH),
+    }), 500
 
 
 def save_config(config):
@@ -471,6 +522,64 @@ def _valid_ip(v, version=None):
     return True
 
 
+def _bad_forward_target(ip, ip6, cfg):
+    """端口转发目标地址的语义校验。返回错误说明字符串；没问题返回 ''。
+
+    「格式合法」不等于「能用」。下面几类地址语法上都是合法 IP，但转发过去
+    要么打不通、要么把流量送进一个不该暴露的服务：
+
+      127.0.0.0/8     路由器自身回环 —— 外部来的包 DNAT 到回环后没有对应
+                      的监听，等于黑洞；部分内核下会形成重定向环路
+      169.254.0.0/16  链路本地 —— 云主机的元数据地址就在这里
+                      （169.254.169.254）。把它设成转发目标，等于把云厂商
+                      的凭据接口经由本机 NAT 暴露到公网
+      0.0.0.0 / ::   未指定
+      广播地址        局域网广播，发过去只会打扰全网
+      路由器自身地址  DNAT 回自己 → 重定向环路
+
+    注意 IPv4-mapped 的 ::ffff:127.0.0.1 也要一并挡住。
+    """
+    import ipaddress
+    try:
+        addr = ipaddress.ip_address(str(ip).strip())
+    except ValueError:
+        return '不是合法 IP'
+
+    if addr.is_loopback:
+        return '指向路由器自身回环，转发过去打不通'
+    if addr.is_link_local:
+        return ('指向链路本地地址（含 169.254.169.254 云元数据地址），'
+                '把它设成转发目标会把该接口经 NAT 暴露到公网')
+    if addr.is_unspecified:
+        return '未指定地址'
+    if addr.version == 4:
+        if addr == ipaddress.ip_address('255.255.255.255'):
+            return '广播地址不能作为转发目标'
+        lan4 = str((cfg or {}).get('lan_subnet4', '') or '').strip()
+        bcast4 = str((cfg or {}).get('lan_broadcast4', '') or '').strip()
+        if bcast4:
+            try:
+                if addr == ipaddress.ip_address(bcast4):
+                    return '广播地址不能作为转发目标'
+            except ValueError:
+                pass
+        if lan4:
+            try:
+                if addr in ipaddress.ip_network(lan4, strict=False):
+                    pass  # 同网段地址是正常转发目标
+            except ValueError:
+                pass
+    if addr.version == 6 and addr.ipv4_mapped is not None:
+        return _bad_forward_target(str(addr.ipv4_mapped), ip6, cfg)
+
+    # 转发目标指向路由器自己 → DNAT 回自身，形成重定向环路
+    for key in ('router_ip4', 'router_ip6'):
+        r = str((cfg or {}).get(key, '') or '').strip()
+        if r and r == str(addr):
+            return '指向路由器自身地址，转发会造成重定向环路'
+    return ''
+
+
 def _split_ports(v):
     """把逗号/中文逗号/空格分隔的端口串归一化为 int 列表；非法则抛 ValueError"""
     raw = v if isinstance(v, list) else str(v or '').replace('，', ',').split(',')
@@ -566,6 +675,17 @@ def validate_config(cfg):
             tgt = str(r.get('target_ip', '') or '').strip()
             if not _valid_ip(tgt):
                 errs.append(f'forward_rules[{i}].target_ip 非法: {tgt!r}')
+            else:
+                why = _bad_forward_target(tgt, r.get('target_ipv6', ''), cfg)
+                if why:
+                    errs.append(f'forward_rules[{i}].target_ip 不可用: {tgt!r} — {why}')
+            tgt6 = str(r.get('target_ipv6', '') or '').strip()
+            if tgt6 and not _valid_ip(tgt6, 6):
+                errs.append(f'forward_rules[{i}].target_ipv6 非法: {tgt6!r}')
+            elif tgt6:
+                why = _bad_forward_target(tgt6, tgt6, cfg)
+                if why:
+                    errs.append(f'forward_rules[{i}].target_ipv6 不可用: {tgt6!r} — {why}')
             for pk in ('tcp_ports', 'udp_ports'):
                 if pk in r:
                     try:
@@ -735,21 +855,31 @@ def _safe_iface(v, default):
     return s if _RE_IFACE.match(s) else default
 
 
-def _safe_ip(v, version=None, default=""):
+def _safe_ip(v, version=None, default="", strict=False):
     """config_to_variables 用：非法 IP 回落到默认值，保证生成的规则里不出现裸字符串。
 
     接受字符串和数组两种写法（setup.sh 写的是数组）；数组取第一个合法项。
-    注意：绝不能在数组形态下静默回落 default —— 那会把用户真实的信任 IP
-    悄悄换成硬编码的 192.168.4.229，属于「拒绝服务 + 意外授权」。
+
+    strict=True（默认 False）时**绝不**回落到 default，非法就返回空串，让这条
+    规则干脆不生成。
+
+    为什么要这个开关：default 里写的是硬编码网段上的地址，例如
+    TRUSTED_IP4 回落成 192.168.4.229 而模板给信任 IP 放行全部端口全部协议。
+    用户把信任 IP 填错或清空，结果不是「少一条白名单」，而是「凭空多出一条
+    全端口授权」—— 属于意外授权，且用户完全无感知。授权类字段必须 fail-closed。
+    而 ROUTER_IP4 这类路由字段的 default 是「首次部署的合理值」，不是授权，
+    保留回落是对的，所以用 strict 区分而不是一刀切。
     """
+    fallback = "" if strict else default
     if isinstance(v, (list, tuple, set)):
         for item in v:
             s = str(item).strip()
             if s and _valid_ip(s, version):
                 return s
-        return default
+        # 数组里一个合法项都没有：同样不能静默回落成别人的 IP
+        return fallback
     s = str(v or '').strip()
-    return s if (s and _valid_ip(s, version)) else default
+    return s if (s and _valid_ip(s, version)) else fallback
 
 
 def _safe_cidr(v, default=""):
@@ -863,10 +993,14 @@ def config_to_variables(config):
         "KNOCK3_PORT": str(_safe_port(config.get("knock3_port", 3), 3)),
         "KNOCK4_PORT": str(_safe_port(config.get("knock4_port", 4), 4)),
         "PORT_SETS_BLOCK": port_sets_block,
-        "TRUSTED_IP4": _safe_ip(config.get("trusted_ip4", ""), 4, "192.168.4.229"),
-        "TRUSTED_IP6": _safe_ip(config.get("trusted_ip6", ""), 6, "fd93:86bb:a142:0:e9d:92ff:fe87:fd28"),
+        "TRUSTED_IP4": _safe_ip(config.get("trusted_ip4", ""), 4, "192.168.4.229", strict=True),
+        "TRUSTED_IP6": _safe_ip(config.get("trusted_ip6", ""), 6, "fd93:86bb:a142:0:e9d:92ff:fe87:fd28", strict=True),
         "ACCESS_MODE": config.get("access_mode") if config.get("access_mode") in ("lan", "trusted") else "trusted",
         "CHINA_IP_BLOCK": "true" if config.get("china_ip_block", True) else "false",
+        # 决定 forward 链要不要放行普通 LAN→WAN：本机做 DNS 递归解析时只允许
+        # 内网访问路由器自己的 DNS（见 template_engine 的 __LAN_WAN_GENERAL__）。
+        "DNS_LAN_RESOLVER_ENABLED": ("true" if config.get("dns_lan_resolver_enabled", False)
+                                     else "false"),
         # 决定 ruleset 前导块：openwrt 接管整机 / linux_gateway 只重建自有表。
         # 非法值一律按 openwrt 处理 —— 宁可行为等同现状，也不要意外不清表。
         "DEPLOY_MODE": (config.get("deploy_mode")
@@ -1176,18 +1310,47 @@ def restore_config():
     backup_path = CONFIG_PATH + '.backup'
     if not os.path.exists(backup_path):
         return jsonify({"success": False, "message": "没有可恢复的备份文件"}), 400
+    tmp_path = CONFIG_PATH + '.restore.tmp'
+    lock_path = CONFIG_PATH + '.lock'
+    lock_fd = None
     try:
-        shutil.copy(backup_path, CONFIG_PATH)
+        # 1. 同一把写锁：save_config 也在用。恢复期间并发保存会把
+        #    「恢复出来的旧配置」和「并发写入的新配置」互相覆盖，
+        #    结果取决于谁最后落盘。
+        try:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        except OSError as e:
+            print(f'[WARN] restore_config 加锁失败（继续无锁恢复）: {e}', flush=True)
+
+        # 2. 先写临时文件再 replace：shutil.copy 是「边读边写」直接落到
+        #    CONFIG_PATH，中途失败/磁盘满会留下一个截断的 JSON。
+        #    而 load_config 遇到截断 JSON 会当损坏处理 → 备份成
+        #    .corrupted.* 后**静默回落到 DEFAULT_CONFIG**，
+        #    等于「恢复配置」反而把配置弄丢了。
+        shutil.copy(backup_path, tmp_path)
+        with open(tmp_path, 'r') as f:
+            json.load(f)          # 校验恢复出来的确实是完整 JSON
+        os.replace(tmp_path, CONFIG_PATH)
         return jsonify({"success": True, "message": "配置已恢复，请刷新页面"})
     except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
+        _unlink_quiet(tmp_path)
+        return jsonify({"success": False,
+                        "message": f"恢复失败，原配置未被改动: {e}"}), 500
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+            except OSError:
+                pass
 
 
 def build_rules(config):
     """生成规则，替换白名单超时时间"""
     variables = config_to_variables(config)
     log_switches = config_to_log_switches(config)
-    rules = generate_rules(variables, log_switches)
+    rules = generate_rules(variables, log_switches, load_lists())
     # 白名单超时强制非负整数：这里是 rules.replace() 字符串拼接，
     # 任意非数字内容都会被原样写进 nft 规则（可注入 delete table 等指令）
     whitelist_timeout = config.get("whitelist_timeout", 18000)
@@ -1812,12 +1975,20 @@ def _restore_lastgood_rules():
     backup = RULES_PATH + '.lastgood'
     if os.path.exists(backup):
         try:
-            os.replace(backup, RULES_PATH)
+            # 用 copy 而不是 os.replace/move：回滚失败时（nft -f 非 0）如果
+            # 把 .lastgood 搬走了，这份唯一的回滚材料就没了 —— 再出一次故障
+            # 就只能退到 _apply_basic_lockdown，端口转发/敲门规则全丢。
+            # 搬走的代价是「回滚成功后 .lastgood 消失」，留着没有额外成本。
+            shutil.copy(backup, RULES_PATH)
             res = subprocess.run(['nft', '-f', RULES_PATH],
                                  capture_output=True, text=True, timeout=30)
             if res.returncode == 0 and not _ruleset_is_empty():
                 print('[OK] 已回滚到上一版自定义规则', flush=True)
                 return 'lastgood', '已回滚到上一版规则'
+            # 回滚没生效：把 RULES_PATH 恢复到「上一版的备份」内容，
+            # 至少磁盘上的材料还在，下次还能再试一次。
+            print(f'[WARN] 回滚后 nft -f 返回 {res.returncode if res else "超时"}，'
+                  f'已保留 .lastgood 供下次重试', flush=True)
         except Exception as e:
             print(f'[WARN] 回滚上一版规则失败: {type(e).__name__}: {e}', flush=True)
     if _apply_basic_lockdown():
@@ -1872,8 +2043,24 @@ def _apply_ruleset(config):
         try:
             shutil.copy(RULES_PATH, lastgood)
         except OSError as e:
-            print(f'[WARN] 备份旧规则失败: {e}', flush=True)
-            had_old = False
+            # 备份失败 = 没有回滚材料。接下来的 os.replace 会把旧文件覆盖掉，
+            # 万一 nft -f 再失败就什么都恢复不了。所以这里直接中止。
+            # （此前是把 had_old 改成 False 继续往下走：失败分支看到
+            #  not had_old 就把刚写好的 RULES_PATH 删掉，而 .lastgood 从没
+            #  创建过 —— 结果是磁盘上既没有旧规则也没有新规则。）
+            print(f'[ERROR] 备份旧规则失败，已中止应用（避免无回滚材料时覆盖现有规则）: {e}',
+                  flush=True)
+            _unlink_quiet(tmp_path)
+            return False, f'备份现有规则失败，已中止应用（未改动现有规则）: {e}'
+        # 备份必须真的可读。copy 返回成功不等于内容写全了（磁盘满、权限、
+        # 配额都可能），拿一个打不开的备份当回滚材料比没有更危险。
+        try:
+            with open(lastgood, 'rb') as bf:
+                bf.read(1)
+        except OSError as e:
+            print(f'[ERROR] 备份校验失败，已中止应用: {e}', flush=True)
+            _unlink_quiet(tmp_path)
+            return False, f'备份现有规则校验失败，已中止应用（未改动现有规则）: {e}'
     os.replace(tmp_path, RULES_PATH)
 
     # 3. 首次应用前额外备份一次完整 ruleset（仅当两个 backup 都不存在时）
@@ -1925,7 +2112,13 @@ def _apply_ruleset(config):
 @app.route('/api/rules/apply', methods=['POST'])
 def apply_rules():
     """保存规则并执行 nft -f（先校验后写盘，失败自动回滚）"""
-    ok, message = _apply_ruleset(load_config())
+    config = load_config()
+    # 配置损坏时 load_config 返回的是硬编码 DEFAULT_CONFIG（内含他人网段）。
+    # 直接拿它下发规则 = 把陌生网段写进真实防火墙，而且回报 success: true。
+    refused = _config_corrupted_response()
+    if refused is not None:
+        return refused
+    ok, message = _apply_ruleset(config)
     if not ok:
         # 语法类问题算客户端错误，其余算服务端错误
         code = 400 if ("语法" in message or "超时" in message) else 500
@@ -3440,6 +3633,70 @@ def set_logd_config():
 
 VALID_SET_NAMES = {"allowed4", "allowed6", "blacklist4", "blacklist6"}
 
+# 名单成员落盘路径。规则集以 `flush ruleset` 开头、每次应用都会整体重建，
+# 只存在于内核 set 里的成员会被静默清空 —— 必须落盘并在生成时回填。
+LISTS_PATH = '/etc/nftables/nftables-web-lists.json'
+
+
+def load_lists():
+    """读取落盘名单成员。
+
+    返回 {set_name: [ip, ...]}。文件不存在/损坏时返回空结构并告警，
+    不能让一次坏文件把整个名单读取路径搞崩（否则名单管理页整个不可用）。
+    """
+    empty = {n: [] for n in sorted(VALID_SET_NAMES)}
+    if not os.path.exists(LISTS_PATH):
+        return empty
+    try:
+        with open(LISTS_PATH, 'r') as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f'[WARN] 名单文件读取失败（本次按空名单处理）: {e}', flush=True)
+        return empty
+    if not isinstance(data, dict):
+        print(f'[WARN] 名单文件格式非法（本次按空名单处理）: {type(data).__name__}', flush=True)
+        return empty
+    out = dict(empty)
+    for name in empty:
+        items = data.get(name)
+        if not isinstance(items, list):
+            continue
+        out[name] = [str(x).strip() for x in items if str(x).strip()]
+    return out
+
+
+def save_lists(data):
+    """原子写回名单文件（与 save_config 同样用临时文件 + replace）"""
+    os.makedirs(os.path.dirname(LISTS_PATH), exist_ok=True)
+    payload = {n: sorted({str(x).strip() for x in (data.get(n) or []) if str(x).strip()})
+               for n in sorted(VALID_SET_NAMES)}
+    tmp = LISTS_PATH + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, LISTS_PATH)
+
+
+def _mutate_lists(set_name, add=(), remove=(), clear=False):
+    """改名单并落盘。返回更新后的 {set_name: [...]}。
+
+    调用方必须先确认内核 nft 操作成功再调这里 —— 顺序不能反：
+    先落盘再改内核，内核失败就会造成「磁盘说有、内核没有」。
+    """
+    data = load_lists()
+    cur = list(data.get(set_name, []))
+    if clear:
+        cur = []
+    for ip in remove:
+        cur = [x for x in cur if x != ip]
+    for ip in add:
+        if ip not in cur:
+            cur.append(ip)
+    data[set_name] = cur
+    save_lists(data)
+    return data
+
 # 历史/预设容量上限
 LIST_HISTORY_MAX = 100
 
@@ -3601,6 +3858,9 @@ def list_add():
         )
         if result.returncode != 0:
             return jsonify({"success": False, "message": f"添加失败: {result.stderr.strip() or result.stdout.strip()}"}), 400
+        # 内核改成功之后再落盘。规则集以 flush ruleset 开头、每次应用都会重建，
+        # 只存在内核里的成员会在重建后静默消失 —— 用户以为还封着，其实已放行。
+        _mutate_lists(set_name, add=[ip])
         _record_list_history('add', ip, _list_type_from_set(set_name))
         return jsonify({"success": True, "message": f"已添加 {ip} 到 {set_name}"})
     except subprocess.TimeoutExpired:
@@ -3631,6 +3891,7 @@ def list_delete():
         )
         if result.returncode != 0:
             return jsonify({"success": False, "message": f"删除失败: {result.stderr.strip() or result.stdout.strip()}"}), 400
+        _mutate_lists(set_name, remove=[ip])
         _record_list_history('delete', ip, _list_type_from_set(set_name))
         return jsonify({"success": True, "message": f"已从 {set_name} 删除 {ip}"})
     except subprocess.TimeoutExpired:
@@ -3657,6 +3918,7 @@ def list_flush():
         )
         if result.returncode != 0:
             return jsonify({"success": False, "message": f"清空失败: {result.stderr.strip() or result.stdout.strip()}"}), 400
+        _mutate_lists(set_name, clear=True)
         _record_list_history('flush', '-', _list_type_from_set(set_name))
         return jsonify({"success": True, "message": f"已清空 {set_name}"})
     except subprocess.TimeoutExpired:
@@ -3815,6 +4077,7 @@ def list_apply_preset(preset_id):
     except subprocess.TimeoutExpired:
         return jsonify({'success': False, 'message': 'nft 命令超时'}), 400
 
+    _mutate_lists(set_name, add=[ip])
     _record_list_history('add', ip, preset['type'],
                          label=preset.get('label', ''), preset_id=preset_id)
     return jsonify({
@@ -4809,7 +5072,10 @@ def _deploy_all_rules(config=None):
         backup_dir = None
 
     def _rollback(msg):
-        shutil.rmtree(backup_dir, ignore_errors=True)
+        # ⚠️ 顺序不能反。原来是「先 rmtree 快照，再判断快照在不在」，
+        # 第二个判断永远为 False —— 于是 _rollback **从来没有真正回滚过**，
+        # 每次都返回「首次部署，无历史配置可回滚」。快照被删掉，conf.d 就停在
+        # 清理+生成之间的半更新状态，而用户看到的提示还说「无历史配置」。
         if backup_dir is None or not os.path.isdir(backup_dir):
             # 首次部署：conf.d 原本就不存在，没有可回滚的历史状态。
             # 此时「回滚」无从谈起，如实说明，不要谎称已回滚。
@@ -4823,42 +5089,53 @@ def _deploy_all_rules(config=None):
             print(f'[WARN] nginx conf 回滚失败: {e}', flush=True)
             shutil.rmtree(backup_dir, ignore_errors=True)
             return False, f"{msg}（回滚 nginx 配置也失败，请手工检查 {NGINX_CONF_DIR}）"
+        # 恢复成功之后才清理快照
         shutil.rmtree(backup_dir, ignore_errors=True)
         return False, f"{msg}（已回滚 nginx 配置，nginx 仍运行原配置）"
 
-    # 清理不再启用的域名配置文件 —— 只碰属于本面板的
-    active_conf_files = set()
-    managed_names = set()
-    for rule in rules:
-        try:
-            d = _sanitize_domain(rule["domain"])
-        except ValueError:
-            continue
-        p = rule.get("listen_port", 443)
-        managed_names.add(f"{d}-{p}.conf")
-        if rule.get("enabled"):
-            active_conf_files.add(f"{d}-{p}.conf")
-
-    if os.path.isdir(NGINX_CONF_DIR):
-        for fname in os.listdir(NGINX_CONF_DIR):
-            if not fname.endswith(".conf"):
+    # 清理与生成是一组不可分割的写操作：清理那一步已经把「不再启用」的 conf
+    # 真删掉了，这之后任何异常都会让 conf.d 停在「旧的删了一半、新的只写了一半」，
+    # 而 nginx 仍在跑旧配置 —— 磁盘与运行态不一致，比直接失败更难排查。
+    # 所以整段包起来，任何异常都走 _rollback() 恢复到部署前快照。
+    try:
+        # 清理不再启用的域名配置文件 —— 只碰属于本面板的
+        active_conf_files = set()
+        managed_names = set()
+        for rule in rules:
+            try:
+                d = _sanitize_domain(rule["domain"])
+            except ValueError:
                 continue
-            full = os.path.join(NGINX_CONF_DIR, fname)
-            # 归属判定：文件名属于本面板某条规则，或文件头带本面板标记
-            is_mine = fname in managed_names or _is_managed_conf(full)
-            if is_mine and fname not in active_conf_files:
-                try:
-                    os.remove(full)
-                except OSError as e:
-                    print(f'[WARN] 删除 nginx 配置失败 {fname}: {e}', flush=True)
+            p = rule.get("listen_port", 443)
+            managed_names.add(f"{d}-{p}.conf")
+            if rule.get("enabled"):
+                active_conf_files.add(f"{d}-{p}.conf")
 
-    # 生成所有启用规则的配置
-    for rule in rules:
-        if not rule.get("enabled"):
-            _remove_nginx_conf_file(rule)
-            continue
-        cert = certs.get(rule.get("ssl_cert_id", ""))
-        _write_nginx_conf_file(rule, cert, settings, i)
+        if os.path.isdir(NGINX_CONF_DIR):
+            for fname in os.listdir(NGINX_CONF_DIR):
+                if not fname.endswith(".conf"):
+                    continue
+                full = os.path.join(NGINX_CONF_DIR, fname)
+                # 归属判定：文件名属于本面板某条规则，或文件头带本面板标记
+                is_mine = fname in managed_names or _is_managed_conf(full)
+                if is_mine and fname not in active_conf_files:
+                    try:
+                        os.remove(full)
+                    except OSError as e:
+                        print(f'[WARN] 删除 nginx 配置失败 {fname}: {e}', flush=True)
+
+        # 生成所有启用规则的配置
+        # idx 是规则序号，给 _write_nginx_conf_file 生成全局唯一的
+        # ssl session 共享内存区名 —— 撞名会让整份 nginx 配置挂掉。
+        # （此前这里误写成未定义的 `i`，任何一条启用规则都会 NameError。）
+        for idx, rule in enumerate(rules, 1):
+            if not rule.get("enabled"):
+                _remove_nginx_conf_file(rule)
+                continue
+            cert = certs.get(rule.get("ssl_cert_id", ""))
+            _write_nginx_conf_file(rule, cert, settings, idx)
+    except Exception as e:
+        return _rollback(f"生成 nginx 配置时异常: {type(e).__name__}: {e}")
 
     # 测试并重载；测试失败必须回滚，不能只报错留下坏配置
     ok, msg = _nginx_test()
@@ -5178,6 +5455,16 @@ def rp_delete_rule(rule_id):
     if not fw_ok:
         return jsonify({"success": False, "message": fw_msg}), 500
 
+    # nginx 侧彻底失败时不能回 success:true。此前这条路径只把 deploy_ok 塞进
+    # 响应体的 nginx_reloaded 字段，顶层仍报成功 —— 前端只认顶层 success，
+    # 于是「部署失败、nginx 还在跑含已删站点的旧配置」被显示成「删除成功」。
+    if not deploy_ok:
+        return jsonify({
+            "success": False,
+            "code": "NGINX_DEPLOY_FAILED",
+            "message": f"反代规则已从配置中移除，但 nginx 配置未生效：{deploy_msg}",
+            "data": {"message": "反代规则已删除（nginx 未生效）", "nginx_reloaded": False},
+        }), 500
     return jsonify({"success": True, "data": {"message": "反代规则已删除", "nginx_reloaded": deploy_ok}})
 
 
@@ -5936,31 +6223,94 @@ def _unlink_quiet(path):
         pass
 
 
-def _apply_basic_lockdown():
+def _interface_exists(name):
+    """网卡名在本机是否真实存在"""
+    if not name:
+        return False
+    try:
+        return bool(os.path.isdir(f'/sys/class/net/{name}'))
+    except OSError:
+        return False
+
+
+def _detect_default_route_if():
+    """从默认路由推断出口接口名（兜底防火墙找不到 lan_if 时用）"""
+    try:
+        with open('/proc/net/route', 'r') as f:
+            lines = f.readlines()[1:]
+    except OSError:
+        return None
+    for line in lines:
+        parts = line.split()
+        if len(parts) > 2 and parts[1] == '00000000':   # destination 0.0.0.0
+            return parts[0] or None
+    return None
+
+
+def _apply_basic_lockdown(config=None):
     """兜底防火墙：WAN block / LAN allow / LAN 侧必要服务端口放行。
     只在主规则 + 备份都不可用时使用，保证路由器至少有基本保护。
 
     双重验证：nft -f - returncode=0 且 _ruleset_is_empty() == False。
     subprocess 异常不抛出，返回 False 让外层回退到下一级（虽然这里已经是最后一级）。
+
+    接口名与端口必须读配置，不能写死 br-lan / 22：
+    deploy_mode=linux_gateway 跑在普通 Linux 上，内核接口是 eth0，
+    规则里写 `iifname "br-lan"` 一条都匹配不上 → policy drop 之下没有任何
+    accept → 兜底防火墙一执行就把管理员自己关在门外，而日志还报「已应用」。
     """
+    if config is None:
+        try:
+            config = load_config()
+        except Exception as e:
+            print(f'[WARN] basic lockdown 读配置失败，用保守默认: {e}', flush=True)
+            config = {}
+
+    lan_if = str(config.get("lan_if", "") or "").strip() or "br-lan"
+
+    # 接口名必须真的存在。写错一个名字，规则照样加载成功、policy drop 照样
+    # 生效，但没有任何一条 accept 匹配得上 —— 管理员被自己的兜底规则关在门外。
+    # 所以这里宁可拒绝执行（返回 False，如实报「未生效」），也不装一份
+    # 必然把自己锁死的规则。
+    if not _interface_exists(lan_if):
+        auto = _detect_default_route_if()
+        if auto and _interface_exists(auto):
+            print(f'[WARN] 配置的 lan_if={lan_if} 不存在，改用默认路由接口 {auto}', flush=True)
+            lan_if = auto
+        else:
+            print(f'[ERROR] lan_if={lan_if} 在本机不存在且无法自动识别，'
+                  f'拒绝执行兜底防火墙（避免 policy drop 下无 accept 把自己锁死）',
+                  flush=True)
+            return False
+
+    # 只放行用户在配置里明确允许的 LAN 端口 + SSH + 面板自身端口。
+    # 不放行的话兜底规则一执行就没法远程自救。
+    ports = set()
+    raw_ports = str(config.get("lan_allowed_ports", "") or "")
+    for part in raw_ports.replace('，', ',').split(','):
+        p = part.strip()
+        if p.isdigit() and 0 < int(p) < 65536:
+            ports.add(int(p))
     try:
         web_port = HTTPS_PORT
     except NameError:
         web_port = 5443
-    ssh_port = 22  # OpenWrt 默认 SSH
+    ports.update({22, int(web_port)})
+
+    port_list = ', '.join(str(p) for p in sorted(ports))
     rules = f'''table inet fw4 {{
     chain input {{
         type filter hook input priority 0; policy drop;
         iifname "lo" accept
         ct state established,related accept
         # SSH / 面板只允许从 LAN 侧访问，绝不在 WAN 侧放行管理端口
-        iifname "br-lan" tcp dport {{ {ssh_port}, {web_port} }} accept
-        iifname "br-lan" accept
+        iifname "{lan_if}" tcp dport {{ {port_list} }} accept
+        iifname "{lan_if}" accept
     }}
     chain forward {{
         type filter hook forward priority 0; policy drop;
-        iifname "br-lan" accept
-        oifname "br-lan" ct state established,related accept
+        iifname "{lan_if}" accept
+        oifname "{lan_if}" ct state established,related accept
     }}
     chain output {{
         type filter hook output priority 0; policy accept;
@@ -6022,11 +6372,20 @@ def _auto_recover_ruleset_if_empty():
     # 「保险丝不能装在电表箱里」：恢复用的规则必须来自当前配置，而不是历史快照。
     if not os.path.exists(RULES_PATH):
         try:
-            ok, msg = _apply_ruleset(load_config())
-            if ok:
-                print(f'[INFO] ✅ 规则文件缺失，已按当前配置重新生成并加载: {msg}', flush=True)
-                return
-            print(f'[WARN] 按当前配置重建失败（{msg}），尝试 backup...', flush=True)
+            # 配置损坏时 load_config() 拿的是硬编码 DEFAULT_CONFIG（含他人网段）。
+            # 开机自动重建时用它，等于每次重启都把陌生网段写进防火墙 —— 必须在
+            # 这条路径上也拦住，否则「应用规则」那头的守卫形同虚设。
+            _cfg = load_config()
+            _bad, _err = _config_corrupted()
+            if _bad:
+                print(f'[ERROR] 配置损坏（{_err}），拒绝按默认配置重建规则，'
+                      f'改用 backup 恢复', flush=True)
+            else:
+                ok, msg = _apply_ruleset(_cfg)
+                if ok:
+                    print(f'[INFO] ✅ 规则文件缺失，已按当前配置重新生成并加载: {msg}', flush=True)
+                    return
+                print(f'[WARN] 按当前配置重建失败（{msg}），尝试 backup...', flush=True)
         except Exception as e:
             print(f'[WARN] 按当前配置重建异常（{e}），尝试 backup...', flush=True)
 
@@ -6047,15 +6406,47 @@ def _auto_recover_ruleset_if_empty():
 
 
 @app.route('/api/rules/health', methods=['GET'])
+def _ruleset_is_functional():
+    """比 _ruleset_is_empty 更严：表在、而且链真的带策略。
+
+    为什么单独一个函数：_ruleset_is_empty 只看 `nft list table inet fw4` 的
+    返回码，也就是「表在不在」。但表被 flush 空之后依然存在、返回码依然是 0 ——
+    此时内核里一条规则都没有，_ruleset_is_empty 照样说「健康」。
+    回滚链路依赖 _ruleset_is_empty 的宽松语义（宁可误报也不能漏报裸奔），
+    所以这里另起一个更严的判断，只给健康检查用。
+
+    返回 (bool, str)：第一个是是否可用，第二个是给人看的说明。
+    """
+    try:
+        res = subprocess.run(['nft', 'list', 'table', 'inet', 'fw4'],
+                             capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        return False, f'无法查询规则集: {e}'
+    if res.returncode != 0:
+        return False, 'table inet fw4 不存在'
+    out = res.stdout or ''
+    if 'hook input' not in out:
+        return False, 'input 链未挂载 —— 规则集不完整（可能被整体 flush 过）'
+    if 'policy drop' not in out and 'policy reject' not in out:
+        return False, 'input 链没有 drop/reject 默认策略 —— 防火墙可能未生效'
+    if 'type filter hook input' not in out and 'type filter hook' not in out:
+        return False, '未找到 filter 类型的 hook 链'
+    return True, '正常'
+
+
 def rules_health():
     """返回当前 nftables ruleset 健康状态（前端可查询/展示）"""
     if not _is_authenticated():
         return jsonify({'success': False, 'code': 'AUTH_REQUIRED', 'message': '未登录'}), 401
-    ruleset_loaded = not _ruleset_is_empty()
+    functional, detail = _ruleset_is_functional()
     return jsonify({
         'success': True,
         'data': {
-            'ruleset_loaded': ruleset_loaded,
+            # ruleset_loaded 保持原语义（表在不在），不破坏前端既有判断
+            'ruleset_loaded': not _ruleset_is_empty(),
+            # 新增：真正「防火墙生效」的判断
+            'ruleset_functional': functional,
+            'detail': detail,
             'rules_file': RULES_PATH,
             'rules_file_exists': os.path.exists(RULES_PATH),
             'backup_file_exists': os.path.exists(RULES_PATH + '.backup'),

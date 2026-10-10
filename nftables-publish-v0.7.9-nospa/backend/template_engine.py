@@ -13,12 +13,14 @@ def load_template():
         return f.read()
 
 
-def generate_rules(variables, log_switches):
+def generate_rules(variables, log_switches, list_elements=None):
     """
     根据变量和日志开关生成最终规则。
 
     variables: dict - 变量名到值的映射
     log_switches: dict - 日志开关名到布尔值的映射
+    list_elements: dict - 名单成员 {allowed4:[...], blacklist4:[...], ...}，
+                    用于在规则重建后把黑/白名单回填回 set（见 _inject_list_elements）
 
     返回: str - 生成的 nftables 规则文本
     """
@@ -172,4 +174,110 @@ def generate_rules(variables, log_switches):
         new_line = f'define {key} = {value}'
         template = re.sub(pattern, lambda _m, _n=new_line: _n, template)
 
+    # 4. 信任 IP 相关规则：条件生成
+    #
+    # TRUSTED_IP4/6 现在是 fail-closed 的（_safe_ip(..., strict=True)）：
+    # 用户填错或清空时返回空串。模板里若还硬写 `ip saddr $TRUSTED_IP4 accept`，
+    # 空串会展开成 `ip saddr "" accept` —— nft 语法错误，整套规则加载失败。
+    # 所以这两处必须按「有没有配」来生成。
+    trusted4 = str(variables.get('TRUSTED_IP4', '') or '').strip()
+    trusted6 = str(variables.get('TRUSTED_IP6', '') or '').strip()
+
+    accept_lines = ['        # 未配置信任IP：不生成该放行规则（fail-closed）']
+    if trusted4:
+        accept_lines.append(f'        ip saddr {trusted4} accept')
+    if trusted6:
+        accept_lines.append(f'        ip6 saddr {trusted6} accept')
+    template = template.replace('__TRUSTED_ACCEPT_BLOCK__', '\n'.join(accept_lines))
+
+    # 敲门链：没有信任 IP 时去掉 `ip saddr != $TRUSTED_IP4` 条件，
+    # 让所有来源都走正常敲门流程（而不是留下一条恒真的判断）。
+    guard = f'ip saddr != {trusted4}' if trusted4 else ''
+    template = template.replace('__TRUSTED_GUARD__', guard)
+
+    # 4.5 LAN→WAN 普通流量放行：条件生成
+    #
+    # 原来是模板里一条无条件 `iifname $LAN_IF oifname $WAN_IF accept`，
+    # 紧跟在两条 DNS 定向放行之后 —— 它无条件为真，把上面「内网只能访问
+    # 指定 DNS」的收紧整个吃掉，内网可以随便指向任意 DNS。
+    # 现在：dns_lan_resolver_enabled 打开时，本机做 DNS 递归解析，
+    # 只放行「指向路由器自己」的 DNS，不放行直连公网 DNS；
+    # 关闭时才放行普通 LAN→WAN（保持原有默认行为，不擅自改变用户意图）。
+    if variables.get('DNS_LAN_RESOLVER_ENABLED') == 'true':
+        # 递归解析时内网应当只跟路由器说话，指向外部 DNS 的请求一律不放行
+        general = '        # DNS 递归解析已启用：LAN→WAN 只允许访问路由器自身 DNS\n' \
+                  '        # （公网 DNS 直连被拒，防止绕过本机解析与日志）\n' \
+                  '        iifname $LAN_IF oifname $WAN_IF meta nfproto ipv4 udp dport 53 \\\n' \
+                  '            ip daddr != $ROUTER_IP4 drop'
+    else:
+        general = '        # 允许其他所有LAN→WAN\n        iifname $LAN_IF oifname $WAN_IF accept'
+    template = template.replace('# LAN_WAN_GENERAL_BLOCK\n', '')
+    template = template.replace('# LAN_WAN_GENERAL_BLOCK', '')
+    template = template.replace('__LAN_WAN_GENERAL__', general)
+
+    # 5. 名单元素回填
+    #
+    # 为什么需要：模板以 `flush ruleset` 开头，完全重建 table inet fw4。
+    # 黑/白名单的成员此前只存在于内核 set 里，用户点「应用规则」或重启
+    # 触发重建时，整个 set 变回空声明 —— 名单静默清空，用户毫无感知。
+    # 所以成员必须落盘，在每次生成规则时回填进 set 声明体内。
+    template = _inject_list_elements(template, list_elements or {})
+
+    return template
+
+
+def _format_set_elements(elements):
+    """把一批 IP 渲染成 nft set 的 elements 声明。
+
+    注意必须带 `elements =` 关键字：nft 的声明式写法是
+        set s { type ipv4_addr; elements = { 1.2.3.4, 5.6.7.8 } }
+    直接把裸 IP 一行一个塞进 set 体里是语法错误（真机 nft -c 实测报
+    "syntax error, unexpected string"），单测只查字符串存在性抓不到。
+    """
+    seen, out = set(), []
+    for raw in elements or []:
+        s = str(raw).strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _inject_list_elements(template, elements):
+    """把名单元素填进模板里对应的占位符。
+
+    元素在写入前必须逐个过一遍 IP 校验 —— 这个文件来自落盘数据，
+    一旦被手工改坏（写进 `delete table` 之类），会随规则集一起 nft -f 下去。
+    校验失败就丢弃该元素并继续，绝不把可疑内容拼进规则。
+    """
+    import ipaddress
+    for placeholder, key in (
+        ('# ALLOWED4_ELEMENTS', 'allowed4'),
+        ('# ALLOWED6_ELEMENTS', 'allowed6'),
+        ('# BLACKLIST4_ELEMENTS', 'blacklist4'),
+        ('# BLACKLIST6_ELEMENTS', 'blacklist6'),
+    ):
+        want6 = key.endswith('6')
+        lines, dropped = [], 0
+        for elem in _format_set_elements(elements.get(key)):
+            try:
+                addr = ipaddress.ip_address(elem.strip())
+            except ValueError:
+                dropped += 1
+                continue
+            if (addr.version == 6) != want6:
+                dropped += 1
+                continue
+            lines.append(elem)
+        if dropped:
+            print(f'[WARN] 名单 {key} 有 {dropped} 个非法元素被丢弃，不写入规则', flush=True)
+        if lines:
+            # 一行写完，元素多时 nft 会自动折行；折行样式由 nft 自己负责
+            block = '        elements = { ' + ', '.join(lines) + ' }'
+            template = template.replace(placeholder + '\n', block + '\n')
+        else:
+            # 没有元素就把占位符整行删掉，不能让注释残留在最终规则集里
+            template = template.replace(placeholder + '\n', '')
+            template = template.replace(placeholder, '')
     return template
