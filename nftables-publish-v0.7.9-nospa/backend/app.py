@@ -519,6 +519,29 @@ def validate_config(cfg):
         if key in cfg and not _is_port(cfg[key]):
             errs.append(f'{key} 端口非法: {cfg[key]!r}（只允许 1-65535）')
 
+    # 网段必须是具体网段，不能是 /0。
+    #
+    # 2026-10-07：Shannon 报 critical + 实测确认 —— 之前 _safe_cidr 只校验
+    # 「是不是合法 CIDR」，0.0.0.0/0 与 ::/0 都合法，于是：
+    #     POST /api/config {"lan_subnet4":"0.0.0.0/0"} → {"success":true,"risks":[]}
+    #     → 8.8.8.8 / 1.1.1.1 等公网 IP 全部 /auth/verify → 200 + lan-bypass
+    # 也就是说填错一个网段就让整个公网网关对全互联网免认证，保存时连风险
+    # 提示都没有。认证服务侧现在也会忽略 /0（纵深防御），但配置入口不该
+    # 放行它 —— 早失败、强提示，别把「全员免认证」交给一次手滑。
+    for key in ('lan_subnet4', 'lan_subnet6'):
+        raw = str(cfg.get(key, '') or '').strip()
+        if not raw:
+            continue
+        try:
+            net = ipaddress.ip_network(raw, strict=False)
+        except ValueError:
+            errs.append(f'{key} 网段非法: {raw!r}')
+            continue
+        if net.prefixlen == 0:
+            errs.append(
+                f'{key} 不能是 {raw}：它匹配所有地址，保存后公网任何来源都会被'
+                f'当成内网而免认证。请填具体网段，如 192.168.100.0/24')
+
     try:
         _split_ports(cfg.get('lan_allowed_ports', ''))
     except ValueError as e:

@@ -40,6 +40,19 @@ os.environ.update({
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend"))
 import auth_gateway as ag
 
+
+def set_cfg(data):
+    """写测试配置并立即失效 auth_gateway 的 mtime 缓存。
+
+    必须这么写：load_gateway_config 按 mtime 缓存，而同一时钟刻度内的两次
+    写入会得到完全相同的 mtime —— 缓存 key 不变，于是读到上一轮的陈旧配置。
+    手工在各处补失效语句漏过一次，改成集中 helper。
+    """
+    with open(CFG, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    ag._config_cache["mtime"] = None
+
+
 PASS, FAIL = [], []
 def check(name, cond, extra=""):
     (PASS if cond else FAIL).append(name)
@@ -191,30 +204,36 @@ for ip, should_pass, why in [
     if should_pass:
         check(f"{ip:<15} 标记为 lan-bypass", r.headers.get("X-Auth-Via") == "lan-bypass")
 
-# 一个网段都没配时，才允许回落到 RFC1918（保留旧的默认行为）
+# 一个网段都没配时**不再**回落 is_private（2026-10-07 收紧）。
+# 旧行为等于「对所有内网地址免认证」：咖啡厅/酒店/公司/邻居 Wi-Fi 的访客
+# 源 IP 就是私网段，能直连公网网关端口并被放行。
 _orig_cfg = json.load(open(CFG))
 _saved = dict(_orig_cfg)
 _orig_cfg.pop("lan_subnet4", None)
 _orig_cfg.pop("lan_subnet6", None)
-json.dump(_orig_cfg, open(CFG, "w"), ensure_ascii=False)
-ag._config_cache["mtime"] = None  # 同上
+set_cfg(_orig_cfg)
 r = ag.app.test_client().get("/auth/verify", headers={"X-Real-IP": "192.168.50.5", "Host": HOST})
-check("未配网段时仍回落 is_private", r.status_code == 200,
-      f"实际 {r.status_code} — 完全没配网段时不该把行为改掉")
-json.dump(_saved, open(CFG, "w"), ensure_ascii=False)
-
-# 缺省值本身也要钉住：auth_lan_bypass 这个键**整个缺失**时必须要求认证
+check("未配网段时要求认证（不再回落 is_private）", r.status_code == 401,
+      f"实际 {r.status_code} — 没配网段不该等于对所有内网地址免认证")
+set_cfg(_saved)
+for zero in ("0.0.0.0/0", "::/0"):
+    _z = json.load(open(CFG)); _zs = dict(_z)
+    _z["lan_subnet4" if ":" not in zero else "lan_subnet6"] = zero
+    set_cfg(_z)
+    r = ag.app.test_client().get("/auth/verify", headers={"X-Real-IP": "8.8.8.8", "Host": HOST})
+    check(f"lan_subnet={zero} 不放行公网", r.status_code == 401,
+          f"实际 {r.status_code} — /0 匹配一切，等于全员免认证")
+    set_cfg(_zs)
 # （fail-closed）。主测试配置里总是显式写了 True，不专门测一次的话，
 # 把缺省值改回 True 不会有任何测试失败。
 _c = json.load(open(CFG))
 _saved2 = dict(_c)
 _c.pop("auth_lan_bypass", None)
-json.dump(_c, open(CFG, "w"), ensure_ascii=False)
-ag._config_cache["mtime"] = None  # load_gateway_config 按 mtime 缓存，不清会读到陈旧配置
+set_cfg(_c)
 r = ag.app.test_client().get("/auth/verify", headers={"X-Real-IP": "192.168.100.50", "Host": HOST})
 check("配置缺失 auth_lan_bypass 时不放行（fail-closed）", r.status_code == 401,
       f"实际 {r.status_code} — 缺配置时应当要求认证而不是默认免认证")
-json.dump(_saved2, open(CFG, "w"), ensure_ascii=False)
+set_cfg(_saved2)
 
 # 11.2 Origin: null 必须按跨站拒绝（旧代码放进白名单放行了）
 print("\n--- 11.2 CSRF：Origin: null 不再放行（旧代码返回 401 走到了密码校验）---")
@@ -259,6 +278,50 @@ cc2 = ag.app.test_client()
 cc2.set_cookie("gw_token", old, domain=HOST)
 r2 = cc2.get("/auth/verify", headers={"X-Real-IP": "8.8.8.8", "Host": HOST})
 check("续期后旧 token 被 /auth/verify 拒绝", r2.status_code == 401, f"实际 {r2.status_code}")
+
+# 11.4 非回环来源不得采信代理头（Shannon 攻击链的第二环）
+print("\n--- 11.4 client_ip 只在回环来源时采信 X-Real-IP ---")
+# 场景模拟「攻击者直接打到认证端口」：remote_addr 不是回环。
+cc_spoof = ag.app.test_client()
+r = cc_spoof.get("/auth/verify", headers={"X-Real-IP": "192.168.100.50", "Host": HOST},
+                  environ_overrides={"REMOTE_ADDR": "203.0.113.66"})
+check("非回环来源伪造 X-Real-IP 为 LAN → 拒绝", r.status_code == 401,
+      f"实际 {r.status_code} — 能碰到认证端口就能声明任意源 IP = 认证绕过")
+# 回环来源（真实 nginx）必须照常采信，否则功能全废
+r = ag.app.test_client().get("/auth/verify",
+                             headers={"X-Real-IP": "192.168.100.50", "Host": HOST},
+                             environ_overrides={"REMOTE_ADDR": "127.0.0.1"})
+check("回环来源（nginx）仍正常采信 X-Real-IP", r.status_code == 200,
+      f"实际 {r.status_code} — 真实部署走的就是这条路径，不能被误伤")
+
+# 11.5 PBKDF2 短路时序预言机
+print("\n--- 11.5 未配置密码时也要跑 PBKDF2（防状态枚举）---")
+import time as _t
+def _timed(pwd, stored):
+    t0 = _t.perf_counter()
+    ag._verify_password(pwd, stored)
+    return _t.perf_counter() - t0
+# 用 _password_hash() 拿**真正的**哈希串。
+# 别用 open(PWD).read() —— 那是 JSON 文本（{"hash": "pbkdf2_sha256$..."}），
+# split("$") 后 algo 对不上会直接抛错，于是「正常路径」和「畸形路径」
+# 都走 except，等于拿自己跟自己比，测不出任何东西（这个坑踩过一次）。
+_good = ag._password_hash()
+_t_empty = _timed("x", "")
+_t_good = _timed("x", _good)
+check("空哈希的耗时不再远低于正常路径", _t_empty > _t_good * 0.2,
+      f"空 {_t_empty*1000:.2f}ms vs 正常 {_t_good*1000:.2f}ms — 差一个数量级就能枚举部署状态")
+print(f"       空哈希 {_t_empty*1000:7.2f}ms   正常哈希 {_t_good*1000:7.2f}ms")
+
+# 11.6 回环绑定检查必须在模块加载时就生效，不能只在 __main__
+print("\n--- 11.6 绑定检查在导入期即执行 ---")
+_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                         "backend", "auth_gateway.py"), encoding="utf-8").read()
+# 找**顶格无缩进**的 `_assert_loopback_bind()`，那才是模块级调用。
+# 不能用 find('if __name__ == "__main__":') 做位置比较 —— 那个字符串在函数
+# docstring 里就出现过一次，会被误当成真的 __main__ 块。
+_module_call = [l for l in _src.split("\n") if l.strip() == "_assert_loopback_bind()"]
+check("绑定检查有模块级调用（不依赖 __main__）", len(_module_call) >= 1,
+      "检查仍在 __main__ 里 —— 被 WSGI 方式导入时会静默失效")
 
 print("\n" + "="*60)
 print(f"通过 {len(PASS)} / {len(PASS)+len(FAIL)}")

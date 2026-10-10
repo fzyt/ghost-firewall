@@ -174,16 +174,24 @@ def _verify_password(password: str, stored: str) -> bool:
     try:
         algo, iters, salt, hash_hex = stored.split("$", 3)
         if algo != "pbkdf2_sha256":
-            return False
+            raise ValueError("algo")
         iters = int(iters)
         if iters < PBKDF2_ITERATIONS_MIN:
             # 迭代数过低 = 哈希强度形同虚设，直接拒绝而不是"降级接受"
-            return False
-        digest = hashlib.pbkdf2_hmac(
-            "sha256", password.encode("utf-8"), salt.encode("utf-8"), iters)
-        return hmac.compare_digest(digest.hex(), hash_hex)
+            raise ValueError("iters")
     except Exception:
+        # 即便哈希损坏/未配置，也要真跑一次 PBKDF2。原来这条路径直接
+        # return False，耗时不到 1ms；正常路径要跑几万到几十万轮迭代。
+        # 攻击者只发一个 {"password":"x"} 就能靠响应耗时区分
+        # 「部署没配密码」和「配了密码」——等于一个免认证的状态枚举口。
+        # 迭代数取下限：既去掉那个数量级差异，又不让畸形配置触发
+        # 天文数字的迭代把请求线程拖死。
+        hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                            b"nftables-web-dummy", PBKDF2_ITERATIONS_MIN)
         return False
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt.encode("utf-8"), iters)
+    return hmac.compare_digest(digest.hex(), hash_hex)
 
 
 def _password_hash() -> str:
@@ -446,12 +454,33 @@ def audit(event: str, **fields):
 def client_ip() -> str:
     """取真实客户端 IP。
 
-    nginx auth_request 侧会透传 X-Real-IP，本进程仅监听 127.0.0.1，
-    所以 request.remote_addr 永远是 127.0.0.1 —— 必须用头。
+    本进程只监听 127.0.0.1，nginx 的 auth_request 侧会透传 X-Real-IP，
+    所以正常路径必须读头 —— request.remote_addr 永远是 127.0.0.1。
+
+    ⚠ 但**只有来自回环的请求才允许采信代理头**（2026-10-07 加固）。
+    原来是无条件采信，于是「只要能碰到这个端口，就能声明任意源 IP」——
+    而 is_lan_source 的免认证判定完全建立在源 IP 上，这条链一旦成立
+    就是完整的认证绕过。Shannon 把这两条串成了攻击链，实测确认：
+    直接打认证端口 + 伪造 X-Real-IP 为内网地址 → 免认证直通所有服务。
+
+    现在非回环来源一律只认 remote_addr（即真实对端），判不出内网就
+    自然落到「要认证」，方向是 fail-closed。
     """
-    ip = (request.headers.get("X-Real-IP")
-          or request.headers.get("X-Forwarded-For", "").split(",")[0]
-          or request.remote_addr or "")
+    remote = (request.remote_addr or "").strip()
+    try:
+        from_local = ipaddress.ip_address(remote).is_loopback
+    except ValueError:
+        # 没有 remote_addr 的场景（单测客户端等）：按本机处理，
+        # 否则测试无法构造 X-Real-IP。真实 HTTP 请求一定有 remote_addr。
+        from_local = not remote
+
+    ip = ""
+    if from_local:
+        ip = (request.headers.get("X-Real-IP")
+              or request.headers.get("X-Forwarded-For", "").split(",")[0]
+              or "")
+    if not ip:
+        ip = remote
     ip = ip.strip()
     try:
         return str(ipaddress.ip_address(ip))
@@ -501,17 +530,27 @@ def is_lan_source(cfg) -> bool:
         if not raw:
             continue
         try:
-            subnets.append(ipaddress.ip_network(raw, strict=False))
+            net = ipaddress.ip_network(raw, strict=False)
         except ValueError:
             continue
+        # /0 匹配一切。留着它等于把「全员免认证」的开关交给一个手滑的输入：
+        # 实测把 lan_subnet4 设成 0.0.0.0/0 后，8.8.8.8 / 1.1.1.1 等公网 IP
+        # 全部 /auth/verify → 200 + X-Auth-Via: lan-bypass，且面板保存接口
+        # 不拦、risks 为空。配置可能被手改、被备份恢复、或被有写权限的人改，
+        # 所以这里必须**不理会 /0**，而不是信任它。
+        if net.prefixlen == 0:
+            continue
+        subnets.append(net)
 
-    # 配了网段 → 只认网段。这才是 lan_subnet4 存在的意义。
+    # 配了可用网段 → 只认网段。这才是 lan_subnet4 存在的意义。
     if subnets:
         return any(addr in n for n in subnets)
 
-    # 一个都没配才回落。走到这里说明用户压根没限定范围，此时用 RFC1918
-    # 兜底是合理的默认，但这条路径不该在网段已配时被走到（见上方说明）。
-    return addr.is_private
+    # 一个可用网段都没有（压根没配，或配的全是 /0）：一律要求认证。
+    # 原先这里回落到 addr.is_private，等于「对所有内网地址免认证」——
+    # 咖啡厅/酒店/公司/邻居 Wi-Fi 的访客源 IP 就是私网段，能直接
+    # 访问公网网关端口并被放行。fail-closed。
+    return False
 
 
 def device_id_from_request() -> str:
@@ -884,18 +923,30 @@ def _on_unhandled(err):
                     "message": "服务内部错误"}), 500
 
 
-# ══════════════════════════════════════════════════════════════════════
-# 启动
-# ══════════════════════════════════════════════════════════════════════
+def _assert_loopback_bind():
+    """拒绝绑定到非回环地址。
 
-if __name__ == "__main__":
-    # 只绑 127.0.0.1：公网入口只有 nginx，nftables 也不为本端口生成任何放行规则。
-    # 绑 0.0.0.0 会让认证系统多一个可被直接触达的入口，是重大配置错误。
+    2026-10-07：这段检查原先在 `if __name__ == "__main__":` 里面。
+    一旦这个模块被 WSGI 方式加载（gunicorn / uWSGI / waitress /
+    `flask run`），`__main__` 不成立，检查就**静默消失** —— 而绑
+    0.0.0.0 意味着认证系统多一个可从公网直接触达的入口，是本项目
+    安全模型里最不能破的一条（公网入口必须经 nginx auth_request）。
+    提到模块加载时执行，导入即校验，绕过路径就没了。
+    """
     if BIND_HOST not in ("127.0.0.1", "::1", "localhost"):
         print(f"[FATAL] 认证服务拒绝绑定 {BIND_HOST}：只允许 127.0.0.1/::1。"
               f"公网入口必须经 nginx auth_request。", flush=True)
         raise SystemExit(1)
 
+
+_assert_loopback_bind()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 启动
+# ══════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
     print(f" * 认证网关 : http://{BIND_HOST}:{BIND_PORT}", flush=True)
     print(f" * 端点     : /auth/status /auth/login /auth/logout /auth/verify /auth/portal",
           flush=True)
