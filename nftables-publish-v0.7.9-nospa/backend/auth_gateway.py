@@ -39,6 +39,7 @@ import json
 import os
 import secrets
 import subprocess
+import threading
 import time
 
 import fcntl
@@ -69,6 +70,69 @@ TOKEN_ABS_TTL_DEFAULT = 0       # 绝对上限，0 = 不启用
 TOKEN_REFRESH_RATIO = 0.5       # 剩余不足一半时才重新签发，避免每个资源都回 Set-Cookie
 DEVICE_COOKIE_TTL = 31536000    # 设备标识 cookie 一年
 PBKDF2_ITERATIONS_MIN = 100000  # 拒绝迭代数过低的存量哈希（等于没加固）
+
+# PBKDF2 并发闸门：限制「同时在跑的 PBKDF2 个数」，防止 GIL 争用把
+# 并发做成负优化。
+#
+# 2026-10-10 实测，同一份代码在两台机器上结论完全相反：
+#
+#   .224 OpenWrt  Python 3.11.14  2 核  → pbkdf2_hmac **不释放 GIL**
+#       并发数   实测墙钟   串行预期   相对串行
+#          1      141ms     150ms     1.06x
+#          2      529ms     300ms     0.57x   并发反而更慢
+#          4     1818ms     601ms     0.33x
+#          8     4800ms    1201ms     0.25x   ← threaded=True 的实测形态
+#
+#   .249 debian   Python 3.13.5   4 核  → pbkdf2_hmac **释放 GIL**
+#          2       98ms     189ms     1.94x   并发有效
+#          8      218ms     758ms     3.47x
+#
+# 也就是说「限不限并发」既取决于 Python 版本，也取决于核数，写死任何
+# 一个值都会在另一半机器上犯错：写死 1 会让 3.13 上的并发白白排队，
+# 写死「不限制」会让 3.11 上的网关被几个并发登录拖垮 4 倍。
+# 所以启动时实测一次，按结果决定闸门大小。
+#
+# 判据：2 线程耗时 / 1 线程耗时。释放 GIL 时应≈1，不释放时应≈2。
+# 阈值取 1.4：即使只有 2 核，真并行也能拿到 ~2.0，区分度充足。
+def _probe_pbkdf2_parallelism():
+    """返回 (闸门大小, 判定说明)。探测失败一律回退到 1（串行最安全）。"""
+    iters = 20000   # 只为测出串并行差异，2 万轮足够且不拖慢启动
+
+    def run(n):
+        ready, done = threading.Barrier(n + 1), threading.Barrier(n + 1)
+
+        def worker():
+            ready.wait()
+            hashlib.pbkdf2_hmac("sha256", b"A" * 1024, b"probe", iters)
+            done.wait()
+
+        ts = [threading.Thread(target=worker) for _ in range(n)]
+        for t in ts:
+            t.start()
+        ready.wait()
+        t0 = time.perf_counter()
+        done.wait()
+        wall = time.perf_counter() - t0
+        for t in ts:
+            t.join()
+        return wall
+
+    try:
+        run(1)                                    # 预热，避开首次调用的冷启动噪声
+        one = min(run(1) for _ in range(2))
+        two = min(run(2) for _ in range(2))
+    except Exception:
+        return 1, "探测失败，回退串行"
+    if one <= 0:
+        return 1, "探测结果异常，回退串行"
+    ratio = two / one
+    if ratio < 1.4:
+        return max(1, os.cpu_count() or 1), f"并发有效（2线程耗时比 {ratio:.2f}）"
+    return 1, f"并发无收益（2线程耗时比 {ratio:.2f}，PBKDF2 不释放 GIL）"
+
+
+PBKDF2_GATE_SIZE, PBKDF2_GATE_WHY = _probe_pbkdf2_parallelism()
+PBKDF2_GATE = threading.BoundedSemaphore(PBKDF2_GATE_SIZE)
 
 COOKIE_TOKEN = "gw_token"
 COOKIE_DEVICE = "gw_device"
@@ -170,28 +234,35 @@ def _absolute_ttl(cfg) -> int:
 # ══════════════════════════════════════════════════════════════════════
 
 def _verify_password(password: str, stored: str) -> bool:
-    """PBKDF2-HMAC-SHA256 校验，常量时间比较。"""
-    try:
-        algo, iters, salt, hash_hex = stored.split("$", 3)
-        if algo != "pbkdf2_sha256":
-            raise ValueError("algo")
-        iters = int(iters)
-        if iters < PBKDF2_ITERATIONS_MIN:
-            # 迭代数过低 = 哈希强度形同虚设，直接拒绝而不是"降级接受"
-            raise ValueError("iters")
-    except Exception:
-        # 即便哈希损坏/未配置，也要真跑一次 PBKDF2。原来这条路径直接
-        # return False，耗时不到 1ms；正常路径要跑几万到几十万轮迭代。
-        # 攻击者只发一个 {"password":"x"} 就能靠响应耗时区分
-        # 「部署没配密码」和「配了密码」——等于一个免认证的状态枚举口。
-        # 迭代数取下限：既去掉那个数量级差异，又不让畸形配置触发
-        # 天文数字的迭代把请求线程拖死。
-        hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
-                            b"nftables-web-dummy", PBKDF2_ITERATIONS_MIN)
-        return False
-    digest = hashlib.pbkdf2_hmac(
-        "sha256", password.encode("utf-8"), salt.encode("utf-8"), iters)
-    return hmac.compare_digest(digest.hex(), hash_hex)
+    """PBKDF2-HMAC-SHA256 校验，常量时间比较。
+
+    整个函数体都在 PBKDF2_GATE 里：真实路径和下面的 dummy 路径
+    都必须过闸门。只给真实路径加会让异常路径绕开限流，出现
+    「未配密码」的请求不排队、「配了密码」的排队——既泄露状态，
+    又给了一个绕开限流的廉价入口。
+    """
+    with PBKDF2_GATE:
+        try:
+            algo, iters, salt, hash_hex = stored.split("$", 3)
+            if algo != "pbkdf2_sha256":
+                raise ValueError("algo")
+            iters = int(iters)
+            if iters < PBKDF2_ITERATIONS_MIN:
+                # 迭代数过低 = 哈希强度形同虚设，直接拒绝而不是"降级接受"
+                raise ValueError("iters")
+        except Exception:
+            # 即便哈希损坏/未配置，也要真跑一次 PBKDF2。原来这条路径直接
+            # return False，耗时不到 1ms；正常路径要跑几万到几十万轮迭代。
+            # 攻击者只发一个 {"password":"x"} 就能靠响应耗时区分
+            # 「部署没配密码」和「配了密码」——等于一个免认证的状态枚举口。
+            # 迭代数取下限：既去掉那个数量级差异，又不让畸形配置触发
+            # 天文数字的迭代把请求线程拖死。
+            hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                                b"nftables-web-dummy", PBKDF2_ITERATIONS_MIN)
+            return False
+        digest = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), salt.encode("utf-8"), iters)
+        return hmac.compare_digest(digest.hex(), hash_hex)
 
 
 def _password_hash() -> str:
@@ -951,5 +1022,7 @@ if __name__ == "__main__":
     print(f" * 端点     : /auth/status /auth/login /auth/logout /auth/verify /auth/portal",
           flush=True)
     print(f" * 公网可达 : 否（仅接受来自 nginx 的 auth_request 与本机请求）", flush=True)
+    print(f" * PBKDF2   : 并发闸门 {PBKDF2_GATE_SIZE} —— {PBKDF2_GATE_WHY}",
+          flush=True)
 
     app.run(host=BIND_HOST, port=BIND_PORT, threaded=True, debug=False)

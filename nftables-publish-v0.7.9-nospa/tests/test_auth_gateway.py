@@ -323,6 +323,82 @@ _module_call = [l for l in _src.split("\n") if l.strip() == "_assert_loopback_bi
 check("绑定检查有模块级调用（不依赖 __main__）", len(_module_call) >= 1,
       "检查仍在 __main__ 里 —— 被 WSGI 方式导入时会静默失效")
 
+# 11.7 PBKDF2 并发闸门
+print("\n--- 11.7 PBKDF2 并发闸门（防 GIL 争用把并发做成负优化）---")
+import threading as _th
+import time as _t2
+
+# A. 闸门存在且大小合法
+check("PBKDF2_GATE 是有效的 BoundedSemaphore",
+      isinstance(getattr(ag, "PBKDF2_GATE", None), _th.BoundedSemaphore),
+      "闸门不存在 —— 并发 PBKDF2 会互相争 GIL")
+_size = getattr(ag, "PBKDF2_GATE_SIZE", 0)
+check("闸门大小是探测得来的合法正整数", isinstance(_size, int) and _size >= 1,
+      f"闸门大小异常：{_size!r}")
+
+# B. 结构性断言：闸门必须包住**整个**函数体，包括异常路径的 dummy PBKDF2。
+#    只包真实路径的话，「未配密码」的请求不排队 —— 既泄露部署状态，
+#    又多了一个绕开限流的廉价入口。这条不能靠计时测，只能看源码位置。
+_fn_src = _src.split("def _verify_password", 1)[1].split("\ndef ", 1)[0]
+_i_gate = _fn_src.find("with PBKDF2_GATE:")
+_i_try = _fn_src.find("try:")
+_i_dummy = _fn_src.find("pbkdf2_hmac(\"sha256\", password.encode(\"utf-8\"),\n"
+                        "                                b\"nftables-web-dummy\"")
+if _i_dummy < 0:      # 换行位置可能随格式化变动，退化成只搜关键字
+    _i_dummy = _fn_src.find("nftables-web-dummy")
+check("_verify_password 整段都在 PBKDF2_GATE 内（含 dummy 路径）",
+      _i_gate >= 0 and _i_gate < _i_try and _i_dummy > _i_gate,
+      f"with 位置 {_i_gate} / try 位置 {_i_try} / dummy 位置 {_i_dummy} —— "
+      f"闸门必须在 try 之前、且 dummy PBKDF2 在闸门之内")
+
+# C. 闸门大小必须是探测出来的，不能写死。
+#    写死 1 会让「PBKDF2 释放 GIL」的机器（Python 3.13 实测 2 线程 1.94x）
+#    白白排队；写死不限制则会让 3.11 的网关被并发登录拖慢 4 倍。
+_src_all = _src
+check("闸门大小来自启动探针而非硬编码",
+      "_probe_pbkdf2_parallelism" in _src_all
+      and "PBKDF2_GATE_SIZE, PBKDF2_GATE_WHY = _probe_pbkdf2_parallelism()" in _src_all,
+      "闸门被写死 —— 无法同时适配 3.11（不释放 GIL）与 3.13（释放 GIL）")
+
+# D. 计时断言：只在「本机并发确实无收益」时才验闸门真的在限流。
+#    在 3.13 那类机器上闸门本来就放行 4 并发，去掉闸门计时也不变，
+#    在这里强行断言只会得到一个恒真的假测试。
+if _size == 1:
+    _good2 = ag._password_hash()
+
+    def _one_call():
+        t = _t2.perf_counter()
+        ag._verify_password("x", _good2)
+        return _t2.perf_counter() - t
+
+    _solo = min(_one_call() for _ in range(2))
+    N = 4
+    _bd, _fn_ = _th.Barrier(N + 1), _th.Barrier(N + 1)
+
+    def _c():
+        _bd.wait()
+        ag._verify_password("x", _good2)
+        _fn_.wait()
+
+    _ts = [_th.Thread(target=_c) for _ in range(N)]
+    for _t_ in _ts:
+        _t_.start()
+    _bd.wait()
+    _t0 = _t2.perf_counter()
+    _fn_.wait()
+    _conc = _t2.perf_counter() - _t0
+    for _t_ in _ts:
+        _t_.join()
+    _ratio = (N * _solo) / _conc if _conc > 0 else 0
+    check(f"{N} 路并发被闸门限流到串行水平",
+          _conc < N * _solo * 2.5,
+          f"并发 {_conc*1000:.0f}ms vs 串行预期 {N*_solo*1000:.0f}ms —— "
+          f"闸门没生效，并发 PBKDF2 在争 GIL")
+    print(f"       单次 {_solo*1000:7.1f}ms   {N} 路并发 {_conc*1000:7.1f}ms"
+          f"   （串行预期 {N*_solo*1000:.0f}ms）")
+else:
+    print(f"       本机 PBKDF2 并发有效（闸门放行 {_size}），跳过计时断言")
+
 print("\n" + "="*60)
 print(f"通过 {len(PASS)} / {len(PASS)+len(FAIL)}")
 if FAIL:
