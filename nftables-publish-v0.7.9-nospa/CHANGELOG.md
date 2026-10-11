@@ -2,6 +2,66 @@
 
 所有重要更改均记录在此文件中。
 
+## [v0.8.1] - 2026-10-11
+
+反代模块收敛为**认证网关单轨**，并重做管理界面。
+v0.8.0 里一条规则同时生成「独立站点 conf」和「网关 location」两套暴露面，
+但 `path_prefix` 既没有写入路径也没有 UI —— 实际只有无认证的独立站点在跑。
+这一版砍掉独立站点，所有服务统一挂在网关的一个端口下。
+
+### 后端：字段校验统一到唯一入口
+
+`PUT /api/reverse-proxy/rules/<id>` 的 `target_protocol` 和 `listen_port` **零校验**。
+实测传 `"http;}\n server { listen 9999; #"` 能注入出第二个 server 块并落盘；
+`listen_port` 传 `''` / `True` / `443.5` / `[443]` 会拼出任意文件名。
+
+根因是 POST 和 PUT 各抄了一份校验，PUT 那边漏了。现在统一为 `_validate_rp_service`，
+POST/PUT 共用 —— 两份校验迟早会再次分叉。
+
+### 后端：修掉一批审核缺陷
+
+- 证书删除保护检查 `rules[].ssl_cert_id`（该字段已随单轨移除）→ 恒空 →
+  删掉网关默认证书不被拦。改查 `settings.default_cert_id`
+- `_deploy_gateway_nginx._undo` 先 `rmtree` 快照再 `copytree` 恢复 → 恢复必然失败，
+  且失败前已把整个 `conf.d` 删光，用户自己的站点配置全丢
+- nginx reload 三处裸调 `/etc/init.d/nginx`，普通 Linux 直接 `FileNotFoundError`
+  → 统一走 `_nginx_reload`，`NGINX_INIT_PATH` 抽成常量
+- `client_max_body_size` 只允许大写 `K/M/G`，照 nginx 文档填最常见的 `10m` 反被拒
+  → 大小写都收、输出归一
+
+### 后端：规则结构简化
+
+规则简化为 `{id, name, enabled, path_prefix, target_address, target_protocol,
+public_access, client_max_body_size, websocket_enabled, icon}`，
+删除 `domain` / `listen_port` / `ssl_cert_id`。
+
+删除 `_generate_nginx_conf` / `_write_nginx_conf_file` / `_remove_nginx_conf_file` /
+`_remove_nginx_conf_by_domain_port`（约 250 行）。新增 `_migrate_rp_rules`：
+旧规则自动派生 `path_prefix`（`nas.test` → `/nas`），挂在 `load_config` 上。
+
+### 前端：界面重做
+
+- 反代表单换字段，新增网关配置卡（总开关/端口/会话超时/绝对有效期/内网免登录/状态行）
+- 修 6 个缺陷：编辑服务会变追加（`delete _editIndex` 写在判断之前，条件恒假）、
+  新增按钮种子字段全是旧的、卡片不显示路径前缀和目标地址、
+  卡片无任何操作按钮（`editRpRule`/`deleteRpRule`/`testRpRule` 从未被 HTML 引用）、
+  `cancelRpEdit` 未定义导致点「取消」抛异常、WebSocket 说明里的损坏字符
+
+### 验证
+
+- 后端回归 142 + 68，变异验证 19/19 捕获
+- 面板 e2e 24/24（连跑 3 次稳定）、网关 e2e 16/16、视觉 22/22
+- 真机 OpenWrt：nginx -t 通过；`/nas/` 走 auth_request + 跳登录，
+  `/dsm/` 走内网 allow/deny，60MB 上传被 413 拦下
+
+### 已知未覆盖
+
+- 证书链路（上传 / ACME / 续期 / 设默认 / 删除保护）在真机一次都没跑过，
+  测试机用的是自签证书，证书库为空
+- 门户后端是假服务（`/tmp/fake_services.py`），未对接真实群晖/DSM
+- `.224` 无物理 WAN 口，敲门限流按源分桶虽有真实流量规则但未经真实 WAN 验证
+- 反代保存仍会连带调用 `_apply_ruleset` 重刷防火墙，与「应用规则」按钮解耦待做
+
 ## [v0.8.0] - 2026-10-05
 
 单端口认证网关（多进程架构）。**这一版的重点不是新功能，是把安全边界重新划清。**
