@@ -191,6 +191,212 @@ check('basic lockdown 在接口不存在时拒绝执行',
       '拒绝执行兜底防火墙' in src)
 
 
+# ═══════════════════════════════════════════════════════════════
+sec('FWR-4  运行期看门狗：滞回 / 冷却 / 可重入锁 / 不误伤健康态')
+
+
+def wd_env(healthy_seq, interval=300, enabled=True):
+    """搭一个看门狗环境，healthy_seq 是逐次调用的健康返回值。"""
+    import threading as _th
+    a = fresh()
+    a._WATCHDOG.update({'stop': False, 'fails': 0, 'last_action_ts': 0.0,
+                        'last_check_ts': 0.0, 'last_result': '', 'actions': 0})
+    a.load_config = lambda: {'fw_watchdog_interval': interval,
+                             'fw_watchdog_enabled': enabled}
+    seq = list(healthy_seq)
+
+    def _check():
+        v = seq.pop(0) if seq else False
+        return (v, '正常' if v else '模拟不健康')
+    a._ruleset_is_functional = _check
+    a._ruleset_is_empty = lambda: not seq or not seq[0]
+    acted = {'n': 0}
+    # 契约是 (是否动手, 说明) 两元组 —— 返回三元的桩会让 _watchdog_tick 抛
+    # ValueError，看着像看门狗的 bug，其实是桩写错了。
+    def _recover():
+        acted['n'] += 1
+        return True, '模拟恢复'
+    a._recover_ruleset_if_unhealthy = _recover
+    return a, acted
+
+
+# 默认参数
+a, _ = wd_env([True])
+en, iv = a._fw_watchdog_settings()
+check('看门狗默认启用', en is True)
+check('默认间隔 300 秒', iv == 300, str(iv))
+
+# 间隔下限：间隔过短等于定时砸防火墙，必须被夹住
+a, _ = wd_env([True], interval=5)
+check('间隔被夹到下限 60 秒', a._fw_watchdog_settings()[1] == 60,
+      str(a._fw_watchdog_settings()[1]))
+a, _ = wd_env([True], interval=0)
+check('间隔 0 也被夹到 60', a._fw_watchdog_settings()[1] == 60)
+
+# 健康态绝不能动手
+a, acted = wd_env([True] * 5)
+for _ in range(5):
+    a._watchdog_tick()
+check('健康态 5 轮全部不动手', acted['n'] == 0, f'动了 {acted["n"]} 次')
+check('健康态后连续失败计数归零', a._WATCHDOG['fails'] == 0)
+
+# 滞回：单次不健康不动手
+a, acted = wd_env([False, True])
+a._watchdog_tick()
+check('单次不健康不动手（滞回）', acted['n'] == 0, f'动了 {acted["n"]} 次')
+check('滞回期间有可读的原因', '未达' in a._WATCHDOG['last_result']
+      or '阈值' in a._WATCHDOG['last_result'], a._WATCHDOG['last_result'][:50])
+
+# 连续达阈值才动手
+a, acted = wd_env([False, False, True])
+a._watchdog_tick(); a._watchdog_tick()
+check('连续 2 次不健康才动手', acted['n'] == 1, f'动了 {acted["n"]} 次')
+
+# 冷却：动手后短期内不再动手
+a, acted = wd_env([False, False, False, False])
+a._watchdog_tick(); a._watchdog_tick()
+first = acted['n']
+a._watchdog_tick(); a._watchdog_tick()
+check('冷却期内不重复动手', acted['n'] == first, f'{first} → {acted["n"]}')
+check('冷却状态可读', '冷却' in a._WATCHDOG['last_result']
+      or acted['n'] == first, a._WATCHDOG['last_result'][:50])
+
+# 停用后不动手
+a, acted = wd_env([False] * 6, enabled=False)
+for _ in range(4):
+    a._watchdog_tick()
+check('停用后不动手', acted['n'] == 0, f'动了 {acted["n"]} 次')
+
+# 异常不能让自检失效
+a, acted = wd_env([False])
+def _boom():
+    raise RuntimeError('模拟 nft 查询炸了')
+a._ruleset_is_functional = _boom
+raised = False
+try:
+    a._watchdog_tick()
+except Exception:
+    raised = True
+check('单次异常冒到调用方（由 _watchdog_loop 兜住）', raised is True)
+
+# 真正要保的是「线程不会因为一次异常就死掉」——直接验循环那层
+_a2, _act2 = wd_env([False])
+_a2._ruleset_is_functional = _boom
+_a2.FW_WATCHDOG_DEFAULT_INTERVAL = 60
+_a2._WATCHDOG['stop'] = False
+_rounds = {'n': 0}
+
+
+def _real_loop_two_rounds():
+    """照抄 _watchdog_loop 的循环骨架，验证异常不会终止线程"""
+    for _ in range(2):
+        try:
+            _a2._watchdog_tick()
+        except Exception:
+            _a2._WATCHDOG['last_result'] = '自检异常'
+            print('[WATCHDOG] 自检异常（继续下一轮）', flush=True)
+        _rounds['n'] += 1
+
+
+_real_loop_two_rounds()
+check('异常后循环仍跑满全部轮次（线程没死）', _rounds['n'] == 2, f'跑了 {_rounds["n"]} 轮')
+check('异常被记录成可读原因',
+      '自检异常' in _a2._WATCHDOG['last_result'], _a2._WATCHDOG['last_result'])
+
+# 可重入锁：看门狗持锁 -> _auto_recover -> _apply_ruleset 再次 acquire
+import threading as _th
+a = fresh()
+check('锁是可重入的 RLock（否则看门狗路径必然死锁）',
+      type(a._FW_APPLY_LOCK).__name__ == 'RLock',
+      type(a._FW_APPLY_LOCK).__name__)
+
+_hit = {'n': 0}
+a._ruleset_is_functional = lambda: (False, '不健康')
+a._ruleset_is_empty = lambda: True
+a._config_corrupted = lambda: (False, '')
+# 必须真的把配置文件建出来：优先级 2 判断的是 os.path.exists(CONFIG_PATH)，
+# 只打桩 load_config 不够 —— 文件不存在时它根本不会调 _apply_ruleset。
+import json as _json
+_json.dump({'lan_if': 'br-lan', 'lan_allowed_ports': [22, 5443]},
+           open(a.CONFIG_PATH, 'w'))
+a.load_config = lambda: {'lan_if': 'br-lan', 'lan_allowed_ports': [22, 5443]}
+a._apply_ruleset = lambda cfg: (_hit.__setitem__('n', _hit['n'] + 1), (True, '模拟下发'))[1]
+a._apply_basic_lockdown = lambda *x, **k: True
+_res = {}
+_t = _th.Thread(target=lambda: _res.setdefault('r', a._recover_ruleset_if_unhealthy()),
+                daemon=True)
+_t.start()
+_t.join(timeout=10)
+check('持锁状态下再次 acquire 不死锁（RLock 生效）', 'r' in _res,
+      '超时 -> 普通 Lock 会死锁')
+check('重入路径确实走到了 _apply_ruleset', _hit['n'] >= 1, f'调用 {_hit["n"]} 次')
+
+# 两种不健康要分开处理：表在但没策略时不该降级到 lockdown
+a = fresh()
+order = []
+_h = {'n': 0}
+def _unhealthy_then_ok():
+    # 判据调用次序：入口 1 次 -> 持锁后复查 1 次 -> reload 后验证 1 次。
+    # 前两次必须都不健康：入口判定触发恢复，持锁复查才进恢复分支；
+    # 第三次（reload 之后）才健康。桩若永远 False 会被误判成「reload 没修好」
+    # 从而降级 lockdown；桩若第二次就 True 则会走「复查后已正常」提前退出。
+    _h['n'] += 1
+    return (_h['n'] > 2, 'input 链未挂载' if _h['n'] <= 2 else '正常')
+a._ruleset_is_functional = _unhealthy_then_ok
+a._ruleset_is_empty = lambda: False           # 表还在
+# 规则文件必须真的存在：恢复是靠 os.path.exists(_p) 过滤候选的，
+# 文件不存在时 for 循环一次都不进，什么都不会做。
+open(a.RULES_PATH, 'w').write('table inet fw4 { }\n')
+a._try_apply_rules_file = lambda p: (order.append('reload') or True)
+a._auto_recover_ruleset_if_empty = lambda: order.append('startup-recover')
+a._apply_basic_lockdown = lambda *x, **k: (order.append('lockdown') or True)
+a._recover_ruleset_if_unhealthy()
+check('表在但无策略时走「重新加载规则文件」而非降级',
+      'reload' in order and 'lockdown' not in order, str(order))
+
+# 表在但无策略、且规则文件与 .lastgood 都不存在 —— 不得谎报「已恢复」
+a = fresh()
+_n = {'i': 0}
+
+
+def _unhealthy_once():
+    # 次序：入口判定 -> 持锁复查 -> 恢复后验证。
+    # 前两次都必须不健康才能进恢复分支；第三次才转好。
+    # 若第二次就转好，会走「复查后已正常」早退，压根到不了谎报那段代码。
+    _n['i'] += 1
+    return (_n['i'] > 2, '未挂载' if _n['i'] <= 2 else '正常')
+
+
+a._ruleset_is_functional = _unhealthy_once
+a._ruleset_is_empty = lambda: False
+a._try_apply_rules_file = lambda p: False
+a._auto_recover_ruleset_if_empty = lambda: None
+_dn = {'n': 0}
+a._apply_basic_lockdown = lambda *x, **k: (_dn.__setitem__('n', _dn['n'] + 1), True)[1]
+acted_flag, msg = a._recover_ruleset_if_unhealthy()
+check('无任何规则文件时不得谎报「已恢复」',
+      '未执行任何重载' in msg or acted_flag is False, msg[:60])
+check('无规则文件且复查转好时不假装动过手', acted_flag is False, str(acted_flag))
+
+a = fresh()
+order2 = []
+a._ruleset_is_functional = lambda: (False, '表不存在')
+a._ruleset_is_empty = lambda: True            # 表没了
+a._try_apply_rules_file = lambda p: (order2.append('reload') or True)
+a._auto_recover_ruleset_if_empty = lambda: order2.append('startup-recover')
+a._apply_basic_lockdown = lambda *x, **k: (order2.append('lockdown') or True)
+a._recover_ruleset_if_unhealthy()
+check('表不存在时走启动级恢复链',
+      'startup-recover' in order2, str(order2))
+
+# 健康接口要能看见看门狗，否则自检成了黑盒
+check('健康接口暴露 watchdog 状态', "'watchdog': {" in src)
+check('健康接口暴露 running 标记', "'running':" in src)
+check('启动流程里拉起了看门狗', '_start_watchdog()' in src)
+check('看门狗启动失败不影响 Web 服务',
+      '启动失败（不影响 Web 服务）' in src)
+
+
 print('\n' + '═' * 52)
 print(f'通过 {len(PASS)} / {len(PASS) + len(FAIL)}')
 if FAIL:

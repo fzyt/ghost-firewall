@@ -2056,6 +2056,17 @@ def _apply_ruleset(config):
     反代规则增删改和 /api/rules/apply 共用本函数，
     避免出现「某条路径跳过了校验和回滚」的不一致。
     """
+    # 与看门狗共用锁：两个 nft -f 交叉执行会得到无法预测的中间规则集，
+    # 而且看门狗的 _try_apply_rules_file 与这里的回滚逻辑会互相覆盖文件。
+    _FW_APPLY_LOCK.acquire()
+    try:
+        return _apply_ruleset_locked(config)
+    finally:
+        _FW_APPLY_LOCK.release()
+
+
+def _apply_ruleset_locked(config):
+    """_apply_ruleset 的实现体。调用方必须已持有 _FW_APPLY_LOCK。"""
     rules = build_rules(config)
     os.makedirs(os.path.dirname(RULES_PATH), exist_ok=True)
 
@@ -6386,6 +6397,188 @@ def _apply_basic_lockdown(config=None):
     return True
 
 
+# ══════════════════════════════════════════════════════════════
+# 防火墙看门狗（运行期自检）
+#
+# 启动时的 _auto_recover_ruleset_if_empty 只在服务启动那一刻跑一次。
+# 如果规则集在服务运行期间被清空 —— 有人 enable 了 fw4、别的工具 flush、
+# 内核异常 —— 不会有人发现，要等到面板服务重启才恢复。期间路由器是裸奔的。
+#
+# 三条安全约束，缺一个都可能把「自检」变成「定时砸防火墙」：
+#   1. 滞回：连续 N 次判定不健康才动手。单次 nft 查询抖动（进程正忙、
+#      超时）不得触发重载。
+#   2. 冷却：动手之后 M 秒内不再尝试。否则规则永久损坏时会每 5 分钟
+#      砸一次防火墙，把正常流量反复打断。
+#   3. 互斥：与 /api/rules/apply 共用同一把锁，避免两个 nft -f 交叉。
+# ══════════════════════════════════════════════════════════════
+
+FW_WATCHDOG_DEFAULT_INTERVAL = 300       # 5 分钟
+FW_WATCHDOG_MIN_INTERVAL = 60
+FW_WATCHDOG_FAIL_THRESHOLD = 2           # 连续几次不健康才动手
+FW_WATCHDOG_COOLDOWN = 900               # 动手后冷却 15 分钟
+
+# 与 _apply_ruleset 共用，防止看门狗和用户点击「应用规则」并发下发。
+# 用可重入锁：本函数持锁期间会调 _auto_recover_ruleset_if_empty，
+# 它内部又走 _apply_ruleset，会再次 acquire 同一把锁 —— 普通 Lock 直接死锁。
+_FW_APPLY_LOCK = threading.RLock()
+
+_WATCHDOG = {
+    'stop': False,
+    'fails': 0,
+    'last_action_ts': 0.0,
+    'last_check_ts': 0.0,
+    'last_result': '尚未检查',
+    'actions': 0,
+}
+
+
+def _fw_watchdog_settings():
+    """读看门狗参数。配置读失败一律用默认值，绝不因为配置问题让自检失效。"""
+    iv = FW_WATCHDOG_DEFAULT_INTERVAL
+    en = True
+    try:
+        cfg = load_config()
+        en = bool(cfg.get('fw_watchdog_enabled', True))
+        iv = int(cfg.get('fw_watchdog_interval', FW_WATCHDOG_DEFAULT_INTERVAL))
+    except Exception:
+        pass
+    # 间隔下限要兜住：间隔太短等于定时重载防火墙，比不检查还糟
+    iv = max(FW_WATCHDOG_MIN_INTERVAL, iv)
+    return en, iv
+
+
+def _recover_ruleset_if_unhealthy():
+    """规则集不健康时恢复。返回 (是否动手了, 说明)。
+
+    两种不健康要分开处理：
+      · 表不在 / 表空      —— 走启动时那套四级恢复
+      · 表在但链没挂策略    —— fw4 表被建出来了却是空的，重新加载规则文件即可，
+                              没必要丢到 basic lockdown（那是降级，会丢端口转发）
+    """
+    functional, detail = _ruleset_is_functional()
+    if functional:
+        return False, '正常'
+
+    with _FW_APPLY_LOCK:
+        # 拿到锁之后再判一次：可能正好是用户在点「应用规则」，别抢
+        functional, detail = _ruleset_is_functional()
+        if functional:
+            return False, '复查后已正常'
+
+        reloaded = False
+        if _ruleset_is_empty():
+            print('[WATCHDOG] 规则集为空，触发启动级恢复链', flush=True)
+            _auto_recover_ruleset_if_empty()
+            reloaded = True
+        else:
+            print(f'[WATCHDOG] fw4 表存在但不可用（{detail}），重新加载规则文件',
+                  flush=True)
+            for _p in (RULES_PATH, RULES_PATH + '.lastgood'):
+                if os.path.exists(_p) and _try_apply_rules_file(_p):
+                    reloaded = True
+                    break
+            if not reloaded:
+                # 原来这里没有这个分支：两个文件都不存在时 for 循环一次都不进，
+                # 什么都没做就往下走复查。复查若恰好返回健康，就会报「已恢复」——
+                # 实际上一条规则都没下发过。必须如实区分「做了什么」和「复查看着怎样」。
+                print('[WATCHDOG] 规则文件与 .lastgood 均不存在，无法重新加载',
+                      flush=True)
+
+        functional, detail = _ruleset_is_functional()
+        if functional:
+            what = '已恢复' if reloaded else '复查后已正常（本次未执行任何重载）'
+            return reloaded, f'{what}（{detail}）'
+        if _apply_basic_lockdown():
+            return True, '主恢复失败，已降级到 basic lockdown'
+        return True, f'❗ 恢复失败：{detail} —— 路由器当前可能无防火墙'
+
+
+def _watchdog_tick():
+    """单次自检。看门狗线程和测试都走这里。"""
+    _WATCHDOG['last_check_ts'] = time.time()
+    en, _ = _fw_watchdog_settings()
+    if not en:
+        _WATCHDOG['last_result'] = '已停用'
+        return None
+
+    functional, detail = _ruleset_is_functional()
+    if functional:
+        _WATCHDOG['fails'] = 0
+        _WATCHDOG['last_result'] = f'正常（{detail}）'
+        return None
+
+    _WATCHDOG['fails'] += 1
+    if _WATCHDOG['fails'] < FW_WATCHDOG_FAIL_THRESHOLD:
+        _WATCHDOG['last_result'] = (
+            f'异常 {_WATCHDOG["fails"]}/{FW_WATCHDOG_FAIL_THRESHOLD}：{detail}'
+            '（未达阈值，先观察）')
+        print(f'[WATCHDOG] {detail}（连续第 {_WATCHDOG["fails"]} 次，'
+              f'未达 {FW_WATCHDOG_FAIL_THRESHOLD} 次阈值，不动手）', flush=True)
+        return None
+
+    # 冷却：避免规则永久损坏时反复砸防火墙
+    since = time.time() - _WATCHDOG['last_action_ts']
+    if _WATCHDOG['last_action_ts'] and since < FW_WATCHDOG_COOLDOWN:
+        _WATCHDOG['last_result'] = (
+            f'异常但处于冷却期（还剩 {int(FW_WATCHDOG_COOLDOWN - since)}s）')
+        return None
+
+    _WATCHDOG['last_action_ts'] = time.time()
+    _WATCHDOG['fails'] = 0
+    acted, msg = _recover_ruleset_if_unhealthy()
+    _WATCHDOG['actions'] += 1
+    _WATCHDOG['last_result'] = msg
+    print(f'[WATCHDOG] 触发恢复：{msg}', flush=True)
+    return acted
+
+
+def _watchdog_loop():
+    """看门狗主循环。任何异常都不能让线程死掉 —— 死了就等于没有自检。"""
+    while not _WATCHDOG['stop']:
+        try:
+            _, interval = _fw_watchdog_settings()
+        except Exception:
+            interval = FW_WATCHDOG_DEFAULT_INTERVAL
+        # 分片睡眠，让 stop 能在 1 秒内生效，不必等满一个间隔
+        slept = 0.0
+        while slept < interval and not _WATCHDOG['stop']:
+            time.sleep(1)
+            slept += 1
+        if _WATCHDOG['stop']:
+            break
+        try:
+            _watchdog_tick()
+        except Exception as e:
+            _WATCHDOG['last_result'] = f'自检异常：{type(e).__name__}: {e}'
+            print(f'[WATCHDOG] 自检异常（继续下一轮）: {e}', flush=True)
+
+
+def _start_watchdog():
+    """启动看门狗线程。已在跑就不重复起。"""
+    global _WATCHDOG_THREAD
+    if _WATCHDOG.get('thread') and _WATCHDOG['thread'].is_alive():
+        return None
+    _WATCHDOG['stop'] = False
+    t = threading.Thread(target=_watchdog_loop, name='fw-watchdog', daemon=True)
+    t.start()
+    _WATCHDOG['thread'] = t
+    print(f'[WATCHDOG] 防火墙自检已启动'
+          f'（间隔 {_fw_watchdog_settings()[1]}s，'
+          f'连续 {FW_WATCHDOG_FAIL_THRESHOLD} 次异常才动手，'
+          f'冷却 {FW_WATCHDOG_COOLDOWN}s）', flush=True)
+    return t
+
+
+def _stop_watchdog():
+    _WATCHDOG['stop'] = True
+    t = _WATCHDOG.get('thread')
+    if t and t.is_alive():
+        t.join(timeout=3)
+
+
+_WATCHDOG_THREAD = None
+
+
 def _auto_recover_ruleset_if_empty():
     """启动时自动恢复 nftables ruleset（如果被清空）。
 
@@ -6514,6 +6707,17 @@ def rules_health():
             # 新增：真正「防火墙生效」的判断
             'ruleset_functional': functional,
             'detail': detail,
+            'watchdog': {
+                'enabled': _fw_watchdog_settings()[0],
+                'interval': _fw_watchdog_settings()[1],
+                'fail_threshold': FW_WATCHDOG_FAIL_THRESHOLD,
+                'cooldown': FW_WATCHDOG_COOLDOWN,
+                'running': bool(_WATCHDOG.get('thread')
+                                and _WATCHDOG['thread'].is_alive()),
+                'consecutive_fails': _WATCHDOG['fails'],
+                'actions': _WATCHDOG['actions'],
+                'last_result': _WATCHDOG['last_result'],
+            },
             'rules_file': RULES_PATH,
             'rules_file_exists': os.path.exists(RULES_PATH),
             'backup_file_exists': os.path.exists(RULES_PATH + '.backup'),
@@ -6549,6 +6753,15 @@ def _start_servers():
     """
     # ========== 启动时自动恢复 nftables ruleset ==========
     _auto_recover_ruleset_if_empty()
+
+    # ========== 运行期防火墙自检 ==========
+    # 启动恢复只覆盖「启动那一刻」。运行期规则集被清空（fw4 被别人 enable、
+    # 别的工具 flush、内核异常）没人会发现，期间路由器裸奔。
+    try:
+        _start_watchdog()
+    except Exception as e:
+        print(f'[WATCHDOG] 启动失败（不影响 Web 服务）: {type(e).__name__}: {e}',
+              flush=True)
 
     import sys as _sys
     from werkzeug.serving import make_server
