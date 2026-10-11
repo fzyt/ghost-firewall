@@ -977,6 +977,52 @@ body .shadow-lg, body .shadow-md, body .shadow { box-shadow: var(--nf-shadow-md)
    所以这里必须同样带 body 前缀（升到 0-1-1），并且声明在组件规则**之后**，
    让同特异性下靠后声明胜出。
    ========================================================================== */
+
+/* ---------- 内网服务接入页（v0.8.1） ---------- */
+/* 表单里的说明块：告诉用户最终会从哪个地址访问 */
+body .nf-hint {
+  background: rgba(123, 163, 212, .08);
+  border: 1px solid rgba(123, 163, 212, .22);
+  border-radius: 9px;
+  padding: 10px 12px;
+  font-size: 12px;
+  color: var(--nf-text-mid);
+  line-height: 1.7;
+}
+body .nf-hint code {
+  color: var(--nf-info);
+  background: rgba(123, 163, 212, .12);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+/* 开关行：勾选框 + 两行文字（标题 + 说明），左对齐、不要挤成一行 */
+body .nf-switch-row {
+  background: rgba(255, 255, 255, .03);
+  border: 1px solid var(--nf-hairline);
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+body .nf-switch-row:hover {
+  border-color: var(--nf-accent-line);
+  background: rgba(79, 201, 192, .05);
+}
+
+/* 状态行 */
+body .nf-status-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 4px;
+  padding: 9px 12px;
+  background: rgba(0, 0, 0, .25);
+  border: 1px solid var(--nf-hairline);
+  border-radius: 9px;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 12px;
+  color: var(--nf-text-hi);
+}
+
 body .nf-mono,
 body code,
 body kbd,

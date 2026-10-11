@@ -144,6 +144,17 @@ function app() {
       selectedDnsProvider: '',
       dnsCredentials: {},
     },
+    // 认证网关配置（v0.8.0 之前界面上完全没有这一块）
+    gw: {
+      gateway_enabled: false,
+      gateway_port: 8443,
+      auth_session_timeout: 1800,
+      auth_absolute_timeout: 0,
+      auth_lan_bypass: true,
+    },
+    gwSaving: false,
+    gwStatus: '',
+
     rpEditingRule: null,
     rpUploading: false,
     rpUploadDomain: '',
@@ -1298,6 +1309,8 @@ function app() {
           };
         }
         await this.loadDnsProviders();
+        // 网关状态一并拉取：开关联入页就能看到，不用再点一次刷新
+        await this.loadGatewayStatus();
       } catch (e) {
         this.showToast('加载反代配置失败: ' + e.message, 'error');
       } finally {
@@ -1333,19 +1346,95 @@ function app() {
       }
     },
 
+    async loadGatewayStatus() {
+      try {
+        const d = await api.get('/api/gateway/status');
+        const g = d.gateway || d.data || d;
+        if (g.gateway_enabled !== undefined) this.gw.gateway_enabled = !!g.gateway_enabled;
+        if (g.gateway_port) this.gw.gateway_port = g.gateway_port;
+        if (g.auth_session_timeout !== undefined) this.gw.auth_session_timeout = g.auth_session_timeout;
+        if (g.auth_absolute_timeout !== undefined) this.gw.auth_absolute_timeout = g.auth_absolute_timeout;
+        if (g.lan_bypass !== undefined) this.gw.auth_lan_bypass = !!g.lan_bypass;
+        const n = (g.services_count !== undefined) ? g.services_count
+                                                    : (Array.isArray(g.services) ? g.services.length : 0);
+        this.gwStatus = `${g.gateway_enabled ? '已启用' : '已关闭'}`
+          + ` · 端口 ${g.gateway_port || '-'}`
+          + ` · 已接入服务 ${n} 条`
+          + (g.auth_alive ? ' · 认证服务运行中' : ' · ⚠️ 认证服务未响应');
+      } catch (e) {
+        this.gwStatus = '状态读取失败：' + e.message;
+      }
+    },
+
+    async saveGatewayConfig() {
+      if (!this.gw.gateway_enabled && !this.rp.rules.length) {
+        if (!confirm('网关将关闭，且当前没有任何服务——确定吗？')) return;
+      }
+      this.gwSaving = true;
+      try {
+        const payload = {
+          gateway_enabled: !!this.gw.gateway_enabled,
+          gateway_port: parseInt(this.gw.gateway_port, 10),
+          auth_session_timeout: parseInt(this.gw.auth_session_timeout, 10) || 0,
+          auth_absolute_timeout: parseInt(this.gw.auth_absolute_timeout, 10) || 0,
+          auth_lan_bypass: !!this.gw.auth_lan_bypass,
+        };
+        await api.post('/api/gateway/config', payload);
+        this.showToast('网关配置已保存并下发', 'success');
+        await this.loadGatewayStatus();
+      } catch (e) {
+        this.showToast('保存失败: ' + e.message, 'error');
+      } finally {
+        this.gwSaving = false;
+      }
+    },
+
+    /* ── 反代服务（v0.8.1：只走认证网关） ──────────────────────
+       规则不再持有 domain / listen_port / ssl_cert_id：
+       证书是网关的统一证书，入口是 gateway_port + path 前缀。 */
+
+    // 网关根地址，用于表单里提示用户最终访问哪个地址
+    gatewayPreviewUrl() {
+      const p = this.gw.gateway_port || 8443;
+      return `https://<你的公网地址>:${p}`;
+    },
+
+    // 前缀冲突/非法的前置提示。返回空字符串表示没问题。
+    rpPrefixConflict(rule) {
+      if (!rule) return '';
+      const pfx = (rule.path_prefix || '').trim();
+      if (!pfx) return '路径前缀必填';
+      if (!pfx.startsWith('/')) return '必须以 / 开头，例如 /nas';
+      if (pfx.includes('..') || pfx.includes('//')) return '不能包含 .. 或 //';
+      if (['/auth', '/_auth', '/'].includes(pfx.replace(/\/+$/, '') || '/')) {
+        return '这是网关保留前缀，不能使用';
+      }
+      const clash = this.rp.rules.find(
+        r => r.id !== rule.id && (r.path_prefix || '').trim() === pfx);
+      if (clash) return `与「${clash.name || clash.path_prefix}」的前缀重复`;
+      return '';
+    },
+
+    rpRuleFormValid() {
+      const r = this.rpEditingRule;
+      if (!r) return false;
+      if (!String(r.name || '').trim()) return false;
+      if (this.rpPrefixConflict(r)) return false;
+      if (!String(r.target_address || '').trim()) return false;
+      return true;
+    },
+
     saveRpRule() {
       const rule = { ...this.rpEditingRule };
-      // lookup cert domain
-      if (rule.ssl_cert_id) {
-        const cert = this.rp.certificates.find(c => c.id == rule.ssl_cert_id);
-        if (cert) {
-          rule.certificate_domain = cert.domain;
-          rule.certificate_days_remaining = cert.days_remaining;
-        }
-      }
-      if (rule._editIndex !== undefined) {
-        this.rp.rules[rule._editIndex] = rule;
-        delete rule._editIndex;
+      // 路径前缀归一：去掉结尾斜杠，输入 /nas/ 和 /nas 等价
+      rule.path_prefix = String(rule.path_prefix || '').trim().replace(/\/+$/, '');
+      // 先取下标再删标记：反序会让编辑永远走 push 分支，编辑一条等于追加一条
+      const idx = rule._editIndex;
+      delete rule._editIndex;
+      if (idx !== undefined && this.rp.rules[idx]) {
+        // 保留后端分配的 id，saveRpRules 靠它决定走 PUT 还是 POST
+        rule.id = this.rp.rules[idx].id;
+        this.rp.rules[idx] = rule;
       } else {
         this.rp.rules.push(rule);
       }
@@ -1353,8 +1442,33 @@ function app() {
       this.saveRpRules();
     },
 
+    // 新建一条服务。字段名必须与 _validate_rp_service 的 clean 输出一致，
+    // 之前这里内联写了 domain / listen_port / ssl_cert_id —— v0.8.1 已砍掉这三个，
+    // 再带着它们提交会被后端忽略，而 path_prefix 反而缺省成 undefined。
+    newRpRule() {
+      this.rpEditingRule = {
+        name: '',
+        path_prefix: '',
+        target_address: '',
+        target_protocol: 'http',
+        client_max_body_size: '',
+        icon: '',
+        enabled: true,
+        public_access: false,
+        websocket_enabled: true,
+      };
+    },
+
     editRpRule(index) {
-      this.rpEditingRule = { ...this.rp.rules[index], _editIndex: index };
+      const r = { ...this.rp.rules[index], _editIndex: index };
+      r.client_max_body_size = r.client_max_body_size || '';
+      r.path_prefix = r.path_prefix || '';
+      r.name = r.name || '';
+      r.target_address = r.target_address || '';
+      r.target_protocol = r.target_protocol || 'http';
+      r.icon = r.icon || '';
+      r.enabled = r.enabled !== false;
+      this.rpEditingRule = r;
     },
 
     async deleteRpRule(index) {
@@ -1406,8 +1520,14 @@ function app() {
     },
 
     async testRpRule(rule) {
+      // v0.8.1 规则恒有 id。旧的 `rule.domain` 兜底是 v0.8.0 残留，
+      // 留着会拼出 /rules/nas.test/test 这种必然 404 的路径。
+      if (!rule.id) {
+        this.showToast('这条服务尚未保存，没有可测试的编号', 'error');
+        return;
+      }
       try {
-        const data = await api.post('/api/reverse-proxy/rules/' + (rule.id || rule.domain) + '/test');
+        const data = await api.post('/api/reverse-proxy/rules/' + rule.id + '/test');
         this.showToast(data.message || '连通性测试成功', 'success');
       } catch (e) {
         this.showToast('测试失败: ' + e.message, 'error');
@@ -1589,11 +1709,10 @@ function app() {
       return this.rp.certificates.find(c => c.id == this.rp.settings.default_cert_id);
     },
 
-    getRpCertDaysClass(days) {
-      if (days === undefined || days === null) return 'text-gray-600';
-      if (days <= 0) return 'text-red-600 font-medium';
-      if (days < 30) return 'text-orange-500';
-      return 'text-gray-600';
+    // 关闭表单。表单用 x-if 包裹，置 null 即整块卸载；原来这个方法在 app.js 里
+    // 根本没有定义，点「取消」直接抛 "cancelRpEdit is not a function"。
+    cancelRpEdit() {
+      this.rpEditingRule = null;
     },
 
     getRpCertStatusText(days) {

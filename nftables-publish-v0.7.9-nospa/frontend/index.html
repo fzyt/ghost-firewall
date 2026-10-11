@@ -1747,7 +1747,75 @@
            x-transition:enter="nfx-enter"
            x-transition:enter-start="nfx-enter-start"
            x-transition:enter-end="nfx-enter-end">
-        <h1 class="text-2xl font-bold mb-6">反代管理</h1>
+        <h1 class="text-2xl font-bold mb-6">内网服务接入</h1>
+
+        <!-- ── 认证网关总开关 ────────────────────────────────────
+             v0.8.0 之前整个网关（开关/端口/超时/LAN 豁免）在界面上
+             完全不存在，只能手工改配置文件 —— 现在补上。 -->
+        <div class="bg-gray-50 border rounded-lg p-5 mb-6">
+          <div class="flex items-start justify-between gap-4 flex-wrap">
+            <div class="flex-1 min-w-[260px]">
+              <label class="flex items-start gap-3 cursor-pointer">
+                <input type="checkbox" x-model="gw.gateway_enabled" class="mt-1">
+                <span>
+                  <span class="block font-semibold">启用认证网关</span>
+                  <span class="block text-xs text-gray-400 mt-1">
+                    下面每条服务都从这里进入。所有服务共用一个公网端口，
+                    访问前需要先登录。关掉网关则所有服务都不可访问。
+                  </span>
+                </span>
+              </label>
+            </div>
+            <div class="flex gap-2">
+              <button @click="saveGatewayConfig()"
+                :disabled="gwSaving"
+                class="px-5 py-2 bg-black text-white rounded text-sm disabled:opacity-50">
+                <span x-text="gwSaving ? '保存中…' : '保存网关配置'"></span>
+              </button>
+              <button @click="loadGatewayStatus()"
+                class="px-4 py-2 border rounded text-sm">刷新状态</button>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mt-5 pt-4 border-t">
+            <div>
+              <label class="block text-sm font-medium mb-1">网关端口</label>
+              <input type="number" x-model.number="gw.gateway_port"
+                class="w-full nf-mono" min="1" max="65535">
+              <p class="text-xs text-gray-400 mt-1">公网唯一入口，需做端口映射</p>
+            </div>
+            <div>
+              <label class="block text-sm font-medium mb-1">会话超时（秒）</label>
+              <input type="number" x-model.number="gw.auth_session_timeout"
+                class="w-full nf-mono" min="0">
+              <p class="text-xs text-gray-400 mt-1">每次访问都会续期，滑动窗口</p>
+            </div>
+            <div>
+              <label class="block text-sm font-medium mb-1">绝对有效期（秒）</label>
+              <input type="number" x-model.number="gw.auth_absolute_timeout"
+                class="w-full nf-mono" min="0">
+              <p class="text-xs text-gray-400 mt-1">0 = 不限制；设了则到期必须重新登录</p>
+            </div>
+          </div>
+
+          <div class="mt-4 pt-4 border-t space-y-3">
+            <label class="flex items-start gap-3 cursor-pointer">
+              <input type="checkbox" x-model="gw.auth_lan_bypass" class="mt-1">
+              <span>
+                <span class="block text-sm font-medium">内网来源免登录</span>
+                <span class="text-xs text-gray-400">
+                  开启后内网网段的设备直接可访问，公网来源仍需登录。
+                  建议只在完全信任的内网开启。
+                </span>
+              </span>
+            </label>
+
+            <div class="nf-status-line" x-show="gwStatus" x-cloak>
+              <span class="text-xs text-gray-400">当前状态：</span>
+              <span x-text="gwStatus"></span>
+            </div>
+          </div>
+        </div>
 
         <!-- 子标签 -->
         <div class="flex gap-2 mb-6">
@@ -1775,7 +1843,7 @@
                 重载 Nginx
               </button>
             </div>
-            <button @click="rpEditingRule = { name: '', domain: '', listen_port: 443, target_address: '', target_protocol: 'http', ssl_cert_id: rp.settings.default_cert_id || '', websocket_enabled: true, public_access: false, client_max_body_size: '50M' }"
+            <button @click="newRpRule()"
               class="px-4 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 transition-colors">
               添加规则
             </button>
@@ -1783,92 +1851,113 @@
           <p class="text-xs text-amber-600 mb-4">⚠️ 规则添加/修改完毕后，需点击右上角「应用规则」，防火墙才会放行对应端口，公网方可访问。</p>
 
           <!-- 编辑/添加表单 -->
-          <!-- 必须用 x-if 而非 x-show：块内 10 个控件直接绑定 rpEditingRule.name /
-               .domain / .listen_port / .target_address / .ssl_cert_id /
-               .websocket_enabled / .public_access / .client_max_body_size 等，
+          <!-- 必须用 x-if 而非 x-show：块内控件直接绑定 rpEditingRule.*，
                而 rpEditingRule 初始值和 cancelRpEdit() 之后都是 null。
                x-show 只管显隐，Alpine 初始化时照样对 x-model 求值 → 每次开页面
-               必抛 "Cannot read properties of null"，还会打断 x-cloak 的移除，
-               导致模态框遮罩永久卡在页面上、整个界面点不动。x-if 从根上避免。 -->
+               必抛 "Cannot read properties of null"。x-if 从根上避免。
+
+               v0.8.1：反代服务只走认证网关（gateway_port + 路径前缀），证书用网关
+               的统一证书，所以不再有 domain / listen_port / ssl_cert_id 三项。 -->
           <template x-if="rpEditingRule">
           <div x-transition class="bg-gray-50 border rounded-lg p-5 mb-6 space-y-4">
-            <h3 class="font-semibold" x-text="rpEditingRule._editIndex !== undefined ? '编辑规则' : '添加规则'"></h3>
+            <h3 class="font-semibold" x-text="rpEditingRule._editIndex !== undefined ? '编辑服务' : '添加服务'"></h3>
+
+            <div class="nf-hint mb-4">
+              访问地址形如 <code class="nf-mono" x-text="gatewayPreviewUrl()"></code>：
+              路径前缀决定这条服务挂在网关的哪个位置，前缀不能重复，也不能用
+              <code class="nf-mono">/auth</code> 这类保留前缀。
+            </div>
+
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div>
-                <label class="block text-sm font-medium mb-1">名称（可选） <span class="text-gray-400 font-normal">用于识别，不超过 64 字</span></label>
-                <input type="text" x-model="rpEditingRule.name" placeholder="例如：群晖 DSM"
-                  maxlength="64"
-                  class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+                <label class="block text-sm font-medium mb-1">服务名称 <span class="text-red-500">*</span>
+                  <span class="text-gray-400 font-normal">用来区分这是哪个服务</span></label>
+                <input type="text" x-model="rpEditingRule.name" placeholder="例如：群晖 NAS"
+                  maxlength="64" class="w-full">
               </div>
+
               <div>
-                <label class="block text-sm font-medium mb-1">域名</label>
-                <input type="text" x-model="rpEditingRule.domain" placeholder="app.example.com"
-                  class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+                <label class="block text-sm font-medium mb-1">路径前缀 <span class="text-red-500">*</span>
+                  <span class="text-gray-400 font-normal">如 /nas，访问时用这个前缀</span></label>
+                <input type="text" x-model="rpEditingRule.path_prefix" placeholder="/nas"
+                  maxlength="64" class="w-full nf-mono">
+                <p class="text-xs text-gray-400 mt-1"
+                   x-show="rpPrefixConflict(rpEditingRule)" x-cloak
+                   x-text="rpPrefixConflict(rpEditingRule)"></p>
               </div>
+
               <div>
-                <label class="block text-sm font-medium mb-1">监听端口</label>
-                <input type="number" x-model.number="rpEditingRule.listen_port" placeholder="443" min="1" max="65535"
-                  class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+                <label class="block text-sm font-medium mb-1">目标地址 <span class="text-red-500">*</span>
+                  <span class="text-gray-400 font-normal">内网服务 IP:端口</span></label>
+                <input type="text" x-model="rpEditingRule.target_address"
+                  placeholder="192.168.100.50:5000" class="w-full nf-mono">
               </div>
-              <div>
-                <label class="block text-sm font-medium mb-1">目标地址</label>
-                <input type="text" x-model="rpEditingRule.target_address" placeholder="192.168.100.2:5000"
-                  class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
-              </div>
+
               <div>
                 <label class="block text-sm font-medium mb-1">目标协议</label>
-                <select x-model="rpEditingRule.target_protocol"
-                  class="w-full border rounded px-3 py-2 text-sm bg-white focus:outline-none focus:border-black">
+                <select x-model="rpEditingRule.target_protocol" class="w-full">
                   <option value="http">http</option>
                   <option value="https">https</option>
                 </select>
               </div>
+
               <div>
-                <label class="block text-sm font-medium mb-1">SSL 证书</label>
-                <select x-model="rpEditingRule.ssl_cert_id"
-                  class="w-full border rounded px-3 py-2 text-sm bg-white focus:outline-none focus:border-black">
-                  <option value="">不使用证书</option>
-                  <template x-for="cert in rp.certificates" :key="cert.id || cert.domain">
-                    <option :value="cert.id" x-text="(cert.domain || '') + (cert.days_remaining !== undefined ? ' (' + cert.days_remaining + '天)' : '')"></option>
-                  </template>
-                </select>
+                <label class="block text-sm font-medium mb-1">上传大小限制
+                  <span class="text-gray-400 font-normal">留空或填 0 = 不限制</span></label>
+                <input type="text" x-model="rpEditingRule.client_max_body_size"
+                  placeholder="例如 10m / 512M / 2G" class="w-full nf-mono">
               </div>
+
               <div>
-                <label class="block text-sm font-medium mb-1">上传大小上限 <span class="text-gray-400 font-normal">如 50M / 1G / 留空用 nginx 默认 1M</span></label>
-                <input type="text" x-model="rpEditingRule.client_max_body_size" placeholder="50M"
-                  pattern="^\d+[KMG]?$"
-                  class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+                <label class="block text-sm font-medium mb-1">图标
+                  <span class="text-gray-400 font-normal">门户页显示，可留空</span></label>
+                <input type="text" x-model="rpEditingRule.icon"
+                  placeholder="如 📁 或 nas" maxlength="16" class="w-full">
               </div>
             </div>
-            <div class="flex gap-6">
-              <div class="flex items-center gap-2">
-                <button @click="rpEditingRule.websocket_enabled = !rpEditingRule.websocket_enabled"
-                  :class="rpEditingRule.websocket_enabled ? 'bg-black' : 'bg-gray-300'"
-                  class="relative w-11 h-6 rounded-full transition-colors flex-shrink-0">
-                  <span :class="rpEditingRule.websocket_enabled ? 'translate-x-5' : 'translate-x-0.5'"
-                    class="absolute top-0.5 left-0 w-5 h-5 bg-white rounded-full shadow transition-transform"></span>
-                </button>
-                <span class="text-sm">WebSocket</span>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2 border-t">
+              <div class="nf-switch-row">
+                <label class="flex items-start gap-3 cursor-pointer">
+                  <input type="checkbox" x-model="rpEditingRule.enabled" class="mt-1">
+                  <span>
+                    <span class="block text-sm font-medium">启用这条服务</span>
+                    <span class="block text-xs text-gray-400">关掉后网关不再分发这条路径，服务立刻不可访问</span>
+                  </span>
+                </label>
               </div>
-              <div class="flex items-center gap-2">
-                <button @click="rpEditingRule.public_access = !rpEditingRule.public_access"
-                  :class="rpEditingRule.public_access ? 'bg-black' : 'bg-gray-300'"
-                  class="relative w-11 h-6 rounded-full transition-colors flex-shrink-0">
-                  <span :class="rpEditingRule.public_access ? 'translate-x-5' : 'translate-x-0.5'"
-                    class="absolute top-0.5 left-0 w-5 h-5 bg-white rounded-full shadow transition-transform"></span>
-                </button>
-                <span class="text-sm">公网访问</span>
+
+              <div class="nf-switch-row">
+                <label class="flex items-start gap-3 cursor-pointer">
+                  <input type="checkbox" x-model="rpEditingRule.public_access" class="mt-1">
+                  <span>
+                    <span class="block text-sm font-medium">公网访问</span>
+                    <span class="block text-xs text-gray-400">
+                      开启：公网可达，但访问前必须先在认证口登录<br>
+                      关闭：仅内网网段可达，公网直连被拒
+                    </span>
+                  </span>
+                </label>
+              </div>
+
+              <div class="nf-switch-row">
+                <label class="flex items-start gap-3 cursor-pointer">
+                  <input type="checkbox" x-model="rpEditingRule.websocket_enabled" class="mt-1">
+                  <span>
+                    <span class="block text-sm font-medium">WebSocket</span>
+                    <span class="block text-xs text-gray-400">需要长期连接的服务（如聊天、实时面板）要开</span>
+                  </span>
+                </label>
               </div>
             </div>
-            <div class="flex gap-3">
-              <button @click="saveRpRule()" :disabled="rp.loading"
-                class="px-5 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50 transition-colors">
-                <span x-text="rp.loading ? '保存中...' : '保存'"></span>
+
+            <div class="flex gap-2 pt-2">
+              <button type="button" class="px-5 py-2 bg-black text-white rounded text-sm"
+                @click="saveRpRule()" :disabled="rpUploading || !rpRuleFormValid()">
+                <span x-text="rpEditingRule._editIndex !== undefined ? '保存修改' : '添加服务'"></span>
               </button>
-              <button @click="rpEditingRule = null"
-                class="px-5 py-2 border border-black rounded text-sm hover:bg-gray-50 transition-colors">
-                取消
-              </button>
+              <button type="button" class="px-4 py-2 border rounded text-sm"
+                @click="cancelRpEdit()">取消</button>
             </div>
           </div>
           </template>
@@ -1880,58 +1969,49 @@
           <div class="space-y-4">
             <template x-for="(rule, index) in rp.rules" :key="index">
               <div class="bg-gray-50 border rounded-lg p-5">
-                <div class="flex items-center justify-between mb-3">
-                  <h3 class="font-bold">
-                    <span x-show="rule.name" x-text="rule.name"></span>
-                    <span x-show="rule.name" class="text-gray-400 font-normal text-sm ml-2" x-text="rule.domain"></span>
-                    <span x-show="!rule.name" x-text="rule.domain || '(未设置域名)'"></span>
-                  </h3>
-                  <div class="flex gap-2">
-                    <button @click="testRpRule(rule)" :disabled="rp.loading"
-                      class="px-3 py-1 border border-black rounded text-xs hover:bg-gray-50 disabled:opacity-50 transition-colors">
-                      测试
-                    </button>
+                <div class="flex items-start justify-between gap-3 mb-3">
+                  <div class="min-w-0">
+                    <h3 class="font-bold flex items-center gap-2 flex-wrap">
+                      <span x-text="rule.name || '(未命名服务)'"></span>
+                      <span x-show="!rule.enabled"
+                        class="text-xs px-2 py-0.5 rounded bg-gray-200 text-gray-500">已停用</span>
+                    </h3>
+                    <!-- 访问路径是这条服务的真实入口，必须一眼可见 -->
+                    <p class="text-sm mt-1 nf-mono text-gray-600 break-all"
+                       x-text="gatewayPreviewUrl() + (rule.path_prefix || '/') + '/'"></p>
+                  </div>
+                  <div class="flex gap-2 shrink-0">
                     <button @click="editRpRule(index)"
-                      class="px-3 py-1 border border-black rounded text-xs hover:bg-gray-50 transition-colors">
-                      编辑
-                    </button>
+                      class="px-3 py-1 border rounded text-xs hover:bg-gray-100 transition-colors">编辑</button>
+                    <button @click="testRpRule(rule)"
+                      class="px-3 py-1 border rounded text-xs hover:bg-gray-100 transition-colors">测试</button>
                     <button @click="deleteRpRule(index)"
-                      class="px-3 py-1 bg-red-500 text-white text-xs rounded hover:bg-red-600 transition-colors">
-                      删除
-                    </button>
+                      class="px-3 py-1 border border-red-300 text-red-600 rounded text-xs hover:bg-red-50 transition-colors">删除</button>
                   </div>
                 </div>
-                <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+
+                <dl class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-3 pt-3 border-t text-sm">
                   <div>
-                    <span class="text-gray-500">目标</span>
-                    <p x-text="(rule.target_protocol || 'http') + '://' + (rule.target_address || '-')"></p>
+                    <dt class="text-xs text-gray-400">目标地址</dt>
+                    <dd class="nf-mono text-gray-700 break-all"
+                        x-text="(rule.target_protocol || 'http') + '://' + (rule.target_address || '-')"></dd>
                   </div>
                   <div>
-                    <span class="text-gray-500">端口</span>
-                    <p x-text="rule.listen_port || '-'"></p>
+                    <dt class="text-xs text-gray-400">上传限制</dt>
+                    <dd class="nf-mono text-gray-700"
+                        x-text="rule.client_max_body_size || '不限制'"></dd>
                   </div>
                   <div>
-                    <span class="text-gray-500">上传上限</span>
-                    <p x-text="rule.client_max_body_size || '默认 1M'"></p>
+                    <dt class="text-xs text-gray-400">公网访问</dt>
+                    <dd :class="rule.public_access ? 'text-green-600' : 'text-gray-400'"
+                        x-text="rule.public_access ? '已开启（需登录）' : '仅内网'"></dd>
                   </div>
                   <div>
-                    <span class="text-gray-500">WebSocket</span>
-                    <p :class="rule.websocket_enabled ? 'text-green-600' : 'text-gray-400'"
-                       x-text="rule.websocket_enabled ? '已开启' : '已关闭'"></p>
+                    <dt class="text-xs text-gray-400">WebSocket</dt>
+                    <dd :class="rule.websocket_enabled ? 'text-green-600' : 'text-gray-400'"
+                        x-text="rule.websocket_enabled ? '已开启' : '已关闭'"></dd>
                   </div>
-                </div>
-                <div class="mt-2 text-sm" x-show="rule.public_access !== undefined">
-                  <span class="text-gray-500">公网访问：</span>
-                  <span :class="rule.public_access ? 'text-green-600' : 'text-gray-400'"
-                        x-text="rule.public_access ? '已开启' : '已关闭'"></span>
-                </div>
-                <div x-show="rule.certificate_domain" class="mt-2 text-sm">
-                  <span class="text-gray-500">证书：</span>
-                  <span x-text="rule.certificate_domain"></span>
-                  <span x-show="rule.certificate_days_remaining !== undefined"
-                    :class="rule.certificate_days_remaining < 30 ? 'text-red-500' : 'text-gray-600'"
-                    x-text="'（剩余 ' + rule.certificate_days_remaining + ' 天）'"></span>
-                </div>
+                </dl>
               </div>
             </template>
           </div>
