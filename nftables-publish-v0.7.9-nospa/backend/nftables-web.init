@@ -5,6 +5,10 @@ STOP=10
 
 APP_DIR="/opt/nftables-web-v2/backend"
 LOG_FILE="/var/log/nftables-web.log"
+# 规则恢复的现场单独记一份。启动 Python 时用的是 > （截断），上面那几条
+# [WARN]/[ERROR] 会被同一次启动顺手擦掉 —— 最该被看见的「防火墙没装上」
+# 反而永远留不下痕迹。这里用独立文件 + 追加，恢复链路的证据不会被截断。
+RECOVERY_LOG="/var/log/nftables-web-recovery.log"
 PID_FILE="/var/run/nftables-web.pid"
 
 start() {
@@ -19,16 +23,24 @@ start() {
         /etc/init.d/firewall stop 2>/dev/null
         /etc/init.d/firewall disable 2>/dev/null
 
-        if nft -f /etc/nftables.d/99-custom-rules.nft 2>>"$LOG_FILE"; then
-            :
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] 启动：尝试加载自定义规则" >>"$RECOVERY_LOG"
+        if nft -f /etc/nftables.d/99-custom-rules.nft 2>>"$RECOVERY_LOG"; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') [OK] 自定义规则加载成功" >>"$RECOVERY_LOG"
         elif [ -f /etc/nftables.d/99-custom-rules.nft.lastgood ]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] 自定义规则加载失败，已回退到 .lastgood" >>"$LOG_FILE"
-            nft -f /etc/nftables.d/99-custom-rules.nft.lastgood 2>>"$LOG_FILE" || {
-                echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] lastgood 规则也加载失败" >>"$LOG_FILE"
-            }
+            echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] 自定义规则加载失败，已回退到 .lastgood" >>"$RECOVERY_LOG"
+            if nft -f /etc/nftables.d/99-custom-rules.nft.lastgood 2>>"$RECOVERY_LOG"; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') [OK] .lastgood 回退成功" >>"$RECOVERY_LOG"
+            else
+                echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] lastgood 规则也加载失败；" \
+                     "Python 层将接手（basic lockdown 兜底），当前防火墙状态未知" >>"$RECOVERY_LOG"
+            fi
         else
-            echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] 自定义规则加载失败且无 .lastgood 备份" >>"$LOG_FILE"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] 自定义规则加载失败且无 .lastgood 备份；" \
+                 "Python 层将接手（basic lockdown 兜底），当前防火墙状态未知" >>"$RECOVERY_LOG"
         fi
+    else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] 自定义规则文件不存在，" \
+             "init 层不做任何加载，交由 Python 层按四级优先级恢复" >>"$RECOVERY_LOG"
     fi
 
     # 自动设置时区

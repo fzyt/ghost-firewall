@@ -357,7 +357,46 @@ def load_config():
         # 必须在合并默认值之后做 —— 否则连默认值里的示例规则都会被迁移掉。
         result = _migrate_rp_rules(result)
         return result
+    # 配置文件不存在。**绝不能用它来重建防火墙**。
+    #
+    # 2026-10-11 真机实测踩过：配置被移走后启动恢复拿 DEFAULT_CONFIG 重建了
+    # 防火墙，生效的敲门端口变成 1/2/3/4、trusted_ip 变成 192.168.100.2、
+    # 转发规则指向 192.168.4.226，而且全程报「已恢复 ruleset」——
+    # 也就是说 someone at 192.168.100.2 直接成了可信管理机，免敲门进面板。
+    #
+    # UI 仍然要能用，所以这里照旧返回默认值；但 _config_corrupted() 会把这个
+    # 情况报成异常，所有「真正改防火墙」的入口都必须先问它。
+    #
+    # 判据不能只看规则文件在不在：实测场景里配置和规则文件是被一起移走的，
+    # 规则文件不在 -> 误判成「全新安装」-> 又落回 DEFAULT_CONFIG。
+    # 所以改成「任一历史产物存在即认为配过」：
+    #   规则文件 / .lastgood / .backup / 配置的 .backup
+    # 全都不存在才是真正的全新安装，用默认值无害。
+    if _config_lost_after_setup():
+        _LAST_LOAD_ERROR = (
+            f'配置文件不存在（{CONFIG_PATH}），但存在历史产物，说明配置曾存在后丢失')
+        print(f'[ERROR] {_LAST_LOAD_ERROR}；'
+              f'拒绝用内置默认值重建规则（默认值含示例端口与陌生网段）', flush=True)
+        return dict(DEFAULT_CONFIG)
     return dict(DEFAULT_CONFIG)
+
+
+def _config_lost_after_setup():
+    """配置文件不在，但存在历史产物 → 配过又丢，不是全新安装。
+
+    缺了配置就不能重建防火墙：DEFAULT_CONFIG 里写死了陌生网段
+    （trusted_ip4=192.168.100.2、转发到 192.168.4.226、敲门端口 1/2/3/4）。
+    宁可退到 basic lockdown，也不要把这些值下发到真实网卡上。
+    """
+    if os.path.exists(CONFIG_PATH):
+        return False
+    markers = [
+        RULES_PATH,
+        RULES_PATH + '.lastgood',
+        RULES_PATH + '.backup',
+        CONFIG_PATH + '.backup',
+    ]
+    return any(os.path.exists(p) for p in markers)
 
 
 # 上一次 load_config() 读到的配置是否损坏。None = 正常。
@@ -6381,23 +6420,34 @@ def _auto_recover_ruleset_if_empty():
     # 一起挡在门外，只能从另一台仍在白名单里的机器登进去救。
     # 「保险丝不能装在电表箱里」：恢复用的规则必须来自当前配置，而不是历史快照。
     if not os.path.exists(RULES_PATH):
-        try:
-            # 配置损坏时 load_config() 拿的是硬编码 DEFAULT_CONFIG（含他人网段）。
-            # 开机自动重建时用它，等于每次重启都把陌生网段写进防火墙 —— 必须在
-            # 这条路径上也拦住，否则「应用规则」那头的守卫形同虚设。
-            _cfg = load_config()
-            _bad, _err = _config_corrupted()
-            if _bad:
-                print(f'[ERROR] 配置损坏（{_err}），拒绝按默认配置重建规则，'
-                      f'改用 backup 恢复', flush=True)
-            else:
-                ok, msg = _apply_ruleset(_cfg)
-                if ok:
-                    print(f'[INFO] ✅ 规则文件缺失，已按当前配置重新生成并加载: {msg}', flush=True)
-                    return
-                print(f'[WARN] 按当前配置重建失败（{msg}），尝试 backup...', flush=True)
-        except Exception as e:
-            print(f'[WARN] 按当前配置重建异常（{e}），尝试 backup...', flush=True)
+        # 配置文件不在，就绝不按配置重建 —— 直接落到优先级 3 / 4。
+        #
+        # 这条比守卫更硬：守卫靠「存在历史产物」来区分全新安装，而实测场景里
+        # 配置和规则文件是被一起移走的，守卫此时判不出异常；只有直接检查
+        # 文件存不存在才靠得住。DEFAULT_CONFIG 的敲门端口是 1/2/3/4、
+        # trusted_ip 是 192.168.100.2 —— 拿它重建等于把陌生网段下发到真实网卡。
+        # 宁可退到 .backup 或 basic lockdown。
+        if not os.path.exists(CONFIG_PATH):
+            print('[ERROR] 配置文件缺失，跳过「按配置重建」，'
+                  '改用 .backup 或 basic lockdown 兜底', flush=True)
+        else:
+            try:
+                # 配置损坏时 load_config() 拿的是硬编码 DEFAULT_CONFIG（含他人网段）。
+                # 开机自动重建时用它，等于每次重启都把陌生网段写进防火墙 —— 必须在
+                # 这条路径上也拦住，否则「应用规则」那头的守卫形同虚设。
+                _cfg = load_config()
+                _bad, _err = _config_corrupted()
+                if _bad:
+                    print(f'[ERROR] 配置损坏（{_err}），拒绝按默认配置重建规则，'
+                          f'改用 backup 恢复', flush=True)
+                else:
+                    ok, msg = _apply_ruleset(_cfg)
+                    if ok:
+                        print(f'[INFO] ✅ 规则文件缺失，已按当前配置重新生成并加载: {msg}', flush=True)
+                        return
+                    print(f'[WARN] 按当前配置重建失败（{msg}），尝试 backup...', flush=True)
+            except Exception as e:
+                print(f'[WARN] 按当前配置重建异常（{e}），尝试 backup...', flush=True)
 
     # 优先级 3：.backup 文件
     backup_path = RULES_PATH + '.backup'
