@@ -6415,7 +6415,6 @@ def _auto_recover_ruleset_if_empty():
     print('[ERROR] ❌ 自动恢复全部失败，ruleset 仍为空，请手动检查 nft 服务和规则文件', flush=True)
 
 
-@app.route('/api/rules/health', methods=['GET'])
 def _ruleset_is_functional():
     """比 _ruleset_is_empty 更严：表在、而且链真的带策略。
 
@@ -6444,8 +6443,16 @@ def _ruleset_is_functional():
     return True, '正常'
 
 
+@app.route('/api/rules/health', methods=['GET'])
 def rules_health():
-    """返回当前 nftables ruleset 健康状态（前端可查询/展示）"""
+    """返回当前 nftables ruleset 健康状态（前端可查询/展示）
+
+    ⚠️ 装饰器必须挂在本函数上，不能挂在 _ruleset_is_functional 上。
+    原来挂在辅助函数上，Flask 于是把 (True, '正常') 当作响应返回 ——
+    元组第一项是 bool，make_response 直接抛 "did not return a valid
+    response"，这个接口从 2026-09-14 起一直是 500。
+    之所以没人发现：前端从来没调用过它。
+    """
     if not _is_authenticated():
         return jsonify({'success': False, 'code': 'AUTH_REQUIRED', 'message': '未登录'}), 401
     functional, detail = _ruleset_is_functional()

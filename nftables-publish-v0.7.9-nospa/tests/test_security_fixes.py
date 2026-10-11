@@ -352,6 +352,59 @@ check('内网豁免不返回 expires_in（门户据此显示免认证文案）',
 
 
 # ─────────────────────────────────────────────────────────────
+sec('SEC-6  路由绑定不能挂到辅助函数上')
+
+# 这一类 bug 已经踩了两次：
+#   1) /auth/status    —— @app.route 挂到了 _status_rate_ok 上（今天新引入又修掉）
+#   2) /api/rules/health —— @app.route 挂到了 _ruleset_is_functional 上
+#      （2026-09-14 引入，一直 500，因为前端从来不调它，没人发现）
+# 两次都是同一个形态：装饰器挂错函数，Flask 拿到裸 bool / 非法元组当响应。
+#
+# 本项目里 Flask 视图一律是不带下划线的公开函数（下划线是模块内辅助函数的
+# 约定），所以「路由绑到下划线函数上」可以直接判定为 bug。
+
+app3 = fresh()
+app3.app.config['TESTING'] = True
+misbound = []
+for _r in app3.app.url_map.iter_rules():
+    _fn = app3.app.view_functions.get(_r.endpoint)
+    if _fn is not None and _fn.__name__.startswith('_'):
+        misbound.append((str(_r), _fn.__name__))
+check('没有路由绑到下划线开头的辅助函数上', not misbound,
+      '; '.join('%s -> %s' % x for x in misbound))
+
+_h = app3.app.view_functions.get('rules_health')
+check('/api/rules/health 绑定的是 rules_health',
+      _h is not None and _h.__name__ == 'rules_health',
+      getattr(_h, '__name__', None))
+
+# 真打一次：这个接口坏了近一个月，必须真的能返回 JSON
+app3.app.before_request_funcs[None] = []
+# rules_health 函数体里还有一道 _is_authenticated() 校验，
+# 光摘 before_request 钩子不够，这里一并打桩。
+app3._is_authenticated = lambda: True
+app3._ruleset_is_empty = lambda: False
+_c3 = app3.app.test_client()
+_r3 = _c3.get('/api/rules/health')
+check('/api/rules/health 不再 500', _r3.status_code < 500, f'HTTP {_r3.status_code}')
+try:
+    _j3 = _r3.get_json() or {}
+    check('/api/rules/health 返回健康字段',
+          'ruleset_functional' in (_j3.get('data') or {}),
+          str(list((_j3.get('data') or {}).keys()))[:80])
+except Exception as _e:
+    check('/api/rules/health 返回健康字段', False, str(_e)[:60])
+
+# 辅助函数本身必须仍然是「返回元组」，不能被改成视图
+app4 = fresh()
+_fn4 = app4._ruleset_is_functional
+_r4 = _fn4()
+check('_ruleset_is_functional 仍是 (bool, str) 辅助函数，不是视图',
+      isinstance(_r4, tuple) and isinstance(_r4[0], bool) and isinstance(_r4[1], str),
+      str(type(_r4)))
+
+
+# ─────────────────────────────────────────────────────────────
 print('\n' + '═' * 52)
 print(f'通过 {len(PASS)} / {len(PASS) + len(FAIL)}')
 if FAIL:
