@@ -1,6 +1,6 @@
 # Version: 0.7.9.1
 from flask import Flask, jsonify, request, send_from_directory, send_file, session
-import os, subprocess, shutil, json, time, re, hmac, hashlib, base64, datetime, uuid, fcntl, io, zipfile, secrets, ssl, ipaddress
+import os, subprocess, shutil, json, time, re, hmac, hashlib, base64, datetime, uuid, fcntl, io, zipfile, secrets, ssl, ipaddress, socket, threading
 from template_engine import load_template, generate_rules
 
 # ======================= 认证配置 =======================
@@ -4158,6 +4158,51 @@ def _sanitize_domain(domain):
     return domain
 
 
+def _host_resolvable(host, timeout=3.0):
+    """域名能不能解析成 IP。
+
+    **为什么必须在这里挡**：nginx 在 `nginx -t`（配置解析阶段）就会去解析
+    proxy_pass 里的 upstream 域名，解析不到直接 `[emerg] host not found in
+    upstream`，整份网关配置生成失败。而反代的保存顺序是「先落盘、后部署」，
+    部署失败不会回滚配置 —— 于是这条毒规则永久留在配置 JSON 里，
+    之后**每一次**反代保存都会重新生成同样失败的配置并返回 500。
+
+    实测（.224）：POST 一条 target=evil.example.com:80 的规则后，
+    连续 4 次 PUT 全部 500，就是这条规则在反复污染。
+
+    返回三态，而不是简单的 True/False：
+      True  —— 能解析，安全
+      False —— 明确解析不到（NXDOMAIN / 无 A 记录），必须拒绝
+      None  —— 解析器超时或本机无 DNS 出口，无法判定，放行但由部署兜底
+    """
+    if not host:
+        return None
+    # 字面量 IP 不需要解析
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+
+    result = {}
+
+    def _resolve():
+        try:
+            socket.setdefaulttimeout(timeout)
+            result['ok'] = bool(socket.getaddrinfo(host, None))
+        except Exception:
+            result['ok'] = False
+
+    t = threading.Thread(target=_resolve, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        # 超时 ≠ 解析不到。本机可能压根没有 DNS 出口（比如只有 /etc/hosts
+        # 的离线环境），此时拒绝会把合法配置也挡在门外。
+        return None
+    return result.get('ok', False)
+
+
 def _sanitize_target_address(addr):
     """校验目标地址格式（IPv4:port 或 domain:port）
     - IPv4：每段 0-255
@@ -4271,6 +4316,14 @@ def _validate_rp_service(data, existing=None, all_rules=None):
         clean["target_address"] = _sanitize_target_address(str(target or '').strip())
     except ValueError as e:
         return None, str(e)
+
+    # 域名型目标必须先确认解析得通。nginx 在 nginx -t 阶段就会解析 upstream
+    # 域名，解析不到整份网关配置就生成失败（详见 _host_resolvable 的说明）。
+    _t_host = clean["target_address"].rsplit(':', 1)[0]
+    if _host_resolvable(_t_host) is False:
+        return None, (f"目标地址 {_t_host!r} 解析不到 IP。"
+                      "nginx 生成配置时会立刻失败并让整个网关配置不可用，"
+                      "请改用可解析的主机名或直接填 IP")
 
     # 目标协议：白名单，绝不能直接拼进 proxy_pass
     proto = str(pick("target_protocol", "http")).strip().lower()
@@ -5308,12 +5361,17 @@ def rp_create_rule():
     rule = {"id": new_id, **clean,
             "created_at": now_iso, "updated_at": now_iso}
     rp["rules"].append(rule)
-    _save_rp_config(config)
 
+    # 顺序：先部署、后落盘。
+    # 部署失败时**不保存**，否则这条规则会永久留在配置里 —— 之后每一次
+    # 反代保存都会重新生成同样失败的 nginx 配置并返回 500，整个功能瘫掉。
+    # _get_rp_config 每次请求都重新 load_config()，所以不落盘即等于没发生。
     deploy_ok, deploy_msg = _deploy_all_rules(config)
     if not deploy_ok:
         return jsonify({"success": False,
-                        "message": f"服务已保存但网关配置未生效: {deploy_msg}"}), 500
+                        "message": f"网关配置未生效，规则已丢弃: {deploy_msg}"}), 500
+
+    _save_rp_config(config)
 
     fw_ok, fw_msg = _apply_ruleset(config)
     if not fw_ok:
@@ -5339,16 +5397,19 @@ def rp_update_rule(rule_id):
         return jsonify({"success": False, "message": err}), 400
 
     now_iso = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    created_at = rule.get("created_at", now_iso)
     rule.clear()
     rule.update({"id": rule_id, **clean,
-                 "created_at": rule.get("created_at", now_iso),
+                 "created_at": created_at,
                  "updated_at": now_iso})
-    _save_rp_config(config)
 
+    # 同新建：先部署、后落盘，部署失败不保存（理由见 rp_create_rule）
     deploy_ok, deploy_msg = _deploy_all_rules(config)
     if not deploy_ok:
         return jsonify({"success": False,
-                        "message": f"服务已保存但网关配置未生效: {deploy_msg}"}), 500
+                        "message": f"网关配置未生效，修改已丢弃: {deploy_msg}"}), 500
+
+    _save_rp_config(config)
 
     fw_ok, fw_msg = _apply_ruleset(config)
     if not fw_ok:
@@ -5365,10 +5426,16 @@ def rp_delete_rule(rule_id):
     if not rule:
         return jsonify({"success": False, "message": "规则不存在"}), 404
     rp["rules"] = [r for r in rp["rules"] if r["id"] != rule_id]
-    _save_rp_config(config)
     # v0.8.1 起反代服务没有独立的站点 conf，删除后由 _deploy_all_rules
     # 重新生成网关配置即可，不需要单独删文件。
+    #
+    # 同新建/修改：先部署、后落盘。删除是唯一「必须落盘」和「必须部署成功」
+    # 方向相反的场景，所以顺序照旧保留先部署 —— 部署失败则不落盘，
+    # 规则仍在配置里、nginx 也仍跑着含该规则的配置，两边一致。
     deploy_ok, deploy_msg = _deploy_all_rules(config)
+
+    if deploy_ok:
+        _save_rp_config(config)
 
     # 更新防火墙（走统一的安全流程：语法预检 + 原子写盘 + 失败回滚）
     fw_ok, fw_msg = _apply_ruleset(config)
@@ -5382,8 +5449,9 @@ def rp_delete_rule(rule_id):
         return jsonify({
             "success": False,
             "code": "NGINX_DEPLOY_FAILED",
-            "message": f"反代规则已从配置中移除，但 nginx 配置未生效：{deploy_msg}",
-            "data": {"message": "反代规则已删除（nginx 未生效）", "nginx_reloaded": False},
+            "message": f"nginx 配置未生效，删除已丢弃: {deploy_msg}",
+            "data": {"message": "删除未生效（nginx 配置生成失败，规则仍在配置中）",
+                     "nginx_reloaded": False},
         }), 500
     return jsonify({"success": True, "data": {"message": "反代规则已删除", "nginx_reloaded": deploy_ok}})
 

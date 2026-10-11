@@ -388,6 +388,10 @@ RATE_LIMIT_WINDOW = 300     # 5 分钟内
 RATE_LIMIT_MAX_FAILS = 5
 RATE_LIMIT_LOCKOUT = 900    # 锁 15 分钟
 
+# /auth/status 的只读限流状态（进程内，不落盘）
+_STATUS_HITS = {}
+_STATUS_RATE_LOCK = threading.Lock()
+
 
 def _mutate_ratelimit(ip: str, on_fail: bool):
     """原子地读改写限流表。返回 (locked, fail_count)。"""
@@ -698,19 +702,57 @@ def auth_login_page():
     return resp
 
 
+def _status_rate_ok(window=60, limit=120):
+    """/auth/status 的进程内滑动窗口限流。
+
+    **刻意不用登录那个 _mutate_ratelimit**：那是文件锁、失败 5 次锁 15 分钟，
+    拿来做只读状态查询的限流会把正常用户直接锁在门外。这里只做计数，
+    最多让这一个端点慢下来，不影响登录、不落盘、不跨进程共享。
+
+    内存里只留最近的源 IP，窗口过期即清，不会无界增长。
+    """
+    now = int(time.time())
+    ip = client_ip() or "-"
+    with _STATUS_RATE_LOCK:
+        hits = [t for t in _STATUS_HITS.get(ip, []) if now - t < window]
+        if len(hits) >= limit:
+            _STATUS_HITS[ip] = hits          # 回写，避免被限流时无限增长
+            return False
+        hits.append(now)
+        _STATUS_HITS[ip] = hits
+        # 清掉没有近期记录的源 IP，防止字典无界增长
+        if len(_STATUS_HITS) > 512:
+            for k, v in list(_STATUS_HITS.items()):
+                if not v or now - max(v) >= window:
+                    _STATUS_HITS.pop(k, None)
+    return True
+
+
 @app.route("/auth/status", methods=["GET"])
 def auth_status():
+    # 限流：这个端点不需要密码就能打，未限流时等于一个免费的状态枚举口
+    # （Shannon AUTH-05）。实测连打 30 次全部 200。
+    # 阈值按「家庭路由器 + 少量设备」定：门户每次打开只调 1 次，
+    # 同一 NAT 后面的几台设备共用一个源 IP，留 120 次/分钟余量很宽。
+    if not _status_rate_ok():
+        return jsonify({"success": False, "code": "RATE_LIMITED",
+                        "message": "请求过于频繁，请稍后重试"}), 429
+
     cfg = load_gateway_config()
     if is_lan_source(cfg):
+        # 不再返回 via="lan-bypass"（Shannon AUTHZ-06）。
+        # 那个字符串等于把「内网豁免」这套机制直接讲给任何能连到这里的人听，
+        # 可用来校准哪些来源 IP 被当作内网。门户真正需要的只是「有没有会话
+        # 倒计时」，用 expires_in 在不在表达就够了，不必知道走的哪条路。
         return jsonify({
-            "authenticated": True, "via": "lan-bypass",
-            "user": "lan", "device_id": device_id_from_request(),
+            "authenticated": True, "user": "lan",
+            "device_id": device_id_from_request(),
         })
     payload = parse_token(request.cookies.get(COOKIE_TOKEN, ""))
     if not payload or is_revoked(payload.get("jti", "")):
         return jsonify({"authenticated": False})
     return jsonify({
-        "authenticated": True, "via": "token",
+        "authenticated": True,
         "user": payload.get("sub"), "device_id": payload.get("dev"),
         "fp": fingerprint(),
         "expires_in": max(0, int(payload["exp"]) - int(time.time())),
@@ -774,6 +816,15 @@ def auth_login():
                         "message": "密码错误", "remaining": remaining}), 401
 
     _mutate_ratelimit(ip, on_fail=False)   # 成功则清空该 IP 失败记录
+
+    # 重新登录前先吊销当前浏览器带着的旧令牌。
+    # 少了这一步（Shannon AUTH-02）：客户端已登录过、令牌仍在有效期内，
+    # 再次登录会签发新令牌，但旧令牌不作废 —— 一旦旧令牌泄露（XSS、
+    # 日志、抓包），用户在面板里重新登录并不能把攻击者踢下线。
+    # 实测：重新登录后旧令牌访问 /auth/portal 仍返回 200，剩余有效期 1799 秒。
+    _old = parse_token(request.cookies.get(COOKIE_TOKEN, ""))
+    if _old:
+        revoke_jti(_old.get("jti", ""), int(_old.get("exp", 0)))
 
     did = device_id_from_request()
     ttl = _session_ttl(cfg)

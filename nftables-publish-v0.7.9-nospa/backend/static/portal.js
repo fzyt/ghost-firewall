@@ -93,14 +93,17 @@
         var d = res.j || {};
         if (!d.authenticated) { goLogin(); return; }
 
-        if (d.via === 'lan-bypass') {
+        // 判据是「有没有会话倒计时」，不是「走的哪条认证路」。
+        // 后端不再返回 via=lan-bypass（那等于把内网豁免这套机制讲给
+        // 任何能连到这里的人听），expires_in 在不在就是等价的信号。
+        if (typeof d.expires_in === 'number') {
+          who.textContent = '已登录为 ' + (d.user || '-') +
+            (d.device_id ? ' · 设备 ' + String(d.device_id).slice(0, 8) : '');
+          startCountdown(d.expires_in);
+        } else {
           who.textContent = '内网来源 · 免认证访问';
           timer.hidden = true;
           if (tick) clearInterval(tick);
-        } else {
-          who.textContent = '已登录为 ' + (d.user || '-') +
-            (d.device_id ? ' · 设备 ' + String(d.device_id).slice(0, 8) : '');
-          if (typeof d.expires_in === 'number') startCountdown(d.expires_in);
         }
         return loadServices();
       })

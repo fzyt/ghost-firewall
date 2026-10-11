@@ -36,7 +36,9 @@
   window.DevFingerprint.fetch('/auth/status', { method: 'GET' })
     .then(function (r) { return r.json(); })
     .then(function (d) {
-      if (d && (d.authenticated || d.via === 'lan-bypass')) {
+      // 内网豁免同样会返回 authenticated:true，所以只判这一个字段即可，
+      // 不需要（也不该）去认「内网免认证」这个机制标记。
+      if (d && d.authenticated) {
         location.replace(safeNext());
       }
     })
