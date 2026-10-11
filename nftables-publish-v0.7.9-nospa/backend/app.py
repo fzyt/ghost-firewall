@@ -353,6 +353,9 @@ def load_config():
         # 合并默认值（防止新增字段丢失）
         result = dict(DEFAULT_CONFIG)
         result.update(config)
+        # v0.8.0 → v0.8.1：反代规则从「独立站点 + 网关」双轨迁到网关单轨。
+        # 必须在合并默认值之后做 —— 否则连默认值里的示例规则都会被迁移掉。
+        result = _migrate_rp_rules(result)
         return result
     return dict(DEFAULT_CONFIG)
 
@@ -502,6 +505,10 @@ _RE_IFACE = re.compile(r'^[A-Za-z0-9_.-]{1,32}$')
 
 
 def _is_port(v):
+    # 用字符串判定而不是 isinstance(v, int)：bool 是 int 的子类，
+    # isinstance(True, int) 为真且 True == 1，会让 JSON 里的 true
+    # 混过端口范围检查；float 同理（443.5 的 str 也不是 digit）。
+    # str().isdigit() 两种情况都会挡住。
     s = str(v).strip()
     if not s.isdigit() or len(s) > 5:
         return False
@@ -4203,12 +4210,161 @@ def _sanitize_client_max_body_size(value):
     value = str(value).strip()
     if not value:
         return ''
-    if not re.match(r'^\d+[KMG]?$', value):
-        raise ValueError(f"无效的 client_max_body_size: '{value}'（必须是数字，可选后缀 K/M/G，例如 50M）")
-    return value
+    # 单位大小写都要接受：nginx 文档里的标准写法是小写（client_max_body_size 10m;），
+    # 真机 nginx/1.26.3 实测 10m 合法。原来只允许大写 K/M/G，用户照文档填
+    # 最常见的 10m 反而被拒。
+    if not re.match(r'^\d+[kKmMgG]?$', value):
+        raise ValueError(f"无效的 client_max_body_size: '{value}'（必须是数字，可选后缀 K/M/G，例如 10m、50M、1G）")
+    return value.upper()
 
 
 # 反代默认设置
+def _validate_rp_service(data, existing=None, all_rules=None):
+    """反代服务字段的统一校验与规范化入口。
+
+    返回 (clean, err)：clean 是清洗后的规则字典，err 非 None 时表示校验失败。
+
+    **为什么要统一**：v0.8.0 之前 POST 与 PUT 各自抄了一份校验，PUT 那边
+    漏掉了 listen_port 与 target_protocol，两个字段未经任何校验就写进
+    配置 —— target_protocol 能直接注入 nginx 指令（实测可注入出第二个
+    server 块），listen_port 能拼进文件路径。两份校验迟早会再次分叉，
+    所以这里只留一个入口，POST/PUT 共用。
+
+    v0.8.1 起反代服务只存在于认证网关一条路径上（统一 gateway_port +
+    path 前缀），证书用网关的统一证书，因此不再需要 domain /
+    listen_port / ssl_cert_id。
+    """
+    existing = existing or {}
+    all_rules = all_rules or []
+
+    def pick(key, default=None):
+        v = data.get(key)
+        return existing.get(key, default) if v is None else v
+
+    clean = {}
+
+    # 名称：仅用于 UI 与 nginx 注释，不参与匹配
+    clean["name"] = _sanitize_name(pick("name", "")) or ""
+
+    # 启用开关：同样要挡 bool 混型
+    en = pick("enabled", True)
+    clean["enabled"] = bool(en) if isinstance(en, (bool, int)) else True
+
+    # 路径前缀：网关分发的唯一依据，必须有
+    prefix = _safe_path_prefix(pick("path_prefix", ""))
+    if not prefix:
+        return None, ("path_prefix 必填，且必须是 /xxx 形式"
+                      "（只允许字母数字与 - _ /，不能包含 .. 或 //）")
+    if prefix in _RESERVED_GATEWAY_PREFIXES:
+        return None, f"path_prefix {prefix!r} 是网关保留前缀，不能使用"
+    for r in all_rules:
+        if r.get("id") == existing.get("id"):
+            continue
+        other = _safe_path_prefix(r.get("path_prefix", ""))
+        if other == prefix:
+            return None, f"path_prefix {prefix!r} 与规则「{r.get('name') or r.get('id')}」重复"
+    clean["path_prefix"] = prefix
+
+    # 目标地址
+    target = pick("target_address", "")
+    try:
+        clean["target_address"] = _sanitize_target_address(str(target or '').strip())
+    except ValueError as e:
+        return None, str(e)
+
+    # 目标协议：白名单，绝不能直接拼进 proxy_pass
+    proto = str(pick("target_protocol", "http")).strip().lower()
+    if proto not in ("http", "https"):
+        return None, "target_protocol 只允许 http 或 https"
+    clean["target_protocol"] = proto
+
+    # 公网访问开关：True=公网可达但必须登录；False=仅内网网段
+    pa = pick("public_access", False)
+    if isinstance(pa, (bool, int)):
+        clean["public_access"] = bool(pa)
+    else:
+        clean["public_access"] = False
+
+    # 上传体积限制
+    try:
+        clean["client_max_body_size"] = _sanitize_client_max_body_size(
+            pick("client_max_body_size", ""))
+    except ValueError as e:
+        return None, str(e)
+
+    # WebSocket
+    ws = pick("websocket_enabled", True)
+    clean["websocket_enabled"] = bool(ws) if isinstance(ws, (bool, int)) else True
+
+    # 门户图标：只允许短字符串，进门户页渲染
+    clean["icon"] = _sanitize_name(str(pick("icon", "") or ""))[:16]
+
+    return clean, None
+
+
+def _migrate_rp_rules(config):
+    """把 v0.8.0 的反代规则迁移到 v0.8.1 的「网关服务」结构。
+
+    v0.8.0 一条规则同时生成「独立站点 conf」和「网关 location」两套暴露面，
+    但 path_prefix 既没有写入路径也没有 UI，导致网关那一侧永远是空的 ——
+    实际只有无认证的独立站点在跑。v0.8.1 砍掉独立站点，只留网关。
+
+    迁移规则：
+      · 有 path_prefix 的原样保留
+      · 没有的，从 domain 第一段派生一个（nas.example.com → /nas），
+        冲突时补数字后缀；派生不出来（无 domain）就用规则序号兜底
+      · domain / listen_port / ssl_cert_id 三个字段丢弃
+    """
+    rp = config.get("reverse_proxy")
+    if not isinstance(rp, dict):
+        return config
+    rules = rp.get("rules")
+    if not isinstance(rules, list):
+        return config
+
+    used = set()
+    out = []
+    for idx, r in enumerate(rules, 1):
+        if not isinstance(r, dict):
+            continue
+        prefix = _safe_path_prefix(r.get("path_prefix", ""))
+        if not prefix:
+            base = ""
+            dom = str(r.get("domain", "") or "").strip().lower()
+            if dom:
+                first = re.split(r'[.\-]', dom)[0]
+                base = _safe_path_prefix('/' + first) or ''
+            if not base:
+                base = f'/svc{idx}'
+            prefix = base
+            n = 1
+            while prefix in used:
+                n += 1
+                cand = _safe_path_prefix(f'{base}{n}')
+                if not cand:
+                    break
+                prefix = cand
+            print(f'[INFO] 反代规则 {r.get("id") or idx} 已迁移到网关结构，'
+                  f'自动分配路径前缀 {prefix}（可在反代管理页修改）', flush=True)
+        used.add(prefix)
+        migrated = {
+            "id": r.get("id") or f'rp_{idx:03d}',
+            "name": _sanitize_name(r.get("name", "")),
+            "enabled": bool(r.get("enabled", True)),
+            "path_prefix": prefix,
+            "target_address": r.get("target_address", ""),
+            "target_protocol": str(r.get("target_protocol", "http") or "http").lower(),
+            "public_access": bool(r.get("public_access", False)),
+            "client_max_body_size": r.get("client_max_body_size", "") or "",
+            "websocket_enabled": bool(r.get("websocket_enabled", True)),
+            "icon": _sanitize_name(str(r.get("icon", "") or ""))[:16],
+            "updated_at": r.get("updated_at", ""),
+        }
+        out.append(migrated)
+    rp["rules"] = out
+    return config
+
+
 RP_DEFAULT_SETTINGS = {
     "http_redirect_enabled": True,
     "hsts_enabled": True,
@@ -4390,164 +4546,14 @@ def _get_cert_expiry(cert_path):
         return None, -1
 
 
-def _generate_nginx_conf(rule, cert, settings, idx=0):
-    """为一条反代规则生成 nginx 配置（Python 字符串拼接）
+# 本面板生成/管理的 nginx 文件标记。conf.d/*.conf 会被 include 进 http 上下文，
+# 所以标记本身也必须是合法 nginx 注释。
+RP_CONF_MARKER = "# Managed by nftables-web-v2"
 
-    idx：规则序号，用于生成唯一的 ssl session 共享内存区名。
-    """
-    domain = _sanitize_domain(rule["domain"])
-    listen_port = rule.get("listen_port", 443)
-    target = _sanitize_target_address(rule.get("target_address", ""))
-    protocol = rule.get("target_protocol", "http")
-    websocket = rule.get("websocket_enabled", True)
-    cert_path = cert.get("cert_path", "") if cert else ""
-    key_path = cert.get("key_path", "") if cert else ""
-    http_redirect = settings.get("http_redirect_enabled", True)
-    hsts = settings.get("hsts_enabled", True)
-    tls_min = settings.get("tls_min_version", "TLSv1.2")
-    tls_protos = TLS_VERSION_MAP.get(tls_min, "TLSv1.2 TLSv1.3")
-    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    lines = []
-    lines.append(f"# ============================================================")
-    lines.append(f"# 反向代理配置: {domain}")
-    if rule.get("name"):
-        lines.append(f"# 名称: {_sanitize_name(rule['name'])}")
-    lines.append(f"# 生成时间: {now_str}")
-    lines.append(f"# nftables-web-v2 自动生成，请勿手动修改")
-    lines.append(f"# ============================================================")
-    lines.append("")
-
-    # HTTP → HTTPS 重定向（检测 80 端口是否可用）
-    if http_redirect and not _is_port_in_use(80):
-        lines.append("server {")
-        lines.append("    listen 80;")
-        lines.append("    listen [::]:80;")
-        lines.append(f"    server_name {domain};")
-        lines.append("")
-        lines.append("    return 301 https://$server_name$request_uri;")
-        lines.append("}")
-        lines.append("")
-
-    # HTTPS server block
-    lines.append("server {")
-    lines.append(f"    listen {listen_port} ssl;")
-    lines.append(f"    listen [::]:{listen_port} ssl;")
-    lines.append("    http2 on;")
-    lines.append(f"    server_name {domain};")
-    lines.append("")
-    lines.append("    # SSL")
-    lines.append(f"    ssl_certificate {cert_path};")
-    lines.append(f"    ssl_certificate_key {key_path};")
-    lines.append(f"    ssl_protocols {tls_protos};")
-    lines.append("    ssl_prefer_server_ciphers on;")
-    lines.append("    ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-GCM-SHA384;")
-    lines.append("    ssl_session_timeout 1d;")
-    # 每条反代规则用带序号的独立共享内存区名。
-    # 原因：nginx 的共享内存区名是全局的，同名不同大小会让**整份配置**加载失败。
-    # OpenWrt 的 LuCI 已声明 shared:SSL:32k，这里若再用 shared:SSL:50m，
-    # nginx 会 [emerg] 拒绝加载，表现是「反代端口一个都起不来」而非明确报错。
-    lines.append(f"    ssl_session_cache shared:SSLRP{idx}:10m;")
-    lines.append("    ssl_session_tickets off;")
-    lines.append("")
-    if hsts:
-        lines.append('    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;')
-        lines.append("")
-    lines.append("    server_tokens off;")
-    lines.append("")
-    # 客户端请求体大小上限（每个 location 单独配，缺省时走 nginx 默认 1M）
-    cmbs = _sanitize_client_max_body_size(rule.get("client_max_body_size", ""))
-    if cmbs:
-        lines.append(f"    client_max_body_size {cmbs};")
-        lines.append("")
-    lines.append("    location / {")
-    if cmbs:
-        lines.append(f"        client_max_body_size {cmbs};")
-    lines.append(f"        proxy_pass {protocol}://{target};")
-    lines.append("")
-    lines.append("        proxy_set_header Host $http_host;")
-    lines.append("        proxy_set_header X-Real-IP $remote_addr;")
-    lines.append("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
-    lines.append("        proxy_set_header X-Forwarded-Proto $scheme;")
-    lines.append("        proxy_set_header X-Forwarded-Host $host;")
-    lines.append("        proxy_set_header X-Forwarded-Port $server_port;")
-    lines.append("")
-    lines.append("        # DSM/Synology cookie 域重写（解决反代登录态丢失）")
-    lines.append("        proxy_cookie_domain ~^(\\d+\\.\\d+\\.\\d+\\.\\d+) $host;")
-    lines.append("")
-    lines.append("        proxy_buffering off;")
-    lines.append("        proxy_request_buffering off;")
-    if websocket:
-        lines.append("")
-        lines.append("        # WebSocket")
-        lines.append("        proxy_http_version 1.1;")
-        lines.append("        proxy_set_header Upgrade $http_upgrade;")
-        lines.append('        proxy_set_header Connection "upgrade";')
-    lines.append("")
-    lines.append("        proxy_connect_timeout 60s;")
-    lines.append("        proxy_send_timeout 300s;")
-    lines.append("        proxy_read_timeout 300s;")
-    lines.append("    }")
-    lines.append("}")
-    lines.append("")
-    return "\n".join(lines)
-
-
-RP_CONF_MARKER = '# Managed by nftables-web-v2 reverse proxy panel'
-
-
-def _is_managed_conf(conf_path):
-    """判断某个 nginx conf 是否由本面板生成（只认文件头标记）"""
-    try:
-        with open(conf_path, 'r', errors='ignore') as f:
-            return f.readline().strip() == RP_CONF_MARKER
-    except OSError:
-        return False
-
-
-def _write_nginx_conf_file(rule, cert, settings, idx=0):
-    """生成并写入 nginx 配置文件，返回配置文件路径
-
-    idx 是该规则在列表中的序号，用来生成唯一的 ssl session 共享内存区名
-    （见 _generate_nginx_conf 里的说明：区名全局唯一，撞名会让整份配置挂掉）。
-    """
-    domain = _sanitize_domain(rule["domain"])
-    listen_port = rule.get("listen_port", 443)
-    conf_content = _generate_nginx_conf(rule, cert, settings, idx)
-    conf_path = os.path.join(NGINX_CONF_DIR, f"{domain}-{listen_port}.conf")
-    os.makedirs(NGINX_CONF_DIR, exist_ok=True)
-    with open(conf_path, "w") as f:
-        # 写入归属标记：_deploy_all_rules 据此判断哪些 conf 归本面板管，
-        # 避免误删用户自己放在 conf.d 下的站点配置
-        f.write(RP_CONF_MARKER + "\n")
-        f.write(conf_content)
-    return conf_path
-
-
-def _remove_nginx_conf_file(rule):
-    """删除反代规则的 nginx 配置文件"""
-    domain = _sanitize_domain(rule.get("domain", ""))
-    listen_port = rule.get("listen_port", 443)
-    conf_path = os.path.join(NGINX_CONF_DIR, f"{domain}-{listen_port}.conf")
-    if os.path.exists(conf_path):
-        os.remove(conf_path)
-        return True
-    return False
-
-
-def _remove_nginx_conf_by_domain_port(domain, listen_port):
-    """按 domain + listen_port 删除指定 nginx conf 文件（domain 已经过 _sanitize_domain）"""
-    if not domain or not listen_port:
-        return False
-    conf_path = os.path.join(NGINX_CONF_DIR, f"{domain}-{listen_port}.conf")
-    if os.path.exists(conf_path):
-        try:
-            os.remove(conf_path)
-            return True
-        except OSError:
-            return False
-    return False
-
+# nginx 服务控制脚本。集中成一个常量：OpenWrt 是 /etc/init.d/nginx，
+# 普通 Linux 发行版是 systemctl，散落硬编码会让非 OpenWrt 部署直接失败
+# （FileNotFoundError），也让测试无法替换。
+NGINX_INIT_PATH = '/etc/init.d/nginx'
 
 GATEWAY_CONF_NAME = "00-nftables-web-gateway.conf"
 GATEWAY_CONF_MARKER = "# Managed by nftables-web-v2 auth gateway"
@@ -4556,6 +4562,16 @@ GATEWAY_CONF_MARKER = "# Managed by nftables-web-v2 auth gateway"
 # 加载失败，表现为「网关端口起不来」而不是任何明确报错。
 GATEWAY_SSL_ZONE = "SSLGATEWAY"
 GATEWAY_SSL_CACHE_SIZE = "10m"
+
+
+def _is_managed_conf(conf_path):
+    """判断某个 nginx conf 是否由本面板生成（只认文件头标记）"""
+    try:
+        with open(conf_path, 'r', errors='ignore') as f:
+            first = f.readline().strip()
+        return first in (RP_CONF_MARKER, GATEWAY_CONF_MARKER)
+    except OSError:
+        return False
 
 
 def _gateway_services(config):
@@ -4751,6 +4767,12 @@ def _generate_gateway_nginx_conf(config):
     # ── 各服务 location ─────────────────────────────────────────
     for rule, prefix, protocol, host, tport in services:
         name = _sanitize_name(rule.get("name") or prefix)
+        try:
+            cmbs = _sanitize_client_max_body_size(rule.get("client_max_body_size", "")) or "0"
+        except ValueError:
+            # 配置被手工改坏时退回「不限」，但不能因此让整份配置生成失败
+            print(f'[WARN] 服务 {name} 的 client_max_body_size 非法，已按不限处理', flush=True)
+            cmbs = "0"
         L.append(f"    # ---- {name} ----")
         L.append(f"    location {prefix}/ {{")
         L.append(f"        proxy_pass {protocol}://{host}:{tport}/;")
@@ -4791,7 +4813,11 @@ def _generate_gateway_nginx_conf(config):
             L.append("        proxy_set_header Connection \"upgrade\";")
         else:
             L.append("        proxy_http_version 1.1;")
-        L.append("        client_max_body_size 0;   # 反代内网服务，不限上传体积")
+        # 上传体积限制：用户配的值在这里**真正生效**。
+        # v0.8.0 这里硬编码 0（不限），界面上填的 client_max_body_size
+        # 只对已废弃的独立站点生效，网关这一侧被完全忽略 —— 配了没反应。
+        # 0 是 nginx 的「不限」，仍作为空值时的默认。
+        L.append(f"        client_max_body_size {cmbs};   # 上传体积限制（0=不限）")
         L.append("    }")
         L.append("")
 
@@ -4844,17 +4870,26 @@ def _deploy_gateway_nginx(config=None):
             print(f'[WARN] 网关配置快照失败: {e}', flush=True)
 
     def _undo(msg):
-        shutil.rmtree(backup_dir, ignore_errors=True)
+        # ⚠️ 顺序不能反。原先是「先 rmtree 快照，再 copytree 回来」——
+        # 快照先被删掉，copytree 必然失败，于是每次回滚都报「回滚也失败」；
+        # 更糟的是它在失败前已经把整个 NGINX_CONF_DIR 删了，用户自己放在
+        # conf.d 下的站点配置会全部丢失。这个顺序错误在本文件里出现过两次
+        # （另一处在 _deploy_all_rules 的 _rollback），一律改成
+        # 「先恢复，最后才清理快照」。
         if not have_backup:
+            shutil.rmtree(backup_dir, ignore_errors=True)
             # 没有历史可回滚，如实说明，不谎称已回滚
             return False, f"{msg}（无可回滚的历史配置）"
         try:
             shutil.rmtree(NGINX_CONF_DIR, ignore_errors=True)
             shutil.copytree(backup_dir, NGINX_CONF_DIR)
-            subprocess.run(['/etc/init.d/nginx', 'reload'],
-                           capture_output=True, text=True, timeout=10)
         except Exception as e:
-            return False, f"{msg}（回滚也失败，请手工检查 {NGINX_CONF_DIR}: {e}）"
+            # 恢复失败时**保留快照**，让用户还能手工捞回来
+            print(f'[ERROR] 网关配置回滚失败，快照保留在 {backup_dir}: {e}', flush=True)
+            return False, (f"{msg}（回滚失败，快照已保留在 {backup_dir}，"
+                           f"请手工恢复: {e}）")
+        shutil.rmtree(backup_dir, ignore_errors=True)
+        _nginx_reload()
         return False, f"{msg}（已回滚 nginx 配置）"
 
     try:
@@ -4885,8 +4920,12 @@ def _deploy_gateway_nginx(config=None):
         if not ok:
             return _undo(f"nginx -t 失败：{msg}")
 
-        subprocess.run(['/etc/init.d/nginx', 'reload'],
-                       capture_output=True, text=True, timeout=15)
+        # 走 _nginx_reload 而不是裸调 init 脚本：它自带降级（init → nginx -s
+        # reload → 直接启动）。裸调在普通 Linux（systemctl 环境，没有
+        # /etc/init.d/nginx）会抛 FileNotFoundError，让整个部署崩掉。
+        _r_ok, r_msg = _nginx_reload()
+        if not _r_ok:
+            return False, f"网关配置已写入，但 nginx 重载失败：{r_msg}"
         shutil.rmtree(backup_dir, ignore_errors=True)
         if enabled:
             n = len(_gateway_services(config))
@@ -5044,22 +5083,22 @@ def _acme_renew(domain, dns_provider="ali", dns_credentials=None):
 
 
 def _deploy_all_rules(config=None):
-    """重新生成所有已启用规则的 nginx 配置并重载 nginx
+    """重新生成认证网关配置并重载 nginx。
 
-    两点安全约束：
-    1. 只删除「属于本面板」的 conf（规则名匹配 或 文件头有本面板标记），
-       用户自己放在 conf.d 下的站点配置一律不动。
-    2. 部署前整目录快照，`nginx -t` 失败时整体回滚，
-       避免磁盘上留下「旧的全删了 + 新的全错」的状态。
+    v0.8.1：反代服务只有网关一条暴露面（gateway_port + path 前缀），
+    不再为每条规则生成独立的站点 conf。原先这里同时生成两套 —— 一套无认证、
+    一套有认证，导致 public_access 在两处含义不同、用户配的字段一半失效。
+
+    保留的安全约束：
+      1. 只删「属于本面板」的 conf（带本面板标记），用户自己放在 conf.d
+         下的站点配置一律不动。
+      2. 部署前整目录快照，nginx -t 失败时整体回滚。
     """
     if config is None:
         config = load_config()
-    rp = config.get("reverse_proxy", {})
-    rules = rp.get("rules", [])
-    certs = {c["id"]: c for c in rp.get("certificates", [])}
-    settings = rp.get("settings", RP_DEFAULT_SETTINGS)
+    config = _migrate_rp_rules(config)
 
-    # 部署前整目录快照（仅在已有内容时），供 nginx -t 失败时回滚
+    # 部署前整目录快照（仅当已有内容时），供 nginx -t 失败时回滚
     backup_dir = NGINX_CONF_DIR + '.deploybak'
     shutil.rmtree(backup_dir, ignore_errors=True)
     if os.path.isdir(NGINX_CONF_DIR):
@@ -5072,19 +5111,13 @@ def _deploy_all_rules(config=None):
         backup_dir = None
 
     def _rollback(msg):
-        # ⚠️ 顺序不能反。原来是「先 rmtree 快照，再判断快照在不在」，
-        # 第二个判断永远为 False —— 于是 _rollback **从来没有真正回滚过**，
-        # 每次都返回「首次部署，无历史配置可回滚」。快照被删掉，conf.d 就停在
-        # 清理+生成之间的半更新状态，而用户看到的提示还说「无历史配置」。
         if backup_dir is None or not os.path.isdir(backup_dir):
             # 首次部署：conf.d 原本就不存在，没有可回滚的历史状态。
-            # 此时「回滚」无从谈起，如实说明，不要谎称已回滚。
             return False, f"{msg}（首次部署，无历史配置可回滚；新配置已写入磁盘但 nginx 未重载）"
         try:
             shutil.rmtree(NGINX_CONF_DIR, ignore_errors=True)
             shutil.copytree(backup_dir, NGINX_CONF_DIR)
-            subprocess.run(['/etc/init.d/nginx', 'reload'],
-                           capture_output=True, text=True, timeout=10)
+            _nginx_reload()
         except Exception as e:
             print(f'[WARN] nginx conf 回滚失败: {e}', flush=True)
             shutil.rmtree(backup_dir, ignore_errors=True)
@@ -5093,64 +5126,38 @@ def _deploy_all_rules(config=None):
         shutil.rmtree(backup_dir, ignore_errors=True)
         return False, f"{msg}（已回滚 nginx 配置，nginx 仍运行原配置）"
 
-    # 清理与生成是一组不可分割的写操作：清理那一步已经把「不再启用」的 conf
-    # 真删掉了，这之后任何异常都会让 conf.d 停在「旧的删了一半、新的只写了一半」，
-    # 而 nginx 仍在跑旧配置 —— 磁盘与运行态不一致，比直接失败更难排查。
-    # 所以整段包起来，任何异常都走 _rollback() 恢复到部署前快照。
     try:
-        # 清理不再启用的域名配置文件 —— 只碰属于本面板的
-        active_conf_files = set()
-        managed_names = set()
-        for rule in rules:
-            try:
-                d = _sanitize_domain(rule["domain"])
-            except ValueError:
-                continue
-            p = rule.get("listen_port", 443)
-            managed_names.add(f"{d}-{p}.conf")
-            if rule.get("enabled"):
-                active_conf_files.add(f"{d}-{p}.conf")
-
+        # 清理本面板遗留的旧站点 conf。
+        # v0.8.0 之前每条规则都会生成 {domain}-{port}.conf，那批文件带本面板
+        # 标记（RP_CONF_MARKER），现在没有任何用途，必须清掉 —— 留着就是
+        # 一批无认证的站点配置还在 nginx 里跑着。
+        removed = 0
         if os.path.isdir(NGINX_CONF_DIR):
             for fname in os.listdir(NGINX_CONF_DIR):
-                if not fname.endswith(".conf"):
+                if not fname.endswith('.conf') or fname == GATEWAY_CONF_NAME:
                     continue
                 full = os.path.join(NGINX_CONF_DIR, fname)
-                # 归属判定：文件名属于本面板某条规则，或文件头带本面板标记
-                is_mine = fname in managed_names or _is_managed_conf(full)
-                if is_mine and fname not in active_conf_files:
+                if _is_managed_conf(full):
                     try:
                         os.remove(full)
+                        removed += 1
                     except OSError as e:
-                        print(f'[WARN] 删除 nginx 配置失败 {fname}: {e}', flush=True)
+                        print(f'[WARN] 删除遗留 nginx 配置失败 {fname}: {e}', flush=True)
+        if removed:
+            print(f'[INFO] 已清理 {removed} 个 v0.8.0 遗留的独立站点配置', flush=True)
 
-        # 生成所有启用规则的配置
-        # idx 是规则序号，给 _write_nginx_conf_file 生成全局唯一的
-        # ssl session 共享内存区名 —— 撞名会让整份 nginx 配置挂掉。
-        # （此前这里误写成未定义的 `i`，任何一条启用规则都会 NameError。）
-        for idx, rule in enumerate(rules, 1):
-            if not rule.get("enabled"):
-                _remove_nginx_conf_file(rule)
-                continue
-            cert = certs.get(rule.get("ssl_cert_id", ""))
-            _write_nginx_conf_file(rule, cert, settings, idx)
+        # 生成网关配置（唯一一份）
+        ok, msg = _deploy_gateway_nginx(config)
     except Exception as e:
         return _rollback(f"生成 nginx 配置时异常: {type(e).__name__}: {e}")
 
-    # 测试并重载；测试失败必须回滚，不能只报错留下坏配置
-    ok, msg = _nginx_test()
     if not ok:
         return _rollback(f"nginx 配置语法错误，未重载: {msg}")
-    shutil.rmtree(backup_dir, ignore_errors=True)
-    ok, msg = _nginx_reload()
 
-    # 认证网关配置跟着一起下发（只增删本面板自己的网关文件）。
-    # 网关失败不影响已成功的反代部署，但要如实带上原因返回给调用方 ——
-    # 静默吞掉会导致「以为网关开了其实没开」。
-    gw_ok, gw_msg = _deploy_gateway_nginx(config)
-    if not gw_ok:
-        return ok, f"{msg}；但认证网关未生效：{gw_msg}"
-    return ok, msg
+    # 快照到 nginx -t 通过之后再清
+    shutil.rmtree(backup_dir, ignore_errors=True)
+    return True, msg
+
 
 
 # ======================= 认证网关 API =======================
@@ -5259,129 +5266,66 @@ def gateway_set_config():
 
 @app.route('/api/reverse-proxy/rules', methods=['GET'])
 def rp_get_rules():
+    """列出反代服务。
+
+    v0.8.1：每条服务对应网关里的一段 location，证书是网关的统一证书，
+    所以这里不再返回每条规则各自的证书信息与独立 conf 路径。
+    """
     config, rp = _get_rp_config()
-    certs = {c["id"]: c for c in rp.get("certificates", [])}
+    config = _migrate_rp_rules(config)
     rules_out = []
     for r in rp["rules"]:
-        cert = certs.get(r.get("ssl_cert_id", ""))
-        cert_path = cert.get("cert_path", "") if cert else ""
-        expires_at, days = _get_cert_expiry(cert_path)
         rules_out.append({
             **r,
-            "ssl_cert_domain": cert.get("domain", "") if cert else "",
-            "ssl_expires_at": expires_at,
-            "ssl_days_remaining": days,
-            # 实际文件名带 listen_port 后缀，必须与 _write_nginx_conf_file 一致
-            "nginx_config_path": os.path.join(
-                NGINX_CONF_DIR,
-                f"{_sanitize_domain(r['domain'])}-{r.get('listen_port', 443)}.conf"),
+            # 访问地址：网关统一入口 + 路径前缀，UI 直接展示这个
+            "access_url": f"{_safe_port(config.get('gateway_port'), 8443)}"
+                          f"{r.get('path_prefix', '')}/",
         })
-    return jsonify({"success": True, "data": {"rules": rules_out, "total": len(rules_out)}})
+    return jsonify({"success": True,
+                    "data": {"rules": rules_out, "total": len(rules_out)}})
+
 
 
 @app.route('/api/reverse-proxy/rules', methods=['POST'])
 def rp_create_rule():
+    """新建一条反代服务。
+
+    v0.8.1：反代服务只存在于认证网关一条路径上（gateway_port + path 前缀），
+    证书用网关的统一证书。所以这里不再有 domain / listen_port / ssl_cert_id，
+    规则本身也不再对应任何独立的 nginx 站点文件。
+    """
     config, rp = _get_rp_config()
     data = request.get_json(silent=True)
     if not data:
         return jsonify({"success": False, "message": "请求体不能为空"}), 400
-    domain = data.get("domain", "").strip()
-    try:
-        domain = _sanitize_domain(domain)
-    except ValueError as e:
-        return jsonify({"success": False, "message": str(e)}), 400
-    target = data.get("target_address", "").strip()
-    try:
-        target = _sanitize_target_address(target)
-    except ValueError as e:
-        return jsonify({"success": False, "message": str(e)}), 400
-    # listen_port 校验
-    listen_port = data.get("listen_port", 443)
-    if not isinstance(listen_port, int) or not (1 <= listen_port <= 65535):
-        return jsonify({"success": False, "message": "listen_port 必须是 1-65535 的整数"}), 400
-    # target_protocol 校验
-    target_protocol = data.get("target_protocol", "http")
-    if target_protocol not in ("http", "https"):
-        return jsonify({"success": False, "message": "target_protocol 只允许 http 或 https"}), 400
-    cert_id = data.get("ssl_cert_id", "").strip()
-    if not domain or not target or not cert_id:
-        return jsonify({"success": False, "message": "domain, target_address, ssl_cert_id 不能为空"}), 400
-    # 检查证书存在
-    cert = _find_rp_cert(rp, cert_id)
-    if not cert:
-        return jsonify({"success": False, "message": "指定的证书不存在"}), 400
-    # 净化 client_max_body_size
-    try:
-        cmbs = _sanitize_client_max_body_size(data.get("client_max_body_size", ""))
-    except ValueError as e:
-        return jsonify({"success": False, "message": str(e)}), 400
+
+    clean, err = _validate_rp_service(data, existing={}, all_rules=rp["rules"])
+    if err:
+        return jsonify({"success": False, "message": err}), 400
+
+    new_id = _next_id("rp", [r["id"] for r in rp["rules"]])
     now_iso = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S+08:00")
-    # 同 domain 已存在规则时，视为"更新"而非新建（防止重试/重复保存产生重复规则）
-    existing = next((r for r in rp["rules"] if r.get("domain") == domain), None)
-    if existing:
-        # 记录旧 listen_port：变化时清理旧 conf（domain 相同所以只需看端口）
-        old_listen_port = existing.get("listen_port")
-        new_listen_port = data.get("listen_port", existing.get("listen_port", 443))
-
-        new_id = existing["id"]
-        rule = {
-            **existing,
-            "name": _sanitize_name(data.get("name", "")) or existing.get("name", ""),
-            "enabled": data.get("enabled", existing.get("enabled", True)),
-            "domain": domain,
-            "listen_port": new_listen_port,
-            "target_address": target,
-            "target_protocol": data.get("target_protocol", existing.get("target_protocol", "http")),
-            "websocket_enabled": data.get("websocket_enabled", existing.get("websocket_enabled", True)),
-            "public_access": data.get("public_access", existing.get("public_access", False)),
-            "ssl_cert_id": cert_id,
-            "client_max_body_size": cmbs,
-            "updated_at": now_iso,
-        }
-        # 就地更新
-        idx = rp["rules"].index(existing)
-        rp["rules"][idx] = rule
-        replaced = True
-
-        # 端口变化：删除旧 conf（否则 nginx 持续加载旧端口配置）
-        if old_listen_port and old_listen_port != new_listen_port:
-            _remove_nginx_conf_by_domain_port(domain, old_listen_port)
-    else:
-        new_id = _next_id("rp", [r["id"] for r in rp["rules"]])
-        rule = {
-            "id": new_id,
-            "name": _sanitize_name(data.get("name", "")),
-            "enabled": data.get("enabled", True),
-            "domain": domain,
-            "listen_port": data.get("listen_port", 443),
-            "target_address": target,
-            "target_protocol": data.get("target_protocol", "http"),
-            "websocket_enabled": data.get("websocket_enabled", True),
-            "public_access": data.get("public_access", False),
-            "ssl_cert_id": cert_id,
-            "client_max_body_size": cmbs,
-            "created_at": now_iso,
-            "updated_at": now_iso,
-        }
-        rp["rules"].append(rule)
-        replaced = False
+    rule = {"id": new_id, **clean,
+            "created_at": now_iso, "updated_at": now_iso}
+    rp["rules"].append(rule)
     _save_rp_config(config)
 
-    # 生成 nginx 配置并重载
     deploy_ok, deploy_msg = _deploy_all_rules(config)
     if not deploy_ok:
-        return jsonify({"success": False, "message": f"规则已保存但 nginx 重载失败: {deploy_msg}"}), 500
+        return jsonify({"success": False,
+                        "message": f"服务已保存但网关配置未生效: {deploy_msg}"}), 500
 
-    # 更新防火墙（走统一的安全流程：语法预检 + 原子写盘 + 失败回滚）
     fw_ok, fw_msg = _apply_ruleset(config)
     if not fw_ok:
         return jsonify({"success": False, "message": fw_msg}), 500
 
-    return jsonify({"success": True, "data": {"rule_id": new_id, "replaced": replaced, "message": "反代规则已更新（同 domain 已有规则）" if replaced else "反代规则创建成功", "nginx_reloaded": True}})
-
+    return jsonify({"success": True, "data": {
+        "rule_id": new_id, "message": "反代服务已创建",
+        "nginx_reloaded": True}})
 
 @app.route('/api/reverse-proxy/rules/<rule_id>', methods=['PUT'])
 def rp_update_rule(rule_id):
+    """更新一条反代服务。校验入口与新建完全一致（_validate_rp_service）。"""
     config, rp = _get_rp_config()
     rule = _find_rp_rule(rp, rule_id)
     if not rule:
@@ -5390,54 +5334,29 @@ def rp_update_rule(rule_id):
     if not data:
         return jsonify({"success": False, "message": "请求体不能为空"}), 400
 
-    # 记录旧的 domain / listen_port：变更时清理旧 nginx conf
-    old_domain = rule.get("domain", "")
-    old_listen_port = rule.get("listen_port")
+    clean, err = _validate_rp_service(data, existing=rule, all_rules=rp["rules"])
+    if err:
+        return jsonify({"success": False, "message": err}), 400
 
-    updatable = ["enabled", "name", "domain", "listen_port", "target_address", "target_protocol",
-                 "websocket_enabled", "public_access", "ssl_cert_id", "client_max_body_size"]
-    for key in updatable:
-        if key in data:
-            rule[key] = data[key]
-
-    # 净化 name（仅作 UI 显示和 nginx 注释，去除换行/#）
-    rule["name"] = _sanitize_name(rule.get("name", ""))
-
-    # 净化 client_max_body_size（空值合法，否则必须匹配 \\d+[KMG]?）
-    try:
-        rule["client_max_body_size"] = _sanitize_client_max_body_size(rule.get("client_max_body_size", ""))
-    except ValueError as e:
-        return jsonify({"success": False, "message": str(e)}), 400
-
-    # 净化域名和目标地址
-    try:
-        rule["domain"] = _sanitize_domain(rule["domain"])
-    except ValueError as e:
-        return jsonify({"success": False, "message": str(e)}), 400
-    try:
-        rule["target_address"] = _sanitize_target_address(rule["target_address"])
-    except ValueError as e:
-        return jsonify({"success": False, "message": str(e)}), 400
-
-    # domain 或 listen_port 变化：删除旧 conf 文件
-    new_listen_port = rule.get("listen_port")
-    if old_domain and (old_domain != rule["domain"] or old_listen_port != new_listen_port):
-        _remove_nginx_conf_by_domain_port(_sanitize_domain(old_domain), old_listen_port)
-
-    rule["updated_at"] = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    now_iso = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    rule.clear()
+    rule.update({"id": rule_id, **clean,
+                 "created_at": rule.get("created_at", now_iso),
+                 "updated_at": now_iso})
     _save_rp_config(config)
 
     deploy_ok, deploy_msg = _deploy_all_rules(config)
     if not deploy_ok:
-        return jsonify({"success": False, "message": f"规则已更新但 nginx 重载失败: {deploy_msg}"}), 500
+        return jsonify({"success": False,
+                        "message": f"服务已保存但网关配置未生效: {deploy_msg}"}), 500
 
-    # 更新防火墙（走统一的安全流程：语法预检 + 原子写盘 + 失败回滚）
     fw_ok, fw_msg = _apply_ruleset(config)
     if not fw_ok:
         return jsonify({"success": False, "message": fw_msg}), 500
 
-    return jsonify({"success": True, "data": {"message": "反代规则已更新", "nginx_reloaded": True}})
-
+    return jsonify({"success": True, "data": {
+        "rule_id": rule_id, "message": "反代服务已更新",
+        "nginx_reloaded": True}})
 
 @app.route('/api/reverse-proxy/rules/<rule_id>', methods=['DELETE'])
 def rp_delete_rule(rule_id):
@@ -5447,7 +5366,8 @@ def rp_delete_rule(rule_id):
         return jsonify({"success": False, "message": "规则不存在"}), 404
     rp["rules"] = [r for r in rp["rules"] if r["id"] != rule_id]
     _save_rp_config(config)
-    _remove_nginx_conf_file(rule)
+    # v0.8.1 起反代服务没有独立的站点 conf，删除后由 _deploy_all_rules
+    # 重新生成网关配置即可，不需要单独删文件。
     deploy_ok, deploy_msg = _deploy_all_rules(config)
 
     # 更新防火墙（走统一的安全流程：语法预检 + 原子写盘 + 失败回滚）
@@ -5819,7 +5739,21 @@ def rp_delete_cert(cert_id):
     if not cert:
         return jsonify({"success": False, "message": "证书不存在"}), 404
 
-    # 检查是否被规则引用
+    # v0.8.1 起规则不再各自持有证书，网关统一用 settings.default_cert_id。
+    # 这里必须改成检查默认证书 —— 否则 referenced_by 恒为空，删证书这道
+    # 保护形同虚设：把正在用的默认证书删掉，网关会退到面板自签证书，
+    # 用户看到的是「浏览器证书警告」，而面板显示一切正常。
+    settings = rp.setdefault("settings", dict(RP_DEFAULT_SETTINGS))
+    is_gateway_default = settings.get("default_cert_id") == cert_id
+
+    if is_gateway_default:
+        return jsonify({
+            "success": False,
+            "message": "该证书正在被认证网关使用（网关统一证书），"
+                       "请先在证书管理里切换网关默认证书再删除",
+        }), 400
+
+    # 兼容旧结构里可能残留的按规则引用
     referenced_by = [r for r in rp.get("rules", []) if r.get("ssl_cert_id") == cert_id]
 
     if referenced_by:
@@ -5886,20 +5820,28 @@ def rp_nginx_reload():
 
 @app.route('/api/reverse-proxy/nginx/preview/<rule_id>', methods=['GET'])
 def rp_nginx_preview(rule_id):
+    """预览这条服务在网关配置里实际生效的那一段。
+
+    v0.8.1 起反代服务只有网关一份配置，预览的就是它的真实产物 ——
+    之前这个端点拼的是独立站点 conf，还把路径写成 {domain}.conf
+    （漏了 -listen_port 后缀），预览出来的内容与实际部署根本不是一回事。
+    """
     config, rp = _get_rp_config()
+    config = _migrate_rp_rules(config)
     rule = _find_rp_rule(rp, rule_id)
     if not rule:
         return jsonify({"success": False, "message": "规则不存在"}), 404
-    cert = _find_rp_cert(rp, rule.get("ssl_cert_id", ""))
-    settings = rp.get("settings", RP_DEFAULT_SETTINGS)
-    # 预览要和实际部署生成一样的内容，所以这里要算出该规则的真实序号
-    try:
-        idx = rp["rules"].index(rule) + 1
-    except ValueError:
-        idx = 0
-    conf_content = _generate_nginx_conf(rule, cert, settings, idx)
-    conf_path = os.path.join(NGINX_CONF_DIR, f"{rule['domain']}.conf")
-    return jsonify({"success": True, "data": {"config_content": conf_content, "config_path": conf_path}})
+    full = _generate_gateway_nginx_conf(config) or ""
+    marker = f"# ---- {_sanitize_name(rule.get('name') or rule.get('path_prefix'))} ----"
+    seg = ''
+    if marker in full:
+        seg = full[full.index(marker):]
+        seg = seg.split('\n    }\n', 1)[0] + '\n    }'
+    return jsonify({"success": True, "data": {
+        "config_content": seg or "# 网关未启用或该服务未启用",
+        "config_path": GATEWAY_CONF_NAME,
+    }})
+
 
 
 # ======================= 全局设置 API =======================
