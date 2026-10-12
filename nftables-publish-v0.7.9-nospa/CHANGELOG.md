@@ -146,6 +146,82 @@ dns_lan_resolver / 带端口转发的完整配置四个场景，全部 rc=0；�
 
 **注意：规则模板改动需点「应用规则」才下发到内核，不会自动生效。**
 
+### P0  配置损坏守卫只挂 1 个端点，且不挡持久化
+
+#### 问题
+
+`_config_corrupted_response()`（配置损坏就拒绝下发）**全库只有 `/api/rules/apply`
+一个调用点**。实测同一份损坏配置下的行为：
+
+| 端点 | 修复前 | 修复后 |
+|---|---|---|
+| `/api/rules/apply` | 500 拒绝下发 | 500 拒绝下发 |
+| **`/api/network/restart`** | **200 照常下发** | 500 拒绝，且**不重启网络** |
+| **`/api/gateway/config`** | **200 下发 + 写回磁盘** | 500 拒绝，不落盘 |
+| **`/api/reverse-proxy/rules` POST** | **200 照常下发** | 500 拒绝 |
+| `/api/reverse-proxy/rules/<id>` PUT/DELETE | 404（规则随配置一起消失，够不着下发） | 同左 |
+
+`/api/network/restart` 原实现是 `build_rules` → `open(RULES_PATH,'w')` →
+`nft -f`，四样全缺：不查损坏、不持 `_FW_APPLY_LOCK`、`open(...,'w')` 是
+truncate+write 非原子、没有 `nft -c` 预检也没有 `.lastgood` 备份。
+
+#### 真正严重的是持久化，不是下发
+
+`/api/gateway/config` 会 `save_config(new_cfg)`。实测这条链：
+
+```
+① 改一次网关端口 → HTTP 200，磁盘配置已变成 trusted_ip4=192.168.100.2
+② 再点「应用规则」→ HTTP 200 规则已应用，守卫是否还拦: False
+③ 再点「重启网络」→ 200，正常下发
+```
+
+落盘之后 `_config_lost_after_setup()` 判定为「全新安装」，守卫**从此永远满足**。
+一次瞬时损坏被固化成永久配置，接口全程返回 200，之后不会再有任何告警。
+
+拿 `.224` 的真实配置对比 `DEFAULT_CONFIG`，39 个字段里 **19 个**会被换成出厂值：
+
+```
+knock1/2/3/4   10376 / 23224 / 32760 / 13550  →  1 / 2 / 3 / 4   （敲门口令全废）
+reverse_proxy  "测试NAS" /nas → 127.0.0.1:15000  →  null        （反代服务整个没了）
+lan_allowed_ports  [22, 5443]  →  ""                                （内网管理端口白名单清空）
+forward_rules   []  →  [{... "target_ip": "192.168.4.226"}]         （凭空多出一条公网转发）
+lan_subnet4 / lan_broadcast4 / ula_prefix6 / wan_prefix6 / trusted_ip4 全部指向陌生网段
+```
+
+缓解因素：损坏现场会以 `.corrupted.<时间戳>` 留存，用户真实配置可从中恢复
+（2026-10-12 `.224` 配置丢失就是这么恢复的）。但前提是知道去哪儿找。
+
+#### 改法
+
+- **守卫下沉到 `_apply_ruleset`**（取锁之前判断，纯内存检查不占锁）——
+  覆盖 `/api/rules/apply`、`/api/gateway/config`、反代增删改、看门狗自愈。
+  看门狗自己本来就查 `_config_corrupted()` 并退到 `.backup` / basic lockdown，
+  所以下沉不会误伤自愈能力
+- **`save_config` 也拦**：新增 `ConfigCorruptedError` + 统一的
+  `@app.errorhandler`。守卫放在函数**最前面**——函数体第一件事是
+  `shutil.copy(CONFIG_PATH, CONFIG_PATH + '.backup')`，而 `load_config()` 检出损坏时
+  会把原件移走，此时 `.backup` 是唯一完好的恢复材料，先复制等于用损坏文件覆盖它。
+  选抛异常 + errorhandler 而不是逐个调用点加 try/except：`save_config` 有 8 个
+  调用点，手写迟早漏一个，而漏掉的那个就是「静默写回出厂配置」的那条路。
+  留 `_force=False` 参数给将来的恢复路径（当前 `restore_config` 走 `os.replace`，
+  不经过这里）
+- **`restart_network` 改走 `_apply_ruleset`**，顺带白捡原子写、`nft -c` 预检、
+  `.lastgood` 备份、加锁。顺序也从「先写文件再重启网络」改成
+  「先重启网络再下发」（重启会重载 fw4 冲掉规则），并且**守卫前置到重启之前**——
+  否则会出现「网络已断才发现规则装不回来」的窗口
+
+#### 验证
+
+- 6 个端点逐一实测：修复前 3 个下发、修复后 0 个下发
+- 持久化实测：修复后配置文件不被重写、规则文件不写、无 `nft` 调用
+- **正常路径实测**（配置完好时 4 个端点）：全部 200、照常下发、照常落盘、
+  `/api/network/restart` 照常重启网络 —— 确认守卫没有误伤
+- 损坏配置下 `/api/network/restart` 确认**没有重启网络**
+- `test_functional_fixes.py` 52→67 条断言，`mutation_check_functional.py`
+  23→31 条变异且 31/31 全捕获（新增 6 条：`_apply_ruleset` 守卫去掉、
+  `save_config` 守卫去掉、守卫挪到备份之后、`restart_network` 改回自己写盘、
+  守卫挪到重启之后、errorhandler 去掉）
+
 ### 顺带修掉的工具 bug
 
 `tools/check-api-coverage.py` 初版只抓 `api.get/post/...`，漏了 multipart

@@ -161,6 +161,79 @@ MUTATIONS = [
      '    if refused is not None:\n'
      '        return refused',
      '    refused = None', 1),
+
+    # ── FIX-9  守卫只挂 1 个端点 / 只挡下发不挡落盘 ──────────────────
+    ('FIX-9 _apply_ruleset 里的守卫去掉（下发旁路重新打开）', 'app',
+     '    bad, err = _config_corrupted()\n'
+     '    if bad:\n'
+     "        print(f'[ERROR] 配置损坏（{err}），拒绝按默认配置下发 nft 规则', flush=True)\n"
+     '        return False, _CORRUPT_REFUSAL.format(err=err, path=CONFIG_PATH)\n',
+     '    pass\n', 1),
+
+    ('FIX-9 save_config 的守卫去掉（损坏被固化成永久配置）', 'app',
+     '    if not _force:\n'
+     '        bad, err = _config_corrupted()\n'
+     '        if bad:\n'
+     '            raise ConfigCorruptedError(_CORRUPT_REFUSAL.format(err=err, path=CONFIG_PATH))\n',
+     '    if False:\n        pass\n', 1),
+
+    ('FIX-9 save_config 的守卫挪到备份之后（唯一完好的恢复材料被覆盖）', 'app',
+     '    if not _force:\n'
+     '        bad, err = _config_corrupted()\n'
+     '        if bad:\n'
+     '            raise ConfigCorruptedError(_CORRUPT_REFUSAL.format(err=err, path=CONFIG_PATH))\n'
+     '    # 自动备份当前配置\n'
+     "    if os.path.exists(CONFIG_PATH):\n"
+     "        shutil.copy(CONFIG_PATH, CONFIG_PATH + '.backup')\n",
+     '    # 自动备份当前配置\n'
+     "    if os.path.exists(CONFIG_PATH):\n"
+     "        shutil.copy(CONFIG_PATH, CONFIG_PATH + '.backup')\n"
+     '    if not _force:\n'
+     '        bad, err = _config_corrupted()\n'
+     '        if bad:\n'
+     '            raise ConfigCorruptedError(_CORRUPT_REFUSAL.format(err=err, path=CONFIG_PATH))\n', 1),
+
+    ('FIX-9 restart_network 改回自己写盘自己跑 nft -f', 'app',
+     '        ok, message = _apply_ruleset(config)\n'
+     '        if not ok:\n'
+     '            return jsonify({"success": False, "message":\n'
+     '                            f"网络已重启，但防火墙规则未生效，{message}"}), 500\n',
+     '        rules = build_rules(config)\n'
+     '        os.makedirs(os.path.dirname(RULES_PATH), exist_ok=True)\n'
+     "        with open(RULES_PATH, 'w') as f:\n"
+     '            f.write(rules)\n'
+     "        res = subprocess.run(['nft', '-f', RULES_PATH], capture_output=True, text=True, timeout=30)\n"
+     '        if res.returncode != 0:\n'
+     '            return jsonify({"success": False, "message": "规则加载失败"}), 500\n', 1),
+
+    ('FIX-9 restart_network 的守卫挪到重启网络之后（网络已断才发现装不回规则）', 'app',
+     '        bad, err = _config_corrupted()\n'
+     '        if bad:\n'
+     '            return jsonify({"success": False, "code": "CONFIG_CORRUPTED",\n'
+     '                            "message": _CORRUPT_REFUSAL.format(err=err, path=CONFIG_PATH)}), 500\n'
+     "        subprocess.run(['/etc/init.d/network', 'restart'],\n"
+     '                       capture_output=True, text=True, timeout=30)\n',
+     "        subprocess.run(['/etc/init.d/network', 'restart'],\n"
+     '                       capture_output=True, text=True, timeout=30)\n'
+     '        bad, err = _config_corrupted()\n'
+     '        if bad:\n'
+     '            return jsonify({"success": False, "code": "CONFIG_CORRUPTED",\n'
+     '                            "message": _CORRUPT_REFUSAL.format(err=err, path=CONFIG_PATH)}), 500\n', 1),
+
+    ('FIX-9 errorhandler 去掉（save_config 抛出的异常变成裸 500）', 'app',
+     '@app.errorhandler(ConfigCorruptedError)\n'
+     'def _handle_config_corrupted(e):\n'
+     '    """save_config 在配置损坏时抛的异常统一在这里变成 500 响应。\n'
+     '\n'
+     '    为什么要单独一个 handler：save_config 有 8 个调用点（保存配置、网络配置、\n'
+     '    名单预设增删改、名单历史清理、反代配置落盘…）。在每个调用点手写 try/except\n'
+     '    迟早会漏一个，而漏掉的那个就是「静默把出厂配置写回磁盘」的那条路。\n'
+     '    统一抛 + 统一格式化，改一处就全覆盖。\n'
+     '    """\n'
+     "    return jsonify({'success': False,\n"
+     "                    'code': 'CONFIG_CORRUPTED',\n"
+     "                    'message': str(e)}), 500\n\n\n",
+     '', 1),
 ]
 
 

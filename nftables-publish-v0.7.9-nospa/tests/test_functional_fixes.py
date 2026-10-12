@@ -10,6 +10,7 @@
   FIX-6  手动更新 IPv6 必须写 /tmp/ddns-ipv6-*（只有 cron 脚本写 → IPv6 DDNS 静默失效）
   FIX-7  上传/重传必须校验证书与私钥配对，且校验失败不覆盖原文件
   FIX-8  /api/rules/save 不再绕过 /api/rules/apply 的安全路径（自己写盘）
+  FIX-9  配置损坏时守卫覆盖全部下发与落盘路径（原来只挂 1 个端点）
 
 每条测试都写成「旧代码必然失败」的形式。沙箱运行：不碰真实路径、
 不执行 openssl / nft / nginx（需要外部命令的分支一律打桩）。
@@ -56,6 +57,22 @@ def strip_comments(text):
     """
     return '\n'.join(l for l in text.splitlines()
                      if not l.lstrip().startswith('#'))
+
+
+def fn_code(src, name):
+    """取函数体并剥掉 docstring 与 # 注释 —— 只剩可执行代码。
+
+    为什么 docstring 也必须剥：这轮已经因为它踩了两次。
+    修 restart_network 时我在 docstring 里写「原实现是 open(RULES_PATH,'w')」
+    来解释改了什么，位置断言立刻匹配到 docstring 而非真实代码，测试误报；
+    守卫前置那条同样栽在「shutil.copy(CONFIG_PATH, ...)」这句解释上。
+    注释会骗人，解释修复原因的 docstring 一样会骗人。
+    """
+    body = fn_src(src, name)
+    # 去掉紧跟 def 的第一个三引号块（函数 docstring）
+    body = re.sub(r'(?s)^(def\s+\w+\([^)]*\)[^\n]*:\n)\s*("""|\'\'\')(?:(?!""").)*?\2\n',
+                  r'\1', body, count=1)
+    return strip_comments(body)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -247,6 +264,60 @@ check('apply_rules 走加锁下发（save 现在共用它）',
       '_apply_ruleset(config)' in fn_src(APP_SRC, 'apply_rules'))
 
 # ─────────────────────────────────────────────────────────────
+sec('FIX-9  配置损坏守卫覆盖全部下发与落盘路径')
+
+_apply = fn_code(APP_SRC, '_apply_ruleset')
+check('_apply_ruleset 内部查 _config_corrupted()',
+      '_config_corrupted()' in _apply,
+      '守卫原来只挂在 /api/rules/apply 一个端点上，其余 5 个端点全绕过')
+check('守卫在取锁之前判断（纯内存检查没理由占锁）',
+      _apply.find('_config_corrupted()') < _apply.find('_FW_APPLY_LOCK.acquire()'))
+check('守卫命中时返回 (False, 拒绝文案) 而不是抛异常',
+      re.search(r'if bad:\s*\n(?:[^\n]*\n){0,3}?\s*return False,', _apply) is not None,
+      '返回 False 让调用方按自己的话术报错，抛异常会让 5 个端点各不相同')
+
+_save = fn_code(APP_SRC, 'save_config')
+# 锚点必须带缩进：docstring 里也出现了同一行文字来解释「为什么守卫要前置」，
+# 只按裸字符串找会先匹配到 docstring，把顺序判断读反（同一个坑第三次）。
+_i_backup = _save.find("    shutil.copy(CONFIG_PATH, CONFIG_PATH + '.backup')")
+check('save_config 也查 _config_corrupted()（阻断持久化）',
+      '_config_corrupted()' in _save,
+      '守卫只挡下发不挡落盘 = 一次瞬时损坏被固化成永久配置')
+check('守卫在「把当前文件复制成 .backup」之前',
+      _i_backup != -1 and _save.find('_config_corrupted()') < _i_backup,
+      f'守卫@{_save.find("_config_corrupted()")} / 备份@{_i_backup}。'
+      'load_config 检出损坏时会把原件移走，这时 .backup 是唯一完好的恢复材料，'
+      '先复制等于用损坏文件覆盖它')
+check('命中时抛 ConfigCorruptedError', 'raise ConfigCorruptedError' in _save)
+check('_force 旁路存在且默认关闭',
+      re.search(r'def save_config\(config,\s*_force=False\)', APP_SRC) is not None)
+check('ConfigCorruptedError 有统一的 errorhandler（8 个调用点不用各写一遍）',
+      '@app.errorhandler(ConfigCorruptedError)' in APP_SRC)
+# {path} 漏填会直接 KeyError —— 这个坑我真踩了一次，所以单列一条
+_refusal_re = r"_CORRUPT_REFUSAL\.format\([^)]*err=err[^)]*path=CONFIG_PATH\)"
+check('_CORRUPT_REFUSAL 的 {err} 与 {path} 两个占位符都填了',
+      len(re.findall(_refusal_re, APP_SRC)) >= 2,
+      f'实际 {len(re.findall(_refusal_re, APP_SRC))} 处（save_config 与 _apply_ruleset 各一处）')
+
+_rn = fn_code(APP_SRC, 'restart_network')
+check('restart_network 改走 _apply_ruleset（拿到原子写/预检/备份/锁）',
+      '_apply_ruleset(config)' in _rn)
+check('restart_network 不再自己 open(RULES_PATH) 写盘',
+      not re.search(r'open\(RULES_PATH,\s*[\'"]w[\'"]\)', _rn))
+check('restart_network 不再自己跑 nft -f',
+      not re.search(r"subprocess\.run\(\['nft',\s*'-f'", _rn))
+_i_guard = _rn.find('_config_corrupted()')
+_i_restart = _rn.find('/etc/init.d/network')
+check('守卫在重启网络之前（否则网络已断才发现装不回规则）',
+      _i_guard != -1 and _i_restart != -1 and _i_guard < _i_restart,
+      f'守卫@{_i_guard} / 重启@{_i_restart}')
+check('重启在下发之前（重启会重载 fw4 冲掉规则）',
+      _i_restart < _rn.find('_apply_ruleset(config)'))
+
+# 守卫下沉不能误伤看门狗自愈 —— 它自己会查并退到 .backup / lockdown
+check('看门狗有自己的损坏检查（守卫下沉不会误伤自愈）',
+      '_config_corrupted()' in fn_src(APP_SRC, '_auto_recover_ruleset_if_empty'))
+
 print()
 if FAIL:
     print(f'❌ 失败 {len(FAIL)} 项：')

@@ -414,6 +414,21 @@ def _config_corrupted():
     return (_LAST_LOAD_ERROR is not None, _LAST_LOAD_ERROR or '')
 
 
+class ConfigCorruptedError(RuntimeError):
+    """配置损坏时拒绝写盘。
+
+    为什么必须阻断「保存」而不只是阻断「下发」：
+    实测（2026-10-12）配置损坏后调 /api/gateway/config 会返回 200，
+    并且把 DEFAULT_CONFIG 连同改动一起 save_config 回磁盘。落盘之后
+    `_config_lost_after_setup()` 判定为「全新安装」，守卫从此永远满足 ——
+    一次瞬时损坏被固化成永久配置，而接口报的是成功。
+
+    39 个字段里 19 个会被换成出厂值：敲门前缀 10376/23224/32760/13550
+    变成 1/2/3/4、反代服务整个变 null、内网管理端口白名单清空，
+    还会凭空多出一条把公网 41820/41825/21116 转发到 192.168.4.226 的规则。
+    """
+
+
 # 配置损坏时拒绝下发规则的统一提示
 _CORRUPT_REFUSAL = ('配置文件已损坏（{err}），已拒绝下发规则。'
                     '请到「功能介绍/配置」页恢复配置，或手工修复 '
@@ -432,8 +447,37 @@ def _config_corrupted_response():
     }), 500
 
 
-def save_config(config):
-    """保存配置到 JSON 文件"""
+@app.errorhandler(ConfigCorruptedError)
+def _handle_config_corrupted(e):
+    """save_config 在配置损坏时抛的异常统一在这里变成 500 响应。
+
+    为什么要单独一个 handler：save_config 有 8 个调用点（保存配置、网络配置、
+    名单预设增删改、名单历史清理、反代配置落盘…）。在每个调用点手写 try/except
+    迟早会漏一个，而漏掉的那个就是「静默把出厂配置写回磁盘」的那条路。
+    统一抛 + 统一格式化，改一处就全覆盖。
+    """
+    return jsonify({'success': False,
+                    'code': 'CONFIG_CORRUPTED',
+                    'message': str(e)}), 500
+
+
+def save_config(config, _force=False):
+    """保存配置到 JSON 文件
+
+    配置损坏时直接抛 ConfigCorruptedError，不落盘。守卫必须放在**最前面**：
+    函数体第一件事是 `shutil.copy(CONFIG_PATH, CONFIG_PATH + '.backup')`，
+    而 load_config() 检出损坏时会把原件移走、只留 .corrupted.*。所以配置损坏
+    期间一旦有人保存，.backup 里那份唯一完好的配置会被损坏文件覆盖 ——
+    等于把最后的恢复材料也毁掉。
+
+    _force=True 只给恢复路径留（当前没有调用方，restore_config 走 os.replace
+    不经过这里）；留着是为了将来需要「明知损坏也要写」时有个显式出口，
+    而不是让调用方去改这个函数的实现。
+    """
+    if not _force:
+        bad, err = _config_corrupted()
+        if bad:
+            raise ConfigCorruptedError(_CORRUPT_REFUSAL.format(err=err, path=CONFIG_PATH))
     # 自动备份当前配置
     if os.path.exists(CONFIG_PATH):
         shutil.copy(CONFIG_PATH, CONFIG_PATH + '.backup')
@@ -1948,25 +1992,37 @@ def save_network_config():
 
 @app.route('/api/network/restart', methods=['POST'])
 def restart_network():
-    """重启网络服务"""
+    """重启网络服务，然后走统一下发路径把防火墙规则装回去。
+
+    为什么必须改成调 _apply_ruleset 而不再自己写文件跑 nft：
+    原实现是 `build_rules` → `open(RULES_PATH,'w')` → `nft -f`，四样全缺 ——
+      · 不查 _config_corrupted()：配置损坏时把 DEFAULT_CONFIG（敲门端口 1/2/3/4、
+        转发指向 192.168.4.226）直接下发，实测返回 200「防火墙规则已重新应用」
+      · 不持 _FW_APPLY_LOCK：可与看门狗的 nft -f 交叉执行
+      · open(...,'w') 是 truncate+write 非原子：与 os.replace 交叉会读到半截文件
+      · 没有 nft -c 预检、没有 .lastgood 备份
+
+    顺序也从「先写文件再重启网络」改成「先重启网络再下发」：网络重启会重载
+    fw4 并冲掉规则集，所以下发必须发生在重启之后。_apply_ruleset 自己会写
+    RULES_PATH，init 脚本开机兜底照样能用。
+    """
     try:
         config = load_config()
-        # 先把规则落盘（供 init 脚本开机兜底），再重启网络
-        rules = build_rules(config)
-        os.makedirs(os.path.dirname(RULES_PATH), exist_ok=True)
-        with open(RULES_PATH, 'w') as f:
-            f.write(rules)
-        subprocess.run(['/etc/init.d/network', 'restart'], capture_output=True, text=True, timeout=30)
-        # 等待网络接口恢复（阻塞 5s 是可接受的，因为后续需要加载 nft 规则）
+        # 重启网络会重载 fw4 并冲掉当前规则集 —— 先确认能下发，再去重启。
+        # 顺序反过来会出现「网络已经断了、规则却装不回来」的窗口：
+        # 守卫只在 _apply_ruleset 里，而那时 damage 已经造成。
+        bad, err = _config_corrupted()
+        if bad:
+            return jsonify({"success": False, "code": "CONFIG_CORRUPTED",
+                            "message": _CORRUPT_REFUSAL.format(err=err, path=CONFIG_PATH)}), 500
+        subprocess.run(['/etc/init.d/network', 'restart'],
+                       capture_output=True, text=True, timeout=30)
+        # 等待网络接口恢复（阻塞 5s 是可接受的，后续要加载 nft 规则）
         time.sleep(5)
-        # 必须检查 nft -f 返回码：原来不管成败都返回 success，
-        # 规则没装上时用户以为重启成功，实际防火墙处于空档
-        res = subprocess.run(['nft', '-f', RULES_PATH], capture_output=True, text=True, timeout=30)
-        if res.returncode != 0:
-            _state, state_msg = _restore_lastgood_rules()
+        ok, message = _apply_ruleset(config)
+        if not ok:
             return jsonify({"success": False, "message":
-                            f"网络已重启，但 nft 规则加载失败，{state_msg}："
-                            f"{res.stderr or res.stdout}"}), 500
+                            f"网络已重启，但防火墙规则未生效，{message}"}), 500
         return jsonify({"success": True, "message": "网络已重启，防火墙规则已重新应用"})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
@@ -2083,9 +2139,24 @@ def _apply_ruleset(config):
     流程：生成 -> 写临时文件 -> `nft -c` 语法预检 -> 原子替换 -> 停 fw4 ->
     `nft -f` -> 失败则回滚到上一版（再失败退到最小兜底防护）。
 
-    反代规则增删改和 /api/rules/apply 共用本函数，
+    反代规则增删改、网关配置、/api/rules/apply、/api/network/restart 共用本函数，
     避免出现「某条路径跳过了校验和回滚」的不一致。
+
+    守卫也放在这里，而不是挂在单个 HTTP 端点上。原来 `_config_corrupted_response()`
+    全库只有 /api/rules/apply 一个调用点，于是同一份损坏配置下：
+        /api/rules/apply   → 500 拒绝下发 ✅
+        /api/network/restart → 200 照常下发（自己写文件自己跑 nft -f）
+        /api/gateway/config  → 200 下发并把 DEFAULT_CONFIG 写回磁盘
+    沉到公共路径后，无论从哪个门进来都会撞上。
     """
+    # 在取锁之前判断：这是一次纯内存检查，没有理由占着锁。
+    # 看门狗（_auto_recover_ruleset_if_empty）自己也会查一遍并退到
+    # .backup / basic lockdown，所以这里拦它不会影响自愈能力。
+    bad, err = _config_corrupted()
+    if bad:
+        print(f'[ERROR] 配置损坏（{err}），拒绝按默认配置下发 nft 规则', flush=True)
+        return False, _CORRUPT_REFUSAL.format(err=err, path=CONFIG_PATH)
+
     # 与看门狗共用锁：两个 nft -f 交叉执行会得到无法预测的中间规则集，
     # 而且看门狗的 _try_apply_rules_file 与这里的回滚逻辑会互相覆盖文件。
     _FW_APPLY_LOCK.acquire()
