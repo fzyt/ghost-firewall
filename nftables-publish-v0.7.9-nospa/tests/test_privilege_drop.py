@@ -325,6 +325,81 @@ check('降权逻辑不碰 nginx/nft 等特权路径',
       '降权函数里出现 subprocess 意味着它还在做特权操作')
 
 # ─────────────────────────────────────────────────────────────
+sec('PD-10  nginx worker 降权脚本：两个「假绿灯」陷阱')
+
+_nginx_sh = open(os.path.join(ROOT_TOOLS := os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), 'tools', 'nginx-priv-drop.sh'),
+    encoding='utf-8').read()
+# 剥掉注释再验：脚本里的排障说明大量提到 "nginx -t" 字样，
+# 不剥掉会把注释误判成代码里的裸调用。
+_nginx_code = '\n'.join(
+    l for l in _nginx_sh.splitlines() if not l.lstrip().startswith('#'))
+# 再剥掉引号内的内容：日志文案里也写着 "nginx -t -c $CONF 通过"，
+# 那是给人看的字符串，不是执行。只剩命令位置的 nginx -t 才是真调用。
+_nginx_exec = re.sub(r'"[^"]*"', '""', _nginx_code)
+_nginx_exec = re.sub(r"'[^']*'", "''", _nginx_exec)
+
+# 陷阱一：nginx -t 读的是 nginx.conf，服务实际跑的是 -c uci.conf。
+# 验错文件 → 报「通过」→ 真正的原因根本不在被验的那份里 → restart 才炸。
+check('语法预检用服务实际加载的配置（nginx -t -c "$CONF"）',
+      'nginx_check() { nginx -t -c "$CONF"' in _nginx_code,
+      '裸 nginx -t 校验的是 nginx.conf，不是 init 脚本起的那份')
+check('命令位置上没有绕过 nginx_check 的裸 nginx -t',
+      len(re.findall(r'nginx -t(?! -c)', _nginx_exec)) == 0,
+      f"存在 {len(re.findall(r'nginx -t(?! -c)', _nginx_exec))} 处不带 -c 的 "
+      f"nginx -t，它验的不是服务实际加载的配置")
+
+# 陷阱二：nginx 的 user 指令内部是 getpwnam() + getgrnam()，两个都要，
+# 且用同一个名字。OpenWrt 的 /etc/passwd 有 nobody，/etc/group 只有
+# nogroup —— 只查用户会漏掉一半，然后 nginx 报 getgrnam 失败拒绝启动。
+check('从 /etc/passwd 取 worker 的 uid',
+      '/etc/passwd' in _nginx_code and 'WORKER_UID=' in _nginx_code)
+check('显式检查 /etc/group 里 worker 组是否存在',
+      re.search(r'grep -q "\^\$\{WORKER_USER\}:" /etc/group', _nginx_code) is not None,
+      '只查 /etc/passwd 会漏掉 /etc/group 缺组这一半')
+check('组缺失时自动补建（而不是让 nginx 启动失败）',
+      re.search(r'>>\s*/etc/group', _nginx_code) is not None)
+
+# user 指令只在 master 启动时生效，reload 不改 worker 身份
+check('指令有变更时走 restart 而非 reload',
+      re.search(r'if \[ "\$CHANGED" = "1" \]; then.*?/etc/init\.d/nginx stop.*?/etc/init\.d/nginx start',
+                _nginx_code, re.S) is not None,
+      '实测踩过：reload 之后 worker 仍是 uid=0')
+check('回滚路径同样是 restart',
+      _nginx_code.count('/etc/init.d/nginx stop') >= 2)
+
+# 「循环体一次都不进 → BAD 保持 0 → 谎报完成」：必须有进程数量下限判断
+check('复核要求 master 与 worker 都至少存在一个',
+      re.search(r'NMASTER.*-eq 0', _nginx_code) is not None
+      and re.search(r'NWORKER.*-eq 0', _nginx_code) is not None)
+check('worker uid 必须等于期望值，而不只是「非 0」',
+      re.search(r'"\$U" != "\$WORKER_UID"', _nginx_code) is not None)
+check('master 必须是 root（worker 降权不等于 master 也降）',
+      re.search(r'master.*?\n.*?不是 root', _nginx_code, re.S) is not None)
+
+# ─────────────────────────────────────────────────────────────
+sec('PD-11  私钥权限：每次写入后都要补组读，否则 worker 读不到')
+
+_app_src = open(os.path.join(BACKEND, 'app.py'), encoding='utf-8').read()
+check('_harden_key_for_nginx_worker 函数存在', '_harden_key_for_nginx_worker' in _app_src)
+_n_chmod = len(re.findall(r'os\.chmod\((?:key_path|NFTABLES_WEB_KEY),\s*0o600\)', _app_src))
+_n_hard = len(re.findall(r'_harden_key_for_nginx_worker\((?:key_path|NFTABLES_WEB_KEY)\)', _app_src))
+check('三处 chmod(key, 600) 全部配了补权限', _n_chmod == 3, f'实际 {_n_chmod} 处')
+check('补权限调用数与 chmod 数一一对应', _n_chmod == _n_hard,
+      f'chmod {_n_chmod} 处 / 补权限 {_n_hard} 处 —— 少一处就是「下次换证书 TLS 握手失败」')
+# 注意这里必须精确盯 OSError 那一支：函数里有两个 return False
+# （ImportError 分支 + OSError 分支），非贪婪的 `.*?return False`
+# 会匹配到第一个，把第二个改成 raise 也照样「通过」—— 变异验证实测过。
+_fn_m = re.search(r'def _harden_key_for_nginx_worker.*?(?=\ndef |\nclass |\n@app|\n# ═)',
+                  _app_src, re.S)
+_fn_src = _fn_m.group(0) if _fn_m else ''
+check('chown/chmod 失败的 OSError 分支返回 False 而不是抛异常',
+      re.search(r'except OSError:\s*\n\s*return False', _fn_src) is not None,
+      f'函数体片段: {repr(_fn_src[-90:])}')
+check('解析不到用户时也返回 False（而不是让证书流程炸掉）',
+      re.search(r'except \(ImportError, KeyError\):\s*\n\s*return False', _fn_src) is not None)
+
+# ─────────────────────────────────────────────────────────────
 print()
 if FAIL:
     print(f'❌ 失败 {len(FAIL)} 项：')

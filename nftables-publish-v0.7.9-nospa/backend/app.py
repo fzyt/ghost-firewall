@@ -4184,6 +4184,44 @@ NFTABLES_WEB_SSL_DIR = os.path.join(NGINX_SSL_DIR, "nftables-web")
 NFTABLES_WEB_CERT = os.path.join(NFTABLES_WEB_SSL_DIR, "fullchain.pem")
 NFTABLES_WEB_KEY = os.path.join(NFTABLES_WEB_SSL_DIR, "privkey.pem")
 
+# nginx worker 运行用户。master 仍需 root（要读私钥、要 bind 低端口），
+# 但 worker 才是真正处理公网流量的进程 —— 它以 root 运行的话，nginx 侧
+# 任何一处漏洞都直接等于整台机器沦陷，和认证网关那半个问题是同一类。
+NGINX_WORKER_USER = "nobody"
+
+
+def _harden_key_for_nginx_worker(path):
+    """私钥 chmod 600 之后，补上 nginx worker 的组读权限。
+
+    为什么必须跟着每次证书写入一起做
+    ------------------------------
+    下面三处（上传 / ACME 续期 / 自签生成）都会 `os.chmod(key, 0o600)`。
+    那是对的 —— 私钥本就不该被别人读到。但 nginx worker 现在以
+    NGINX_WORKER_USER 运行，它必须能读私钥才能做 TLS 握手，于是：
+        只改一次 nginx 的 user → 下一次换证书，worker 立刻读不到私钥
+    而 nginx 的表现是「握手失败」，前端只看到一个 TLS 报错，没有任何提示
+    说明是权限 —— 这种故障极难排查。
+
+    所以规则是：**谁把权限打回 600，谁就负责把它补成 worker 可读。**
+    640 root:<worker 组> 对「其他用户」依然完全关闭；worker 组在 OpenWrt
+    上是 nobody 组、没有任何成员，实际暴露面和 600 等价，只是多了 nginx
+    这一条读取路径。
+
+    解析不到用户或 chown 失败都不抛异常 —— 证书该存还是要存，
+    降权是加固措施，不该反过来把证书流程搞挂。
+    """
+    try:
+        import grp
+        gid = grp.getgrnam(NGINX_WORKER_USER).gr_gid
+    except (ImportError, KeyError):
+        return False
+    try:
+        os.chown(path, 0, gid)
+        os.chmod(path, 0o640)
+        return True
+    except OSError:
+        return False
+
 # 注：面板 HTTPS 端口 HTTPS_PORT 已提到文件顶部定义（validate_config 需要它做端口交叉校验）
 
 # TLS 版本映射
@@ -5628,6 +5666,7 @@ def rp_upload_cert():
     cert_file.save(fullchain_path)
     key_file.save(key_path)
     os.chmod(key_path, 0o600)
+    _harden_key_for_nginx_worker(key_path)
 
     expires_at, days = _get_cert_expiry(fullchain_path)
     now_iso = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S+08:00")
@@ -5731,6 +5770,7 @@ def rp_reupload_cert(cert_id):
         cert_file.save(cert_path)
         key_file.save(key_path)
         os.chmod(key_path, 0o600)
+        _harden_key_for_nginx_worker(key_path)
     except OSError as e:
         return jsonify({"success": False, "message": f"写入文件失败: {e}"}), 500
 
@@ -6209,6 +6249,7 @@ def _ensure_self_signed_cert():
                 '-addext', f'subjectAltName=IP:{cn},DNS:{cn}',
             ], check=True, capture_output=True, text=True, timeout=30)
             os.chmod(NFTABLES_WEB_KEY, 0o600)
+            _harden_key_for_nginx_worker(NFTABLES_WEB_KEY)
             os.chmod(NFTABLES_WEB_CERT, 0o644)
             print(f"[INFO] 已生成自签证书 (CN={cn}) 有效期 10 年", flush=True)
             return NFTABLES_WEB_CERT, NFTABLES_WEB_KEY

@@ -30,11 +30,19 @@ os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GW = os.path.join(ROOT, 'backend', 'auth_gateway.py')
+APP_PY = os.path.join(ROOT, 'backend', 'app.py')
 INIT = os.path.join(ROOT, 'backend', 'nftables-web-auth.init')
 TEST = os.path.join(ROOT, 'tests', 'test_privilege_drop.py')
 
 ORIG_GW = open(GW, encoding='utf-8').read()
+ORIG_APP = open(APP_PY, encoding='utf-8').read()
 ORIG_INIT = open(INIT, encoding='utf-8').read()
+ORIG_SH = open(os.path.join(ROOT, 'tools', 'nginx-priv-drop.sh'), encoding='utf-8').read()
+
+
+def _orig_of(path):
+    return {GW: ORIG_GW, APP_PY: ORIG_APP,
+            INIT: ORIG_INIT}.get(path, ORIG_SH)
 
 
 def run_tests():
@@ -45,10 +53,11 @@ def run_tests():
 
 
 def restore():
-    with open(GW, 'w', encoding='utf-8') as f:
-        f.write(ORIG_GW)
-    with open(INIT, 'w', encoding='utf-8') as f:
-        f.write(ORIG_INIT)
+    for path, content in ((GW, ORIG_GW), (APP_PY, ORIG_APP),
+                          (INIT, ORIG_INIT),
+                          (os.path.join(ROOT, 'tools', 'nginx-priv-drop.sh'), ORIG_SH)):
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
     for d in (os.path.join(ROOT, 'backend', '__pycache__'),
               os.path.join(ROOT, 'tests', '__pycache__')):
         if os.path.isdir(d):
@@ -128,6 +137,56 @@ MUTATIONS = [
 ]
 
 
+# ─────────────────────────────────────────────────────────────
+# nginx worker 降权：重点是那两个「假绿灯」陷阱
+#   N1  校验用回裸 nginx -t → 验的不是服务实际加载的那份配置
+#   N2  只查用户不查组   → OpenWrt 缺 nobody 组时 nginx 直接拒启动
+# ─────────────────────────────────────────────────────────────
+
+NGINX_SH = os.path.join(ROOT, 'tools', 'nginx-priv-drop.sh')
+
+MUTATIONS += [
+    ('N1  校验退回裸 nginx -t（验错配置文件的假绿灯）',
+     NGINX_SH, [('nginx_check() { nginx -t -c "$CONF" "$@"; }',
+                 'nginx_check() { nginx -t; }')]),
+
+    ('N2  不再检查 /etc/group 里的 worker 组（OpenWrt 缺组直接起不来）',
+     NGINX_SH, [('''if ! grep -q "^${WORKER_USER}:" /etc/group; then
+    echo "  /etc/group 里没有组 $WORKER_USER —— nginx 的 getgrnam() 会失败"
+    echo "${WORKER_USER}:x:${WORKER_GID}:" >> /etc/group
+    say "已补建组 ${WORKER_USER} (gid=${WORKER_GID})"
+fi''', 'if false; then :; fi')]),
+
+    ('N3  指令变更时改用 reload（worker 身份不会变）',
+     NGINX_SH, [('''    /etc/init.d/nginx stop 2>/dev/null || true
+    sleep 1
+    /etc/init.d/nginx start''', '''    nginx -s reload 2>/dev/null || true
+    sleep 1
+    :''')]),
+
+    ('N4  去掉 worker 数量下限（服务没起来也会报「完成」）',
+     NGINX_SH, [('''if [ "$NMASTER" -eq 0 ]; then
+    echo "nginx 一个进程都没有 —— 服务没起来" >&2; BAD=1
+elif [ "$NWORKER" -eq 0 ]; then
+    echo "没有 worker 进程" >&2; BAD=1
+fi''', ':')]),
+
+    ('N5  worker 校验放宽成「只要非 0 就算过」',
+     NGINX_SH, [('''            elif [ "$U" != "$WORKER_UID" ]; then
+                echo "worker pid=$p uid=$U，与期望 $WORKER_UID 不符" >&2; BAD=1
+''', '')]),
+
+    ('N6  少一处私钥补权限（下次换证书就 TLS 握手失败）',
+     APP_PY, [('    os.chmod(key_path, 0o600)\n    _harden_key_for_nginx_worker(key_path)',
+               '    os.chmod(key_path, 0o600)')]),
+
+    ('N7  补权限改成会抛异常（加固反过来搞挂证书流程）',
+     APP_PY, [('''    except OSError:
+        return False''', '''    except OSError:
+        raise''')]),
+]
+
+
 def main():
     print('=== 基线：未变异时测试必须全绿 ===')
     restore()
@@ -140,7 +199,7 @@ def main():
 
     caught = missed = 0
     for name, path, edits in MUTATIONS:
-        src = ORIG_GW if path == GW else ORIG_INIT
+        src = _orig_of(path)
         bad = [old for old, _ in edits if old not in src]
         if bad:
             print(f'  ⚠️  {name}')

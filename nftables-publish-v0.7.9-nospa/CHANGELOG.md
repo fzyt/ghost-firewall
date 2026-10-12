@@ -68,6 +68,79 @@ root 权限域，攻击者拿到 root 的第一件事就是把它关掉。
 - 发现 `/etc/nftables.d/` 下的规则文件本来就是 644 且含无密钥 —— 未改动，
   仅记录在此以免后续误以为与本次改动有关
 
+---
+
+## [v0.8.2-rc1] 2026-10-12 · nginx worker 同样降权
+
+与上面的网关降权同属一类，但入口在 HTTP 层而不是应用层。
+
+### 问题
+
+`/etc/nginx/uci.conf` 里是显式的 `user root;`，worker 进程以 root 运行。
+master 需要 root（读私钥、bind 低端口），但**真正处理公网流量的是 worker**。
+nginx 侧任何一处漏洞（请求走私、模块缺陷、配置误伤）落地就是 root。
+
+### 改法
+
+新增 `tools/nginx-priv-drop.sh`：master 保留 root，worker 降到 `nobody`。
+配套在 `app.py` 加 `_harden_key_for_nginx_worker()`，在**每一次私钥写入之后**
+补组读权限 —— 见下面「私钥权限为什么必须跟着每次写入走」。
+
+### 实测踩到的三个坑（都已写成回归测试）
+
+1. **`nginx -t` 验的不是服务实际加载的配置。** 裸 `nginx -t` 读
+   `/etc/nginx/nginx.conf`，而 init 脚本起的是 `nginx -c /etc/nginx/uci.conf`。
+   两份文件不同，于是拿到一个**假绿灯**，真正的原因根本不在被验的那份里，
+   `restart` 之后网关直接起不来。→ 脚本改为 `nginx -t -c "$CONF"`。
+
+2. **nginx 的 `user` 指令内部是 `getpwnam()` + `getgrnam()`，两个都要查，
+   而且用同一个名字。** OpenWrt 的 `/etc/passwd` 里有 `nobody`，
+   `/etc/group` 里却只有 `nogroup` 没有 `nobody` —— 只查用户会漏掉这一半，
+   nginx 报 `getgrnam("nobody") failed` 拒绝启动。→ 脚本检测并自动补建组。
+
+3. **`user` 指令只在 master 启动时生效，`reload` 不改 worker 身份。**
+   实测 reload 之后 worker 仍然是 uid=0。→ 指令有变更时走
+   `/etc/init.d/nginx stop && start`。
+
+另外复核那段原本写成「遍历进程、发现 worker 还是 uid=0 就报错」，
+**但 nginx 一个进程都没有时循环体一次都不进，BAD 保持 0，脚本会谎报「完成」**。
+已补进程数量下限判断。
+
+### 私钥权限为什么必须跟着每次写入走
+
+`app.py` 在三处（上传 `:5669`、ACME 续期 `:5773`、自签生成 `:6252`）
+都会 `os.chmod(key, 0o600)`。那是对的 —— 私钥本就不该被别人读到。
+但 worker 现在以 `nobody` 运行，必须能读私钥才能做 TLS 握手，于是：
+
+> 只改一次 nginx 的 user → 下一次换证书，worker 立刻读不到私钥，
+> 而 nginx 的表现只是「TLS 握手失败」，没有任何提示说明是权限问题。
+
+规则：**谁把权限打回 600，谁就负责补成 worker 可读。**
+`640 root:nobody` 对「其他用户」依然完全关闭，实际暴露面和 600 等价。
+
+### 真机实测（.224）
+
+```
+master pid=6965 uid=0                      ← 保留 root，正确
+worker pid=7172 uid=65534                  ← 已降权
+worker pid=7173 uid=65534
+privkey.pem  root:nogroup 640              ← worker 的 gid 65534 读得到
+端到端      网关 200 / 登录 200 / 面板 200 / 防火墙 257 行
+```
+
+### 关于 chroot：评估后决定不做
+
+评估过给认证网关加 chroot 做二层隔离，**结论是不做**，理由是数据不支持：
+
+- 磁盘只剩 **19.6M**，Python stdlib + site-packages 是 **52M**
+- 放进去只能走「硬链接约 3 万 inode」或「bind mount 等于把 52M 全搬进去」
+  两条路，前者在 2 核机器上很慢，后者让「最小化」名存实亡
+- 还要在主机上留 5 个 mount，崩溃即残留
+- 而它相对已拿到的非 root 权限，边际收益很小：实测 `nftweb` 本来就
+  读不到 `/etc/shadow`、SSH 私钥、`/root`，也动不了 `nft`、杀不了进程
+
+风险收益不成比例，不做。
+
 ### 仍未覆盖
 
 - **证书链路**（上传 / ACME / 续期 / 设默认 / 删除保护）真机零验证
