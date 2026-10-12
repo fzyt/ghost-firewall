@@ -640,6 +640,57 @@ def _split_ports(v):
     return out
 
 
+def _rp_forward_conflicts(cfg):
+    """端口转发指向「已启用的反代服务」时返回错误列表，否则空。
+
+    为什么必须抽成独立函数
+    --------------------
+    这条检查以前只写在 validate_config 里，而 validate_config 只有
+    /api/config 会调。反代的 POST/PUT/DELETE 走的是另一条路，压根不经过
+    validate_config —— 于是「先建端口转发、再建指向同一后端的反代」这个
+    顺序就绕过了检查，形成一条免登录的公网入口：端口转发走 nftables DNAT，
+    不经过 nginx 的认证层。
+
+    抽出来之后，validate_config 和反代 CRUD 共用同一份判断。两份逻辑迟早
+    分叉 —— 反代的 PUT 那次就是这么漏的。
+
+    参数是**完整的候选配置**（含将要落盘的那条规则），返回的是给用户看的
+    错误文案列表。
+    """
+    rp_targets = set()
+    rp = cfg.get('reverse_proxy')
+    if isinstance(rp, dict) and isinstance(rp.get('rules'), list):
+        for r in rp['rules']:
+            if not isinstance(r, dict) or not r.get('enabled'):
+                continue
+            host, _, port = str(r.get('target_address', '')).rpartition(':')
+            if host and _is_port(port):
+                rp_targets.add((host.strip(), int(port)))
+
+    errs = []
+    if rp_targets and isinstance(cfg.get('forward_rules'), list):
+        for i, r in enumerate(cfg.get('forward_rules') or [], 1):
+            if not isinstance(r, dict):
+                continue
+            tgt = str(r.get('target_ip', '') or '').strip()
+            if not tgt:
+                continue
+            try:
+                exposed = {(tgt, p) for key in ('tcp_ports', 'udp_ports')
+                           for p in _safe_ports(r.get(key, ''))}
+            except Exception:
+                continue
+            for host, port in sorted(exposed & rp_targets):
+                errs.append(
+                    f'forward_rules[{i}]（端口 {port} → {tgt}）会绕过认证：'
+                    f'{tgt}:{port} 已有已启用的反代规则承载该服务，'
+                    f'端口转发走 nftables DNAT、不经过 nginx 的认证层，'
+                    f'会形成一条免登录的公网入口。建议删掉这条转发，'
+                    f'改用反代访问该服务。'
+                )
+    return errs
+
+
 def validate_config(cfg):
     """校验配置中所有会进入 nft 规则的字段，返回错误列表（空列表 = 通过）"""
     errs = []
@@ -764,36 +815,11 @@ def validate_config(cfg):
     # 若这个组合正好是某条已启用反代规则的后端地址，那条认证路径就被旁路了：
     # 敲门成功的 IP 可以直接访问该端口，完全不需要登录。
     # ------------------------------------------------------------------
-    rp_targets = set()
-    rp = cfg.get('reverse_proxy')
-    if isinstance(rp, dict) and isinstance(rp.get('rules'), list):
-        for r in rp['rules']:
-            if not isinstance(r, dict) or not r.get('enabled'):
-                continue
-            host, _, port = str(r.get('target_address', '')).rpartition(':')
-            if host and _is_port(port):
-                rp_targets.add((host.strip(), int(port)))
-
-    if rp_targets and isinstance(cfg.get('forward_rules'), list):
-        for i, r in enumerate(cfg.get('forward_rules') or [], 1):
-            if not isinstance(r, dict):
-                continue
-            tgt = str(r.get('target_ip', '') or '').strip()
-            if not tgt:
-                continue
-            try:
-                exposed = {(tgt, p) for key in ('tcp_ports', 'udp_ports')
-                           for p in _safe_ports(r.get(key, ''))}
-            except Exception:
-                continue
-            for host, port in sorted(exposed & rp_targets):
-                errs.append(
-                    f'forward_rules[{i}]（端口 {port} → {tgt}）会绕过认证：'
-                    f'{tgt}:{port} 已有已启用的反代规则承载该服务，'
-                    f'端口转发走 nftables DNAT、不经过 nginx 的认证层，'
-                    f'会形成一条免登录的公网入口。建议删掉这条转发，'
-                    f'改用反代访问该服务。'
-                )
+    # ------------------------------------------------------------------
+    # 端口转发与反代服务的交叉校验。实现见 _rp_forward_conflicts ——
+    # 反代 CRUD 也要用它，所以不能在这里内联一份。
+    # ------------------------------------------------------------------
+    errs.extend(_rp_forward_conflicts(cfg))
 
     # ------------------------------------------------------------------
     # v0.8.0：部署模式 + 认证网关配置校验
@@ -1556,20 +1582,24 @@ def preview_rules_changes():
 
 @app.route('/api/rules/save', methods=['POST'])
 def save_rules():
-    """生成规则并写入文件"""
-    config = load_config()
-    rules = build_rules(config)
+    """已废弃 —— 转发到 /api/rules/apply 的完整安全路径。
 
-    os.makedirs(os.path.dirname(RULES_PATH), exist_ok=True)
+    原实现是 build_rules() + 直接写盘，绕过了 v0.8.x 加的**全部**三样东西：
 
-    # 备份
-    if os.path.exists(RULES_PATH):
-        shutil.copy(RULES_PATH, RULES_PATH + '.backup')
+      · _config_corrupted_response()：配置损坏时 load_config() 返回硬编码的
+        DEFAULT_CONFIG（内含他人网段）。原实现拿它直接落盘，等于把陌生网段
+        写进真实防火墙，还回报 success: true。/api/rules/apply 正是为了堵
+        这一点才有 _config_corrupted_response()。
+      · _FW_APPLY_LOCK：与看门狗的 nft -f 交叉执行会得到无法预测的中间规则集。
+      · _apply_ruleset() 的语法校验与失败回滚：原实现写完就返回，
+        规则集坏掉要等看门狗下次自愈才被发现。
 
-    with open(RULES_PATH, 'w') as f:
-        f.write(rules)
-
-    return jsonify({"success": True, "message": "规则已保存", "path": RULES_PATH})
+    本文件 2082 行的注释已经写明「避免出现某条路径跳过了校验和回滚」——
+    这条路径当时就是那个例外。tools/check-api-coverage.py 报出它全仓 0 引用，
+    是个没有任何调用方的旁路。保留端点只为不打断可能存在的外部调用方
+    （curl / 脚本），语义直接对齐 apply。
+    """
+    return apply_rules()
 
 
 # === 网络配置辅助函数 ===
@@ -2294,6 +2324,17 @@ def update_ipv6():
         forward_rules = config.get("forward_rules", [])
         updated = []
 
+        # 与 IPV6_CRON_SCRIPT 保持一致：写路由器本机地址，供 DDNS 的
+        # ip_script 读。之前只有 cron 脚本写这个文件，手动点「更新 IPv6」
+        # 只改了内核 set，/tmp/ddns-ipv6-* 始终是空的 —— 阿里云 DDNS 和
+        # 通用 DDNS（ip_script=/bin/cat /tmp/ddns-ipv6-N）读到的还是旧值，
+        # IPv6 记录静默停在过期地址上，没有任何报错。
+        try:
+            with open("/tmp/ddns-ipv6-0", "w") as f:
+                f.write(f"{prefix}::1")
+        except OSError as e:
+            print(f"[WARN] 写 /tmp/ddns-ipv6-0 失败: {e}", flush=True)
+
         for idx, rule in enumerate(forward_rules, 1):
             set_name = f"nas_ip6_{idx}"
             # 清空该规则的集合
@@ -2319,6 +2360,12 @@ def update_ipv6():
                 "success": result.returncode == 0,
                 "error": result.stderr.strip() if result.returncode != 0 else None,
             })
+            # 同上：与 cron 脚本一样把完整地址落到中转文件，DDNS 才读得到
+            try:
+                with open(f"/tmp/ddns-ipv6-{idx}", "w") as f:
+                    f.write(full_ipv6)
+            except OSError as e:
+                print(f"[WARN] 写 /tmp/ddns-ipv6-{idx} 失败: {e}", flush=True)
 
         return jsonify({
             "success": True,
@@ -4195,14 +4242,20 @@ def _harden_key_for_nginx_worker(path):
 
     为什么必须跟着每次证书写入一起做
     ------------------------------
-    下面三处（上传 / ACME 续期 / 自签生成）都会 `os.chmod(key, 0o600)`。
-    那是对的 —— 私钥本就不该被别人读到。但 nginx worker 现在以
+    写入私钥的路径一共五条，其中三条会自己 `chmod(key, 0o600)`：
+        · 上传        app.py  cert_file.save 后 chmod
+        · 重新上传    app.py  cert_file.save 后 chmod
+        · 自签生成    app.py  openssl 之后 chmod
+    另外两条是 ACME 路径（_acme_issue / _acme_renew），acme.sh 自己写出
+    privkey.pem 600 root，**项目这边根本不 chmod**，所以必须显式调本函数。
+
+    chmod 600 本身是对的 —— 私钥本就不该被别人读到。但 nginx worker 现在以
     NGINX_WORKER_USER 运行，它必须能读私钥才能做 TLS 握手，于是：
         只改一次 nginx 的 user → 下一次换证书，worker 立刻读不到私钥
     而 nginx 的表现是「握手失败」，前端只看到一个 TLS 报错，没有任何提示
     说明是权限 —— 这种故障极难排查。
 
-    所以规则是：**谁把权限打回 600，谁就负责把它补成 worker 可读。**
+    所以规则是：**谁把私钥写到磁盘上，谁就负责保证 nginx worker 读得到。**
     640 root:<worker 组> 对「其他用户」依然完全关闭；worker 组在 OpenWrt
     上是 nobody 组、没有任何成员，实际暴露面和 600 等价，只是多了 nginx
     这一条读取路径。
@@ -4653,6 +4706,43 @@ def _next_id(prefix, existing_ids):
             nums.append(int(m.group(1)))
     n = max(nums) + 1 if nums else 1
     return f"{prefix}_{n:03d}"
+
+
+def _cert_key_pair_ok(cert_path, key_path):
+    """校验证书与私钥是否配对，返回 (是否配对, 失败原因)。
+
+    为什么必须校验
+    --------------
+    上传/重传原来只做了域名正则 + 三字段非空，然后把文件直接落盘。
+    传错私钥（很容易：同一域名换证书时把两个文件选反了）的话，nginx 会
+    拿着不匹配的 key 做 TLS 握手 —— 表现是浏览器一个证书错误，
+    而面板这边 expires_at 正常、UI 照样显示「● 有效」，排障方向会被
+    完全带偏到「是不是 nginx 配置错了」。
+
+    做法是比较两边的公钥：`openssl x509 -pubkey` 取证书里的公钥，
+    `openssl pkey -pubout` 取私钥推导出的公钥。用 pkey 而不是 rsa，
+    是为了 RSA / ECDSA 两种私钥都能过。
+    """
+    if not (cert_path and key_path and os.path.exists(cert_path)
+            and os.path.exists(key_path)):
+        return False, "证书或私钥文件不存在"
+    try:
+        c = subprocess.run(["openssl", "x509", "-in", cert_path, "-noout", "-pubkey"],
+                           capture_output=True, text=True, timeout=10)
+        k = subprocess.run(["openssl", "pkey", "-in", key_path, "-pubout"],
+                           capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        # 校验不了不等于校验失败 —— openssl 缺失等环境问题不该拦住用户存证书
+        return True, f"无法校验（{type(e).__name__}），已跳过"
+    if c.returncode != 0:
+        return False, "证书文件无法解析（可能不是 PEM 格式的 x509 证书）"
+    if k.returncode != 0:
+        return False, "私钥文件无法解析（可能不是 PEM 格式的私钥）"
+    pub_c = "".join(c.stdout.split())
+    pub_k = "".join(k.stdout.split())
+    if pub_c != pub_k:
+        return False, "证书与私钥不配对（两个文件的公钥不一致）"
+    return True, "配对正常"
 
 
 def _get_cert_expiry(cert_path):
@@ -5182,6 +5272,12 @@ def _acme_issue(domain, dns_provider="ali", dns_credentials=None):
     except Exception as e:
         return False, {"error": str(e)}
 
+    # acme.sh 以 root 写出 privkey.pem（600 root）。nginx worker 现在以
+    # NGINX_WORKER_USER 运行，不补组读权限的话它读不到私钥 → TLS 握手失败，
+    # 而面板这边 expires_at 正常、UI 显示「有效」，故障表现为浏览器一个
+    # 证书错误，排障方向会被完全带偏。
+    _harden_key_for_nginx_worker(keyfile)
+
     expires_at, days = _get_cert_expiry(fullchain)
     return True, {
         "cert_path": fullchain,
@@ -5219,6 +5315,9 @@ def _acme_renew(domain, dns_provider="ali", dns_credentials=None):
 
     cert_dir = os.path.join(NGINX_SSL_DIR, domain)
     fullchain = os.path.join(cert_dir, "fullchain.pem")
+    # 同 _acme_issue：续期会重写 privkey.pem，权限必须跟着补。
+    # 路径固定可推导，不需要问 acme.sh 要 key 在哪。
+    _harden_key_for_nginx_worker(os.path.join(cert_dir, "privkey.pem"))
     expires_at, days = _get_cert_expiry(fullchain)
     return True, {"new_expires_at": expires_at, "days_remaining": days}
 
@@ -5388,10 +5487,17 @@ def gateway_set_config():
         return jsonify({"success": False, "message": "；".join(errs),
                         "errors": errs}), 400
 
-    save_config(new_cfg)
+    # 先部署、后落盘 —— 与反代规则 CRUD 同一顺序。
+    # 原来是 save_config() 在前：一旦 nginx 部署失败，磁盘上已经是新配置，
+    # 而生效的是旧配置，两者从此不一致；用户看到「配置已保存但网关部署失败」，
+    # 下次再动别的字段时又会基于这份落盘配置重新生成，静默放大问题。
+    # _deploy_gateway_nginx 自己带快照与 _undo，失败不留痕。
     deploy_ok, deploy_msg = _deploy_gateway_nginx(new_cfg)
     if not deploy_ok:
-        return jsonify({"success": False, "message": f"配置已保存但网关部署失败：{deploy_msg}"}), 500
+        return jsonify({"success": False,
+                        "message": f"网关部署失败，配置未保存：{deploy_msg}"}), 500
+
+    save_config(new_cfg)
 
     # 改的是防火墙侧要放行的端口，必须同步 nftables，否则「配好了但公网连不上」
     fw_ok, fw_msg = _apply_ruleset(new_cfg)
@@ -5450,6 +5556,15 @@ def rp_create_rule():
             "created_at": now_iso, "updated_at": now_iso}
     rp["rules"].append(rule)
 
+    # 交叉校验：这条反代的目标如果已经有端口转发指向它，就形成了一条免登录
+    # 的公网入口 —— DNAT 走 nftables，根本不经过 nginx 的认证层。
+    # 必须放在 append 之后（config 里才是候选状态）、部署之前（拦住才不生成
+    # nginx 配置）。rp 是 config 的子字典引用，所以 pop 能干净地撤销 append。
+    conflicts = _rp_forward_conflicts(config)
+    if conflicts:
+        rp["rules"].pop()
+        return jsonify({"success": False, "message": "；".join(conflicts)}), 400
+
     # 顺序：先部署、后落盘。
     # 部署失败时**不保存**，否则这条规则会永久留在配置里 —— 之后每一次
     # 反代保存都会重新生成同样失败的 nginx 配置并返回 500，整个功能瘫掉。
@@ -5486,10 +5601,19 @@ def rp_update_rule(rule_id):
 
     now_iso = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S+08:00")
     created_at = rule.get("created_at", now_iso)
+    original = dict(rule)          # 交叉校验失败时要原样还回去
     rule.clear()
     rule.update({"id": rule_id, **clean,
                  "created_at": created_at,
                  "updated_at": now_iso})
+
+    # 交叉校验（同新建）：改动后的目标若与端口转发撞上，就是免登录入口。
+    # 校验的是「已改完」的候选状态，所以放在 mutate 之后、部署之前。
+    conflicts = _rp_forward_conflicts(config)
+    if conflicts:
+        rule.clear()
+        rule.update(original)
+        return jsonify({"success": False, "message": "；".join(conflicts)}), 400
 
     # 同新建：先部署、后落盘，部署失败不保存（理由见 rp_create_rule）
     deploy_ok, deploy_msg = _deploy_all_rules(config)
@@ -5663,8 +5787,28 @@ def rp_upload_cert():
     os.makedirs(cert_dir, exist_ok=True)
     fullchain_path = os.path.join(cert_dir, "fullchain.pem")
     key_path = os.path.join(cert_dir, "privkey.pem")
-    cert_file.save(fullchain_path)
-    key_file.save(key_path)
+
+    # 先落到临时文件校验，通过了再覆盖正式文件。
+    # 直接 save 到正式路径的话，传错私钥就已经把原来能用的证书冲掉了 ——
+    # 而 nginx 还在用旧证书配新私钥，故障立刻出现且不可逆。
+    tmp_c = fullchain_path + ".upload.tmp"
+    tmp_k = key_path + ".upload.tmp"
+    try:
+        cert_file.save(tmp_c)
+        key_file.save(tmp_k)
+        ok, why = _cert_key_pair_ok(tmp_c, tmp_k)
+        if not ok:
+            _unlink_quiet(tmp_c)
+            _unlink_quiet(tmp_k)
+            return jsonify({"success": False,
+                            "message": f"证书校验未通过：{why}"}), 400
+        os.replace(tmp_c, fullchain_path)
+        os.replace(tmp_k, key_path)
+    except Exception as e:
+        _unlink_quiet(tmp_c)
+        _unlink_quiet(tmp_k)
+        return jsonify({"success": False, "message": f"写入证书失败: {e}"}), 500
+
     os.chmod(key_path, 0o600)
     _harden_key_for_nginx_worker(key_path)
 
@@ -5767,8 +5911,20 @@ def rp_reupload_cert(cert_id):
         return jsonify({"success": False, "message": "证书路径配置异常"}), 500
 
     try:
-        cert_file.save(cert_path)
-        key_file.save(key_path)
+        tmp_c = cert_path + ".reupload.tmp"
+        tmp_k = key_path + ".reupload.tmp"
+        cert_file.save(tmp_c)
+        key_file.save(tmp_k)
+        # 同 upload：先校验再覆盖。传错私钥时原来能用的证书必须保住 ——
+        # nginx 正在用它，被冲掉就是立即且不可逆的握手失败。
+        ok, why = _cert_key_pair_ok(tmp_c, tmp_k)
+        if not ok:
+            _unlink_quiet(tmp_c)
+            _unlink_quiet(tmp_k)
+            return jsonify({"success": False,
+                            "message": f"证书校验未通过：{why}"}), 400
+        os.replace(tmp_c, cert_path)
+        os.replace(tmp_k, key_path)
         os.chmod(key_path, 0o600)
         _harden_key_for_nginx_worker(key_path)
     except OSError as e:

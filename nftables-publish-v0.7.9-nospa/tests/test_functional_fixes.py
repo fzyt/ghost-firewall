@@ -1,0 +1,257 @@
+"""功能性审查发现的 7 个缺陷的回归测试。
+
+运行:  PYTHONDONTWRITEBYTECODE=1 python3 tests/test_functional_fixes.py
+
+  FIX-1  ACME 申请/续期后必须补私钥权限（nginx worker 已降权，读不到会握手失败）
+  FIX-2  证书 source 取值前后端一致（不一致会让续期按钮永远不显示）
+  FIX-3  /auth/static/ 下的 HTML 必须带 CSP（真机实测过它可达且无该头）
+  FIX-4  网关配置必须先部署后落盘（原来反过来，失败时磁盘已是新配置）
+  FIX-5  反代 CRUD 必须做与端口转发的交叉校验（防免认证 DNAT 直达）
+  FIX-6  手动更新 IPv6 必须写 /tmp/ddns-ipv6-*（只有 cron 脚本写 → IPv6 DDNS 静默失效）
+  FIX-7  上传/重传必须校验证书与私钥配对，且校验失败不覆盖原文件
+  FIX-8  /api/rules/save 不再绕过 /api/rules/apply 的安全路径（自己写盘）
+
+每条测试都写成「旧代码必然失败」的形式。沙箱运行：不碰真实路径、
+不执行 openssl / nft / nginx（需要外部命令的分支一律打桩）。
+"""
+import io
+import os
+import re
+import sys
+import contextlib
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BACKEND = os.path.join(ROOT, 'backend')
+sys.path.insert(0, os.path.abspath(BACKEND))
+
+PASS, FAIL = [], []
+
+
+def check(name, ok, detail=''):
+    (PASS if ok else FAIL).append(name)
+    print(('  ✅ ' if ok else '  ❌ ') + name + (f'  — {detail}' if detail else ''))
+
+
+def sec(title):
+    print(f'\n=== {title} ===')
+
+
+APP_SRC = open(os.path.join(BACKEND, 'app.py'), encoding='utf-8').read()
+AUTH_SRC = open(os.path.join(BACKEND, 'auth_gateway.py'), encoding='utf-8').read()
+FE_HTML = open(os.path.join(ROOT, 'frontend', 'index.html'), encoding='utf-8').read()
+
+
+def fn_src(src, name):
+    """取函数体（含下一行 def 之前的内容）。"""
+    m = re.search(rf'^def {re.escape(name)}\(.*?(?=\n@app\.route|\ndef |\nclass |\n# ═)',
+                  src, re.S | re.M)
+    return m.group(0) if m else ''
+
+
+def strip_comments(text):
+    """去掉 # 注释行。
+
+    不剥注释会踩同一个坑踩第二次：解释「为什么原来顺序反了」的注释里
+    写着 save_config()，做位置判断时就把它当成了真正的调用点。
+    """
+    return '\n'.join(l for l in text.splitlines()
+                     if not l.lstrip().startswith('#'))
+
+
+# ─────────────────────────────────────────────────────────────
+sec('FIX-1  ACME 申请/续期后补私钥权限')
+
+_issue = fn_src(APP_SRC, '_acme_issue')
+_renew = fn_src(APP_SRC, '_acme_renew')
+check('_acme_issue 内有 _harden_key_for_nginx_worker',
+      '_harden_key_for_nginx_worker' in _issue,
+      'acme.sh 以 root 写出 privkey.pem600，worker(nobody) 读不到 → 握手失败')
+check('_acme_renew 内有 _harden_key_for_nginx_worker',
+      '_harden_key_for_nginx_worker' in _renew,
+      '续期会重写 privkey.pem，同样要补')
+check('加固调用在 --install-cert 之后（不是之前）',
+      _issue.find('_harden_key_for_nginx_worker') > _issue.find('--install-cert'),
+      '写在 install-cert 之前等于加固了一个还不存在的文件')
+check('续期里加固的是 privkey.pem 而不是 fullchain',
+      'privkey.pem' in _renew)
+
+# 五条私钥写入路径，三条 chmod + 两条 ACME，全都要覆盖
+_sec_m = re.search(r'def _harden_key_for_nginx_worker.*?(?=\ndef |\n@app\.route|\n# ═)',
+                   APP_SRC, re.S)
+_fn_src = _sec_m.group(0) if _sec_m else ''
+check('docstring 如实列出五条写入路径',
+      '五条' in _fn_src and 'ACME' in _fn_src,
+      '上一版 docstring 写「三处（上传/ACME续期/自签）」但第三处其实是 reupload，'
+      '注释自己撒谎恰好掩盖了 ACME 的缺口')
+
+# ─────────────────────────────────────────────────────────────
+sec('FIX-2  证书 source 取值前后端一致')
+
+_src_vals = set(re.findall(r'"source":\s*"(\w+)"', APP_SRC))
+check('后端写入的 source 取值', bool(_src_vals), str(sorted(_src_vals)))
+check('后端用的是 auto/manual', _src_vals == {'auto', 'manual'}, str(sorted(_src_vals)))
+
+_fe_src_vals = set(re.findall(r"cert\.source === '(\w+)'", FE_HTML))
+check('前端判断的 source 取值', bool(_fe_src_vals), str(sorted(_fe_src_vals)))
+# 注意是「前端用到的值必须都在后端集合内」，不是两边集合完全相等 ——
+# 前端只关心它要判的那一个值，没理由把另一个也写进模板里。
+check('前端用到的取值后端确实会写（否则续期按钮永不显示）',
+      _fe_src_vals and _fe_src_vals <= _src_vals,
+      f'前端 {sorted(_fe_src_vals)} 必须是后端 {sorted(_src_vals)} 的子集')
+check("前端不再残留 'acme' 判断", 'acme' not in _fe_src_vals)
+check('后端 /renew 的守卫与前端一致（只接受 auto）',
+      re.search(r'cert\.get\("source"\) != "auto"', APP_SRC) is not None)
+
+# ─────────────────────────────────────────────────────────────
+sec('FIX-3  /auth/static/ 下的 HTML 带 CSP')
+
+_static = fn_src(AUTH_SRC, 'static_files')
+check('static_files 里设了 CSP',
+      'Content-Security-Policy' in _static,
+      '真机实测：/auth/static/login.html 返回 200 且无该响应头')
+check('CSP 只对 HTML 加（CSS/JS 加了也无害但没必要）',
+      re.search(r'endswith\("\.html"\)|endswith\(\'\.html\'\)', _static) is not None)
+check('CSP 值来自常量而不是就地再抄一份',
+      'CSP_PORTAL_HTML' in _static and 'CSP_LOGIN_HTML' in _static,
+      '就地再抄一份迟早分叉')
+check('login.html 与 portal.html 用的是不同 CSP（form-action 不同）',
+      'CSP_PORTAL_HTML if filename == "portal.html" else CSP_LOGIN_HTML' in _static)
+check('两个常量都已定义',
+      'CSP_LOGIN_HTML = (' in AUTH_SRC and 'CSP_PORTAL_HTML = (' in AUTH_SRC)
+check('门户页与登录页改用常量（不再内联第二份）',
+      _static.count('Content-Security-Policy') == 1
+      and fn_src(AUTH_SRC, 'portal_page').count('Content-Security-Policy') == 1
+      and fn_src(AUTH_SRC, 'auth_login_page').count('Content-Security-Policy') == 1)
+
+# ─────────────────────────────────────────────────────────────
+sec('FIX-4  网关配置先部署后落盘')
+
+_gw = fn_src(APP_SRC, 'gateway_set_config')
+if not _gw:
+    # 函数名可能不同，从路由装饰器兜底
+    m = re.search(r'@app\.route\(\s*[\'"]/api/gateway/config[\'"].*?(?=\n@app\.route)',
+                  APP_SRC, re.S)
+    _gw = m.group(0) if m else ''
+check('找到网关配置保存路由', bool(_gw), '' if _gw else '未找到 /api/gateway/config')
+
+# 顺序判断必须剥注释：解释「为什么原来顺序反了」的注释里就写着 save_config()，
+# 而且那句注释的字节位置恰好落在真正调用之前，不剥就会读出「顺序反了」的假象。
+_gw_code = strip_comments(_gw)
+_i_save = _gw_code.find('save_config(')
+_i_deploy = _gw_code.find('_deploy_gateway_nginx(')
+check('先部署、后落盘',
+      _i_deploy != -1 and _i_save != -1 and _i_deploy < _i_save,
+      f'deploy@{_i_deploy} save@{_i_save}'
+      + ('' if (_i_deploy != -1 and _i_save != -1 and _i_deploy < _i_save) else ' —— 顺序反了'))
+# 同样剥注释：那条「配置已保存但网关部署失败」是旧文案，当前只该出现在解释它的注释里
+check('部署失败的提示不再声称「已保存」',
+      '配置已保存但网关部署失败' not in _gw_code,
+      '落盘在前时说「已保存」是实话，但下一次改别的字段会基于这份落盘配置重新生成')
+check('部署失败时明确告知配置未保存',
+      '配置未保存' in _gw_code)
+
+# ─────────────────────────────────────────────────────────────
+sec('FIX-5  反代 CRUD 做与端口转发的交叉校验')
+
+_conf = fn_src(APP_SRC, '_rp_forward_conflicts')
+check('_rp_forward_conflicts 已抽成独立函数', bool(_conf))
+check('validate_config 调用它（不再内联一份）',
+      '_rp_forward_conflicts(cfg)' in fn_src(APP_SRC, 'validate_config'))
+check('validate_config 内不再残留 rp_targets 内联逻辑',
+      'rp_targets = set()' not in fn_src(APP_SRC, 'validate_config'),
+      '两份逻辑迟早分叉 —— 反代的 PUT 就是这么漏的')
+
+for fn in ('rp_create_rule', 'rp_update_rule'):
+    body = fn_src(APP_SRC, fn)
+    check(f'{fn} 调用了交叉校验',
+          '_rp_forward_conflicts(' in body,
+          '不调用就能构造免登录入口：先建转发、再建指向同一后端的反代')
+    check(f'{fn} 校验在部署之前',
+          body.find('_rp_forward_conflicts(') != -1
+          and body.find('_rp_forward_conflicts(') < body.find('_deploy_all_rules('))
+    check(f'{fn} 冲突时撤销了内存里的改动',
+          re.search(r'rp\["rules"\]\.pop\(\)|rule\.update\(original\)', body) is not None)
+
+# ─────────────────────────────────────────────────────────────
+sec('FIX-6  手动更新 IPv6 写中转文件')
+
+_ipv6 = fn_src(APP_SRC, 'update_ipv6')
+# 断言必须盯 open() 调用本身。只找 '/tmp/ddns-ipv6-0' 这个字面量的话，
+# 旁边 print("[WARN] 写 /tmp/ddns-ipv6-0 失败") 里也有同样的串 —— 变异把
+# 真正的写入删掉、把警告留着，测试照样全绿。这已经是第三次被注释/旁证字面量骗了。
+_writes = re.findall(r'with open\((f?)"/tmp/ddns-ipv6-(0|\{idx\})",\s*"w"\)', _ipv6)
+check('update_ipv6 写 /tmp/ddns-ipv6-0（路由器本机地址）',
+      ('', '0') in _writes,
+      'DDNS 的 ip_script 读的就是这个文件；已匹配到 ' + str(_writes))
+check('update_ipv6 写 /tmp/ddns-ipv6-{idx}（各条转发）',
+      ('f', '{idx}') in _writes,
+      '已匹配到 ' + str(_writes))
+check('两处写入都在（不是只写本机地址）', len(_writes) == 2, str(_writes))
+
+# 每处写入都必须被 try/except OSError 包住：写不进去是环境问题，
+# 让整个接口 500 反而把「DDNS 输入缺失」变成一个看不出原因的故障。
+_guards = re.findall(r'try:\s*\n(?:[^\n]*\n)*?[^\n]*with open\([^\n]*ddns-ipv6[^\n]*\n(?:[^\n]*\n)*?\s*except OSError[^\n]*:\s*\n\s*print\(',
+                     strip_comments(_ipv6))
+check('两处写入都包了 try/except OSError（IO 失败不阻断主流程）',
+      len(_guards) == 2,
+      f'匹配到 {len(_guards)} 处 —— 保护数与写入数不等就说明有裸写的')
+
+# ─────────────────────────────────────────────────────────────
+sec('FIX-7  上传/重传校验证书与私钥配对')
+
+_pair = fn_src(APP_SRC, '_cert_key_pair_ok')
+check('_cert_key_pair_ok 函数存在', bool(_pair))
+check('比较的是两边的公钥（不是比字符串）',
+      'x509' in _pair and '-pubkey' in _pair and 'pkey' in _pair and '-pubout' in _pair)
+check('用 pkey 而不是 rsa（ECDSA 私钥也能过）',
+      '["openssl", "pkey"' in _pair)
+check('公钥不一致时判定为不配对（整个校验的核心）',
+      re.search(r'if pub_c != pub_k:\s*\n\s*return False',
+                strip_comments(_pair)) is not None,
+      '只把两边公钥都取出来却从不比较 = 校验形同虚设，恰好还是原来那个 bug')
+# 剥注释：except 与 return True 之间夹着解释「为什么放行」的一行注释
+check('openssl 不可用时放行，不拦用户存证书',
+      re.search(r'except Exception[^\n]*:\s*\n\s*return True',
+                strip_comments(_pair)) is not None,
+      '校验不了 ≠ 校验失败，环境缺 openssl 不该拦住用户存证书')
+
+for fn, tmp_c, tmp_k in (('rp_upload_cert', '.upload.tmp', '.upload.tmp'),
+                         ('rp_reupload_cert', '.reupload.tmp', '.reupload.tmp')):
+    body = fn_src(APP_SRC, fn)
+    check(f'{fn} 调用了配对校验',
+          '_cert_key_pair_ok(' in body)
+    check(f'{fn} 先写临时文件再校验',
+          f'{tmp_c}' in body and f'{tmp_k}' in body,
+          '直接 save 到正式路径的话，传错私钥已经把原来能用的证书冲掉了')
+    check(f'{fn} 校验失败时删除临时文件并返回 400',
+          re.search(r'if not ok:.*?_unlink_quiet.*?400', body, re.S) is not None)
+    check(f'{fn} 校验通过才 os.replace 覆盖正式文件',
+          'os.replace(' in body)
+
+check('垃圾文件（非 x509）会被拒绝而不是入库',
+      'return False, "证书文件无法解析' in _pair)
+
+# ─────────────────────────────────────────────────────────────
+sec('FIX-8  /api/rules/save 不绕过 apply 的安全路径')
+
+_save = fn_src(APP_SRC, 'save_rules')
+check('/api/rules/save 转发给 apply_rules',
+      re.search(r'\n\s*return apply_rules\(\)', strip_comments(_save)) is not None,
+      '自己 build_rules + 写盘会同时绕过配置损坏守卫、_FW_APPLY_LOCK、'
+      '语法校验与失败回滚这四样')
+check('不再直接往 RULES_PATH 写盘',
+      not re.search(r'open\(RULES_PATH,\s*[\'"]w[\'"]\)', _save))
+check('apply_rules 侧的配置损坏守卫还在（save 现在共用它）',
+      '_config_corrupted_response()' in fn_src(APP_SRC, 'apply_rules'))
+check('apply_rules 走加锁下发（save 现在共用它）',
+      '_apply_ruleset(config)' in fn_src(APP_SRC, 'apply_rules'))
+
+# ─────────────────────────────────────────────────────────────
+print()
+if FAIL:
+    print(f'❌ 失败 {len(FAIL)} 项：')
+    for f in FAIL:
+        print('   - ' + f)
+    sys.exit(1)
+print(f'通过 {len(PASS)} / {len(PASS)}')
+print('全部通过')

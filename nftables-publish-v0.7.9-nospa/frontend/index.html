@@ -2119,7 +2119,7 @@
                         class="px-3 py-1 border border-black rounded text-xs hover:bg-gray-50 disabled:opacity-50 transition-colors">
                         设为默认
                       </button>
-                      <button x-show="cert.source === 'acme'" @click="renewRpCert(cert)" :disabled="rpUploading"
+                      <button x-show="cert.source === 'auto'" @click="renewRpCert(cert)" :disabled="rpUploading"
                         class="px-3 py-1 border border-black rounded text-xs hover:bg-gray-50 disabled:opacity-50 transition-colors">
                         续期
                       </button>
@@ -2134,7 +2134,7 @@
                     </div>
                   </div>
                   <div class="text-sm space-y-1">
-                    <p><span class="text-gray-500">来源：</span><span x-text="cert.source === 'acme' ? '自动申请' : '手动上传'"></span><span x-show="cert.source === 'acme' && cert.dns_provider" class="text-gray-400"> (<span x-text="cert.dns_provider"></span>)</span></p>
+                    <p><span class="text-gray-500">来源：</span><span x-text="cert.source === 'auto' ? '自动申请' : '手动上传'"></span><span x-show="cert.source === 'auto' && cert.dns_provider" class="text-gray-400"> (<span x-text="cert.dns_provider"></span>)</span></p>
                     <p x-show="cert.issuer"><span class="text-gray-500">颁发者：</span><span x-text="cert.issuer"></span></p>
                     <p><span class="text-gray-500">有效期：</span>
                       <span x-show="cert.not_before && cert.expires_at" x-text="(cert.not_before || '') + ' ~ ' + (cert.expires_at || '')"></span>

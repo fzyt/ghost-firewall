@@ -184,6 +184,19 @@ fi''', ':')]),
      APP_PY, [('''    except OSError:
         return False''', '''    except OSError:
         raise''')]),
+
+    # N8/N9 针对 P0-2 本身。旧版断言按参数名统计，这两条路径传的不是 key_path，
+    # 从来没进过计数 —— 也就是说没有任何变异能打中「ACME 漏加固」这个缺陷。
+    ('N8  _acme_issue 少一处补权限（acme.sh 写的 privkey worker 读不到）',
+     APP_PY, [('    _harden_key_for_nginx_worker(keyfile)', '    pass')]),
+
+    ('N9  _acme_renew 少一处补权限（续期重写 privkey 后又是 600 root）',
+     APP_PY, [('    _harden_key_for_nginx_worker(os.path.join(cert_dir, "privkey.pem"))',
+               '    pass')]),
+
+    ('N10 chmod 之后紧跟的补权限被挪到 chmod 之前（顺序反了等于没加固）',
+     APP_PY, [('    os.chmod(key_path, 0o600)\n    _harden_key_for_nginx_worker(key_path)',
+               '    _harden_key_for_nginx_worker(key_path)\n    os.chmod(key_path, 0o600)')]),
 ]
 
 

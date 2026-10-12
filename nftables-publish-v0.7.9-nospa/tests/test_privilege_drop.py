@@ -383,10 +383,21 @@ sec('PD-11  私钥权限：每次写入后都要补组读，否则 worker 读不
 _app_src = open(os.path.join(BACKEND, 'app.py'), encoding='utf-8').read()
 check('_harden_key_for_nginx_worker 函数存在', '_harden_key_for_nginx_worker' in _app_src)
 _n_chmod = len(re.findall(r'os\.chmod\((?:key_path|NFTABLES_WEB_KEY),\s*0o600\)', _app_src))
-_n_hard = len(re.findall(r'_harden_key_for_nginx_worker\((?:key_path|NFTABLES_WEB_KEY)\)', _app_src))
+# 关键：这里数的是**全部**调用点，不能按参数名过滤。
+# 原版写的是 re.findall(r'_harden_key_for_nginx_worker\((?:key_path|NFTABLES_WEB_KEY)\)'),
+# 而两条 ACME 路径传的是 `keyfile` 和 `os.path.join(cert_dir, "privkey.pem")` ——
+# 于是它们从来没进过统计。断言号称「补权限与 chmod 一一对应」，
+# 却对 P0-2「ACME 路径漏加固」完全失明，那条缺陷就是这样活下来的。
+# 现在改成数所有调用点，五条写入路径必须一条不少。
+_n_hard = len(re.findall(r'^\s+_harden_key_for_nginx_worker\(', _app_src, re.M))
 check('三处 chmod(key, 600) 全部配了补权限', _n_chmod == 3, f'实际 {_n_chmod} 处')
-check('补权限调用数与 chmod 数一一对应', _n_chmod == _n_hard,
-      f'chmod {_n_chmod} 处 / 补权限 {_n_hard} 处 —— 少一处就是「下次换证书 TLS 握手失败」')
+check('五条私钥写入路径都调了补权限（含两条不 chmod 的 ACME 路径）',
+      _n_hard == 5, f'实际 {_n_hard} 处')
+# 三条会 chmod 的路径必须是 chmod 之后紧跟加固：顺序反了等于去加固一个还没被改过的权限
+_ORDER_RE = r'os\.chmod\((?:key_path|NFTABLES_WEB_KEY),\s*0o600\)\s*\n\s*_harden_key_for_nginx_worker\('
+check('chmod 之后紧跟补权限（顺序反了等于没加固）',
+      len(re.findall(_ORDER_RE, _app_src)) == 3,
+      f'实际匹配 {len(re.findall(_ORDER_RE, _app_src))} 处')
 # 注意这里必须精确盯 OSError 那一支：函数里有两个 return False
 # （ImportError 分支 + OSError 分支），非贪婪的 `.*?return False`
 # 会匹配到第一个，把第二个改成 raise 也照样「通过」—— 变异验证实测过。

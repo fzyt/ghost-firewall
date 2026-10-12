@@ -147,6 +147,25 @@ STATIC_ALLOWED = frozenset({
     "portal.html", "portal.js",
 })
 
+# 两个 HTML 页面的 CSP。两者只差 form-action：登录页有表单要提交到
+# /auth/login，门户页没有表单。
+#
+# 抽成常量是因为 /auth/static/ 也必须用同一套 —— 之前 CSP 只加在
+# `/` 和 `GET /auth/login` 两个路由上，而 /auth/static/ 是白名单里的
+# 静态文件直达路径，同样能取到 login.html / portal.html。
+# 真机实测过：/auth/static/login.html 返回 200 且**没有**该响应头，
+# nginx 里 location /auth/static/ 排在 location /auth/ 之前，
+# 最长前缀匹配，所以它真的可达，不是一纸空谈。
+CSP_LOGIN_HTML = (
+    "default-src 'none'; script-src 'self'; style-src 'self'; "
+    "connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+)
+CSP_PORTAL_HTML = (
+    "default-src 'none'; script-src 'self'; style-src 'self'; "
+    "img-src 'self' data:; connect-src 'self'; "
+    "form-action 'none'; frame-ancestors 'none'; base-uri 'none'"
+)
+
 # 网关内部端点占用的前缀（与 app.py 的 _RESERVED_GATEWAY_PREFIXES 保持一致）
 RESERVED_PREFIXES = ("/_auth", "/auth")
 
@@ -664,6 +683,11 @@ def static_files(filename):
     resp = send_from_directory(STATIC_DIR, filename)
     resp.headers["Cache-Control"] = "no-cache"
     resp.headers["X-Content-Type-Options"] = "nosniff"
+    # HTML 必须带 CSP：白名单里的 login.html / portal.html 从这里也能直接取到，
+    # 少了这一头就等于多了一条绕过 CSP 的路。CSS/JS 加了也无害。
+    if filename.endswith(".html"):
+        resp.headers["Content-Security-Policy"] = (
+            CSP_PORTAL_HTML if filename == "portal.html" else CSP_LOGIN_HTML)
     return resp
 
 
@@ -676,11 +700,7 @@ def portal_page():
     resp.headers["X-Content-Type-Options"] = "nosniff"
     # 门户页自己只发同源请求；CSP 收紧到 'self'，
     # 连内联脚本都禁掉（页面用的是外部 .js 文件）。
-    resp.headers["Content-Security-Policy"] = (
-        "default-src 'none'; script-src 'self'; style-src 'self'; "
-        "img-src 'self' data:; connect-src 'self'; "
-        "form-action 'none'; frame-ancestors 'none'; base-uri 'none'"
-    )
+    resp.headers["Content-Security-Policy"] = CSP_PORTAL_HTML
     return resp
 
 
@@ -695,10 +715,7 @@ def auth_login_page():
     resp.headers["Cache-Control"] = "no-store"
     resp.headers["X-Robots-Tag"] = "noindex, nofollow"
     resp.headers["X-Content-Type-Options"] = "nosniff"
-    resp.headers["Content-Security-Policy"] = (
-        "default-src 'none'; script-src 'self'; style-src 'self'; "
-        "connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
-    )
+    resp.headers["Content-Security-Policy"] = CSP_LOGIN_HTML
     return resp
 
 

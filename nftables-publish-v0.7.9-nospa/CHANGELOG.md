@@ -2,6 +2,169 @@
 
 所有重要更改均记录在此文件中。
 
+## [v0.8.3] - 2026-10-12
+
+功能性审查发现的 7 个缺陷修复。**规则链相关问题不在本版范围**（P0-1 见文末）。
+
+### P0-2  ACME 路径漏掉私钥权限加固（上一版引入的回归）
+
+v0.8.2 把 nginx worker 降到了 `nobody`，但私钥仍是 `600 root`。
+上传和重传两条路径都会 `chmod(key, 0o600)` 之后调 `_harden_key_for_nginx_worker()`，
+**ACME 两条路径不会** —— acme.sh 自己写出 `privkey.pem` 600 root，项目这边根本不 chmod。
+
+后果：手动传的证书能用，ACME 申请的证书一续期就 TLS 握手失败。而面板这侧
+`expires_at` 正常、UI 照样显示「● 有效」，排障方向会被完全带偏到「是不是
+nginx 配置错了」。
+
+- `_acme_issue()` 与 `_acme_renew()` 各补一次 `_harden_key_for_nginx_worker()`
+- 顺手修了 `_harden_key_for_nginx_worker` 的 docstring：原来写「三条路径
+  （上传/ACME续期/自签）」，但第三条其实是 reupload 不是 ACME —— **注释自己
+  撒谎，恰好掩盖了 ACME 的缺口**。改成如实列出五条
+
+### P0-3  证书续期按钮永远不显示
+
+后端写 `"source": "auto"`，前端判 `cert.source === 'acme'`。两边对不上，
+ACME 证书的「续期」按钮从来不会出现。
+
+改前端（`cert.source === 'auto'`）而不是改后端：后端 `auto` 已经落进存量
+配置，`/renew` 的 `!= "auto"` 守卫也按 `auto` 写的，动后端会同时打断两者。
+
+### P1-1  反代 CRUD 漏交叉校验，可构造免认证 DNAT 直达
+
+`rp_create_rule` / `rp_update_rule` / `rp_delete_rule` 都不调 `validate_config`，
+所以完全绕过了「端口转发目标不能是已启用的反代服务」这条交叉校验。
+于是可以先建一条端口转发，再建一条指向同一后端的反代 —— DNAT 走 nftables，
+根本不经过 nginx 的认证层，一条完全免登录的公网入口就成立了。
+
+- 把交叉校验抽成唯一入口 `_rp_forward_conflicts(cfg)`，`validate_config` 与
+  反代 CRUD 共用。两份逻辑迟早分叉，PUT 就是这么漏的
+- `rp_create_rule` 在 append 后、部署前校验，冲突时 `rp["rules"].pop()` 撤销
+- `rp_update_rule` 在 mutate 后、部署前校验，冲突时 `rule.update(original)` 还原
+- 新增 `tools/check-api-coverage.py`：比对前后端接口覆盖度
+
+### P1-2  `/auth/static/` 下的 HTML 拿不到 CSP
+
+`location /auth/static/` 排在 `location /auth/` 之前，所以 `login.html` 和
+`portal.html` 可以直接从静态路径取到（真机实测返回 200），**不带 CSP** ——
+等于多了一条绕过 CSP 的路。
+
+- `auth_gateway.py` 新增 `CSP_LOGIN_HTML` / `CSP_PORTAL_HTML` 常量
+- `static_files` 对 `.html` 按文件名选对应 CSP；门户页与登录页改用常量，
+  不再各自内联第二份（两份 form-action 不同的策略迟早分叉）
+
+### P1-3  网关配置先落盘后部署
+
+`/api/gateway/config` 里 `save_config()` 排在 `_deploy_gateway_nginx()` 前面。
+nginx 部署失败时磁盘上已经是新配置、生效的却是旧配置，两者从此不一致；
+提示还写着「配置已保存但网关部署失败」，用户下次动别的字段时又会基于这份
+落盘配置重新生成，把问题静默放大。
+
+改为**先部署、后落盘**，失败时明确返回「网关部署失败，配置未保存」。
+
+### P2-1  手动更新 IPv6 不写 DDNS 中转文件
+
+`/tmp/ddns-ipv6-*` 只有 cron 脚本会写。手动点「更新 IPv6」只改了内核 set，
+中转文件始终是空的 —— 阿里云 DDNS 与通用 DDNS（`ip_script=/bin/cat
+/tmp/ddns-ipv6-N`）读到的还是旧值，**IPv6 记录静默停在过期地址上，没有任何报错**。
+
+`update_ipv6()` 现在同样写 `/tmp/ddns-ipv6-0` 与 `/tmp/ddns-ipv6-{idx}`，
+且写失败只告警不阻断（IO 错误不该让整个接口 500）。
+
+### P2-2  上传证书不校验证书与私钥配对
+
+原来只做域名正则 + 三字段非空就落盘。传错私钥（换证书时两个文件选反，
+非常容易）的话 nginx 拿着不匹配的 key 做 TLS 握手，而面板 `expires_at`
+正常、UI 显示「● 有效」，排障方向同样被带偏。
+
+- 新增 `_cert_key_pair_ok()`：比较两边公钥（`openssl x509 -pubkey` vs
+  `openssl pkey -pubout`）。用 `pkey` 而非 `rsa`，ECDSA 私钥也能过
+- openssl 不可用时**放行**：校验不了 ≠ 校验失败，环境问题不该拦住用户存证书
+- `rp_upload_cert` / `rp_reupload_cert` 改为**先写 `.tmp` 校验、通过才
+  `os.replace` 覆盖** —— 传错私钥时原来能用的证书必须保住
+
+### P2-3  `/api/rules/save` 是一条绕过全部安全机制的旁路
+
+这条是新写的 `tools/check-api-coverage.py` 报出来的：后端 75 条路由里，
+它是唯一一条「有路由、前端零调用」**且**绕过 v0.8.x 全部加固的。
+
+原实现 `build_rules()` + 直接写盘，同时绕过：
+
+- `_config_corrupted_response()` —— 配置损坏时 `load_config()` 返回硬编码
+  `DEFAULT_CONFIG`（内含他人网段），原实现拿它直接落盘，等于把陌生网段写进
+  真实防火墙，还回报 `success: true`
+- `_FW_APPLY_LOCK` —— 与看门狗的 `nft -f` 交叉执行
+- `_apply_ruleset()` 的语法校验与失败回滚
+
+`app.py:2082` 的注释早就写明「避免出现某条路径跳过了校验和回滚」——
+这条路径当时就是那个例外。
+
+改为转发给 `/api/rules/apply`（保留端点，不打断可能存在的 curl / 脚本调用方）。
+**是否直接从路由表删掉更干净，留给你定。**
+
+### 顺带修掉的工具 bug
+
+`tools/check-api-coverage.py` 初版只抓 `api.get/post/...`，漏了 multipart
+上传走的裸 `fetch(...)`，把整条证书上传链路误判成死接口；改用正则抓第一个实参
+又会在拼接 URL 的闭合引号处截断。这两处都会产出「后端有路由但前端从不调用」
+的**假结论** —— 假阳性比漏报更糟，它会让人去删一个其实在用的接口。改成正经解析
+实参（跟踪引号与嵌套）后【A】前端调了但后端没有、【C】方法不匹配均为空。
+
+修正后工具报出的另外 10 条真死接口（前端零调用，且无表单/location 等其他入口）：
+
+```
+/api/knock-info                 /api/network/wan-ipv6
+/api/aliyun-ddns/test           /api/network/install-ipv6-cron
+/api/firewall/china-ips-script  /api/scripts/update-ipv6.sh
+/api/rules/health               /api/auth/change-password
+/api/reverse-proxy/nginx/preview/:id
+/api/reverse-proxy/certificates/:id/reupload
+```
+
+其中 **`/api/reverse-proxy/certificates/:id/reupload` 本轮刚加了配对校验，
+但前端没有任何入口** —— 也就是说那个修复目前只有 curl 能触发。
+是否补一个「重新上传」按钮，也留给你定。
+
+### 测试
+
+新增 `tests/test_functional_fixes.py`（52 条断言）+ `tests/mutation_check_functional.py`
+（25 条变异）。所有变异 100% 被捕获。
+
+跑测试时发现并修掉三处**测试自身的弱点**（不是代码 bug）：
+
+1. 断言匹配到了解释性注释里的字面量（`save_config()`、「配置已保存但网关部署
+   失败」）—— 已加 `strip_comments()`，位置判断前先剥注释
+2. FIX-6 断言只找 `/tmp/ddns-ipv6-*` 这个串，旁边的 `print("[WARN] 写 …失败")`
+   里有同样的串，于是「删掉真正的写入、留着警告」也能通过 —— 改成盯 `open()` 调用本身
+3. `test_privilege_drop.py` 的 PD-11 按参数名 `(key_path|NFTABLES_WEB_KEY)` 统计
+   加固调用点，**把两条 ACME 路径排除在统计之外** —— 这正是 P0-2 能长期存在的
+   原因：断言号称「补权限与 chmod 一一对应」，却对 ACME 完全失明。改成数全部
+   调用点（5 处）并新增「chmod 之后紧跟加固」的顺序断言，对应补 N8/N9/N10 三条变异
+
+### 回归（改动前后各跑一遍）
+
+```
+单元  test_review_fixes 142 · test_privilege_drop 51 · test_auth_gateway 68
+      test_security_fixes · test_fw_recovery · test_log_parser · test_functional_fixes 52
+      前端 test_frontend.js 29                                  —— 全绿
+变异  mutation_check 19/19 · mutation_check_security 10/10
+      mutation_check_privilege 19/19 · mutation_check_functional 25/25 —— 全捕获
+```
+
+### 不在本版范围
+
+- **P0-1**：开启「境外 IP 拦截」但集合为空时，`china_ipv4 drop` 在 `input_wan`
+  链内排第 2 条，敲门在第 25 条、白名单放行在第 30 条 —— 空集合会让 WAN IPv4
+  全断，且语法合法所以不回滚。**规则链问题按要求本轮不改**
+- 面板 9 条低危 finding + 3 个网关低危 finding
+- 证书链路的真机验证见下
+
+### 尚未真机验证
+
+本版代码**尚未部署到 .224**，以下仍需用户在真环境确认：
+证书上传/重传链路、ACME 续期后的 worker 读权限、真实 NAS/DSM 门户后端、
+真实 WAN 敲门限流（.224 无物理 WAN 口且内核不支持任何虚拟网卡类型，
+结构上做不到）。
+
 ## [v0.8.2] - 2026-10-12
 
 认证网关**降权运行**。这是本项目第一次把「公网可达的代码」移出 root 权限域。
