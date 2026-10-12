@@ -1061,7 +1061,99 @@ def _assert_loopback_bind():
         raise SystemExit(1)
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 权限降级
+# ══════════════════════════════════════════════════════════════════════
+
+def _drop_privileges() -> bool:
+    """把进程从 root 降到专用账号。返回是否真的降了。
+
+    为什么这是本文件最要紧的一段
+    ------------------------------
+    本进程是**唯一直接处理公网请求的代码**：面板只在 LAN、认证 API 只在
+    回环，但 nginx 的 auth_request 会把来自公网的每一次请求送进这里。
+    所以「这个进程」本身就是公网攻击面的边界。
+
+    它以 root 运行时，任何一处 RCE 的后果都不是「服务被攻破」，而是
+    **整台机器沦陷**：
+      · ``nft flush ruleset``  → 防火墙全开
+      · kill 看门狗进程        → 规则集被清空后永远不再自愈
+      · 读 /etc/shadow、SSH 私钥、改 nftables-web-config.json
+
+    看门狗挡不住这个场景 —— 它和被保护的对象在同一个 root 权限域里，
+    攻击者拿到 root 的第一件事就是把它关掉。**降权是把「一个服务的漏洞」
+    限制成「一个服务的漏洞」的唯一手段。**
+
+    三条硬约束
+    ----------
+    1. **失败即退出。** 绝不能「打印个警告然后继续以 root 跑」—— 那种
+       代码比不写更糟：读代码的人以为已经降权了，实际没有。
+    2. **顺序不能反。** ``setgid`` 必须在 ``setuid`` 之前：uid 一旦变成
+       非 0，进程就再没权限改 gid，也没有任何办法退回 root。
+    3. **必须清 supplementary groups。** 只 ``setuid`` 不 ``initgroups``
+       的话，残留的组权限照样能读文件 —— 那种降权是假的。
+
+    没设 ``AUTH_DROP_UID`` 就整体跳过：开发机和单元测试不以 root 跑，
+    无条件降权只会让测试跑不起来。真机由 init 脚本注入这三个环境变量；
+    没注入 = 维持既有行为，注入了就必须生效，否则拒绝启动。
+    """
+    raw_uid = os.environ.get("AUTH_DROP_UID", "").strip()
+    if not raw_uid:
+        return False
+
+    try:
+        uid = int(raw_uid)
+        gid = int(os.environ.get("AUTH_DROP_GID", "").strip())
+        user = os.environ.get("AUTH_DROP_USER", "").strip()
+    except ValueError:
+        print("[FATAL] AUTH_DROP_UID / AUTH_DROP_GID 必须是整数。拒绝启动。",
+              flush=True)
+        raise SystemExit(1)
+
+    # uid=0 等于没降权。与其默默放行，不如让配置错误立刻暴露。
+    if uid == 0:
+        print("[FATAL] AUTH_DROP_UID=0 —— 那等于没有降权。拒绝启动。", flush=True)
+        raise SystemExit(1)
+    # 没有用户名就没法 initgroups，而不清组权限的 setuid 是假降权。
+    if not user:
+        print("[FATAL] 缺少 AUTH_DROP_USER：没有用户名就无法清 supplementary "
+              "groups，这样的降权是假的。拒绝启动。", flush=True)
+        raise SystemExit(1)
+
+    if os.getuid() != 0:
+        # 已经是非 root（例如被别的东西降过权再拉起的）。此时 setuid 到
+        # 同 uid 是允许的，但身份对不上说明环境变量与实际不符，不能放过。
+        if os.getuid() == uid and os.getgid() == gid:
+            print(f"[OK] 进程本就是 {user}({uid}:{gid})，无需降权", flush=True)
+            return True
+        print(f"[FATAL] 当前 uid={os.getuid()} gid={os.getgid()}，"
+              f"与要求降到的 {uid}:{gid} 不符。拒绝启动。", flush=True)
+        raise SystemExit(1)
+
+    try:
+        # 顺序见上文约束 2、3：initgroups → setgid → setuid
+        os.initgroups(user, gid)
+        os.setgid(gid)
+        os.setuid(uid)
+    except (OSError, PermissionError, LookupError) as e:
+        # 权限错误是 OSError 的子类，单独列出只为让日志一眼看出是权限问题
+        print(f"[FATAL] 降权到 {user}({uid}:{gid}) 失败: "
+              f"{type(e).__name__}: {e} —— 拒绝以 root 继续运行。", flush=True)
+        raise SystemExit(1)
+
+    # 复核。用 geteuid 不是 getuid：有效 uid 才是内核做权限判定用的那个。
+    if os.geteuid() != uid or os.getuid() != uid or os.getgid() != gid:
+        print(f"[FATAL] 降权后身份不符：euid={os.geteuid()} uid={os.getuid()} "
+              f"gid={os.getgid()}，期望 {uid}/{uid}/{gid}。拒绝继续。", flush=True)
+        raise SystemExit(1)
+
+    print(f"[OK] 权限已降级：{user} uid={uid} gid={gid}", flush=True)
+    return True
+
+
+# 与 _assert_loopback_bind 同为模块级校验：导入即执行，WSGI 加载也逃不掉。
 _assert_loopback_bind()
+_drop_privileges()
 
 
 # ══════════════════════════════════════════════════════════════════════

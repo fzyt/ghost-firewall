@@ -2,6 +2,80 @@
 
 所有重要更改均记录在此文件中。
 
+## [v0.8.2] - 2026-10-12
+
+认证网关**降权运行**。这是本项目第一次把「公网可达的代码」移出 root 权限域。
+
+### 问题
+
+`auth_gateway.py` 是**唯一直接处理公网请求的进程**：面板只在 LAN、认证 API
+只在回环，但 nginx 的 `auth_request` 会把公网流量送进这里。
+
+它此前由 init 脚本以 root 启动，而它**根本不需要 root** —— 只读配置、
+做 PBKDF2、绑 `127.0.0.1:8444`（>1024 不需特权）、调 `logger`（任意用户可调）。
+
+后果不是「服务被攻破」，而是**整台机器沦陷**：任何一处 RCE 都可以
+`nft flush ruleset` 关掉防火墙、`kill` 掉看门狗进程让规则集永远不再自愈、
+读 SSH 私钥与 `/etc/shadow`。看门狗挡不住这个 —— 它和被保护对象在同一个
+root 权限域，攻击者拿到 root 的第一件事就是把它关掉。
+
+### 根因
+
+降权不能靠外部工具：OpenWrt 没有 `useradd` / `adduser` / `su` / `setpriv`
+（busybox 未编译这些 applet），`chroot` 也是 BusyBox 版且**没有 `--userspec`**，
+只能切根目录不能降权。所以降权只能在 Python 进程内用 `os.setuid()` 完成。
+
+### 改法
+
+- `auth_gateway.py` 新增 `_drop_privileges()`，**模块级执行**（与既有的
+  `_assert_loopback_bind()` 同一模式：导入即生效，gunicorn / waitress 加载也逃不掉）
+- init 脚本幂等建 `nftweb` 用户（直接追加 `/etc/passwd`+`/etc/group`，
+  与 dnsmasq / logd / ubus 同样的做法），预建数据文件并改属主
+- `/etc/nftables` 设 setgid：日后 `app.py` 以 root 重建密码/密钥文件时，
+  组仍归 `nftweb`，网关读得到 —— 少了这一步，「用户改密码 → 文件被重建 →
+  属主变 root → 登录全断」会在某个随机时刻炸开
+
+### 安全设计要点（每条都有对应测试）
+
+- **失败即退出**：降权失败绝不「打印警告然后继续以 root 跑」——
+  那比不写更糟，读代码的人会以为已经降权了
+- **两道独立防线**：①`except` 里 `raise SystemExit(1)` ②降权后复核
+  `geteuid`/`getuid`/`getgid`。只拆①，②仍然独立拦住 —— 变异验证里
+  专门区分了这两种情况，避免把「变异太弱」误判成「测试没用」
+- **`initgroups` 不可省**：只 `setuid` 不清组权限 = 假降权
+- **顺序不可反**：`setgid` 必须在 `setuid` 之前，uid 一旦非 0 就再也改不了 gid
+- **`AUTH_DROP_UID=0` 直接拒绝启动**：那等于没有降权
+- init 脚本在进程起来后**再核一次 `/proc/<pid>/status` 的 uid**，为 0 就杀掉并报错
+
+### 真机实测（.224，OpenWrt 24.10，Python 3.11.14）
+
+```
+进程身份    Uid: 1000 1000 1000 1000 / Gid: 1000 1000 1000 1000 / Groups: 1000
+文件可读    password / secret / config.json  → OK（登录不断）
+文件不可读  /etc/shadow、dropbear 私钥、/root 下任何东西 → Permission denied
+反向验证    nft flush ruleset        → Operation not permitted (you must be root)
+            nft add rule ... accept  → Operation not permitted
+            kill -9 1                → Operation not permitted
+端到端      网关登录成功 {"success":true,"user":"kirito"}，审计日志正常落盘
+```
+
+`cp nftables-web-secret → /tmp` 仍然成功，这是**必须保留**的能力 ——
+网关要靠这个密钥签 token，砍掉它等于砍掉认证。
+
+### 顺带修掉的两个问题
+
+- `_drop_privileges()` 未配置环境变量时整体跳过，开发机与单元测试不受影响
+- 发现 `/etc/nftables.d/` 下的规则文件本来就是 644 且含无密钥 —— 未改动，
+  仅记录在此以免后续误以为与本次改动有关
+
+### 仍未覆盖
+
+- **证书链路**（上传 / ACME / 续期 / 设默认 / 删除保护）真机零验证
+- **WAN 侧规则在任何机器上都未执行过**：`.224` 无物理 WAN 口，且内核不支持
+  任何虚拟网卡类型（veth / dummy / macvlan / ipvlan 均 `Not supported`），
+  结构上不具备验证条件。需在有真 WAN 口的设备上验收
+- 面板 9 条 finding + 网关 3 条低危仍按原划界暂缓
+
 ## [v0.8.1] - 2026-10-11
 
 反代模块收敛为**认证网关单轨**，并重做管理界面。

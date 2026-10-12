@@ -19,6 +19,97 @@ PID_FILE="/var/run/nftables-web-auth.pid"
 # auth_gateway.py 启动时会检查 AUTH_BIND_HOST，绑到非回环地址直接退出。
 AUTH_BIND_HOST="127.0.0.1"
 
+# ══════════════════════════════════════════════════════════════════════
+# 权限降级
+#
+# 本服务是**唯一直接处理公网请求的进程**（面板仅 LAN、本服务仅回环，
+# 但 nginx 的 auth_request 会把公网流量送进来）。以 root 运行时，
+# 网关侧任何一处 RCE 都等于整台机器沦陷：
+#   nft flush ruleset  → 防火墙全开
+#   kill 看门狗进程     → 规则集清空后永远不再自愈
+# 看门狗挡不住这个 —— 它和被保护对象在同一个 root 权限域，攻击者拿到
+# root 的第一件事就是关掉它。所以降权是唯一有效的收敛手段。
+#
+# OpenWrt 没有 useradd/adduser（busybox 未编译这些 applet），建用户的
+# 办法就是直接往 /etc/passwd、/etc/group 追加一行 —— dnsmasq / logd /
+# ubus 这些系统账号本来也都是各包 postinst 这样写进去的。
+# /etc 在 overlay(/dev/loop0 ext4) 上，所以建一次长期有效。
+# ══════════════════════════════════════════════════════════════════════
+
+NFTWEB_USER="nftweb"
+NFTWEB_UID=""
+NFTWEB_GID=""
+
+_find_free_id() {
+    # 在 $2..$3 区间里找第一个没被 $1 占用的 id
+    _file="$1"; _lo="$2"; _hi="$3"; _i="$_lo"
+    while [ "$_i" -le "$_hi" ]; do
+        if ! awk -F: -v n="$_i" '$3==n {found=1} END{exit found?0:1}' "$_file"; then
+            echo "$_i"
+            return 0
+        fi
+        _i=$((_i + 1))
+    done
+    return 1
+}
+
+ensure_nftweb_user() {
+    if grep -q "^${NFTWEB_USER}:" /etc/passwd 2>/dev/null; then
+        NFTWEB_UID=$(awk -F: -v u="$NFTWEB_USER" '$1==u {print $3}' /etc/passwd)
+        NFTWEB_GID=$(awk -F: -v u="$NFTWEB_USER" '$1==u {print $4}' /etc/passwd)
+        [ -n "$NFTWEB_UID" ] && [ -n "$NFTWEB_GID" ] && return 0
+        echo "  $NFTWEB_USER 已在 /etc/passwd 里但 uid/gid 读不出来，请人工检查" >&2
+        return 1
+    fi
+
+    NFTWEB_GID=$(_find_free_id /etc/group 1000 1099) || {
+        echo "  /etc/group 1000-1099 无空闲 GID" >&2; return 1; }
+    NFTWEB_UID=$(_find_free_id /etc/passwd 1000 1099) || {
+        echo "  /etc/passwd 1000-1099 无空闲 UID" >&2; return 1; }
+
+    echo "${NFTWEB_USER}:x:${NFTWEB_GID}:${NFTWEB_USER}:" >> /etc/group
+    echo "${NFTWEB_USER}:x:${NFTWEB_UID}:${NFTWEB_GID}:${NFTWEB_USER}:/var/nftables-web:/bin/false" >> /etc/passwd
+    mkdir -p /var/nftables-web
+    echo "  已创建 ${NFTWEB_USER} uid=${NFTWEB_UID} gid=${NFTWEB_GID}"
+}
+
+# 降权之后进程就建不出这些文件了（/etc/nftables 与 /var/log 都是 root 755），
+# 所以必须在启动前以 root 身份准备好。每次 start 都重跑一遍，
+# 兼作自愈：文件若被误删或被 app.py 重建成 root 属主，这里会修回来。
+prepare_nftweb_files() {
+    _cfgdir="/etc/nftables"
+
+    # 目录 setgid：日后 app.py 以 root 重建文件时（新文件组默认跟目录走），
+    # 组仍是 nftweb，降权后的网关才读得到密码/密钥。
+    # 少了这一步，「用户改密码 → 文件被删后重建 → 属主变 root → 网关读不到
+    # → 登录全断」这个坑就会在某个随机时刻炸开。
+    chgrp "$NFTWEB_USER" "$_cfgdir" || return 1
+    chmod g+s "$_cfgdir" || return 1
+
+    # 只读类：root 拥有、nftweb 组可读。640 对「其他」仍然完全关闭，
+    # 暴露面和原来的 600 等价，但网关读得到。
+    for f in nftables-web-secret nftables-web-password; do
+        [ -f "$_cfgdir/$f" ] || continue
+        chgrp "$NFTWEB_USER" "$_cfgdir/$f" || return 1
+        chmod 640 "$_cfgdir/$f" || return 1
+    done
+
+    # 读写类：网关自己写、自己 flock、自己 chmod 600，属主必须是它
+    for f in nftables-web-auth-ratelimit.json nftables-web-auth-ratelimit-revoked.json; do
+        [ -f "$_cfgdir/$f" ] || : > "$_cfgdir/$f" || return 1
+        chown "${NFTWEB_UID}:${NFTWEB_GID}" "$_cfgdir/$f" || return 1
+        chmod 600 "$_cfgdir/$f" || return 1
+    done
+
+    # 审计日志：网关追加写，面板只读。预建是因为 /var/log 不可写给非 root。
+    _audit="/var/log/nftables-web-auth.log"
+    [ -f "$_audit" ] || : > "$_audit" || return 1
+    chown "${NFTWEB_UID}:${NFTWEB_GID}" "$_audit" || return 1
+    chmod 640 "$_audit" || return 1
+
+    return 0
+}
+
 get_port() {
     # 从配置里读认证端口，读不到就用默认 8444
     local port="8444"
@@ -47,15 +138,36 @@ start() {
     local port
     port=$(get_port)
 
-    echo "Starting nftables-web-auth on 127.0.0.1:$port ..."
+    # ── 降权准备。任何一步失败都必须在这里停住：带着没配好的属主去启动，
+    #    auth_gateway.py 会因为读不到密码文件而让登录全断，而且是静默的。
+    if ! ensure_nftweb_user; then
+        echo "nftables-web-auth: 创建 ${NFTWEB_USER} 失败，拒绝启动" >&2
+        return 1
+    fi
+    if ! prepare_nftweb_files; then
+        echo "nftables-web-auth: 准备 ${NFTWEB_USER} 的文件权限失败，拒绝启动" >&2
+        return 1
+    fi
+    echo "Starting nftables-web-auth on 127.0.0.1:$port (uid ${NFTWEB_UID}:${NFTWEB_GID}) ..."
     cd "$APP_DIR" || return 1
     AUTH_BIND_HOST="$AUTH_BIND_HOST" AUTH_API_PORT="$port" \
+        AUTH_DROP_UID="$NFTWEB_UID" AUTH_DROP_GID="$NFTWEB_GID" AUTH_DROP_USER="$NFTWEB_USER" \
         python3 auth_gateway.py >>"$AUTH_LOG" 2>&1 &
     echo $! > "$PID_FILE"
     sleep 1
 
     if kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-        echo "Started nftables-web-auth (PID $(cat "$PID_FILE"))"
+        # 进程活着不等于降权成功。auth_gateway.py 里降权失败是直接 exit 的，
+        # 这里再核一次实际身份 —— 万一将来有人改坏了那段代码，这里是最后一道闸。
+        local real_uid
+        real_uid=$(awk '/^Uid:/ {print $2}' "/proc/$(cat "$PID_FILE")/status" 2>/dev/null)
+        if [ "$real_uid" = "0" ]; then
+            echo "nftables-web-auth: 进程起来了但 uid 仍是 0，降权未生效 —— 停掉它" >&2
+            kill "$(cat "$PID_FILE")" 2>/dev/null
+            rm -f "$PID_FILE"
+            return 1
+        fi
+        echo "Started nftables-web-auth (PID $(cat "$PID_FILE"), uid $real_uid)"
         # 认证服务必须能起来，否则 nginx 的 auth_request 会全部 502，
         # 公网入口等于全断。这里失败要说清楚，不要静默。
         return 0
