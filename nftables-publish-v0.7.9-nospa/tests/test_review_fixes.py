@@ -673,6 +673,44 @@ check('黑名单早于 LAN ULA 放行', bl < ula)
 check('黑名单早于 LAN fe80 放行', bl < fe80)
 
 # ─────────────────────────────────────────────────────────────
+sec('规则链修复  forward 链也必须有黑名单，且早于 established')
+# 转发流量走 forward hook，input hook 根本不触发 —— input 链那两条黑名单
+# 对端口转发零效果。已在 .224 用 `ip route get` 实测确认：DNAT 目标非本机
+# → dev br-lan（转发），目标本机 → local dev lo（input）。
+def chain_body(text, name):
+    """按花括号深度取链体。不能用裸 split('}') —— 集合字面量的
+    `ip saddr { ... }` 会把链体提前截断（这个坑我踩过一次）。"""
+    out, inside, depth = [], False, 0
+    for ln in text.split('\n'):
+        s = ln.strip()
+        if not inside:
+            if re.match(r'chain\s+' + re.escape(name) + r'\s*\{', s):
+                inside = True
+                depth = s.count('{') - s.count('}')
+            continue
+        depth += s.count('{') - s.count('}')
+        if depth <= 0 and s.startswith('}'):
+            break
+        if s and not s.startswith('#'):
+            out.append(s)
+    return out
+
+app = fresh()
+fwd = chain_body(app.build_rules(app.load_config()), 'forward')
+f_bl4 = next((i for i, l in enumerate(fwd) if '@blacklist4' in l), -1)
+f_bl6 = next((i for i, l in enumerate(fwd) if '@blacklist6' in l), -1)
+f_est = next((i for i, l in enumerate(fwd) if 'ct state { established, related }' in l), -1)
+check('forward 链里有 IPv4 黑名单 drop', f_bl4 != -1)
+check('forward 链里有 IPv6 黑名单 drop', f_bl6 != -1)
+check('forward 链的黑名单早于 established accept（对已建立连接生效）',
+      f_bl4 < f_est and f_bl6 < f_est, f'黑名单 {f_bl4}/{f_bl6} / established {f_est}')
+check('forward 链的黑名单排在链体第一、二位（policy drop 之后立刻）',
+      f_bl4 == 1 and f_bl6 == 2, f'实际 {f_bl4} / {f_bl6}')
+check('forward 链的黑名单用独立日志前缀（能与 input 链的区分开）',
+      '[BLACKLIST4-FWD]' in (fwd[f_bl4] if f_bl4 >= 0 else '')
+      and '[BLACKLIST6-FWD]' in (fwd[f_bl6] if f_bl6 >= 0 else ''))
+
+# ─────────────────────────────────────────────────────────────
 print('\n' + '=' * 60)
 print(f'通过 {len(PASS)} / {len(PASS) + len(FAIL)}' + (f'，失败 {len(FAIL)}' if FAIL else ''))
 if FAIL:

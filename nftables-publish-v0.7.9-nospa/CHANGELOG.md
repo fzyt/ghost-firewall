@@ -101,6 +101,51 @@ nginx 部署失败时磁盘上已经是新配置、生效的却是旧配置，�
 改为转发给 `/api/rules/apply`（保留端点，不打断可能存在的 curl / 脚本调用方）。
 **是否直接从路由表删掉更干净，留给你定。**
 
+### P1  forward 链缺黑名单 —— 拉黑对已转发端口无效
+
+黑名单 drop 只写在 `input` 链（第 173-174 行）。但 DNAT 把目标改成内网主机后
+会重新路由，目标不是本机就**只走 `forward` hook，`input` hook 根本不触发** ——
+所以拉黑一个 IP 之后，它照常能用端口转发。
+
+在 `.224` 上用 `ip route get` 实测确认了路由分流：
+
+```
+ip route get 192.168.100.50  →  192.168.100.50 dev br-lan   ← 转发（forward hook）
+ip route get 127.0.0.1       →  local 127.0.0.1 dev lo       ← 本机（input hook）
+```
+
+`input_wan` 里**不需要**加：黑名单 drop 在 `input` 链内排第 10 位，
+`jump input_wan` 排第 46 位，定向到路由器本机的 WAN 流量早就被拦住了。
+
+实际利用面窄：`forward` 的放行条件是 `ip saddr @allowed4`，没敲过门的黑名单 IP
+进不了 allowed4，确实转发不了。真正的缺口是「敲门成功后又被拉黑」——
+`nftables.conf:369` 敲门成功 `add @allowed4`（5h 超时），而 `372-373` 拉黑时
+只加黑名单、不清 allowed4，那个 IP 在剩余 5 小时里照常转发。
+
+改动（`backend/templates/nftables.conf`，forward 链）：
+
+```
+ip saddr @blacklist4 log prefix "[BLACKLIST4-FWD] " drop
+ip6 saddr @blacklist6 log prefix "[BLACKLIST6-FWD] " drop
+ct state { established, related } accept
+```
+
+- **必须排在 established 之前**，否则已建立连接的后续报文会先命中 established
+  直接放行，黑名单就只能挡新连接 —— 和 `input` 链当初把黑名单从 established
+  之后挪到之前是同一个道理
+- 日志前缀用 `-FWD` 与 `input` 链区分，日志里能看出是「访问路由器被拦」还是
+  「转发被拦」
+- 固定语句，不依赖任何配置开关（`blacklist4`/`blacklist6` 在模板里无条件定义），
+  面板黑名单功能维护的就是这两个集合，前后端不用各改一处
+
+验证：`.224` 真机 `nft -c -f`（只检查不下发）过 baseline / trusted /
+dns_lan_resolver / 带端口转发的完整配置四个场景，全部 rc=0；渲染顺序断言确认
+黑名单落在链体第 1、2 位。回归 `test_review_fixes` 142→147，
+`mutation_check` 19→21 且 21/21 全捕获（新增两种退化：挪到 established 之后、
+整条删掉）。
+
+**注意：规则模板改动需点「应用规则」才下发到内核，不会自动生效。**
+
 ### 顺带修掉的工具 bug
 
 `tools/check-api-coverage.py` 初版只抓 `api.get/post/...`，漏了 multipart

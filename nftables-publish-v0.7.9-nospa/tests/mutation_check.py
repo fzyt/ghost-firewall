@@ -107,6 +107,19 @@ MUTATIONS = [
      '        ct state { established, related } accept;\n'
      '        ip saddr @blacklist4 log prefix "[BLACKLIST4] " drop\n'
      '        ip6 saddr @blacklist6 log prefix "[BLACKLIST6] " drop', 1),
+
+    ('forward 链的黑名单被挪到 established 之后（只挡新连接，挡不住进行中的会话）', 'tpl',
+     '        ip saddr @blacklist4 log prefix "[BLACKLIST4-FWD] " drop\n'
+     '        ip6 saddr @blacklist6 log prefix "[BLACKLIST6-FWD] " drop\n'
+     '        ct state { established, related } accept',
+     '        ct state { established, related } accept\n'
+     '        ip saddr @blacklist4 log prefix "[BLACKLIST4-FWD] " drop\n'
+     '        ip6 saddr @blacklist6 log prefix "[BLACKLIST6-FWD] " drop', 1),
+
+    ('forward 链的黑名单被整条删掉（端口转发重新变成免黑名单）', 'tpl',
+     '        ip saddr @blacklist4 log prefix "[BLACKLIST4-FWD] " drop\n'
+     '        ip6 saddr @blacklist6 log prefix "[BLACKLIST6-FWD] " drop\n',
+     '', 1),
 ]
 
 
