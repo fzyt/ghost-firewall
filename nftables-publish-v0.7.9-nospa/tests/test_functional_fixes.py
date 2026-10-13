@@ -11,6 +11,8 @@
   FIX-7  上传/重传必须校验证书与私钥配对，且校验失败不覆盖原文件
   FIX-8  /api/rules/save 不再绕过 /api/rules/apply 的安全路径（自己写盘）
   FIX-9  配置损坏时守卫覆盖全部下发与落盘路径（原来只挂 1 个端点）
+  FIX-10 网关 0 服务时 nginx 配置必须能加载（$auth_user 未定义会让整份配置被拒）
+  FIX-10b 配置缺 reverse_proxy 段时不能 AttributeError（全新安装即命中）
 
 每条测试都写成「旧代码必然失败」的形式。沙箱运行：不碰真实路径、
 不执行 openssl / nft / nginx（需要外部命令的分支一律打桩）。
@@ -317,6 +319,103 @@ check('重启在下发之前（重启会重载 fw4 冲掉规则）',
 # 守卫下沉不能误伤看门狗自愈 —— 它自己会查并退到 .backup / lockdown
 check('看门狗有自己的损坏检查（守卫下沉不会误伤自愈）',
       '_config_corrupted()' in fn_src(APP_SRC, '_auto_recover_ruleset_if_empty'))
+
+# ── FIX-10 ────────────────────────────────────────────────────────
+# 网关开着 + 0 个反代服务时生成的 nginx 配置必须能加载。
+# 旧代码在这里产出 [emerg] unknown "auth_user" variable（.224 真机实测），
+# 后果不是少个功能，是整份配置拒绝加载 → 整个网关连 portal/登录页一起没了。
+sec('FIX-10 网关 0 服务时 nginx 配置仍可加载（$auth_user 必须有定义）')
+_gen = fn_src(APP_SRC, '_generate_gateway_nginx_conf')
+
+# 只看剥掉注释后的代码 —— 解释这个 bug 的注释里就写着 auth_request_set，
+# 做位置判断时会被当成真的赋值语句（同一个坑已经踩过三次）。
+_gen_code = strip_comments(_gen)
+
+# 匹配「独立的 set 指令」而不是任何含 set 的子串。
+# auth_request_set $auth_device 本身就包含 "set $auth_device" ——
+# 用普通 in / find 的话，把 auth_request_set 删掉测试照样全绿（已踩到）。
+_SET_RE = r'(?<![A-Za-z0-9_])set\s+\$(\w+)'
+# log_format 里用到的 nginx 内置变量：这些不需要（也不允许）用 set 定义。
+_NGINX_BUILTIN_VARS = {
+    'time_iso8601', 'remote_addr', 'request_method', 'status',
+    'body_bytes_sent', 'request_time', 'host', 'uri',
+    'http_user_agent', 'http_referer',
+}
+_i_set_user = _gen_code.find('set $auth_user')
+_i_loop = _gen_code.find('for rule, prefix, protocol, host, tport in services')
+check('$auth_user 在服务端级别有 set 默认值（不依赖服务循环）',
+      _i_set_user != -1 and (_i_loop == -1 or _i_set_user < _i_loop),
+      f'set@{_i_set_user} / 循环@{_i_loop}')
+_gen_vars = set(re.findall(_SET_RE, _gen_code))
+check('$auth_device 同样有 set 默认值（不能被 auth_request_set 顶替）',
+      'auth_device' in _gen_vars,
+      f'独立 set 的变量: {sorted(_gen_vars)}')
+check('$auth_user 同样是独立 set（不能被 auth_request_set 顶替）',
+      'auth_user' in _gen_vars)
+
+# 行为断言：真的调一次生成函数，0 服务时两个变量都必须在 server 块里被定义。
+try:
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location('_nftapp_zero', os.path.join(BACKEND, 'app.py'))
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    _cfg = _mod.load_config()
+    _cfg['gateway_enabled'] = True
+    _rp = _cfg.get('reverse_proxy')
+    if isinstance(_rp, dict):
+        _rp['rules'] = []
+    _conf = _mod._generate_gateway_nginx_conf(_cfg)
+    _zero_ok = isinstance(_conf, str) and 'set $auth_user' in _conf
+    check('0 服务生成物里确实定义了 $auth_user（行为验证）', _zero_ok,
+          f'{len(_conf) if isinstance(_conf, str) else 0} 字符')
+    # 反向断言：log_format 里引用的变量都必须真的被 set 定义过。
+    # log_format 是**多行续行**的，只扫含 'log_format' 关键字的那一行会漏掉
+    # 最后那行 'auth_user="$auth_user" auth_dev="$auth_device"'; —— 正是它。
+    if isinstance(_conf, str):
+        _fm = _conf.find('log_format')
+        _block = _conf[_fm:_conf.find(';', _fm)] if _fm != -1 else ''
+        _defs = set(re.findall(_SET_RE, _conf))
+        _uses = set(re.findall(r'\$(\w+)', _block))
+        # nginx 自带变量不需要 set；自定义变量（auth_user / auth_device）必须有。
+        _missing = _uses - _defs - _NGINX_BUILTIN_VARS
+        check('log_format 引用的自定义变量全部有独立 set 定义',
+              not _missing and {'auth_user', 'auth_device'} <= _uses,
+              f'缺失: {sorted(_missing)}' if _missing
+              else f'自定义变量 {sorted(_uses & {"auth_user", "auth_device"})} 已定义')
+    # 有服务时仍然要保留 auth_request_set 的真实赋值（别被默认值盖掉）
+    _cfg2 = _mod.load_config()
+    _cfg2['gateway_enabled'] = True
+    _rules = (_cfg2.get('reverse_proxy') or {}).get('rules') or []
+    if _rules:
+        _c2 = _mod._generate_gateway_nginx_conf(_cfg2)
+        check('有服务时 auth_request_set 仍负责赋真实值',
+              'auth_request_set $auth_user' in _c2)
+except Exception as _e:   # noqa: BLE001
+    check('0 服务生成物里确实定义了 $auth_user（行为验证）', False, repr(_e))
+
+# FIX-10b：配置里没有 reverse_proxy 段时不能崩。
+# DEFAULT_CONFIG 压根不含这个键，全新安装时 rp 是 None，
+# 旧代码直接 rp.get("certificates") → AttributeError（.224 真机复现）。
+_gen2 = strip_comments(fn_src(APP_SRC, '_generate_gateway_nginx_conf'))
+_i_rp = _gen2.find('rp = config.get("reverse_proxy")')
+_i_rpchk = _gen2.find('if not isinstance(rp, dict)')
+_i_certs = _gen2.find('rp.get("certificates")')
+check('reverse_proxy 非 dict 时兜底为空 dict',
+      _i_rp != -1 and _i_rpchk != -1 and _i_rp < _i_rpchk < _i_certs,
+      f'取值@{_i_rp} / 兜底@{_i_rpchk} / 用证书@{_i_certs}')
+check('兜底不能只包住 settings（证书读取在它之后，会先炸）',
+      'if isinstance(rp.get("settings"), dict)' in _gen2)
+
+try:
+    _fresh = dict(_mod.load_config())
+    _fresh.pop('reverse_proxy', None)          # 模拟全新安装
+    _fresh['gateway_enabled'] = True
+    _c_fresh = _mod._generate_gateway_nginx_conf(_fresh)
+    check('配置完全没有 reverse_proxy 段时也能生成（不 AttributeError）',
+          isinstance(_c_fresh, str) and 'set $auth_user' in _c_fresh)
+except Exception as _e:   # noqa: BLE001
+    check('配置完全没有 reverse_proxy 段时也能生成（不 AttributeError）',
+          False, repr(_e))
 
 print()
 if FAIL:

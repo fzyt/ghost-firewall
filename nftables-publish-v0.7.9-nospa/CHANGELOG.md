@@ -4,7 +4,7 @@
 
 ## [v0.8.3] - 2026-10-12
 
-功能性审查发现的 7 个缺陷修复。**规则链相关问题不在本版范围**（P0-1 见文末）。
+功能性审查发现的 9 个缺陷修复。**规则链相关问题不在本版范围**（P0-1 见文末）。
 
 ### P0-2  ACME 路径漏掉私钥权限加固（上一版引入的回归）
 
@@ -51,6 +51,9 @@ ACME 证书的「续期」按钮从来不会出现。
 - `auth_gateway.py` 新增 `CSP_LOGIN_HTML` / `CSP_PORTAL_HTML` 常量
 - `static_files` 对 `.html` 按文件名选对应 CSP；门户页与登录页改用常量，
   不再各自内联第二份（两份 form-action 不同的策略迟早分叉）
+- 真机复验：`.224` 上 `/auth/static/login.html` 与 `portal.html` 经网关 8443
+  均已带上 CSP，且两个取值正确区分（登录页 `form-action 'self'`、门户页
+  `form-action 'none'` + `img-src data:`）
 
 ### P1-3  网关配置先落盘后部署
 
@@ -222,6 +225,59 @@ lan_subnet4 / lan_broadcast4 / ula_prefix6 / wan_prefix6 / trusted_ip4 全部指
   `save_config` 守卫去掉、守卫挪到备份之后、`restart_network` 改回自己写盘、
   守卫挪到重启之后、errorhandler 去掉）
 
+### P0  删掉最后一个反代服务，网关整个挂掉
+
+网关开着但一个反代服务都没有时，生成的 nginx 配置**加载不了**：
+
+```
+[emerg] unknown "auth_user" variable
+nginx: configuration file /etc/nginx/uci.conf test failed
+```
+
+原因不直观。access_log 的 `log_format` 里引用了 `$auth_user` / `$auth_device`，
+而真正给这两个变量赋值的 `auth_request_set` 只写在「每个反代服务」的 location 里。
+服务数为 0 时那个循环一次都不执行 —— 变量被引用、却从头到尾没人定义，
+nginx 直接拒绝加载**整份**配置。
+
+后果不是「网关少了点什么」，是整个网关连 portal 页、登录页一起消失。
+而触发路径是个再普通不过的操作：**删掉最后一个反代服务**。
+`_deploy_gateway_nginx` 的 `nginx -t` 预检会把它挡下来并回滚，
+用户看到的就是「最后一个反代服务删不掉」。
+
+改法：`server` 块里显式给出两个变量的空默认值，位置在 `server_tokens off;` 之后、
+服务循环之前。服务 location 里的 `auth_request_set` 会在认证子请求返回后覆盖成
+真实值，不影响鉴权与审计。
+
+`.224` 真机复验：修复前 `nginx -t` 报 `[emerg] unknown "auth_user" variable`，
+修复后同一份生成物 `test is successful`。
+
+### P0  全新安装打开网关开关直接崩
+
+`DEFAULT_CONFIG` 里**根本没有 `reverse_proxy` 这个键**。全新安装（或配置文件缺失
+回落到默认配置）时 `config.get("reverse_proxy")` 就是 `None`，而
+`_generate_gateway_nginx_conf` 紧接着就 `rp.get("certificates")`：
+
+```
+AttributeError: 'NoneType' object has no attribute 'get'    （app.py:4943，.224 真机复现）
+```
+
+`app.py` 里的 `_get_rp_config()` 本来会做这个规范化，但生成函数是绕开它自己读
+config 的，所以得自己兜住。改成 `if not isinstance(rp, dict): rp = {}`，
+位置必须在取证书**之前** —— 只包住 `settings` 那一步的话兜底形同虚设。
+
+两个 bug 同源：都是「反代服务数为 0」这条路径从来没被走过。
+
+#### 验证
+
+- `.224` 真机：0 服务生成物 `nginx -t` 从 failed 转 successful；缺 `reverse_proxy`
+  段时正常生成 3790 字符，不再 AttributeError。真配置已还原（md5 与备份一致）
+- `test_functional_fixes.py` 67→75 条断言，`mutation_check_functional.py` 31→35 条
+  变异且 35/35 全捕获
+- **断言本身也踩过一次坑**：最初用 `'set $auth_device' in src` 判定，
+  结果 `auth_request_set $auth_device` 本身就含这个子串 ——
+  把 `set` 删掉测试照样全绿。改成 `(?<![A-Za-z0-9_])set\s+\$(\w+)` 才算真的在测。
+  顺带修了 `log_format` 多行续行导致 `$auth_device` 根本没被扫到的问题
+
 ### 顺带修掉的工具 bug
 
 `tools/check-api-coverage.py` 初版只抓 `api.get/post/...`，漏了 multipart
@@ -247,10 +303,13 @@ lan_subnet4 / lan_broadcast4 / ula_prefix6 / wan_prefix6 / trusted_ip4 全部指
 
 ### 测试
 
-新增 `tests/test_functional_fixes.py`（52 条断言）+ `tests/mutation_check_functional.py`
-（25 条变异）。所有变异 100% 被捕获。
+新增 `tests/test_functional_fixes.py`（75 条断言）+ `tests/mutation_check_functional.py`
+（35 条变异）。所有变异 100% 被捕获。
 
-跑测试时发现并修掉三处**测试自身的弱点**（不是代码 bug）：
+全量回归（本版改动后）：单测 75 + 147 + 51 + 47 + 68 + 53 + 前端 29 全部通过，
+变异 35 + 21 + 19 + 10 共 85 条全部捕获。
+
+跑测试时发现并修掉四处**测试自身的弱点**（不是代码 bug）：
 
 1. 断言匹配到了解释性注释里的字面量（`save_config()`、「配置已保存但网关部署
    失败」）—— 已加 `strip_comments()`，位置判断前先剥注释
@@ -260,15 +319,20 @@ lan_subnet4 / lan_broadcast4 / ula_prefix6 / wan_prefix6 / trusted_ip4 全部指
    加固调用点，**把两条 ACME 路径排除在统计之外** —— 这正是 P0-2 能长期存在的
    原因：断言号称「补权限与 chmod 一一对应」，却对 ACME 完全失明。改成数全部
    调用点（5 处）并新增「chmod 之后紧跟加固」的顺序断言，对应补 N8/N9/N10 三条变异
+4. FIX-10 的断言用 `'set $auth_device' in src` 判定有没有默认值 ——
+   `auth_request_set $auth_device` 本身就含这个子串，**把真正的 `set` 删掉测试照样
+   全绿**。第一版就是这样漏过去的，是变异验证抓出来的。改成
+   `(?<![A-Za-z0-9_])set\s+\$(\w+)`，顺带发现 `log_format` 是多行续行、
+   只扫首行的话 `$auth_device` 根本没被检查到
 
 ### 回归（改动前后各跑一遍）
 
 ```
-单元  test_review_fixes 142 · test_privilege_drop 51 · test_auth_gateway 68
-      test_security_fixes · test_fw_recovery · test_log_parser · test_functional_fixes 52
-      前端 test_frontend.js 29                                  —— 全绿
-变异  mutation_check 19/19 · mutation_check_security 10/10
-      mutation_check_privilege 19/19 · mutation_check_functional 25/25 —— 全捕获
+单元  test_review_fixes 147 · test_privilege_drop 51 · test_auth_gateway 68
+      test_security_fixes 47 · test_fw_recovery 53 · test_log_parser
+      test_functional_fixes 75 · 前端 test_frontend.js 29        —— 全绿
+变异  mutation_check 21/21 · mutation_check_security 10/10
+      mutation_check_privilege 19/19 · mutation_check_functional 35/35 —— 全捕获
 ```
 
 ### 不在本版范围
@@ -279,12 +343,30 @@ lan_subnet4 / lan_broadcast4 / ula_prefix6 / wan_prefix6 / trusted_ip4 全部指
 - 面板 9 条低危 finding + 3 个网关低危 finding
 - 证书链路的真机验证见下
 
-### 尚未真机验证
+### 真机验证进度（.224，OpenWrt 测试机）
 
-本版代码**尚未部署到 .224**，以下仍需用户在真环境确认：
-证书上传/重传链路、ACME 续期后的 worker 读权限、真实 NAS/DSM 门户后端、
-真实 WAN 敲门限流（.224 无物理 WAN 口且内核不支持任何虚拟网卡类型，
-结构上做不到）。
+已在本机部署实测通过的：
+
+- **证书链路全通过** —— 配对上传 → `640 root:nogroup` → worker `nobody(65534)`
+  fork 降权后**真读到私钥**；传错私钥/垃圾文件 → 400 且原文件字节未变、无 `.tmp`
+  残留；重传三种情形全部保住原文件；ACME 场景 `600 root:root` → 加固后
+  `640 root:nogroup`
+- **反代 nginx 配置生成 9 场景** —— 基线/单服务/多服务/WebSocket/非公网/网关关闭，
+  全部用服务真实参数 `nginx -t -c /etc/nginx/uci.conf` rc=0
+- **认证网关** —— 登录成功、`/auth/verify` 对伪造 token 正确返回 **401**、
+  错密码前 5 次 401、第 6 次起 429 限流生效
+- **P1-2 的 CSP** —— `/auth/static/login.html` 与 `portal.html` 经网关 8443 均已带上，
+  两个取值正确区分（登录页 `form-action 'self'` / 门户页 `form-action 'none'`）；
+  白名单外文件（`../app.py`、`secret.txt`）一律 404
+- **本版两个 P0** —— 0 服务生成物 `nginx -t` 转 successful；缺 `reverse_proxy`
+  段时不再 AttributeError
+
+仍未验证：
+
+- 真实 NAS/DSM 门户后端（目前仍接 `/tmp/fake_services.py`）
+- 真实 WAN 敲门限流（`.224` 无物理 WAN 口且内核不支持任何虚拟网卡类型，
+  结构上做不到，需 Proxmox 侧加虚拟网卡）
+- 面板全 API 烟测、看门狗与规则生成顺序的真机复核
 
 ## [v0.8.2] - 2026-10-12
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""变异验证：把功能性审查的 7 组修复逐条改回旧行为，确认 tests/test_functional_fixes.py 会变红。
+"""变异验证：把功能性审查的 10 组修复逐条改回旧行为，确认 tests/test_functional_fixes.py 会变红。
 
 全绿的测试套件不能证明它在测东西 —— 必须在缺陷重现时失败。
 每条变异对应「这个修复如果没做，会退化出什么行为」，不是随便改改看能不能被抓。
@@ -234,6 +234,42 @@ MUTATIONS = [
      "                    'code': 'CONFIG_CORRUPTED',\n"
      "                    'message': str(e)}), 500\n\n\n",
      '', 1),
+
+    # ── FIX-10  0 服务时 $auth_user 无定义 / 缺 reverse_proxy 段崩溃 ──
+    ('FIX-10 去掉 $auth_user 默认值（0 服务时 nginx unknown variable）', 'app',
+     '    L.append(\'    set $auth_user "";\')\n'
+     '    L.append(\'    set $auth_device "";\')',
+     '    pass  # 变异：还原成不定义', 1),
+
+    ('FIX-10 $auth_device 漏掉默认定义', 'app',
+     '    L.append(\'    set $auth_device "";\')',
+     '    pass  # 变异：只补了 user', 1),
+
+    ('FIX-10b 去掉 reverse_proxy 的 dict 兜底（全新安装即 AttributeError）', 'app',
+     '    rp = config.get("reverse_proxy")\n'
+     '    if not isinstance(rp, dict):\n'
+     '        rp = {}\n'
+     '    if isinstance(rp.get("settings"), dict):\n'
+     '        settings = rp["settings"]',
+     '    rp = config.get("reverse_proxy")\n'
+     '    if isinstance(rp, dict) and isinstance(rp.get("settings"), dict):\n'
+     '        settings = rp["settings"]', 1),
+
+    ('FIX-10b 兜底挪到 settings 之后（证书读取先炸，兜底形同虚设）', 'app',
+     '    rp = config.get("reverse_proxy")\n'
+     '    if not isinstance(rp, dict):\n'
+     '        rp = {}\n'
+     '    if isinstance(rp.get("settings"), dict):\n'
+     '        settings = rp["settings"]\n'
+     '\n'
+     '    cert_id = str(settings.get("default_cert_id", "") or "")\n'
+     '    certs = {c.get("id"): c for c in (rp.get("certificates") or [])',
+     '    rp = config.get("reverse_proxy")\n'
+     '    if isinstance(rp, dict) and isinstance(rp.get("settings"), dict):\n'
+     '        settings = rp["settings"]\n'
+     '\n'
+     '    cert_id = str(settings.get("default_cert_id", "") or "")\n'
+     '    certs = {c.get("id"): c for c in ((rp or {}).get("certificates") or [])', 1),
 ]
 
 

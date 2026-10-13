@@ -4935,8 +4935,18 @@ def _generate_gateway_nginx_conf(config):
     api_port = _safe_port(config.get("auth_api_port"), 8444)
     services = _gateway_services(config)
     settings = {}
+    # reverse_proxy 必须是 dict，不能只在下面取 settings 时才判类型。
+    #
+    # DEFAULT_CONFIG 里压根没有 reverse_proxy 这个键，全新安装（或配置文件
+    # 缺失回落到默认配置）时 config.get("reverse_proxy") 就是 None。
+    # 紧接着的 rp.get("certificates") 会直接 AttributeError，
+    # 整个网关配置生成崩掉 —— 表现为「全新装完打开网关开关就报错」，
+    # .224 真机复现过。_get_rp_config() 本来会做这个规范化，
+    # 但这个函数是绕开它自己读 config 的，所以得自己兜住。
     rp = config.get("reverse_proxy")
-    if isinstance(rp, dict) and isinstance(rp.get("settings"), dict):
+    if not isinstance(rp, dict):
+        rp = {}
+    if isinstance(rp.get("settings"), dict):
         settings = rp["settings"]
 
     cert_id = str(settings.get("default_cert_id", "") or "")
@@ -4977,6 +4987,22 @@ def _generate_gateway_nginx_conf(config):
     L.append(f"    listen [::]:{port} ssl;")
     L.append("    http2 on;")
     L.append("    server_tokens off;")
+    # 认证身份变量的服务器级默认值。
+    #
+    # 少了这两行：「网关开着 + 一个反代服务都没有」会让整份配置被 nginx 拒绝加载。
+    # 原因很隐蔽 —— access_log 的 log_format 引用了 $auth_user / $auth_device，
+    # 而真正给它们赋值的 auth_request_set 只写在「每个反代服务」的 location 里。
+    # 服务数为 0 时那个循环一次都不执行，两个变量从头到尾没人定义，nginx 启动就
+    # [emerg] unknown "auth_user" variable 直接罢工。
+    #
+    # 这不是什么边角状态：删掉最后一个反代服务后保存配置，落地的就是它。
+    # 而且后果不是「网关少了点东西」，是**整个网关连同 portal、登录页一起没了**。
+    #
+    # 这里显式给出空默认值，变量恒存在；服务 location 里的 auth_request_set
+    # 会在认证子请求返回后覆盖成真实值，不影响鉴权与审计。
+    L.append("    # 认证身份变量默认值（服务 location 内由 auth_request_set 覆盖）")
+    L.append('    set $auth_user "";')
+    L.append('    set $auth_device "";')
     L.append("")
     L.append("    # SSL")
     L.append(f"    ssl_certificate {cert_path};")
