@@ -17,6 +17,7 @@ FILES = {
     'app': os.path.join(ROOT, 'backend', 'app.py'),
     'auth': os.path.join(ROOT, 'backend', 'auth_gateway.py'),
     'fe': os.path.join(ROOT, 'frontend', 'index.html'),
+    'js': os.path.join(ROOT, 'frontend', 'app.js'),
 }
 TEST = os.path.join(ROOT, 'tests', 'test_functional_fixes.py')
 
@@ -99,10 +100,12 @@ MUTATIONS = [
      '                f.write(f"{prefix}::1")',
      '            pass  # 变异：DDNS 读不到本机地址', 1),
 
+    # 锚点缩进跟着 FIX-12 的改动一起挪了位置（写中转文件移进了成功分支），
+    # 变异脚本必须跟着代码走 —— 锚点对不上就跳过，不改就是让变异名存实亡。
     ('FIX-6 手动更新 IPv6 不写 /tmp/ddns-ipv6-{idx}', 'app',
-     '                with open(f"/tmp/ddns-ipv6-{idx}", "w") as f:\n'
-     '                    f.write(full_ipv6)',
-     '                pass  # 变异：DDNS 读不到转发地址', 1),
+     '                    with open(f"/tmp/ddns-ipv6-{idx}", "w") as f:\n'
+     '                        f.write(full_ipv6)',
+     '                    pass  # 变异：DDNS 读不到转发地址', 1),
 
     ('FIX-6 写中转文件失败时改成抛异常（一个 IO 错误让整个接口 500）', 'app',
      '        except OSError as e:\n'
@@ -270,6 +273,73 @@ MUTATIONS = [
      '\n'
      '    cert_id = str(settings.get("default_cert_id", "") or "")\n'
      '    certs = {c.get("id"): c for c in ((rp or {}).get("certificates") or [])', 1),
+
+    # ── FIX-11  名单增量操作不持锁 ────────────────────────────────
+    ('FIX-11 _nft_set_write 不持锁（又与看门狗 nft -f 交叉执行）', 'app',
+     '    with _FW_APPLY_LOCK:\n'
+     "        return subprocess.run(['nft'] + list(args), capture_output=True,\n"
+     '                              text=True, timeout=timeout)',
+     '    return subprocess.run([\'nft\'] + list(args), capture_output=True,\n'
+     '                          text=True, timeout=timeout)', 1),
+
+    ('FIX-11 list_add 退回裸 subprocess.run（绕过统一入口 = 绕过锁）', 'app',
+     "        result = _nft_set_write(['add', 'element', 'inet', 'fw4', set_name, '{', ip, '}'])",
+     "        result = subprocess.run(\n"
+     "            ['nft', 'add', 'element', 'inet', 'fw4', set_name, '{', ip, '}'],\n"
+     '            capture_output=True, text=True, timeout=10\n'
+     '        )', 1),
+
+    ('FIX-11 list_flush 退回裸 subprocess.run', 'app',
+     "        result = _nft_set_write(['flush', 'set', 'inet', 'fw4', set_name])",
+     "        result = subprocess.run(\n"
+     "            ['nft', 'flush', 'set', 'inet', 'fw4', set_name],\n"
+     '            capture_output=True, text=True, timeout=10\n'
+     '        )', 1),
+
+    ('FIX-11 list_delete 退回裸 subprocess.run', 'app',
+     "        result = _nft_set_write(['delete', 'element', 'inet', 'fw4', set_name, '{', ip, '}'])",
+     "        result = subprocess.run(\n"
+     "            ['nft', 'delete', 'element', 'inet', 'fw4', set_name, '{', ip, '}'],\n"
+     '            capture_output=True, text=True, timeout=10\n'
+     '        )', 1),
+
+    ('FIX-11 presets/apply 退回裸 subprocess.run', 'app',
+     '        result = _nft_set_write(cmd[1:])',
+     '        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)', 1),
+
+    ('FIX-11 update_ipv6 的批量事务不持锁', 'app',
+     "                with _FW_APPLY_LOCK:\n"
+     "                    result = subprocess.run(['nft', '-f', '-'], input=batch,\n"
+     '                                            capture_output=True, text=True,\n'
+     '                                            timeout=10)',
+     "                result = subprocess.run(['nft', '-f', '-'], input=batch,\n"
+     '                                        capture_output=True, text=True,\n'
+     '                                        timeout=10)', 1),
+
+    # ── FIX-12  update_ipv6 部分失败被掩盖 ─────────────────────────
+    ('FIX-12 flush 与 add 拆回两条命令（add 失败时旧地址被清空）', 'app',
+     "            batch = (f\"flush set inet fw4 {set_name}\\n\"\n"
+     '                     f"add element inet fw4 {set_name} {{ {full_ipv6} }}\\n")',
+     '            batch = f"add element inet fw4 {set_name} {{ {full_ipv6} }}\\n"\n'
+     '            _nft_set_write([\'flush\', \'set\', \'inet\', \'fw4\', set_name])', 1),
+
+    ('FIX-12 顶层 success 无条件 True（部分失败也报成功）', 'app',
+     '            "success": not failed,',
+     '            "success": True,', 1),
+
+    ('FIX-12 message 数的是尝试数不是成功数', 'app',
+     '            message = (f"成功 {len(updated)} 条，失败 {len(failed)} 条："',
+     '            message = (f"已更新 {len(updated)} 条，失败 {len(failed)} 条："', 1),
+
+    ('FIX-12 部分失败仍返回 200（前端封装按 success 判，这里是双保险）', 'app',
+     '        }), (200 if not failed else 500)',
+     '        })', 1),
+
+    ('FIX-12 前端不再读 failed 明细（后端算好了但界面看不见）', 'js',
+     '        const failed = e.data && e.data.failed;\n'
+     '        if (failed && failed.length) {',
+     '        const failed = null;\n'
+     '        if (failed && failed.length) {', 1),
 ]
 
 

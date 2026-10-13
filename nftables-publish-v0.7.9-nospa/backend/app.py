@@ -2394,6 +2394,8 @@ def update_ipv6():
         prefix = wan_info["prefix"]
         forward_rules = config.get("forward_rules", [])
         updated = []
+        failed = []
+        skipped = []
 
         # 与 IPV6_CRON_SCRIPT 保持一致：写路由器本机地址，供 DDNS 的
         # ip_script 读。之前只有 cron 脚本写这个文件，手动点「更新 IPv6」
@@ -2408,42 +2410,90 @@ def update_ipv6():
 
         for idx, rule in enumerate(forward_rules, 1):
             set_name = f"nas_ip6_{idx}"
-            # 清空该规则的集合
-            subprocess.run(['nft', 'flush', 'set', 'inet', 'fw4', set_name],
-                           capture_output=True, text=True, timeout=10)
-
             target_ipv6 = rule.get("target_ipv6", "").strip()
-            if not target_ipv6:
+            suffix = _extract_ipv6_suffix(target_ipv6) if target_ipv6 else ""
+
+            if not target_ipv6 or not suffix:
+                # 没配 IPv6 目标的规则：仍然要清空它的 set（配过的地址可能
+                # 已经被删掉了），但不算「失败」。
+                skipped.append({
+                    "set_name": set_name,
+                    "target_ipv6": target_ipv6,
+                    "reason": "未配置 target_ipv6，已清空该集合",
+                })
+                _nft_set_write(['flush', 'set', 'inet', 'fw4', set_name])
                 continue
-            suffix = _extract_ipv6_suffix(target_ipv6)
-            if not suffix:
-                continue
+
             full_ipv6 = f"{prefix}:{suffix}"
-            result = subprocess.run(
-                ['nft', 'add', 'element', 'inet', 'fw4', set_name, '{', full_ipv6, '}'],
-                capture_output=True, text=True, timeout=10
-            )
-            updated.append({
-                "set_name": set_name,
-                "target_ipv6": target_ipv6,
-                "suffix": suffix,
-                "full_ipv6": full_ipv6,
-                "success": result.returncode == 0,
-                "error": result.stderr.strip() if result.returncode != 0 else None,
-            })
-            # 同上：与 cron 脚本一样把完整地址落到中转文件，DDNS 才读得到
+
+            # flush 与 add 放进**同一个 nft 事务**。
+            #
+            # 原来是先 nft flush set 再 nft add element 两条独立命令：
+            # add 失败时（比如地址格式被内核拒了）set 已经空了 —— 原来那条
+            # 还能用的 IPv6 地址被清掉、新地址没加上，而接口照样回
+            # 「已更新 N 条」。IPv6 访问静默失效，界面上是绿的。
+            #
+            # nft -f 是整份文件一个事务：任一行失败则整体不生效，
+            # 旧地址原地不动。
+            batch = (f"flush set inet fw4 {set_name}\n"
+                     f"add element inet fw4 {set_name} {{ {full_ipv6} }}\n")
             try:
-                with open(f"/tmp/ddns-ipv6-{idx}", "w") as f:
-                    f.write(full_ipv6)
-            except OSError as e:
-                print(f"[WARN] 写 /tmp/ddns-ipv6-{idx} 失败: {e}", flush=True)
+                with _FW_APPLY_LOCK:
+                    result = subprocess.run(['nft', '-f', '-'], input=batch,
+                                            capture_output=True, text=True,
+                                            timeout=10)
+            except subprocess.TimeoutExpired:
+                result = None
+
+            if result is not None and result.returncode == 0:
+                updated.append({
+                    "set_name": set_name,
+                    "target_ipv6": target_ipv6,
+                    "suffix": suffix,
+                    "full_ipv6": full_ipv6,
+                    "success": True,
+                    "error": None,
+                })
+                # 与 cron 脚本一样把完整地址落到中转文件，DDNS 才读得到
+                try:
+                    with open(f"/tmp/ddns-ipv6-{idx}", "w") as f:
+                        f.write(full_ipv6)
+                except OSError as e:
+                    print(f"[WARN] 写 /tmp/ddns-ipv6-{idx} 失败: {e}", flush=True)
+            else:
+                err = ('nft 命令超时' if result is None
+                       else (result.stderr or result.stdout or '').strip()
+                       [:200])
+                print(f"[ERROR] {set_name} 更新失败（{full_ipv6}）：{err}", flush=True)
+                failed.append({
+                    "set_name": set_name,
+                    "target_ipv6": target_ipv6,
+                    "full_ipv6": full_ipv6,
+                    "error": err or '未知错误',
+                })
+
+        # 汇总口径必须是「成功的条数」，不是「尝试的条数」。
+        # 之前这里 len(updated) 数的是尝试，3 条里第 2 条失败也报「已更新 3 条」，
+        # 顶层 success 还无条件是 True —— 前端只弹这个 message，
+        # 逐条的 success/error 根本没人读。
+        if failed:
+            message = (f"成功 {len(updated)} 条，失败 {len(failed)} 条："
+                       + "、".join(f['set_name'] for f in failed))
+        else:
+            message = f"已更新 {len(updated)} 条 IPv6 地址"
+            if skipped:
+                message += f"（{len(skipped)} 条未配置 IPv6 目标，已清空）"
 
         return jsonify({
-            "success": True,
+            "success": not failed,
             "prefix": prefix,
             "updated": updated,
-            "message": f"已更新 {len(updated)} 条 IPv6 地址",
-        })
+            "failed": failed,
+            "skipped": skipped,
+            "succeeded_count": len(updated),
+            "failed_count": len(failed),
+            "message": message,
+        }), (200 if not failed else 500)
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 
@@ -4011,6 +4061,30 @@ def get_blacklist():
         return jsonify({"success": False, "message": str(e)}), 500
 
 
+def _nft_set_write(args, timeout=10):
+    """对内核 set 做一次写操作，**持有 _FW_APPLY_LOCK**。
+
+    为什么名单的增量操作必须持锁：`_FW_APPLY_LOCK` 当初引入就是为了防
+    「增量 nft 操作与看门狗的 nft -f 交叉执行」，代码注释里写得很明白，
+    但只有 `_apply_ruleset()` 和 `_recover_ruleset_if_unhealthy()` 两处真的拿了。
+    名单的 add/delete/flush/apply 全在锁外裸跑 subprocess。
+
+    交叉执行的两种坏结果，第二种更要命：
+
+      ① add 落在 `nft -f` 的 `flush ruleset` 之后 → 内核元素被冲掉。
+         而 `_mutate_lists()` 是在内核成功之后才落盘的，磁盘上记着这个 IP，
+         内核里没有 —— 用户看到「已封禁」，实际已经放行。
+
+      ② add 撞上重建中途、set 还不存在的窗口 → nft 报错，接口回 400，
+         但那是几百毫秒的瞬时状态，不是用户能理解的失败原因。
+
+    统一从这里走，避免以后再新增一个「忘了加锁」的名单操作。
+    """
+    with _FW_APPLY_LOCK:
+        return subprocess.run(['nft'] + list(args), capture_output=True,
+                              text=True, timeout=timeout)
+
+
 @app.route('/api/lists/add', methods=['POST'])
 def list_add():
     """添加 IP 到指定名单"""
@@ -4027,10 +4101,7 @@ def list_add():
     if _detect_ip_version(ip) is None:
         return jsonify({"success": False, "message": f"无效的 IP 地址: {ip!r}（应为单个 IPv4/IPv6，不支持 CIDR）"}), 400
     try:
-        result = subprocess.run(
-            ['nft', 'add', 'element', 'inet', 'fw4', set_name, '{', ip, '}'],
-            capture_output=True, text=True, timeout=10
-        )
+        result = _nft_set_write(['add', 'element', 'inet', 'fw4', set_name, '{', ip, '}'])
         if result.returncode != 0:
             return jsonify({"success": False, "message": f"添加失败: {result.stderr.strip() or result.stdout.strip()}"}), 400
         # 内核改成功之后再落盘。规则集以 flush ruleset 开头、每次应用都会重建，
@@ -4060,10 +4131,7 @@ def list_delete():
     if _detect_ip_version(ip) is None:
         return jsonify({"success": False, "message": f"无效的 IP 地址: {ip!r}（应为单个 IPv4/IPv6，不支持 CIDR）"}), 400
     try:
-        result = subprocess.run(
-            ['nft', 'delete', 'element', 'inet', 'fw4', set_name, '{', ip, '}'],
-            capture_output=True, text=True, timeout=10
-        )
+        result = _nft_set_write(['delete', 'element', 'inet', 'fw4', set_name, '{', ip, '}'])
         if result.returncode != 0:
             return jsonify({"success": False, "message": f"删除失败: {result.stderr.strip() or result.stdout.strip()}"}), 400
         _mutate_lists(set_name, remove=[ip])
@@ -4087,10 +4155,7 @@ def list_flush():
     if set_name not in VALID_SET_NAMES:
         return jsonify({"success": False, "message": f"无效的 set_name，允许值: {', '.join(sorted(VALID_SET_NAMES))}"}), 400
     try:
-        result = subprocess.run(
-            ['nft', 'flush', 'set', 'inet', 'fw4', set_name],
-            capture_output=True, text=True, timeout=10
-        )
+        result = _nft_set_write(['flush', 'set', 'inet', 'fw4', set_name])
         if result.returncode != 0:
             return jsonify({"success": False, "message": f"清空失败: {result.stderr.strip() or result.stdout.strip()}"}), 400
         _mutate_lists(set_name, clear=True)
@@ -4243,7 +4308,7 @@ def list_apply_preset(preset_id):
                '{', ip, '}']
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        result = _nft_set_write(cmd[1:])
         if result.returncode != 0:
             return jsonify({
                 'success': False,

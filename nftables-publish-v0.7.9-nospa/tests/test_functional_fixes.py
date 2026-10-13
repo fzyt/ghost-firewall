@@ -13,6 +13,8 @@
   FIX-9  配置损坏时守卫覆盖全部下发与落盘路径（原来只挂 1 个端点）
   FIX-10 网关 0 服务时 nginx 配置必须能加载（$auth_user 未定义会让整份配置被拒）
   FIX-10b 配置缺 reverse_proxy 段时不能 AttributeError（全新安装即命中）
+  FIX-11 名单增量 nft 操作持 _FW_APPLY_LOCK（原来与看门狗 nft -f 交叉执行）
+  FIX-12 update_ipv6 部分失败不再被掩盖（原子事务 + 如实汇总 + 前端显示明细）
 
 每条测试都写成「旧代码必然失败」的形式。沙箱运行：不碰真实路径、
 不执行 openssl / nft / nginx（需要外部命令的分支一律打桩）。
@@ -416,6 +418,69 @@ try:
 except Exception as _e:   # noqa: BLE001
     check('配置完全没有 reverse_proxy 段时也能生成（不 AttributeError）',
           False, repr(_e))
+
+# ── FIX-11 ───────────────────────────────────────────────────────
+# 名单的增量 nft 操作必须持 _FW_APPLY_LOCK。
+# 这个锁当初引入就是为了防「增量操作与看门狗 nft -f 交叉执行」，
+# 但只有 _apply_ruleset / _recover_ruleset_if_unhealthy 两处真拿了，
+# 名单 add/delete/flush/apply 全在锁外裸跑。
+sec('FIX-11 名单增量操作持 _FW_APPLY_LOCK（防与看门狗 nft -f 交叉执行）')
+_hold = fn_src(APP_SRC, '_nft_set_write')
+check('_nft_set_write 存在（统一入口，新增名单操作不会再漏加锁）',
+      'def _nft_set_write' in APP_SRC)
+check('_nft_set_write 内部持锁',
+      '_FW_APPLY_LOCK' in _hold and 'with _FW_APPLY_LOCK' in _hold)
+
+# 五个运行期写 set 的调用点必须全部走这个入口，不能还有裸 subprocess.run
+WRITE_RE = (r"subprocess\.run\(\s*\[\s*'nft',\s*'(?:add|delete|flush)',"
+            r"\s*'(?:element|set)',\s*'inet',\s*'fw4'")
+_bare = re.findall(WRITE_RE, APP_SRC)
+check('没有任何「裸 subprocess.run 直接改内核 set」', not _bare,
+      f'仍有 {len(_bare)} 处' if _bare else '5 处写操作全部走 _nft_set_write')
+
+for _fn, _label in (('list_add', 'add'), ('list_delete', 'delete'),
+                    ('list_flush', 'flush')):
+    _s = strip_comments(fn_src(APP_SRC, _fn))
+    check(f'{_label} 走 _nft_set_write', '_nft_set_write(' in _s)
+_s_apply = strip_comments(fn_src(APP_SRC, 'list_apply_preset'))
+check('presets/apply 走 _nft_set_write', '_nft_set_write(' in _s_apply)
+check('update_ipv6 的批量事务也持锁（同样是写内核 set）',
+      '_FW_APPLY_LOCK' in strip_comments(fn_src(APP_SRC, 'update_ipv6')))
+
+# ── FIX-12  update_ipv6 的失败必须报出来 ─────────────────────────
+sec('FIX-12 update_ipv6 部分失败不再被掩盖')
+_u6 = strip_comments(fn_src(APP_SRC, 'update_ipv6'))
+check('flush 与 add 放进同一个 nft 事务（add 失败时旧地址不丢）',
+      "'nft', '-f', '-'" in _u6 and 'flush set inet fw4' in _u6,
+      '原来先 flush 再 add 是两条命令，add 失败 set 就空了')
+check('不再有独立的 flush 命令后跟 add 命令的非原子写法',
+      not re.search(r"'flush',\s*'set'.*?\n.*?'add',\s*'element'", _u6, re.S))
+check('顶层 success 由失败数决定，不是无条件 True',
+      '"success": not failed' in _u6)
+check('message 里的条数是成功数不是尝试数',
+      '成功 {len(updated)} 条，失败 {len(failed)} 条' in _u6)
+check('失败项单独返回且带错误原因',
+      '"failed": failed' in _u6 and '"error": err' in _u6)
+check('部分失败时返回非 2xx',
+      re.search(r"\),\s*\(200 if not failed else 500\)", _u6) is not None)
+check('失败项写进了服务端日志（不是只有前端能看见）',
+      '[ERROR]' in _u6 and '更新失败' in _u6)
+
+# 前端必须真的读逐条失败 —— 后端算好了但没人看，等于没修
+_fe_js = open(os.path.join(ROOT, 'frontend', 'app.js'), encoding='utf-8').read()
+_ui6 = _fe_js[_fe_js.find('async updateIpv6'):_fe_js.find('async updateChinaIps')]
+_ui6_nc = '\n'.join(l for l in _ui6.splitlines()
+                    if not l.strip().startswith('//') and not l.strip().startswith('*'))
+# 必须盯**绑定本身**，不能只判「函数里出现过 e.data」——
+# 模板串 `${e.data.succeeded_count}` 里也有 e.data，把它改成 null 断言照样通过。
+# 这个坑今天已经踩到第四次了（注释、子串、多行续行、模板串）。
+check('前端 updateIpv6 把 e.data.failed 绑给了 failed',
+      re.search(r'const\s+failed\s*=\s*e\.data\s*&&\s*e\.data\.failed', _ui6_nc)
+      is not None)
+check('前端失败时弹的是 error 提示而不是 success',
+      re.search(r'failed\.length.*?\'error\'', _ui6_nc, re.S) is not None)
+check('前端失败提示里带上了具体是哪些 set 失败',
+      'f.set_name' in _ui6_nc and 'failed.map' in _ui6_nc)
 
 print()
 if FAIL:

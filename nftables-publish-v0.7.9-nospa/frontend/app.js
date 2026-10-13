@@ -1265,7 +1265,19 @@ function app() {
         const data = await api.post('/api/network/update-ipv6');
         this.showToast(data.message || 'IPv6 刷新完成', 'success');
       } catch (e) {
-        this.showToast(e.message || 'IPv6 刷新失败', 'error');
+        // 后端把「成功的条数」和逐条失败都算好了；api 封装见到
+        // success:false 就抛，明细在 e.data 里。
+        // 原来这里只看 data.message，updated[] 里的 error 一次都没读过 ——
+        // 部分失败时后端还报 success:true，界面弹的是绿色的「已更新 N 条」，
+        // 而实际上那批地址一条都没加上。
+        const failed = e.data && e.data.failed;
+        if (failed && failed.length) {
+          const names = failed.map(f => `${f.set_name}(${f.full_ipv6})`).join('、');
+          this.showToast(
+            `成功 ${e.data.succeeded_count} 条，失败 ${failed.length} 条：${names}`, 'error');
+        } else {
+          this.showToast(e.message || 'IPv6 刷新失败', 'error');
+        }
       } finally {
         this.ipv6Updating = false;
       }
