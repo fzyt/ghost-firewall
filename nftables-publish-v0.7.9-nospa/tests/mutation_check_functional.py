@@ -18,6 +18,7 @@ FILES = {
     'auth': os.path.join(ROOT, 'backend', 'auth_gateway.py'),
     'fe': os.path.join(ROOT, 'frontend', 'index.html'),
     'js': os.path.join(ROOT, 'frontend', 'app.js'),
+    'tool': os.path.join(ROOT, 'tools', 'check-api-coverage.py'),
 }
 TEST = os.path.join(ROOT, 'tests', 'test_functional_fixes.py')
 
@@ -340,6 +341,56 @@ MUTATIONS = [
      '        if (failed && failed.length) {',
      '        const failed = null;\n'
      '        if (failed && failed.length) {', 1),
+
+    # ── FIX-14  回环白名单 ────────────────────────────────────────
+    ('FIX-14 只放行 IPv6 回环（IPv4 本机访问被 deny all 挡成 403）', 'app',
+     '            L.append("        allow 127.0.0.1;")\n'
+     '            L.append("        allow ::1;")',
+     '            L.append("        allow ::1;")', 1),
+
+    ('FIX-14 把 ::1 换成 127.0.0.1（等于把 IPv6 回环堵回去）', 'app',
+     '            L.append("        allow 127.0.0.1;")\n'
+     '            L.append("        allow ::1;")',
+     '            L.append("        allow 127.0.0.1;")', 1),
+
+    ('FIX-14 回环白名单排在 deny all 之后（写了也不生效）', 'app',
+     '            L.append("        allow 127.0.0.1;")\n'
+     '            L.append("        allow ::1;")\n'
+     '            L.append("        deny all;")',
+     '            L.append("        deny all;")\n'
+     '            L.append("        allow 127.0.0.1;")\n'
+     '            L.append("        allow ::1;")', 1),
+
+    # ── FIX-13  界面没接上（等于死接口还在） ───────────────────────
+    ('FIX-13 侧边栏去掉改密码入口（功能又变成只有 curl 能用）', 'fe',
+     '          修改密码\n', '\n', 1),
+
+    ('FIX-13 证书重传按钮改成对所有证书显示（ACME 证书会被误导向重传）', 'fe',
+     'x-show="cert.source !== \'auto\'"\n'
+     '                        @click="pickRpReupload(cert, \'cert\')"',
+     '@click="pickRpReupload(cert, \'cert\')"', 1),
+
+    ('FIX-13 阿里云测试不再传 ipv6_source（IPv6 来源文件为空这个静默失效又测不到了）',
+     'js',
+     "          ipv6_source: isAaaa ? (src || '') : '',",
+     "          ipv6_source: '',", 1),
+
+    ('FIX-13 工具把「刻意不做界面」的清单删掉（5 条误报又回来了）', 'tool',
+     "    '/api/knock-info': '供 LAN 内客户端脚本读敲门端口，刻意无面板入口',",
+     "    # '/api/knock-info': 误报登记被删", 1),
+
+    # ── FIX-15  x-show 与组件根位置（真实浏览器实测逮到的） ────────
+    ('FIX-15 看门狗区退回 x-show（watchdog 为 null 时刷 TypeError）', 'fe',
+     '<template x-if="rulesHealth.watchdog">',
+     '<div x-show="rulesHealth.watchdog"', 1),
+
+    ('FIX-15 阿里云结果行退回 x-show（result 为 null 时刷 TypeError）', 'fe',
+     '<template x-if="aliyunTest.result && aliyunTest.index === index">',
+     '<p x-show="aliyunTest.result && aliyunTest.index === index"', 1),
+
+    ('FIX-15 弹窗被挪出 x-data 组件根（遮罩挡住整页，按钮全点不动）', 'fe',
+     '    </main>\n',
+     '    </main>\n  </div>\n', 1),
 ]
 
 

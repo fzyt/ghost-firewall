@@ -102,6 +102,50 @@ function app() {
     initUpToDate: false,
     repairing: false,
 
+    // 规则集健康 / 看门狗（/api/rules/health）。
+    // v0.8.x 加了一整套下发失败回滚 + 看门狗自愈，界面上却完全看不见 ——
+    // 用户只能靠「服务还能不能上」反推防火墙是不是真的活着。
+    rulesHealth: {
+      loading: false,
+      loaded: false,
+      ruleset_loaded: false,
+      ruleset_functional: false,
+      rules_file_exists: false,
+      backup_file_exists: false,
+      rules_file: '',
+      detail: '',
+      watchdog: null,
+    },
+
+    // 修改密码（/api/auth/change-password）。
+    // 面板此前根本没有改密码入口 —— 密码只能用 ssh + 手改文件改。
+    pwModal: {
+      show: false,
+      old_password: '',
+      new_password: '',
+      confirm_password: '',
+      loading: false,
+      error: '',
+    },
+
+    // IPv6 相关（/api/network/wan-ipv6 + /api/network/install-ipv6-cron）
+    ipv6: {
+      loading: false,
+      hasAddress: false,
+      full_addr: '',
+      prefix: '',
+      source: '',
+      cronInstalling: false,
+      cronInstalled: false,
+      cronMessage: '',
+    },
+
+    // 阿里云 DDNS 单条记录连通性测试（/api/aliyun-ddns/test）
+    aliyunTest: { running: false, index: null, result: null },
+
+    // 反代 nginx 配置片段预览（/api/reverse-proxy/nginx/preview/:id）
+    nginxPreview: { show: false, loading: false, name: '', content: '', error: '' },
+
     ddnsTab: 'general',
     aliyunSubTab: 'setup',
 
@@ -784,7 +828,76 @@ function app() {
       } catch (e) {
         this.showToast('加载DDNS配置失败: ' + e.message, 'error');
     }
-  },
+      await this.loadWanIpv6();
+    },
+
+    // WAN 公网 IPv6 —— DDNS 的值从哪来，界面上原来一个字都没说。
+    // 用户看到「DDNS 没生效」时，第一反应就是怀疑地址没取到。
+    async loadWanIpv6() {
+      this.ipv6.loading = true;
+      try {
+        const d = await api.get('/api/network/wan-ipv6');
+        this.ipv6.hasAddress = true;
+        this.ipv6.full_addr = d.full_addr || '';
+        this.ipv6.prefix = d.prefix || '';
+        this.ipv6.source = d.source || '';
+      } catch (e) {
+        // 404 是正常情况（没公网 IPv6），不是错误 —— 单独标记，不要弹错误提示
+        this.ipv6.hasAddress = false;
+        this.ipv6.full_addr = '';
+        this.ipv6.prefix = '';
+        this.ipv6.source = '';
+      } finally {
+        this.ipv6.loading = false;
+      }
+    },
+
+    async installIpv6Cron() {
+      this.ipv6.cronInstalling = true;
+      try {
+        const r = await api.post('/api/network/install-ipv6-cron');
+        this.ipv6.cronInstalled = true;
+        this.ipv6.cronMessage = r.message || '已安装定时更新';
+        this.showToast(this.ipv6.cronMessage, 'success');
+      } catch (e) {
+        this.ipv6.cronInstalled = false;
+        this.ipv6.cronMessage = e.message || '安装失败';
+        this.showToast('安装 IPv6 定时更新失败: ' + this.ipv6.cronMessage, 'error');
+      } finally {
+        this.ipv6.cronInstalling = false;
+      }
+    },
+
+    // 阿里云 DDNS：拿一条记录真去改一次，验证凭据/权限/网络都通。
+    // 传 ipv6_source 而不传 value —— 后端会自己去读 /tmp/ddns-ipv6-N，
+    // 这样连「IPv6 来源文件是不是空的」也一起测到了（那正是 v0.8.3 修过的坑）。
+    async testAliyunRecord(index) {
+      const rec = (this.aliyun.records || [])[index];
+      if (!rec) return;
+      const rr = rec.RR || rec.rr;
+      const rtype = rec.Type || rec.type;
+      const src = this.getAliyunRecordIpv6Source(index);
+      const isAaaa = rtype === 'AAAA';
+
+      this.aliyunTest.running = true;
+      this.aliyunTest.index = index;
+      this.aliyunTest.result = null;
+      try {
+        const r = await api.post('/api/aliyun-ddns/test', {
+          rr: rr,
+          type: rtype,
+          ipv6_source: isAaaa ? (src || '') : '',
+          value: isAaaa ? '' : (rec.Value || rec.value || ''),
+        });
+        this.aliyunTest.result = { ok: true, rr: rr, message: r.message || '记录更新成功' };
+        this.showToast(`测试成功：${rr} — ${this.aliyunTest.result.message}`, 'success');
+      } catch (e) {
+        this.aliyunTest.result = { ok: false, rr: rr, message: e.message || '测试失败' };
+        this.showToast(`测试失败：${rr} — ${this.aliyunTest.result.message}`, 'error');
+      } finally {
+        this.aliyunTest.running = false;
+      }
+    },
 
   getProviderName(id) {
     const p = this.ddns.providers.find(p => p.id === id);
@@ -1200,6 +1313,61 @@ function app() {
         this.initHasFw4Stop = data.init_has_fw4_stop;
         this.initUpToDate = data.init_up_to_date;
       } catch(e) {}
+      await this.loadRulesHealth();
+    },
+
+    async loadRulesHealth() {
+      this.rulesHealth.loading = true;
+      try {
+        const d = await api.get('/api/rules/health');
+        this.rulesHealth = {
+          ...this.rulesHealth,
+          ruleset_loaded: !!d.ruleset_loaded,
+          ruleset_functional: !!d.ruleset_functional,
+          rules_file_exists: !!d.rules_file_exists,
+          backup_file_exists: !!d.backup_file_exists,
+          rules_file: d.rules_file || '',
+          detail: d.detail || '',
+          watchdog: d.watchdog || null,
+          loaded: true,
+        };
+      } catch (e) {
+        this.rulesHealth = { ...this.rulesHealth, loaded: false, detail: e.message || '查询失败' };
+      } finally {
+        this.rulesHealth.loading = false;
+      }
+    },
+
+    // ── 修改密码 ────────────────────────────────────────────────
+    openPasswordModal() {
+      this.pwModal = { show: true, old_password: '', new_password: '', confirm_password: '', loading: false, error: '' };
+    },
+
+    async changePassword() {
+      const m = this.pwModal;
+      if (!m.old_password || !m.new_password) {
+        m.error = '旧密码和新密码都要填'; return;
+      }
+      if (m.new_password !== m.confirm_password) {
+        // 先本地比对：两次不一致直接拦下，不浪费一次旧密码校验额度
+        m.error = '两次输入的新密码不一致'; return;
+      }
+      if (m.new_password.length < 4) {
+        m.error = '新密码至少 4 位'; return;
+      }
+      m.loading = true; m.error = '';
+      try {
+        const r = await api.post('/api/auth/change-password', {
+          old_password: m.old_password,
+          new_password: m.new_password,
+        });
+        this.showToast(r.message || '密码已修改', 'success');
+        m.show = false;
+      } catch (e) {
+        m.error = e.message || '修改失败';
+      } finally {
+        m.loading = false;
+      }
     },
 
     async repairInitScript() {
@@ -1713,6 +1881,72 @@ function app() {
         this.showToast((data.data && data.data.message) || '已设为默认证书', 'success');
       } catch (e) {
         this.showToast('设置失败: ' + e.message, 'error');
+      }
+    },
+
+    // 手动证书的「续期」：覆盖文件、保留 cert id 与所有引用关系。
+    // 这是 v0.8.3 加了证书/私钥配对校验的端点，但界面上从来没有入口 ——
+    // 那个校验此前只有 curl 能触发，等于对普通用户不生效。
+    rpReuploadTarget: null,
+    rpReuploadCertFile: null,
+    rpReuploadKeyFile: null,
+
+    pickRpReupload(cert, kind) {
+      this.rpReuploadTarget = cert;
+      this.rpReuploadCertFile = null;
+      this.rpReuploadKeyFile = null;
+      // 由页面上的 <input type=file> 触发，用户选完立刻读回来
+      this.$nextTick(() => {
+        const el = document.getElementById('rp-reupload-' + kind);
+        if (el) el.click();
+      });
+    },
+
+    async submitRpReupload(kind, event) {
+      const file = event.target.files && event.target.files[0];
+      if (!file || !this.rpReuploadTarget) return;
+      if (kind === 'cert') {
+        this.rpReuploadCertFile = file;
+        this.$nextTick(() => document.getElementById('rp-reupload-key')?.click());
+        return;
+      }
+      const certFile = this.rpReuploadCertFile;
+      const keyFile = file;
+      if (!certFile) { this.showToast('请先选择证书文件', 'error'); return; }
+
+      this.rpUploading = true;
+      try {
+        const fd = new FormData();
+        fd.append('cert_file', certFile);
+        fd.append('key_file', keyFile);
+        const resp = await fetch('/api/reverse-proxy/certificates/'
+          + this.rpReuploadTarget.id + '/reupload', { method: 'POST', body: fd });
+        const json = await resp.json();
+        if (json.success === false) throw new Error(json.message || '重新上传失败');
+        this.showToast((json.data && json.data.message) || '证书已更新', 'success');
+        this.rpReuploadTarget = null;
+        this.rpReuploadCertFile = null;
+        await this.loadReverseProxy();
+      } catch (e) {
+        // 校验失败时后端会保住原文件不动，这里如实告诉用户「原证书未受影响」
+        this.showToast('重新上传失败：' + e.message, 'error');
+      } finally {
+        this.rpUploading = false;
+      }
+    },
+
+    // 反代规则生成的 nginx 配置片段预览（调试用）。
+    // 配置部署失败时 nginx -t 只会说一句语法错，看不出是哪条规则生成的。
+    async previewRpNginx(rule) {
+      this.nginxPreview = { show: true, loading: true, name: rule.name || rule.path_prefix || rule.id, content: '', error: '' };
+      try {
+        const d = await api.get('/api/reverse-proxy/nginx/preview/' + rule.id);
+        const data = d.data || d;
+        this.nginxPreview.content = data.config_content || '';
+      } catch (e) {
+        this.nginxPreview.error = e.message || '预览失败';
+      } finally {
+        this.nginxPreview.loading = false;
       }
     },
 

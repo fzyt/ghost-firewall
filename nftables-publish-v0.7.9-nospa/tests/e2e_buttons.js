@@ -168,10 +168,17 @@ async function dismissModals(page) {
   await page.evaluate(() => {
     const st = document.querySelector('[x-data]')?._x_dataStack?.[0];
     if (!st) return;
-    // 面板里所有模态开关的已知字段，一并归零
+    // 面板里所有模态开关的已知字段，一并归零。
+    // 新增模态必须登记到这里 —— 否则测试器自己点开弹窗后不关，
+    // 后面每一个按钮都会被遮罩挡住，整页报 "Timeout exceeded"，
+    // 看起来像满屏都是产品 bug，实际是这个列表漏了一个字段。
     for (const k of ['diffModal', 'presetModalOpen', 'rpEditingRule']) {
       if (k === 'diffModal' && st.diffModal) st.diffModal.show = false;
-      else st[k] = null;
+      else if (st[k] !== undefined) st[k] = null;
+    }
+    // 新增的模态是对象形态（{show, ...}），不是简单置 null
+    for (const k of ['pwModal', 'nginxPreview']) {
+      if (st[k]) { st[k].show = false; st[k].loading = false; st[k].error = ''; }
     }
     if (st.diffModal) st.diffModal.loading = false;
   });

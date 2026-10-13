@@ -120,6 +120,11 @@
           加载中…
         </div>
         <span x-show="!loading">仅限内网访问</span>
+        <!-- 改密码入口。面板此前完全没有这个功能，密码只能用 ssh 手改文件。 -->
+        <button x-show="!loading" @click="openPasswordModal()"
+          class="mt-3 nf-btn nf-btn--magnetic" style="width:100%;padding:7px 12px;font-size:.78rem">
+          修改密码
+        </button>
       </div>
     </aside>
 
@@ -735,6 +740,47 @@
         </div>
         <!-- ===== 通用 DDNS ===== -->
         <div x-show="ddnsTab === 'general'">
+          <!-- WAN 公网 IPv6 + 定时更新安装。
+               这两件事原来完全没有界面：用户看到「DDNS 不生效」时，
+               根本没法判断是地址没取到，还是压根没装定时任务。 -->
+          <div class="bg-gray-50 border rounded-lg p-5 mb-6">
+            <div class="flex items-center justify-between mb-4 flex-wrap gap-3">
+              <div>
+                <h2 class="font-semibold">WAN 公网 IPv6</h2>
+                <p class="text-xs text-gray-500 mt-1">
+                  DDNS 的 AAAA 记录就取自这个地址。取不到时所有 IPv6 解析都停在旧值上。
+                </p>
+              </div>
+              <div class="flex gap-2">
+                <button @click="loadWanIpv6()" :disabled="ipv6.loading"
+                  class="px-3 py-1 border rounded text-xs disabled:opacity-50">
+                  <span x-text="ipv6.loading ? '查询中…' : '重新查询'"></span>
+                </button>
+                <button @click="installIpv6Cron()" :disabled="ipv6.cronInstalling"
+                  title="把 IPv6 更新脚本写进 /etc/cron.d，由系统定时刷新 DDNS"
+                  class="px-3 py-1 border rounded text-xs disabled:opacity-50">
+                  <span x-text="ipv6.cronInstalling ? '安装中…' : '安装定时更新'"></span>
+                </button>
+              </div>
+            </div>
+
+            <div class="flex items-center gap-3">
+              <span class="w-3 h-3 rounded-full inline-block"
+                :class="ipv6.hasAddress ? 'bg-green-500' : 'bg-amber-500'"></span>
+              <span class="text-sm font-medium" x-text="ipv6.hasAddress ? '已取到地址' : '暂无公网 IPv6'"></span>
+              <span class="text-sm text-gray-500 break-all"
+                x-text="ipv6.hasAddress
+                  ? ipv6.full_addr + '（取自 ' + (ipv6.source === 'wan' ? 'WAN 接口' : 'LAN 接口') + '）'
+                  : '没有全局 IPv6 地址，AAAA 记录无法更新'"></span>
+            </div>
+
+            <div x-show="ipv6.hasAddress" class="mt-3 nf-mono text-xs text-gray-500 break-all"
+              x-text="'前缀（拼接各转发规则 IPv6 后缀用）：' + ipv6.prefix"></div>
+
+            <div x-show="ipv6.cronMessage" class="mt-3 text-xs"
+              :class="ipv6.cronInstalled ? 'text-green-600' : 'text-red-600'"
+              x-text="ipv6.cronMessage"></div>
+          </div>
           <div class="flex items-center justify-between mb-6">
             <div></div>
             <div class="flex gap-3">
@@ -997,6 +1043,7 @@
                     <th class="text-left px-4 py-3 font-medium text-gray-600">类型</th>
                     <th class="text-left px-4 py-3 font-medium text-gray-600">当前值</th>
                     <th class="text-left px-4 py-3 font-medium text-gray-600">状态</th>
+                    <th class="text-left px-4 py-3 font-medium text-gray-600">IPv6 来源</th>
                     <th class="text-left px-4 py-3 font-medium text-gray-600">操作</th>
                   </tr>
                 </thead>
@@ -1025,6 +1072,24 @@
                         </select>
                         <!-- A 记录不显示 -->
                         <span x-show="(rec.Type || rec.type) === 'A'" class="text-xs text-gray-400">自动</span>
+                      </td>
+                      <td class="px-4 py-3">
+                        <!-- 真去改一次这条记录：凭据、权限、网络、IPv6 来源
+                             文件是否产出地址，全都在这一次调用里验完。
+                             AAAA 记录传 ipv6_source 不传 value，让后端自己读
+                             /tmp/ddns-ipv6-N —— 那正是 v0.8.3 修过的静默失效点。 -->
+                        <button @click="testAliyunRecord(index)"
+                          :disabled="aliyunTest.running"
+                          class="px-2 py-1 border rounded text-xs hover:bg-gray-100 disabled:opacity-50 transition-colors">
+                          <span x-text="aliyunTest.running && aliyunTest.index === index ? '测试中…' : '测试'"></span>
+                        </button>
+                        <!-- 结果行同样用 x-if：result 初始是 null，x-show 不会阻止
+                             aliyunTest.result.message 求值，会抛 TypeError。 -->
+                        <template x-if="aliyunTest.result && aliyunTest.index === index">
+                          <p class="text-xs mt-1 max-w-[220px] break-words"
+                            :class="aliyunTest.result.ok ? 'text-green-600' : 'text-red-600'"
+                            x-text="aliyunTest.result.message"></p>
+                        </template>
                       </td>
                     </tr>
                   </template>
@@ -1062,6 +1127,92 @@
            x-transition:enter-start="nfx-enter-start"
            x-transition:enter-end="nfx-enter-end">
         <h1 class="text-2xl font-bold mb-6">防火墙状态</h1>
+        <!-- ── 规则集健康 + 看门狗 ────────────────────────────────
+     v0.8.x 加了一整套下发失败回滚 + 看门狗自愈，界面上却一个字都没有：
+     规则没装上、或者被谁 flush 了又还没到重试时间，用户从面板上看不出来，
+     只能靠「还能不能上网」反推。这里把内核的真实状态直接摊开。 -->
+        <div class="bg-gray-50 border rounded-lg p-5 mb-6">
+          <div class="flex items-center justify-between mb-4">
+            <h2 class="font-semibold">规则集健康</h2>
+            <button @click="loadRulesHealth()" :disabled="rulesHealth.loading"
+              class="px-3 py-1 border rounded text-xs disabled:opacity-50">
+              <span x-text="rulesHealth.loading ? '查询中…' : '刷新'"></span>
+            </button>
+          </div>
+
+          <div x-show="rulesHealth.loaded" class="space-y-3">
+            <div class="flex items-center gap-3">
+              <span class="w-3 h-3 rounded-full inline-block"
+                :class="rulesHealth.ruleset_functional ? 'bg-green-500' : 'bg-red-500'"></span>
+              <span class="text-sm font-medium">内核规则集</span>
+              <span class="text-sm text-gray-500"
+                x-text="rulesHealth.ruleset_functional
+                  ? '可用（input 链已挂载且带策略）'
+                  : '不可用 —— ' + (rulesHealth.detail || '状态未知')"></span>
+            </div>
+            <div class="flex items-center gap-3">
+              <span class="w-3 h-3 rounded-full inline-block"
+                :class="rulesHealth.ruleset_loaded ? 'bg-green-500' : 'bg-red-500'"></span>
+              <span class="text-sm font-medium">规则表</span>
+              <span class="text-sm text-gray-500"
+                x-text="rulesHealth.ruleset_loaded ? '已加载到内核' : '内核中没有'"></span>
+            </div>
+            <div class="flex items-center gap-3">
+              <span class="w-3 h-3 rounded-full inline-block"
+                :class="rulesHealth.rules_file_exists ? 'bg-green-500' : 'bg-red-500'"></span>
+              <span class="text-sm font-medium">规则文件</span>
+              <span class="text-sm text-gray-500 break-all"
+                x-text="(rulesHealth.rules_file_exists ? '存在' : '缺失') + ' · ' + rulesHealth.rules_file"></span>
+            </div>
+            <div class="flex items-center gap-3">
+              <span class="w-3 h-3 rounded-full inline-block"
+                :class="rulesHealth.backup_file_exists ? 'bg-green-500' : 'bg-amber-500'"></span>
+              <span class="text-sm font-medium">回滚备份</span>
+              <span class="text-sm text-gray-500"
+                x-text="rulesHealth.backup_file_exists ? '已就绪' : '没有备份，看门狗自愈会少一条退路'"></span>
+            </div>
+          </div>
+          <p x-show="!rulesHealth.loaded && !rulesHealth.loading"
+             class="text-sm text-gray-500" x-text="rulesHealth.detail || '查询失败'"></p>
+
+          <!-- 看门狗。用 x-if 而不是 x-show —— x-show 只是把 display 设成 none，
+       内层的 x-text 表达式照样会求值，而 watchdog 初始是 null，
+       于是刷出一片 "Cannot read properties of null (reading 'last_result')"。
+       这是真实浏览器实测逮到的：curl 打接口全绿，因为 /api/rules/health
+       返回正常，坏的是「数据还没到时模板已经渲染」这一段。
+       x-if 才是真把子树摘掉。 -->
+          <template x-if="rulesHealth.watchdog">
+            <div class="mt-5 pt-4 border-t space-y-3">
+              <div class="flex items-center justify-between">
+                <span class="text-sm font-medium">看门狗</span>
+                <span class="text-xs px-2 py-0.5 rounded"
+                  :class="rulesHealth.watchdog.enabled
+                    ? 'bg-green-100 text-green-700' : 'bg-gray-200 text-gray-600'"
+                  x-text="rulesHealth.watchdog.enabled ? '已启用' : '已停用'"></span>
+              </div>
+              <div class="nf-mono text-xs text-gray-500 space-y-1">
+                <p>
+                  上次自检：<span x-text="rulesHealth.watchdog.last_result || '—'"></span>
+                </p>
+                <p>
+                  检查间隔 <span x-text="rulesHealth.watchdog.interval"></span> 秒 ·
+                  连续失败 <span x-text="rulesHealth.watchdog.consecutive_fails"></span>/<span x-text="rulesHealth.watchdog.fail_threshold"></span> 次触发 ·
+                  已恢复 <span x-text="rulesHealth.watchdog.actions"></span> 次
+                </p>
+                <p>
+                  冷却 <span x-text="rulesHealth.watchdog.cooldown"></span> 秒 ·
+                  运行中：<span x-text="rulesHealth.watchdog.running ? '是' : '否'"></span>
+                </p>
+              </div>
+              <p class="text-xs text-gray-400 leading-relaxed">
+                看门狗每 <span x-text="rulesHealth.watchdog.interval"></span> 秒检查一次。
+                发现规则集表不存在或链没挂策略时，会按「重新加载规则文件 → .lastgood →
+                启动级恢复链 → basic lockdown」的顺序自救，最后一级会丢掉端口转发。
+              </p>
+            </div>
+          </template>
+        </div>
+
         <div class="bg-gray-50 border rounded-lg p-5 space-y-5">
           <!-- fw4 -->
           <div class="flex items-center gap-3">
@@ -1985,6 +2136,10 @@
                       class="px-3 py-1 border rounded text-xs hover:bg-gray-100 transition-colors">编辑</button>
                     <button @click="testRpRule(rule)"
                       class="px-3 py-1 border rounded text-xs hover:bg-gray-100 transition-colors">测试</button>
+                    <!-- 看这条服务在网关 nginx 里到底生成了什么。部署失败时
+                         nginx -t 只报行号，没有上下文很难定位是哪条规则的问题。 -->
+                    <button @click="previewRpNginx(rule)"
+                      class="px-3 py-1 border rounded text-xs hover:bg-gray-100 transition-colors">配置预览</button>
                     <button @click="deleteRpRule(index)"
                       class="px-3 py-1 border border-red-300 text-red-600 rounded text-xs hover:bg-red-50 transition-colors">删除</button>
                   </div>
@@ -2122,6 +2277,15 @@
                       <button x-show="cert.source === 'auto'" @click="renewRpCert(cert)" :disabled="rpUploading"
                         class="px-3 py-1 border border-black rounded text-xs hover:bg-gray-50 disabled:opacity-50 transition-colors">
                         续期
+                      </button>
+                      <!-- 重新上传：v0.8.3 给这条路径加了证书/私钥配对校验，
+                           但界面上一直没有入口，那个校验此前只有 curl 能触发。
+                           只对手动证书有意义（ACME 用上面的「续期」）。 -->
+                      <button x-show="cert.source !== 'auto'"
+                        @click="pickRpReupload(cert, 'cert')" :disabled="rpUploading"
+                        title="用新的证书和私钥覆盖当前证书，证书 ID 与所有引用关系保持不变"
+                        class="px-3 py-1 border border-black rounded text-xs hover:bg-gray-50 disabled:opacity-50 transition-colors">
+                        重新上传
                       </button>
                       <button @click="downloadRpCert(cert)" :disabled="rpUploading"
                         class="px-3 py-1 border border-black rounded text-xs hover:bg-gray-50 disabled:opacity-50 transition-colors">
@@ -2295,9 +2459,90 @@
       </div>
     </div>
   </div>
+
+
+  <!-- 重新上传证书用的隐藏文件选择框。拆成两个 input 是为了让用户按顺序
+       先选证书、再选私钥；下次更新时每张卡片的「重新上传」按钮都走它们。
+       cert 与 key 顺序选反是换证书时最常见的失误，后端会校验配对并在
+       失败时保住原文件，所以这里给不出错的余地。 -->
+  <input type="file" id="rp-reupload-cert" class="hidden"
+    @change="submitRpReupload('cert', $event)" />
+  <input type="file" id="rp-reupload-key" class="hidden"
+    @change="submitRpReupload('key', $event)" />
+
+  <!-- ======================= 修改密码弹窗 ======================= -->
+  <div x-show="pwModal.show" x-cloak
+    class="fixed inset-0 z-[200] bg-black bg-opacity-50 flex items-center justify-center px-4">
+    <div class="bg-white rounded-xl shadow-2xl w-full max-w-md">
+      <div class="p-5 border-b flex items-center justify-between">
+        <h2 class="text-lg font-bold">修改管理员密码</h2>
+        <button @click="pwModal.show = false" class="text-gray-400 hover:text-gray-600">✕</button>
+      </div>
+
+      <form class="p-5 space-y-4" @submit.prevent="changePassword()">
+        <div>
+          <label class="block text-sm font-medium mb-1">当前密码</label>
+          <input type="password" x-model="pwModal.old_password"
+            class="w-full border rounded px-3 py-2 nf-mono"
+            autocomplete="current-password" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">新密码</label>
+          <input type="password" x-model="pwModal.new_password"
+            class="w-full border rounded px-3 py-2 nf-mono"
+            autocomplete="new-password" />
+          <p class="text-xs text-gray-500 mt-1">4–128 位。改完立即生效，当前会话不受影响。</p>
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">确认新密码</label>
+          <input type="password" x-model="pwModal.confirm_password"
+            class="w-full border rounded px-3 py-2 nf-mono"
+            autocomplete="new-password" />
+        </div>
+
+        <div x-show="pwModal.error" x-text="pwModal.error"
+          class="bg-red-50 border border-red-200 text-red-700 rounded px-3 py-2 text-sm"></div>
+
+        <div class="flex gap-2 justify-end pt-2">
+          <button type="button" @click="pwModal.show = false"
+            class="px-4 py-2 border rounded text-sm">取消</button>
+          <button type="submit" :disabled="pwModal.loading"
+            class="px-5 py-2 bg-black text-white rounded text-sm disabled:opacity-50">
+            <span x-text="pwModal.loading ? '提交中…' : '确认修改'"></span>
+          </button>
+        </div>
+      </form>
+    </div>
   </div>
 
-  <!-- ======================= dry-run diff 预览弹窗 ======================= -->
+  <!-- ======================= 反代 nginx 配置预览弹窗 ======================= -->
+  <div x-show="nginxPreview.show" x-cloak
+    class="fixed inset-0 z-[200] bg-black bg-opacity-50 flex items-center justify-center px-4">
+    <div class="bg-white rounded-xl shadow-2xl w-full max-w-3xl max-h-[85vh] flex flex-col">
+      <div class="p-5 border-b flex items-center justify-between">
+        <h2 class="text-lg font-bold">
+          nginx 配置预览
+          <span class="text-sm font-normal text-gray-500" x-text="nginxPreview.name"></span>
+        </h2>
+        <button @click="nginxPreview.show = false" class="text-gray-400 hover:text-gray-600">✕</button>
+      </div>
+      <div class="p-5 overflow-y-auto flex-1">
+        <p x-show="nginxPreview.loading" class="text-gray-400 py-8 text-center">加载中…</p>
+        <p x-show="!nginxPreview.loading && nginxPreview.error"
+           class="text-red-600 text-sm" x-text="nginxPreview.error"></p>
+        <pre x-show="!nginxPreview.loading && !nginxPreview.error"
+          class="nf-mono text-xs whitespace-pre-wrap break-all bg-gray-50 border rounded p-4"
+          x-text="nginxPreview.content"></pre>
+      </div>
+      <div class="p-4 border-t text-xs text-gray-500">
+        这是该条反代服务在网关 nginx 配置里生成的全部片段。部署失败时
+        <span class="nf-mono">nginx -t</span> 只报行号，这里能直接看到完整上下文。
+      </div>
+    </div>
+  </div>
+
+  </div>
+
 
   <script src="app.js"></script>
 </body>

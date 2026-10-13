@@ -278,6 +278,126 @@ config 的，所以得自己兜住。改成 `if not isinstance(rp, dict): rp = {
   把 `set` 删掉测试照样全绿。改成 `(?<![A-Za-z0-9_])set\s+\$(\w+)` 才算真的在测。
   顺带修了 `log_format` 多行续行导致 `$auth_device` 根本没被扫到的问题
 
+### P1  12 条死接口：7 条补界面，5 条在工具里说清为什么不做
+
+`tools/check-api-coverage.py` 报出 12 条「后端有路由、前端零调用」。逐条看过之后
+**只有 7 条是真缺界面**，其余 5 条本来就不该有界面：
+
+| 端点 | 为什么不补 UI |
+|---|---|
+| `/api/firewall/china-ips-script` | 脚本下载端点，给外部 crontab 取用 |
+| `/api/scripts/update-ipv6.sh` | 同上 |
+| `/api/knock-info` | 供 LAN 内客户端脚本读敲门端口，刻意无面板入口 |
+| `/api/rules/save` | 已废弃，保留是为了不打断可能存在的 curl 调用方 |
+| `/:file` | 前端静态路由，不是 API |
+
+工具原本把这 5 类和真缺口混在同一张清单里报出来。**假阳性比漏报更糟** ——
+一份天天误报的清单，用久了就没人看了。新增 `INTENTIONAL_NO_UI` 登记与
+独立的【D】类输出，B 类现在为 0。
+
+补上的 7 条界面：
+
+1. **修改密码** —— 侧边栏页脚。此前面板**根本没有改密码入口**，密码只能用
+   ssh 手改文件。要求输入两次新密码，不一致时在本地拦下，不浪费旧密码校验额度
+2. **规则集健康 + 看门狗状态卡** —— 加在「防火墙状态」页。v0.8.x 加了一整套
+   下发失败回滚与看门狗自愈，界面上却一个字都没有：规则没装上、或者被 flush 了
+   还没到重试时间，用户只能靠「还能不能上网」反推。现在直接摊开内核真实状态，
+   含看门狗的上次自检结果、已恢复次数、冷却与阈值
+3. **证书重新上传** —— 本轮刚加固的证书/私钥配对校验，此前**只有 curl 能触发**。
+   拆成两个隐藏 file input（先证书后私钥），避免把顺序选反
+4. **WAN 公网 IPv6 展示 + 安装定时更新** —— DDNS 的值取自这个地址，此前界面上
+   一个字都没说，用户看到「DDNS 不生效」没法判断是地址没取到还是没装定时任务
+5. **阿里云记录连通性测试** —— 每条记录一个测试按钮，用该记录自己的 RR/Type/Value。
+   AAAA 记录传 `ipv6_source` 不传 `value`，让后端自己去读 `/tmp/ddns-ipv6-N` ——
+   顺带把「IPv6 来源文件是空的」这个静默失效点也测到
+6. **反代 nginx 配置预览** —— 部署失败时 `nginx -t` 只报行号，没有上下文很难定位
+
+### P1  弹窗被放到了 Alpine 组件根外，整页按钮点不动
+
+这个是**真实浏览器实测逮到的**，curl 打接口完全测不出来。
+
+新增的两个弹窗被写在了 `x-data="app()"` 组件根**之外**。`x-show` 依赖 Alpine
+求值，元素在组件根外时 `nginxPreview` 是 `undefined`，指令根本不生效，
+遮罩层保持默认的 `display: block` —— 于是它盖住整页，**所有按钮都点不动**。
+面板直接变成一块砖。
+
+`tests/e2e_buttons.js probe` 第一步就报：
+
+```
+page.click: Timeout 30000ms exceeded
+  - <div class="p-4 border-t text-xs text-gray-500">…</div>
+    from <div x-show="nginxPreview.show" class="fixed inset-0 z-[200] …">
+    subtree intercepts pointer events
+```
+
+已加回归断言：按 `<div>` 深度判断每个弹窗/文件输入框是否落在组件根内
+（根外的元素深度恒为 0），并检查全文 div 标签配平。
+
+### P1  `x-show` 挡不住 null 解引用，页面刷出 270 条 TypeError
+
+和上一条**同一类根因**：Alpine 指令的语义被想当然地理解了。`x-show` 只是把
+`display` 设成 `none`，**内层的 `x-text` 照样求值**。
+
+健康卡的看门狗区当时是 `x-show="rulesHealth.watchdog"`，而 `watchdog` 初值是
+`null`（接口还没回来）。于是页面刚打开就刷：
+
+```
+[30×] Cannot read properties of null (reading 'last_result')
+[30×] Cannot read properties of null (reading 'interval')
+[30×] Cannot read properties of null (reading 'consecutive_fails')
+[60×] Cannot read properties of null (reading 'enabled')
+...  共 270 条
+```
+
+阿里云测试的结果行 `x-show="aliyunTest.result && ..."` 是同一个坑：
+`x-show` 的条件写了非空判断，同一元素上的 `x-text` 却直接
+`aliyunTest.result.message`。
+
+两处都改成 `<template x-if>` —— `x-if` 才是真把子树摘掉，表达式根本不会求值。
+
+**这一条 curl 完全测不出来**：`/api/rules/health` 返回完全正常，
+坏的是「数据还没到时模板已经渲染」这一段。只有真在浏览器里打开页面、
+让控制台跑一遍才会暴露。
+
+修完之后浏览器复测：页面级错误从 **300 条降到 30 条**，剩下的全是
+`/api/network/wan-ipv6` 的 404（`.224` 没有公网 IPv6，属预期情况，
+前端已按「无地址」处理）。
+
+顺带修了 `tests/e2e_buttons.js` 的一处缺口：它的弹窗清理只认
+`diffModal / presetModalOpen / rpEditingRule`，**新增模态必须登记进去** ——
+不然测试器自己点开弹窗后不关，后面每个按钮都被遮罩挡住，
+整页报 `Timeout exceeded`，看着像满屏产品 bug。已补上 `pwModal` 与
+`nginxPreview`，并写进注释说明为什么漏了会这样。
+
+### P1  网关只放行 IPv6 回环，漏了 IPv4
+
+`public_access=false` 的服务生成的 nginx 片段里写了 `allow ::1;` 却没写
+`allow 127.0.0.1;` —— 于是从路由器本机用 IPv4 回环访问自己的网关会被
+`deny all` 挡成 403，而同样语义的 `curl https://[::1]:8443/dsm/` 却能通。
+同一个「本机」两种结果，纯属遗漏。
+
+安全上没有风险：`127.0.0.1` 只有路由器自己发起的连接才是这个源地址，
+公网侧根本无法伪造（WAN 入向本来就有反伪造 drop）。已补，并加了「不是把
+`::1` 换成 `127.0.0.1`」的反向断言。
+
+### P1  名单增量操作不持 `_FW_APPLY_LOCK`
+
+`_FW_APPLY_LOCK` 当初引入就是为了防「增量 nft 操作与看门狗的 `nft -f` 交叉执行」，
+代码注释里写得很明白 —— 但全库只有 `_apply_ruleset()` 与
+`_recover_ruleset_if_unhealthy()` 两处真的拿了。名单的 add / delete / flush /
+presets-apply 全在锁外裸跑 `subprocess.run`。
+
+交叉执行的坏结果，第二种更要命：
+
+- add 落在 `nft -f` 的 `flush ruleset` 之后 → 内核元素被冲掉。而
+  `_mutate_lists()` 是在内核成功之后才落盘的，磁盘记着这个 IP、内核里没有 ——
+  用户看到「已封禁」，实际已经放行
+- add 撞上重建中途、set 还不存在的窗口 → nft 报错回 400，但那是几百毫秒的
+  瞬时状态，不是用户能理解的失败原因
+
+抽出统一入口 `_nft_set_write()`，五处写操作全部走它。以后再新增名单操作
+不会再漏加锁 —— 漏一次就是一次静默的放行。
+
 ### P1  看门狗把空规则文件误判成「恢复成功」，`.lastgood` 永远轮不到
 
 `_try_apply_rules_file()` 的第二道检查是「表还在吗」（`_ruleset_is_empty()`）。
@@ -373,14 +493,14 @@ for _p in (RULES_PATH, RULES_PATH + '.lastgood'):
 
 ### 测试
 
-新增 `tests/test_functional_fixes.py`（75 条断言）+ `tests/mutation_check_functional.py`
-（35 条变异）+ `tests/mutation_check_fw_recovery.py`（11 条变异）。
+新增 `tests/test_functional_fixes.py`（131 条断言）+ `tests/mutation_check_functional.py`
+（56 条变异）+ `tests/mutation_check_fw_recovery.py`（11 条变异）。
 所有变异 100% 被捕获。
 
-全量回归（本版改动后）：单测 75 + 147 + 51 + 47 + 68 + 69 + 前端 29 全部通过，
-变异 35 + 21 + 19 + 10 + 11 共 96 条全部捕获。
+全量回归（本版改动后）：单测 131 + 147 + 51 + 47 + 68 + 69 + 前端 29 全部通过，
+变异 56 + 21 + 10 + 19 + 11 共 117 条全部捕获。
 
-跑测试时发现并修掉五处**测试自身的弱点**（不是代码 bug）：
+跑测试时发现并修掉九处**测试自身的弱点**（不是代码 bug）：
 
 1. 断言匹配到了解释性注释里的字面量（`save_config()`、「配置已保存但网关部署
    失败」）—— 已加 `strip_comments()`，位置判断前先剥注释
@@ -400,15 +520,25 @@ for _p in (RULES_PATH, RULES_PATH + '.lastgood'):
    **删掉 `hook input` 检查这个变异完全抓不到**。补一个「换成 forward hook、
    `policy drop` 还在」的独立样例；另补 `nft -f` 非零退出码、`subprocess` 三类异常、
    重试循环 `break` 的三组输入
+6. FIX-12 前端断言写成「函数里出现过 `e.data`」—— 模板串 `${e.data.succeeded_count}`
+   里也有 e.data，把它改成 null 断言照样通过。改成盯绑定本身
+   `const failed = e.data && e.data.failed`
+7. FIX-13 断言用「全文出现过『修改密码』」判断侧边栏入口 —— 弹窗那段的分隔注释里
+   也有同样四个字，把真正的按钮删掉测试照样绿。改成先切出侧边栏范围再找
+8. FIX-13 对工具源码的断言没剥注释 —— 把登记项注释掉，字符串本身还在文件里。
+   同一个坑今天已经踩到第五次：注释、子串、多行续行、模板串、Python 注释
+9. 这一轮整体缺一类断言：**Alpine 指令语义**（组件根位置、`x-show` 与 `x-if`
+   的区别）。加了两条：按 `<div>` 深度确认弹窗在 `x-data="app()"` 根内；
+   扫出「同一元素上既有 `x-show` 又解引用可能为 null 的对象」这个反模式
 
 ### 回归（改动前后各跑一遍）
 
 ```
 单元  test_review_fixes 147 · test_privilege_drop 51 · test_auth_gateway 68
       test_security_fixes 47 · test_fw_recovery 69 · test_log_parser
-      test_functional_fixes 75 · 前端 test_frontend.js 29        —— 全绿
+      test_functional_fixes 131 · 前端 test_frontend.js 29       —— 全绿
 变异  mutation_check 21/21 · mutation_check_security 10/10
-      mutation_check_privilege 19/19 · mutation_check_functional 35/35
+      mutation_check_privilege 19/19 · mutation_check_functional 56/56
       mutation_check_fw_recovery 11/11                            —— 全捕获
 ```
 

@@ -123,10 +123,31 @@ for p, ms in sorted(calls.items()):
     if p not in routes:
         orphan.append((p, ms))
 
+# 「后端有、前端不调」不等于「缺 UI」。有几类端点本来就不该有界面，
+# 把它们和真缺口混在一张清单里报出来，久而久之整份报告就没人看了 ——
+# 假阳性比漏报更糟，它会让人去给一个刻意不做的功能编个界面。
+#
+# 三类：
+#   1. 静态文件路由       —— nginx/Flask 直接给浏览器，不是 API
+#   2. 脚本下载端点       —— 给外部 crontab / shell 用 URL 取，界面没意义
+#   3. 给外部客户端用的   —— 刻意匿名或半匿名，且要求内网来源
+#   4. 已废弃但保留的     —— 保留是为了不打断可能存在的 curl 调用方
+INTENTIONAL_NO_UI = {
+    '/:file': '静态文件路由，不是 API',
+    '/api/firewall/china-ips-script': '脚本下载端点，供外部 crontab 取用',
+    '/api/scripts/update-ipv6.sh': '脚本下载端点，供外部 crontab 取用',
+    '/api/knock-info': '供 LAN 内客户端脚本读敲门端口，刻意无面板入口',
+    '/api/rules/save': '已废弃，转发到 /api/rules/apply；保留是为了不打断 curl 调用方',
+}
+
 dead = []
+intentional = []
 for p, ms in sorted(routes.items()):
     if p.startswith('/auth') or p in ('/', '/_auth'):
         continue          # 网关路径，由 nginx 转发，不经前端
+    if p in INTENTIONAL_NO_UI:
+        intentional.append((p, ms, INTENTIONAL_NO_UI[p]))
+        continue
     if p not in calls:
         dead.append((p, ms))
 
@@ -141,6 +162,11 @@ if not dead:
     print('  无')
 for p, ms in dead:
     print(f'  ⚠️  {p}  [{",".join(sorted(ms))}]')
+
+if intentional:
+    print('\n【D】刻意不做界面（不是缺口，报出来只是解释为什么）')
+    for p, ms, why in intentional:
+        print(f'  ·  {p}  [{",".join(sorted(ms))}]  —— {why}')
 
 print('\n【C】方法不匹配')
 bad = 0

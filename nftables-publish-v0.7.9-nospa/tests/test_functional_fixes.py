@@ -482,6 +482,150 @@ check('前端失败时弹的是 error 提示而不是 success',
 check('前端失败提示里带上了具体是哪些 set 失败',
       'f.set_name' in _ui6_nc and 'failed.map' in _ui6_nc)
 
+# ── FIX-13  死接口补界面 ─────────────────────────────────────────
+# tools/check-api-coverage.py 报出 12 条「后端有、前端不调」。逐条看过之后
+# 只有 7 条是真缺界面，其余 5 条本来就该没有（脚本下载端点、给外部脚本用的、
+# 已废弃保留的、静态文件路由）。这里断言 7 条都真的接上了。
+sec('FIX-13 7 条死接口补上界面，其余 5 条在工具里显式说明原因')
+_FE_HTML = FE_HTML
+_JS = open(os.path.join(ROOT, 'frontend', 'app.js'), encoding='utf-8').read()
+
+_UI_PAIRED = [
+    ('/api/auth/change-password', '改密码表单'),
+    ('/api/rules/health', '规则集健康卡'),
+    ('/api/reverse-proxy/certificates/', '证书重新上传按钮'),
+    ('/api/network/wan-ipv6', 'WAN 公网 IPv6 展示'),
+    ('/api/network/install-ipv6-cron', '安装 IPv6 定时更新'),
+    ('/api/aliyun-ddns/test', '阿里云记录连通性测试'),
+    ('/api/reverse-proxy/nginx/preview/', '反代 nginx 配置预览'),
+]
+for _ep, _label in _UI_PAIRED:
+    check(f'{_label} 在 app.js 里调了 {_ep}', _ep in _JS)
+
+_FOOT = _FE_HTML[_FE_HTML.find('<div class="nf-sidebar__foot">'):
+                   _FE_HTML.find('</aside>')]
+check('改密码入口在侧边栏页脚（不是塞进某个功能页）',
+      # 必须限定在侧边栏范围内找：页面里还有一处「修改密码」在 HTML 注释里
+      # （弹窗那段的分隔注释），只看全文的话把真正的按钮删掉测试照样通过。
+      'openPasswordModal()' in _FOOT and '修改密码' in _FOOT)
+check('改密码要求输入两次新密码',
+      'confirm_password' in _JS and '两次输入的新密码不一致' in _JS)
+check('健康卡展示看门狗的上次自检结果',
+      'watchdog.last_result' in _FE_HTML and 'watchdog.actions' in _FE_HTML)
+check('健康卡区分「规则集可用」与「内核里有表」',
+      'ruleset_functional' in _FE_HTML and 'ruleset_loaded' in _FE_HTML)
+check('证书重传只对手动证书显示（ACME 走续期）',
+      "cert.source !== 'auto'" in _FE_HTML)
+check('证书重传先选证书再选私钥，两次都走同一个端点',
+      'pickRpReupload' in _JS and 'submitRpReupload' in _JS
+      and '/reupload' in _JS)
+check('nginx 预览读的是 config_content 字段',
+      'config_content' in _JS)
+check('阿里云测试按行取记录自身的 RR/Type/Value',
+      'rec.RR || rec.rr' in _JS and 'rec.Type || rec.type' in _JS)
+check('阿里云 AAAA 测试传 ipv6_source 不传 value（让后端读 /tmp/ddns-ipv6-N）',
+      'ipv6_source: isAaaa' in _JS and "value: isAaaa ? ''" in _JS)
+check('阿里云表格补了表头（加了一列就得分表头跟着改）',
+      '>IPv6 来源<' in _FE_HTML)
+
+# 弹窗必须落在 x-data="app()" 组件根内部。
+#
+# 这条是被真实浏览器逮到的：x-show 依赖 Alpine 求值，元素在组件根之外时
+# nginxPreview 是 undefined，指令根本不生效，遮罩层保持默认的 display:block
+# —— 于是它盖住整页，所有按钮都点不动。静态测试（curl 打接口）完全测不出来，
+# 只有真去点按钮才会暴露。已加进 e2e 的回归路径。
+_HTML_LINES = _FE_HTML.split('\n')
+_depth = 0
+_depth_at = {}
+for _i, _ln in enumerate(_HTML_LINES, 1):
+    if 'x-data="app()"' in _ln:
+        _depth_at['__root__'] = (_i, _depth)
+    _s = re.sub(r'<!--.*?-->', '', _ln)
+    _depth += _s.count('<div') - _s.count('</div>')
+    if 'x-data="app()"' in _ln:
+        _depth_at['__root__'] = (_i, _depth + _s.count('<div') - _s.count('</div>'))
+
+# 重新算一次，记录每个标记所在行的深度
+_depth = 0
+_marks = {}
+for _i, _ln in enumerate(_HTML_LINES, 1):
+    _s = re.sub(r'<!--.*?-->', '', _ln)
+    _depth += _s.count('<div') - _s.count('</div>')
+    for _k in ('diffModal.show', 'pwModal.show', 'nginxPreview.show',
+               'rp-reupload-cert', 'rp-reupload-key'):
+        if _k in _ln and _k not in _marks:
+            _marks[_k] = (_i, _depth)
+
+# 组件根从开启到闭合之间，根外的元素深度恒为 0；
+# 根内的弹窗深度 ≥ 1（外面还包着 <main> 或直接就是根的子级）。
+for _k, (_i, _d) in _marks.items():
+    check(f'{_k} 在 x-data 组件根内（放根外会让 x-show 失效、遮罩挡住整页）',
+          _d >= 1, f'行 {_i} depth={_d}')
+check('HTML 的 div 标签配平（搬移弹窗时最容易破的地方）', _depth == 0,
+      f'末尾 depth={_depth}')
+
+# x-show 不阻止求值 —— 里面解引用可能为 null 的对象会刷 TypeError。
+#
+# 和「弹窗放到组件根外」是同一类根因：Alpine 指令的语义被想当然地理解了。
+# 真实浏览器实测逮到：watchdog 初始 null，x-show 只是把 display 设成 none，
+# 内层 x-text 照样跑，页面刷出 270 次 "Cannot read properties of null"。
+# curl 打接口完全测不出来 —— /api/rules/health 返回正常，
+# 坏的是「数据还没到时模板已经渲染」这一段。
+# 反模式：同一个元素上既有 x-show 又直接解引用可能为 null 的对象。
+# x-show 只改 display，指令表达式照样求值 —— 这是 Alpine 最容易被想当然的地方。
+def _xshow_deref_conflicts(html, prefix):
+    """找出「带 x-show 的元素同时又解引用 prefix」的开标签。"""
+    obj = prefix.rstrip('.')
+    bad = []
+    for m in re.finditer(r'<[a-zA-Z][^>]*>', html, re.S):
+        tag = m.group(0)
+        if 'x-show=' not in tag:
+            continue
+        if re.search(re.escape(prefix), tag):
+            bad.append(tag[:110].replace('\n', ' '))
+    return bad
+
+
+for _label, _prefix in (('watchdog（健康卡的看门狗区）', 'rulesHealth.watchdog.'),
+                        ('aliyunTest.result（阿里云测试结果行）', 'aliyunTest.result.')):
+    _conf = _xshow_deref_conflicts(_FE_HTML, _prefix)
+    check(f'{_label}：没有「x-show 与解引用同一元素」的反模式', not _conf,
+          f'{len(_conf)} 处: {_conf[:1]}')
+
+check('看门狗区用的是 x-if 而不是 x-show',
+      '<template x-if="rulesHealth.watchdog">' in _FE_HTML)
+check('阿里云结果行用的是 x-if 而不是 x-show',
+      '<template x-if="aliyunTest.result && aliyunTest.index === index">' in _FE_HTML)
+
+# ── FIX-14  网关 allow 127.0.0.1 ──────────────────────────────────
+sec('FIX-14 仅内网服务同时放行 IPv4 与 IPv6 回环')
+_gen2b = fn_src(APP_SRC, '_generate_gateway_nginx_conf')
+_gen2b_c = strip_comments(_gen2b)
+check('生成物里有 allow 127.0.0.1', 'allow 127.0.0.1;' in _gen2b_c)
+check('生成物里仍保留 allow ::1（IPv6 回环没被这个改动挤掉）',
+      'allow ::1;' in _gen2b_c)
+check('两个回环都在 allow {lan_cidr} 之后、deny all 之前',
+      # lan_cidr 是生成函数里的局部变量，测试里拿不到它的值 ——
+      # 只能按源码里的模板字面量 'allow {lan_cidr}' 来定位顺序。
+      _gen2b_c.find('allow 127.0.0.1;') > _gen2b_c.find('allow {lan_cidr}')
+      and _gen2b_c.find('allow 127.0.0.1;') < _gen2b_c.find('deny all;'))
+check('不是把 ::1 改成 127.0.0.1（那是把 IPv6 回环堵回去）',
+      _gen2b_c.count('allow ::1;') == 1 and _gen2b_c.count('allow 127.0.0.1;') == 1)
+
+# 工具不再把这 5 类误报成「缺界面」
+_TOOL = open(os.path.join(ROOT, 'tools', 'check-api-coverage.py'), encoding='utf-8').read()
+# 必须剥掉 Python 注释再找：把登记项注释掉，字符串本身还在文件里，
+# 不剥注释的话断言照样通过（这个坑今天已经踩到第五次了）。
+_TOOL_CODE = strip_comments(_TOOL)
+for _ep in ('/api/knock-info', '/api/scripts/update-ipv6.sh',
+            '/api/firewall/china-ips-script', '/api/rules/save', '/:file'):
+    check(f'工具把 {_ep} 归入「刻意不做界面」', repr(_ep) in _TOOL_CODE)
+check('工具有独立的 D 类输出（解释为什么不报）', '【D】' in _TOOL_CODE)
+check('工具的 D 类清单不是摆设：B 类判定里真的排除了它们',
+      'INTENTIONAL_NO_UI' in _TOOL_CODE
+      and re.search(r'if p in INTENTIONAL_NO_UI:.*?continue', _TOOL_CODE, re.S)
+      is not None)
+
 print()
 if FAIL:
     print(f'❌ 失败 {len(FAIL)} 项：')

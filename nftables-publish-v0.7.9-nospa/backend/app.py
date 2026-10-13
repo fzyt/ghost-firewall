@@ -5189,6 +5189,14 @@ def _generate_gateway_nginx_conf(config):
             # 仅内网 → 按来源地址拦截，不进认证
             L.append(f"        # public_access=false：仅内网 {lan_cidr} 可达，公网直连被拒")
             L.append(f"        allow {lan_cidr};")
+            # 回环白名单：IPv4 和 IPv6 都要写。
+            # 原来只写了 `allow ::1;` —— 于是 `curl https://127.0.0.1:8443/dsm/`
+            # 从路由器本机发起的 IPv4 回环请求不在 lan_cidr 里，直接吃 deny all
+            # 变成 403，而同样语义的 `curl https://[::1]:8443/dsm/` 却能通。
+            # 同一个「本机」两种结果，纯属遗漏。
+            # 安全上没有风险：127.0.0.1 只有路由器自己发起的连接才是这个源地址，
+            # 公网侧根本无法伪造（WAN 入向本来就有反伪造 drop）。
+            L.append("        allow 127.0.0.1;")
             L.append("        allow ::1;")
             L.append("        deny all;")
             L.append("        auth_request_set $auth_user \"lan\";")
