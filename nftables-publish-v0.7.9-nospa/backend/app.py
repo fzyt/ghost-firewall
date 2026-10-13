@@ -6541,8 +6541,21 @@ def _try_apply_rules_file(path):
 
     双重验证（A-3 修复点）：
       1. nft -f returncode == 0
-      2. _ruleset_is_empty() 返回 False（确认 fw4 表真存在）
+      2. _ruleset_is_functional() 返回 True（确认 fw4 表真存在且真的带策略）
     防止 "nft -f empty.nft" / "nft -f 假文件" 返回 0 但实际表不存在的情况。
+
+    第二道检查用的是「严」判据而不是「表在不在」：
+    nft 对整份文件是先解析后应用，语法错误会整体拒绝（这条实测过，现网零改动），
+    但**语法合法、内容为空的文件会静默成功** —— 而现网本来就有 fw4 表时，
+    「表还在吗」根本看不出区别，于是返回 True。
+
+    这个误判不是小事：看门狗的重试循环是
+        for p in (RULES_PATH, RULES_PATH + '.lastgood'):
+            if os.path.exists(p) and _try_apply_rules_file(p): break
+    一次假成功就会 break 掉，**.lastgood 永远轮不到**，接着走 basic lockdown ——
+    而 basic lockdown 是降级，会丢掉端口转发。规则文件被清空这种场景
+    （手工编辑、磁盘写满、脚本截断）恰好就是最需要 .lastgood 的一次。
+    .224 真机演练过：空文件返回 True，现网 12 链 163 条规则一条没变。
 
     subprocess 异常（A-4 修复点）也返回 False，不抛出：
       - FileNotFoundError：nft 二进制不存在
@@ -6561,9 +6574,11 @@ def _try_apply_rules_file(path):
               f'stderr={(res.stderr or res.stdout)[:200]}', flush=True)
         return False
 
-    # 二次验证：returncode=0 也要确认表真存在
-    if _ruleset_is_empty():
-        print(f'[WARN] nft -f {path} returncode=0 但 fw4 表仍不存在，视为失败', flush=True)
+    # 二次验证：returncode=0 也要确认规则真的落地了
+    ok, detail = _ruleset_is_functional()
+    if not ok:
+        print(f'[WARN] nft -f {path} returncode=0 但规则集仍不可用（{detail}），'
+              f'视为失败', flush=True)
         return False
 
     return True

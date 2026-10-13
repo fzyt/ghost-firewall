@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import tempfile
+import types
 
 BACKEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'backend')
 sys.path.insert(0, os.path.abspath(BACKEND))
@@ -388,6 +389,178 @@ a._apply_basic_lockdown = lambda *x, **k: (order2.append('lockdown') or True)
 a._recover_ruleset_if_unhealthy()
 check('表不存在时走启动级恢复链',
       'startup-recover' in order2, str(order2))
+
+# ── _try_apply_rules_file 的第二道检查 ──────────────────────────
+# .224 真机演练发现的：空文件走完 nft -f 返回 0，而「fw4 表还在吗」根本
+# 看不出区别，于是被判成「已生效」。后果是看门狗的重试循环在这个文件上
+# break，.lastgood 永远轮不到，直接降级 basic lockdown 丢掉端口转发。
+_t = fresh()
+_t.subprocess = types.SimpleNamespace(
+    run=lambda *a, **k: types.SimpleNamespace(
+        returncode=0, stdout='', stderr='', TimeoutExpired=TimeoutError, OSError=OSError),
+    TimeoutExpired=TimeoutError, OSError=OSError)
+_ok = fresh()
+_ok._ruleset_is_functional = lambda: (True, '正常')
+_ok._ruleset_is_empty = lambda: False
+_ok.subprocess = _t.subprocess
+check('rc=0 且规则集可用 → 判成功',
+      _ok._try_apply_rules_file('/tmp/whatever.nft') is True)
+
+# 语法合法但内容为空：nft 返回 0，表也还在 —— 必须判失败
+_bad = fresh()
+_bad._ruleset_is_empty = lambda: False                 # 表还在（这是旧判据骗人的地方）
+_bad._ruleset_is_functional = lambda: (False, 'input 链未挂载')
+_bad.subprocess = _t.subprocess
+check('空文件（rc=0 但规则集仍不可用）判失败，不再误报成功',
+      _bad._try_apply_rules_file('/tmp/empty.nft') is False)
+
+_src_try = src[src.index('def _try_apply_rules_file'):]
+_src_try = _src_try[:_src_try.index('\ndef ')]
+check('二次检查用的是严判据 _ruleset_is_functional 而非 _ruleset_is_empty',
+      '_ruleset_is_functional()' in _src_try)
+check('二次检查已不再依赖 _ruleset_is_empty',
+      '_ruleset_is_empty()' not in _src_try)
+
+# 关键后果：空规则文件不得让重试循环提前 break —— .lastgood 必须还有机会
+a = fresh()
+_tried = []
+_a_seq = {'n': 0}
+
+
+def _empty_then_ok():
+    # 第 1、2 次判定不健康（入口 + 持锁复查），reload 之后第 3 次才健康。
+    _a_seq['n'] += 1
+    return (_a_seq['n'] > 3, '未挂载' if _a_seq['n'] <= 3 else '正常')
+
+
+a._ruleset_is_functional = _empty_then_ok
+a._ruleset_is_empty = lambda: False
+a.subprocess = _t.subprocess
+open(a.RULES_PATH, 'w').write('')            # 主规则文件被清空
+open(a.RULES_PATH + '.lastgood', 'w').write('table inet fw4 { }\n')
+_real_try = a._try_apply_rules_file
+
+
+def _recording_try(p):
+    _tried.append(p)
+    # 主文件空 → 严判据说没生效（假 0）；.lastgood 有内容 → 判成功
+    return p.endswith('.lastgood')
+
+
+a._try_apply_rules_file = _recording_try
+a._auto_recover_ruleset_if_empty = lambda: None
+a._apply_basic_lockdown = lambda *x, **k: True
+a._recover_ruleset_if_unhealthy()
+check('主规则文件为空时不会跳过 .lastgood',
+      any(p.endswith('.lastgood') for p in _tried), str(_tried))
+
+# 反过来：主规则文件**真的**生效时就必须停手。
+# 没有 break 的话会把 .lastgood 也套上去，等于用旧规则盖掉刚恢复好的新规则。
+_a2 = fresh()
+_seq = {'n': 0}
+
+
+def _ok_on_reload():
+    _seq['n'] += 1
+    return (_seq['n'] > 2, '未挂载' if _seq['n'] <= 2 else '正常')
+
+
+_tried2 = []
+_a2._ruleset_is_functional = _ok_on_reload
+_a2._ruleset_is_empty = lambda: False
+open(_a2.RULES_PATH, 'w').write('table inet fw4 { }\n')
+open(_a2.RULES_PATH + '.lastgood', 'w').write('table inet fw4 { }\n')
+_a2._try_apply_rules_file = lambda p: (_tried2.append(p) or True)
+_a2._auto_recover_ruleset_if_empty = lambda: None
+_a2._apply_basic_lockdown = lambda *x, **k: True
+_a2._recover_ruleset_if_unhealthy()
+check('主规则文件生效后立刻停手，不再拿 .lastgood 盖上去',
+      len(_tried2) == 1 and _tried2[0].endswith('rules.nft'), str(_tried2))
+
+# ── nft -f 的失败与异常必须被吞掉 ───────────────────────────────
+# 直接单测 _try_apply_rules_file 的两条早退分支。它们原先没有断言覆盖：
+# 变异把 returncode 检查和 except 全删掉，58 条断言照样全绿。
+def _stub_run(rc, raise_exc=None):
+    def _run(*a, **k):
+        if raise_exc is not None:
+            raise raise_exc
+        return types.SimpleNamespace(returncode=rc, stdout='', stderr='boom',
+                                     TimeoutExpired=TimeoutError, OSError=OSError)
+    return types.SimpleNamespace(run=_run, TimeoutExpired=TimeoutError, OSError=OSError)
+
+
+_r = fresh()
+_r.subprocess = _stub_run(rc=1)
+_r._ruleset_is_functional = lambda: (True, '正常')
+_r._ruleset_is_empty = lambda: False
+check('nft -f 非零退出码必须判失败（不能只看表还在不在）',
+      _r._try_apply_rules_file('/tmp/bad.nft') is False)
+
+for _exc_name, _exc in (('FileNotFoundError', FileNotFoundError()),
+                        ('TimeoutExpired', TimeoutError()),
+                        ('OSError', OSError('boom'))):
+    _e = fresh()
+    _e.subprocess = _stub_run(rc=0, raise_exc=_exc)
+    _e._ruleset_is_functional = lambda: (True, '正常')
+    _e._ruleset_is_empty = lambda: False
+    try:
+        _got = _e._try_apply_rules_file('/tmp/x.nft')
+        _ok = _got is False
+        _err = ''
+    except BaseException as _x:      # noqa: BLE001
+        _ok = False
+        _err = f'抛出了 {type(_x).__name__}'
+    check(f'{_exc_name} 被吞掉并判失败（异常不得炸穿恢复链路）', _ok, _err)
+
+# ── 健康判据的严格性 ────────────────────────────────────────────
+# 这两条原先也没有断言：把 hook input / policy drop 的检查删掉，
+# 整体 flush 过、策略没生效的规则集都会被判成「健康」，看门狗永远不启动。
+_HEALTHY = ('table inet fw4 {\n'
+            '\tchain input {\n'
+            '\t\ttype filter hook input priority 0; policy drop;\n'
+            '\t\tjump accept_lan\n'
+            '\t}\n'
+            '}\n')
+
+_cases = [
+    ('完整健康的规则集判为正常', _HEALTHY, True),
+    ('缺 hook input（整体 flush 过）判不健康',
+     _HEALTHY.replace('type filter hook input priority 0; policy drop;\n'
+                      '\t\tjump accept_lan',
+                      'jump accept_lan'), False),
+    ('hook input 没了但 policy drop 还在（换了别的 hook）判不健康',
+     # 上一条样例同时去掉了 hook 与 policy，会被下一条检查兜住 ——
+     # 那样「删掉 hook input 检查」这个变异就抓不到了，所以要单独造一个。
+     'table inet fw4 {\n'
+     '\tchain forward {\n'
+     '\t\ttype filter hook forward priority 0; policy drop;\n'
+     '\t}\n'
+     '}\n', False),
+    ('没有 drop/reject 策略判不健康',
+     _HEALTHY.replace('policy drop', 'policy accept'), False),
+    ('表不存在（nft 报错）判不健康', '__RC1__', False),
+]
+for _label, _stdout, _want in _cases:
+    _h = fresh()
+    if _stdout == '__RC1__':
+        _h.subprocess = _stub_run(rc=1)
+    else:
+        _h.subprocess = types.SimpleNamespace(
+            run=lambda *a, **k: types.SimpleNamespace(
+                returncode=0, stdout=_stdout, stderr='',
+                TimeoutExpired=TimeoutError, OSError=OSError),
+            TimeoutExpired=TimeoutError, OSError=OSError)
+    _got, _detail = _h._ruleset_is_functional()
+    check(_label, _got is _want, f'返回 {_got} / {_detail[:40]}')
+
+# nft 查询本身异常时必须 fail-closed（判不健康，触发恢复），
+# 绝不能因为「查不到」就当成一切正常。
+_hx = fresh()
+_hx.subprocess = types.SimpleNamespace(
+    run=lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError('no nft')),
+    TimeoutExpired=TimeoutError, OSError=OSError)
+_got, _d = _hx._ruleset_is_functional()
+check('nft 不可用时判不健康（fail-closed，不能放行）', _got is False, _d[:40])
 
 # 健康接口要能看见看门狗，否则自检成了黑盒
 check('健康接口暴露 watchdog 状态', "'watchdog': {" in src)

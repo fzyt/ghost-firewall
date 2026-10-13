@@ -4,7 +4,7 @@
 
 ## [v0.8.3] - 2026-10-12
 
-功能性审查发现的 9 个缺陷修复。**规则链相关问题不在本版范围**（P0-1 见文末）。
+功能性审查发现的 10 个缺陷修复，外加 1 处看门狗恢复链路缺陷。**规则链相关问题不在本版范围**（P0-1 见文末）。
 
 ### P0-2  ACME 路径漏掉私钥权限加固（上一版引入的回归）
 
@@ -278,6 +278,76 @@ config 的，所以得自己兜住。改成 `if not isinstance(rp, dict): rp = {
   把 `set` 删掉测试照样全绿。改成 `(?<![A-Za-z0-9_])set\s+\$(\w+)` 才算真的在测。
   顺带修了 `log_format` 多行续行导致 `$auth_device` 根本没被扫到的问题
 
+### P1  看门狗把空规则文件误判成「恢复成功」，`.lastgood` 永远轮不到
+
+`_try_apply_rules_file()` 的第二道检查是「表还在吗」（`_ruleset_is_empty()`）。
+这个判据挡不住**语法合法但内容为空**的文件 —— `nft -f` 返回 0，而现网本来就有
+`inet fw4` 表，「表还在吗」根本看不出区别，于是返回 True。
+
+后果在调用方：
+
+```python
+for _p in (RULES_PATH, RULES_PATH + '.lastgood'):
+    if os.path.exists(_p) and _try_apply_rules_file(_p):
+        reloaded = True
+        break          # ← 空文件在这里就 break 掉了
+```
+
+一次假成功就 break，**`.lastgood` 永远轮不到**，接着走 basic lockdown ——
+而 basic lockdown 是降级，会丢掉端口转发。规则文件被清空这种场景
+（手工编辑、磁盘写满、脚本截断）恰好就是最需要 `.lastgood` 的一次。
+
+第二道检查改用严判据 `_ruleset_is_functional()`：表在、input 链挂 hook、
+且带 drop/reject 策略才算生效。空文件在任何一种「需要恢复」的前提下都过不了。
+
+对 `_apply_basic_lockdown()` 无影响 —— 它生成的正是
+`type filter hook input priority 0; policy drop`，严判据同样成立。
+
+`.224` 真机演练（用必然失败或必然 no-op 的文件，全程不动现网）：
+
+| 场景 | 结果 |
+|---|---|
+| 语法错误的规则文件 | 正确拒绝，现网 12 链 163 条规则零改动 |
+| `RULES_PATH` / `.lastgood` / `.backup` 三个恢复源 | `nft -c` 全部 rc=0 |
+| 健康规则集 + 空文件 | 判成功（正确 —— 规则集确实可用） |
+| **不健康规则集 + 空文件** | **判失败 → 会继续试 `.lastgood`** |
+| nft 不可用时做健康检查 | fail-closed（判不健康，触发恢复） |
+| 不存在的路径 | 正确拒绝 |
+| 演练收尾指纹 | 与基线完全一致 |
+
+### 测试：看门狗这批断言从来没做过变异验证
+
+四个既有变异脚本（`mutation_check` / `_security` / `_privilege` / `_functional`）
+分别对着 `test_review_fixes` / `test_security_fixes` / `test_privilege_drop` /
+`test_functional_fixes`，**没有一个覆盖 `test_fw_recovery.py`** ——
+那 58 条断言从来没被证明过「在缺陷重现时会失败」。
+
+新增 `tests/mutation_check_fw_recovery.py`（11 条变异）。首轮跑出 **5 条未被捕获**，
+暴露的全是断言本身的洞，逐条补上：
+
+- `nft -f` 非零退出码、`subprocess` 三类异常（`FileNotFoundError` /
+  `TimeoutExpired` / `OSError`）—— 原先完全没有断言覆盖，把它们整个删掉测试照样全绿
+- 健康判据的严格性：只测了「完整健康」和「缺 policy」两种输入，
+  **缺 `hook input` 的样例同时缺了 policy**，被下一条检查兜住，
+  于是「删掉 hook input 检查」这个变异抓不到。补一个「换了别的 hook、
+  policy drop 还在」的独立样例
+- 重试循环的 `break`：原先只测了「第一个失败」，补了「第一个成功就必须停手」，
+  否则拿旧 `.lastgood` 盖掉刚恢复好的新规则这种退化也测不出来
+
+断言 58→69 条，变异 11/11 全捕获。
+
+### 面板全 API 烟测（`.224`）
+
+27 个只读端点逐一实测，**全部行为正确**：
+
+- `/api/knock-info` 从本机回环打返回 403 `LAN_ONLY` —— 设计如此（只给 LAN 内
+  客户端脚本用）。从真实内网地址（192.168.100.249）匿名打返回 200，
+  读出的 4 个端口与内核规则完全一致；其他端点匿名仍是 401
+- `/api/network/wan-ipv6` 404 —— `.224` 只有 `fe80::`，环境限制
+- `/api/aliyun-ddns/records` 400 —— DDNS 域名未配置
+- 带路径参数的端点：`nginx/preview/rp_001` 返回真实 location 片段，
+  不存在的 id 与不存在的证书一律 404
+
 ### 顺带修掉的工具 bug
 
 `tools/check-api-coverage.py` 初版只抓 `api.get/post/...`，漏了 multipart
@@ -304,12 +374,13 @@ config 的，所以得自己兜住。改成 `if not isinstance(rp, dict): rp = {
 ### 测试
 
 新增 `tests/test_functional_fixes.py`（75 条断言）+ `tests/mutation_check_functional.py`
-（35 条变异）。所有变异 100% 被捕获。
+（35 条变异）+ `tests/mutation_check_fw_recovery.py`（11 条变异）。
+所有变异 100% 被捕获。
 
-全量回归（本版改动后）：单测 75 + 147 + 51 + 47 + 68 + 53 + 前端 29 全部通过，
-变异 35 + 21 + 19 + 10 共 85 条全部捕获。
+全量回归（本版改动后）：单测 75 + 147 + 51 + 47 + 68 + 69 + 前端 29 全部通过，
+变异 35 + 21 + 19 + 10 + 11 共 96 条全部捕获。
 
-跑测试时发现并修掉四处**测试自身的弱点**（不是代码 bug）：
+跑测试时发现并修掉五处**测试自身的弱点**（不是代码 bug）：
 
 1. 断言匹配到了解释性注释里的字面量（`save_config()`、「配置已保存但网关部署
    失败」）—— 已加 `strip_comments()`，位置判断前先剥注释
@@ -324,15 +395,21 @@ config 的，所以得自己兜住。改成 `if not isinstance(rp, dict): rp = {
    全绿**。第一版就是这样漏过去的，是变异验证抓出来的。改成
    `(?<![A-Za-z0-9_])set\s+\$(\w+)`，顺带发现 `log_format` 是多行续行、
    只扫首行的话 `$auth_device` 根本没被检查到
+5. `test_fw_recovery.py` 的健康判据只喂了「完整健康」和「缺 policy」两种输入 ——
+   「缺 `hook input`」那个样例同时缺了 policy，被下一条检查兜住，于是
+   **删掉 `hook input` 检查这个变异完全抓不到**。补一个「换成 forward hook、
+   `policy drop` 还在」的独立样例；另补 `nft -f` 非零退出码、`subprocess` 三类异常、
+   重试循环 `break` 的三组输入
 
 ### 回归（改动前后各跑一遍）
 
 ```
 单元  test_review_fixes 147 · test_privilege_drop 51 · test_auth_gateway 68
-      test_security_fixes 47 · test_fw_recovery 53 · test_log_parser
+      test_security_fixes 47 · test_fw_recovery 69 · test_log_parser
       test_functional_fixes 75 · 前端 test_frontend.js 29        —— 全绿
 变异  mutation_check 21/21 · mutation_check_security 10/10
-      mutation_check_privilege 19/19 · mutation_check_functional 35/35 —— 全捕获
+      mutation_check_privilege 19/19 · mutation_check_functional 35/35
+      mutation_check_fw_recovery 11/11                            —— 全捕获
 ```
 
 ### 不在本版范围
@@ -360,13 +437,24 @@ config 的，所以得自己兜住。改成 `if not isinstance(rp, dict): rp = {
   白名单外文件（`../app.py`、`secret.txt`）一律 404
 - **本版两个 P0** —— 0 服务生成物 `nginx -t` 转 successful；缺 `reverse_proxy`
   段时不再 AttributeError
+- **看门狗恢复链路演练** —— 用必然失败或必然 no-op 的规则文件，全程不动现网：
+  语法错误正确拒绝、三个恢复源文件 `nft -c` 全过、**不健康规则集 + 空文件正确
+  判失败**（修复前会误报成功）、nft 不可用时 fail-closed；
+  收尾规则集指纹（12 链 / 163 条）与基线完全一致
+- **面板 27 个只读端点** —— 全部行为正确，含带路径参数的
+  `nginx/preview/<id>` 与 `certificates/<id>/download`
 
 仍未验证：
 
 - 真实 NAS/DSM 门户后端（目前仍接 `/tmp/fake_services.py`）
 - 真实 WAN 敲门限流（`.224` 无物理 WAN 口且内核不支持任何虚拟网卡类型，
   结构上做不到，需 Proxmox 侧加虚拟网卡）
-- 面板全 API 烟测、看门狗与规则生成顺序的真机复核
+- **看门狗「整体 flush 后自愈」的完整演练** —— 做这一项必须真的删掉
+  `inet fw4` 表，而那张表同时承载 OpenWrt 自己的 LAN 放行（含 SSH），
+  看门狗只会恢复我们的自定义规则、恢复不了 OpenWrt 基线，
+  可能永久失去这台测试机。已改用「必然失败 / 必然 no-op 的规则文件」
+  演练看门狗的**决策逻辑**（这部分已全覆盖），自愈本身靠 69 条单测 + 11 条变异保证
+- 规则生成顺序的真机复核（模板已 `nft -c` 验过 4 场景，未做逐条比对）
 
 ## [v0.8.2] - 2026-10-12
 
