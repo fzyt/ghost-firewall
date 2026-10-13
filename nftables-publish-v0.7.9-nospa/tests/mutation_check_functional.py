@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""变异验证：把功能性审查的 10 组修复逐条改回旧行为，确认 tests/test_functional_fixes.py 会变红。
+"""变异验证：把功能性审查的修复逐条改回旧行为，确认 tests/test_functional_fixes.py 会变红。
 
 全绿的测试套件不能证明它在测东西 —— 必须在缺陷重现时失败。
 每条变异对应「这个修复如果没做，会退化出什么行为」，不是随便改改看能不能被抓。
@@ -19,6 +19,7 @@ FILES = {
     'fe': os.path.join(ROOT, 'frontend', 'index.html'),
     'js': os.path.join(ROOT, 'frontend', 'app.js'),
     'tool': os.path.join(ROOT, 'tools', 'check-api-coverage.py'),
+    'tpl': os.path.join(ROOT, 'backend', 'templates', 'nftables.conf'),
 }
 TEST = os.path.join(ROOT, 'tests', 'test_functional_fixes.py')
 
@@ -391,6 +392,23 @@ MUTATIONS = [
     ('FIX-15 弹窗被挪出 x-data 组件根（遮罩挡住整页，按钮全点不动）', 'fe',
      '    </main>\n',
      '    </main>\n  </div>\n', 1),
+
+    # ── FIX-16 敲门限流 burst 不容得下整轮序列 ──────────────────────
+    # .224 真机实测：第 1 步用光 @knock_rate4 的桶后，第 2~4 步全部超限，
+    # 只剩链尾兜底丢弃 —— 敲门从来没有成功过。
+    ('FIX-16 敲门限流退回 1/minute burst 1（缺陷本体：四步序列必死）', 'tpl',
+     'limit rate 1/second burst 4 packets',
+     'limit rate 1/minute burst 1 packets', 8),
+
+    ('FIX-16 只把 v4 第一步的 burst 改回 1（该源连第二轮都进不去）', 'tpl',
+     'udp dport $KNOCK1_PORT \\\n'
+     '            add @knock_rate4 { ip saddr limit rate 1/second burst 4 packets } \\',
+     'udp dport $KNOCK1_PORT \\\n'
+     '            add @knock_rate4 { ip saddr limit rate 1/second burst 1 packets } \\', 1),
+
+    ('FIX-16 把 IPv6 第四步整条注释掉（测剥注释有效：文本在但规则已死）', 'tpl',
+     '        udp dport $KNOCK4_PORT ip6 saddr @knock3_done6 \\\n',
+     '        # udp dport $KNOCK4_PORT ip6 saddr @knock3_done6 \\\n', 1),
 ]
 
 

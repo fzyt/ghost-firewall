@@ -549,10 +549,17 @@ check('不再存在规则级 limit rate 1/minute（全局桶）',
 check('声明了 knock_rate4 集合', 'set knock_rate4' in r and 'set knock_rate6' in r)
 check('knock_rate4 集合是 dynamic+timeout（桶能回收）',
       re.search(r'set knock_rate4 \{[^}]*flags dynamic,timeout', r) is not None)
-check('v4 敲门按源分桶', r.count('@knock_rate4 { ip saddr limit rate 1/minute') == 4,
-      str(r.count('@knock_rate4 { ip saddr limit rate 1/minute')))
-check('v6 敲门按源分桶', r.count('@knock_rate6 { ip6 saddr limit rate 1/minute') == 4,
-      str(r.count('@knock_rate6 { ip6 saddr limit rate 1/minute')))
+# 这两条原本把 `limit rate 1/minute` 写死，等于把 2026-10-13 在 .224 真机
+# 逮到的那个缺陷（burst=1 容不下四步序列，敲门第 2 步起永远超限落链尾）
+# 固化成了「正确行为」。现在断言的是真正的不变量：桶按源走，且 burst >= 序列长度。
+for _fam, _saddr in (('4', 'ip saddr'), ('6', 'ip6 saddr')):
+    _bursts = re.findall(
+        r'@knock_rate%s \{ %s limit rate \S+ burst (\d+) packets \}' % (_fam, _saddr), r)
+    check(f'v{_fam} 敲门按源分桶（元素级 limit，4 步齐全）', len(_bursts) == 4,
+          f'匹配 {len(_bursts)} 处')
+    check(f'v{_fam} 敲门限流 burst 容得下一整轮 4 步序列',
+          bool(_bursts) and all(int(b) >= 4 for b in _bursts),
+          f'burst={sorted(set(_bursts))}')
 check('v6 链没有误用 v4 集合',
       'knock_wan_v6' in r and r.split('chain knock_wan_v6')[1].split('chain knock_lan')[0].count('@knock_rate4') == 0)
 

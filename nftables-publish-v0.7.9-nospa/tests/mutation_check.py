@@ -96,9 +96,13 @@ MUTATIONS = [
      '"TRUSTED_IP4": _safe_ip(config.get("trusted_ip4", ""), 4, "192.168.4.229", strict=True),',
      '"TRUSTED_IP4": _safe_ip(config.get("trusted_ip4", ""), 4, "192.168.4.229"),', 1),
 
+    # 锚点曾写死 `1/minute burst 1`（P1-6 当时的形状）。2026-10-13 在 .224
+    # 真机实测发现 burst=1 正是「敲门第 2 步起永远超限落链尾」的缺陷本体，
+    # 模板已改成 1/second burst 4，这里同步换锚点，变异仍代表
+    # 「退回规则级全局桶」这个原始危害。
     ('敲门限流改回规则级全局桶', 'tpl',
-     'add @knock_rate4 { ip saddr limit rate 1/minute burst 1 packets }',
-     'limit rate 1/minute burst 1 packets', 4),
+     'add @knock_rate4 { ip saddr limit rate 1/second burst 4 packets }',
+     'limit rate 1/second burst 4 packets', 4),
 
     ('黑名单放回 established accept 之后', 'tpl',
      '        ip saddr @blacklist4 log prefix "[BLACKLIST4] " drop\n'

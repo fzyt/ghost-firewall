@@ -626,6 +626,82 @@ check('工具的 D 类清单不是摆设：B 类判定里真的排除了它们',
       and re.search(r'if p in INTENTIONAL_NO_UI:.*?continue', _TOOL_CODE, re.S)
       is not None)
 
+# ---------------------------------------------------------------- FIX-16
+sec('FIX-16 敲门限流 burst 必须容得下一整轮序列')
+# 2026-10-13 .224 真机实测：knock_wan_v4 四步序列 0 次成功，第 1 步就把
+# @knock_rate4 里该源地址的限流桶用光，第 2~4 步全部超限不匹配，
+# 只剩链尾 [KNOCK-WAN4-UNMATCHED] 兜底丢弃。根因：限流挂在 set 元素上，
+# 四个步骤写的是同一个集合，桶跨规则共享。
+_TPL = open(os.path.join(BACKEND, 'templates', 'nftables.conf'), encoding='utf-8').read()
+
+
+def nft_live_code(text):
+    """剥掉 nft 注释，并把反斜杠续行拼成**逻辑语句**。
+
+    为什么不能只剥整行注释：nft 的一条规则是好几行用 `\\` 续起来的，
+    只把首行注释掉，后面几行还躺在文件里，断言照样数得到限流表达式 ——
+    「文本在但规则已经死了」正是这套断言最典型的假绿。
+
+    关键在 orphan（孤儿续行）这一支：某条语句的续行被注释掉之后，
+    后面那些以 `\\` 结尾的物理行其实已经是无主的碎片，拼起来会伪装成
+    一条完整规则。所以要记住「上一条语句被截断了」，把直到第一个不带
+    `\\` 的行为止的碎片整段丢掉。
+
+    模板里字符串内不含 `#`（已核对：只有 define 行有行尾注释，# 在引号外），
+    所以按 # 截断是安全的。
+    """
+    lines = []
+    orphan = False          # 上一条语句的续行被注释掉了
+    for raw in text.splitlines():
+        line = re.sub(r'#.*$', '', raw).rstrip()
+        if not line:
+            # 判断依据必须是**物理行原文**是否以 \ 结尾：剥完注释这行是空的，
+            # 但正是这条物理行承载着续行符 —— 它被注释掉，语句就断在这里。
+            # （早先写成看 lines[-1]，那是它前面那条正常行，永远不带 \，形同虚设。）
+            if raw.rstrip().endswith('\\'):
+                orphan = True
+            continue
+        if orphan:
+            if line.endswith('\\'):
+                continue    # 仍是孤儿碎片
+            orphan = False
+            continue        # 这一行是孤儿语句的收尾，同样丢掉
+        lines.append(line)
+    joined, buf = [], ''
+    for line in lines:
+        if line.endswith('\\'):
+            buf += line[:-1].rstrip() + ' '
+        else:
+            joined.append(buf + line)
+            buf = ''
+    if buf:
+        joined.append(buf)
+    return '\n'.join(joined)
+
+
+_TPL_CODE = nft_live_code(_TPL)
+
+# 序列长度由 KNOCK1..KNOCK4 决定，burst 必须 >= 它
+_KNOCK_STEPS = 4
+_limits = re.findall(
+    r'add @knock_rate[46] \{ ip6? saddr limit rate (\S+) burst (\d+) packets \}', _TPL_CODE)
+check('v4+v6 共 8 处敲门限流都在（4 步 × 2 条链）',
+      len(_limits) == 8, '实际匹配 %d 处' % len(_limits))
+check('每处 burst 都容得下一整轮 %d 步序列' % _KNOCK_STEPS,
+      bool(_limits) and all(int(b) >= _KNOCK_STEPS for _, b in _limits),
+      'burst=%s' % sorted({b for _, b in _limits}))
+check('限流窗口不是 1/minute（配 4 步序列需秒级窗口）',
+      bool(_limits) and all(rate != '1/minute' for rate, _ in _limits),
+      'rate=%s' % sorted({r for r, _ in _limits}))
+for _fam, _chain in (('4', 'knock_wan_v4'), ('6', 'knock_wan_v6')):
+    _body = re.search(r'chain %s \{(.*?)\n    \}' % _chain, _TPL_CODE, re.S)
+    _in_chain = len(re.findall(r'add @knock_rate%s \{ ip6? saddr limit rate' % _fam,
+                               _body.group(1))) if _body else -1
+    check('chain %s 内正好 4 步各带一次限流' % _chain, _in_chain == _KNOCK_STEPS,
+          '实际 %d 处' % _in_chain)
+check('没有残留 burst 1 的敲门限流（那正是本缺陷本身）',
+      'limit rate 1/minute burst 1 packets' not in _TPL_CODE)
+
 print()
 if FAIL:
     print(f'❌ 失败 {len(FAIL)} 项：')
