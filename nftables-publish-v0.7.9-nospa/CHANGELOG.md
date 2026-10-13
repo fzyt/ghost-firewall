@@ -444,6 +444,12 @@ for _p in (RULES_PATH, RULES_PATH + '.lastgood'):
 - **面板 27 个只读端点** —— 全部行为正确，含带路径参数的
   `nginx/preview/<id>` 与 `certificates/<id>/download`
 
+- **规则生成顺序（直接读内核，不重新渲染不下发）** —— 14 条断言全通过：
+  `forward` 链 `BLACKLIST4-FWD`/`BLACKLIST6-FWD` 落在第 2、3 条、`established`
+  accept 在第 4 条；`input` 链黑名单第 11 条、`established` 第 13 条；
+  `jump input_wan` 在黑名单之后（第 29 条）；敲门端口集合 4 个与配置一致；
+  5 个关键集合全部已定义
+
 仍未验证：
 
 - 真实 NAS/DSM 门户后端（目前仍接 `/tmp/fake_services.py`）
@@ -454,7 +460,6 @@ for _p in (RULES_PATH, RULES_PATH + '.lastgood'):
   看门狗只会恢复我们的自定义规则、恢复不了 OpenWrt 基线，
   可能永久失去这台测试机。已改用「必然失败 / 必然 no-op 的规则文件」
   演练看门狗的**决策逻辑**（这部分已全覆盖），自愈本身靠 69 条单测 + 11 条变异保证
-- 规则生成顺序的真机复核（模板已 `nft -c` 验过 4 场景，未做逐条比对）
 
 ## [v0.8.2] - 2026-10-12
 
