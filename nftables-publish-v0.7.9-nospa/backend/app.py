@@ -609,6 +609,8 @@ def load_config():
         # v0.8.0 → v0.8.1：反代规则从「独立站点 + 网关」双轨迁到网关单轨。
         # 必须在合并默认值之后做 —— 否则连默认值里的示例规则都会被迁移掉。
         result = _migrate_rp_rules(result)
+        # 补回 setup.sh 旧版本丢掉的掩码。同样必须在合并之后。
+        result = _migrate_lan_subnet(result)
         return result
     # 配置文件不存在。**绝不能用它来重建防火墙**。
     #
@@ -650,6 +652,47 @@ def _config_lost_after_setup():
         CONFIG_PATH + '.backup',
     ]
     return any(os.path.exists(p) for p in markers)
+
+
+def _migrate_lan_subnet(config):
+    """补回 setup.sh 旧版本丢掉的掩码（无掩码 → /24）。
+
+    2026-10-15：setup.sh 的网段探测曾写成
+        ... | cut -d/ -f1 | sed 's/\\.[0-9]*$/.0/'
+    掩码被整个丢掉，配置里留下 "192.168.100.0"。下游 _safe_cidr 会把它
+    归一化成 192.168.100.0/32，于是网关里 public=false 的反代只放行
+    1 个地址，整个 LAN 都打不开 —— 而保存/部署全程不报错。
+
+    为什么在 load_config 里修而不是只改 setup.sh：已经装过的机器配置里
+    就是这个形状，只改脚本的话它们永远好不了，且用户手上没有输入框
+    （前端没有 lan_subnet4 的表单）可以改。
+
+    只在**没有掩码**时改。带掩码的一律不碰 —— 用户可能有意填 /28 之类，
+    那是合法配置，不能被"自愈"覆盖成 /24。
+
+    补不出可信掩码时保持原样：宁可让网关按 /32 拒绝（可用性损失、
+    可见），也不要猜一个掩码把放行范围放大到别的网段（安全性损失、
+    不可见）。
+    """
+    for key in ('lan_subnet4', 'lan_subnet6'):
+        raw = str(config.get(key, '') or '').strip()
+        if not raw:
+            continue
+        try:
+            # ip_address 只认裸地址，带 /24 的会直接抛 ValueError ——
+            # 「只处理缺掩码的值」这件事就靠这一句，不要再加 '/' 判断，
+            # 那是恒等分支（两条路都 continue），加了反而看不出哪条真正生效。
+            ipaddress.ip_address(raw)
+        except ValueError:
+            continue
+        # IPv6 常用 /64，IPv4 默认 /24
+        default_plen = 64 if ':' in raw else 24
+        fixed = f'{raw}/{default_plen}'
+        print(f'[WARNING] {key}={raw!r} 缺少掩码，已按 /{default_plen} 处理: {fixed}'
+              f'（setup.sh 旧版本缺陷；如实际掩码不同请手工改对）',
+              flush=True)
+        config[key] = fixed
+    return config
 
 
 # 上一次 load_config() 读到的配置是否损坏。None = 正常。
@@ -852,6 +895,39 @@ def _auto_detect_network(config=None):
             net = ipaddress.ip_network(f"{ipaddr}/{netmask}", strict=False)
             result['LAN_SUBNET4'] = str(net)
             result['LAN_BROADCAST4'] = str(net.broadcast_address)
+    except FileNotFoundError:
+        # /etc/config/network 不存在 = 不是 OpenWrt（linux_gateway 部署模式），
+        # 属正常情况，不该刷警告。下面还有 `ip addr` 兜底路径。
+        pass
+    except Exception as e:
+        # uci 存在但解析失败：同样不算致命，交给下面的兜底路径。
+        print(f'[WARN] 读取 uci 网络段失败: {type(e).__name__}: {e}', flush=True)
+    # uci 里没有 network.lan.ipaddr/netmask 时，回落到内核接口地址。
+    #
+    # 2026-10-15 实测：.224 的 uci 只有 network.lan=interface，没有 ipaddr/
+    # netmask，于是这条路径恒空，LAN_SUBNET4 一直用模板默认的 192.168.4.0/24。
+    # 那不是「检测失败后安全回落」—— 它把检测结果和默认值混为一谈了：
+    # 真实 LAN 是 192.168.100.0/24，模板却拿 192.168.4.0/24 去匹配。
+    #
+    # 只取第一个 IPv4：多地址 LAN（VLAN/多网段）必须收敛成单值，
+    # 否则下游 ip_network 归一化会得到错误的掩码。
+    if 'LAN_SUBNET4' not in result:
+        try:
+            import ipaddress
+            res = subprocess.run(['ip', '-4', 'addr', 'show', 'dev', lan_if],
+                                 capture_output=True, text=True, timeout=5)
+            for line in res.stdout.splitlines():
+                f = line.split()
+                if len(f) >= 2 and f[0] == 'inet':
+                    net = ipaddress.ip_network(f[1], strict=False)
+                    result['LAN_SUBNET4'] = str(net)
+                    result['LAN_BROADCAST4'] = str(net.broadcast_address)
+                    break
+        except (OSError, ValueError, subprocess.SubprocessError) as e:
+            print(f'[WARN] LAN 网段探测失败（lan_if={lan_if}）: '
+                  f'{type(e).__name__}: {e}', flush=True)
+
+    try:
         res = subprocess.run(['ip', '-6', 'addr', 'show', 'dev', lan_if], capture_output=True, text=True, timeout=5)
         for line in res.stdout.splitlines():
             if 'inet6' in line and 'fd' in line:
@@ -1112,6 +1188,31 @@ def validate_config(cfg):
     for key in ('lan_subnet4', 'lan_subnet6'):
         raw = str(cfg.get(key, '') or '').strip()
         if not raw:
+            continue
+        # 必须带掩码。
+        #
+        # 2026-10-15：实测 '192.168.100.0'（无掩码）能被放行，而
+        # _safe_cidr 会把它归一化成 192.168.100.0/32 —— 放行范围从
+        # 256 个地址悄悄缩成 1 个。后果是网关里 public=false 的反代
+        # 对整个 LAN 不可用（只有 .0 自己能连），而保存时没有任何提示。
+        # 它不是理论问题：setup.sh 的网段探测曾用 `cut -d/ -f1` 丢掩码，
+        # 装出来的配置就是这个形状（见 setup/setup.sh:detect_lan_ipv4）。
+        #
+        # 为什么不能「无掩码 = 全网段」：同一个 _safe_cidr 对非法输入是
+        # 回落 default（网关侧传的是 192.168.0.0/16），那是放大 256 倍，
+        # 比缩小更危险。所以这里明确拒绝，让用户自己写清楚。
+        if '/' not in raw:
+            # 先判合法性：'garbage' 也缺掩码，但说它「缺少掩码」会误导用户
+            # 去查掩码格式，而它真正的问题是压根不是 IP。
+            try:
+                ipaddress.ip_network(raw, strict=False)
+            except ValueError:
+                errs.append(f'{key} 网段非法: {raw!r}')
+                continue
+            errs.append(
+                f'{key} 缺少掩码: {raw!r}。必须写成 CIDR，'
+                f'IPv4 如 192.168.100.0/24、IPv6 如 fd00::/64 —— '
+                f'只写地址会被当成单地址，LAN 内其他机器都连不上')
             continue
         try:
             net = ipaddress.ip_network(raw, strict=False)

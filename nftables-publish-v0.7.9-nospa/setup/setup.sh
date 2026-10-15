@@ -118,6 +118,127 @@ die() {
 }
 
 # ============================================================
+# 探测 LAN 接口的 IPv4 网段 / 广播 / 主机地址
+#
+# 输出三行 shell 赋值（可直接 eval），探测不到时什么都不输出。
+#
+# 为什么必须带掩码（2026-10-15 修复，.224 实跑复现）：
+# 旧实现是
+#     ip -4 addr show "$LAN_IFACE" | grep inet | awk '{print $2}' \
+#         | cut -d/ -f1 | sed 's/\.[0-9]*$/.0/'
+# 三个缺陷叠在同一个管道里：
+#   1. `cut -d/ -f1` 把掩码整个丢掉。192.168.100.224/24 → "192.168.100.0"，
+#      写进配置后 _safe_cidr 归一化成 /32 —— 网关里 public=false 的反代
+#      只放行 1 个地址，整个 LAN（256 台）都打不开。安装过程不报错。
+#   2. 没有 head -1。LAN 接口挂第二个 IPv4（VLAN/多网段）时输出是两行，
+#      直接嵌进 JSON 就成 "192.168.100.0\n10.8.0.0" —— **整个 config.json
+#      变成非法 JSON**，启动时静默回退 DEFAULT_CONFIG，于是 trusted_ip4 变成
+#      192.168.100.2、转发规则指向 192.168.4.226，而接口照样返回 success。
+#      这比缺陷 1 严重得多。
+#   3. broadcast4 靠 "${lan_subnet4%.*}.255" 拼，只对 /24 成立；
+#      掩码补回来之后它还会拼成 "192.168.100.0/24.255" 这种非法值。
+#
+# 改用 python3 而不是 awk 手算位运算：python3 本来就是硬依赖（后端是 Flask，
+# install_deps 会装，本函数由 init_config 在其之后调用），ipaddress 的
+# 网络号/广播号语义不需要自己维护。
+detect_lan_ipv4() {
+    command -v python3 >/dev/null 2>&1 || return 0
+
+    # 用文件传参而不是插值：接口名来自 uci，不可控
+    python3 - "$1" <<'PYEOF'
+import ipaddress
+import subprocess
+import sys
+
+iface = sys.argv[1] if len(sys.argv) > 1 else ''
+cidr = ''
+host = ''
+
+# 1) 从接口地址取「主机地址 + CIDR」。只取第一个 —— 多个 IPv4 绝不能拼进 JSON
+#    （旧实现在这里没有 head -1，多地址 LAN 会写出非法 JSON）。
+try:
+    res = subprocess.run(['ip', '-4', 'addr', 'show', 'dev', iface],
+                         capture_output=True, text=True, timeout=5)
+    for line in res.stdout.splitlines():
+        f = line.split()
+        if len(f) >= 2 and f[0] == 'inet':
+            host = f[1].split('/', 1)[0]
+            cidr = f[1]
+            break
+except (OSError, subprocess.SubprocessError):
+    pass
+
+# 2) 拿不到地址时，回落到内核 route 表里已经算好的「网络地址 + 掩码」。
+#    单独用 route 是有意义的：某些环境 addr 拿不到但 route 在。
+try:
+    if not cidr:
+        res = subprocess.run(
+            ['ip', '-4', 'route', 'show', 'dev', iface,
+             'proto', 'kernel', 'scope', 'link'],
+            capture_output=True, text=True, timeout=5)
+        for line in res.stdout.splitlines():
+            f = line.split()
+            if f and '/' in f[0] and f[0][0].isdigit():
+                cidr = f[0]
+                break
+except (OSError, subprocess.SubprocessError):
+    pass
+
+if not cidr:
+    sys.exit(0)
+
+try:
+    net = ipaddress.ip_network(cidr, strict=False)
+except ValueError:
+    sys.exit(0)
+if net.version != 4:
+    sys.exit(0)
+
+print('lan_subnet4=%s' % net)
+print('lan_broadcast4=%s' % net.broadcast_address)
+if host:
+    print('lan_host4=%s' % host)
+PYEOF
+}
+
+# 从网段算出广播地址。只在探测不到接口地址时兜底 —— 掩码不一定是 /24，
+# 拼 "${x%.*}.255" 在 /23、/8 上都是错的。
+detect_lan_broadcast4() {
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 - "$1" <<'PYEOF'
+import ipaddress
+import sys
+
+try:
+    net = ipaddress.ip_network(sys.argv[1] if len(sys.argv) > 1 else '',
+                               strict=False)
+except ValueError:
+    sys.exit(0)
+if net.version != 4:
+    sys.exit(0)
+print(net.broadcast_address)
+PYEOF
+}
+
+# 从网段算出常用网关地址（网络地址 + 1）。只在探测不到主机地址时兜底。
+detect_lan_ipv4_gateway() {
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 - "$1" <<'PYEOF'
+import ipaddress
+import sys
+
+try:
+    net = ipaddress.ip_network(sys.argv[1] if len(sys.argv) > 1 else '',
+                               strict=False)
+except ValueError:
+    sys.exit(0)
+if net.version != 4 or net.num_addresses < 2:
+    sys.exit(0)
+print(net.network_address + 1)
+PYEOF
+}
+
+# ============================================================
 # 工具函数
 # ============================================================
 is_interactive() {
@@ -549,13 +670,34 @@ init_config() {
         fi
     fi
 
-    local lan_subnet4 broadcast4
-    lan_subnet4="$(ip -4 addr show "$LAN_IFACE" 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1 | sed 's/\.[0-9]*$/.0/')"
-    [ -z "$lan_subnet4" ] && lan_subnet4="192.168.1.0"
-    broadcast4="${lan_subnet4%.*}.255"
+    local lan_subnet4 broadcast4 router_ip4 trusted_ip4 trusted_ip6
+    local lan_broadcast4 lan_host4
+    lan_subnet4="" broadcast4="" router_ip4=""
+    lan_broadcast4="" lan_host4=""
 
-    local router_ip4 trusted_ip4 trusted_ip6
-    router_ip4="$(ip -4 addr show "$LAN_IFACE" 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1)"
+    # 掩码必须带、必须是单值 —— 两个都会直接决定防火墙的放行范围。
+    # 详见 detect_lan_ipv4() 的注释（旧实现为什么是部署级阻断）。
+    #
+    # 注意变量名对不上是故意的：探测函数产出 lan_broadcast4/lan_host4，
+    # 这里再映射到 init_config 用的 broadcast4/router_ip4 —— 不能直接
+    # 依赖 eval 出来的名字，否则两者一改名就静默退化成下面的兜底值。
+    eval "$(detect_lan_ipv4 "$LAN_IFACE")"
+    broadcast4="$lan_broadcast4"
+    router_ip4="$lan_host4"
+
+    # 兜底：探测失败时用 OpenWrt 默认网段。
+    # 兜底值一律带掩码 —— 无掩码会被 _safe_cidr 归一成 /32，
+    # 让 public=false 的反代只对 1 个地址开放。
+    [ -z "$lan_subnet4" ] && lan_subnet4="${LAN_SUBNET4_FALLBACK:-192.168.1.0/24}"
+    if [ -z "$broadcast4" ]; then
+        # 按掩码算广播，不能用 "${x%.*}.255"（只对 /24 成立）
+        broadcast4="$(detect_lan_broadcast4 "$lan_subnet4")"
+    fi
+    [ -z "$broadcast4" ] && broadcast4="${lan_subnet4%/*}"'.255'
+    if [ -z "$router_ip4" ]; then
+        # 网关地址：网络地址 + 1（192.168.1.0/24 → 192.168.1.1）
+        router_ip4="$(detect_lan_ipv4_gateway "$lan_subnet4")"
+    fi
     [ -z "$router_ip4" ] && router_ip4="192.168.1.1"
 
     # 自动检测信任 IP（LAN 网关 IP）

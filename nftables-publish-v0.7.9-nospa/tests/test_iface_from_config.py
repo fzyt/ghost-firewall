@@ -135,12 +135,90 @@ sec('3. linux_gateway 部署模式（eth0/wan0，两个都不是默认值）')
 argv, det = capture_argv(
     mod, {'wan_if': 'wan0', 'lan_if': 'eth0'},
     answers={'wan0': WANV6, 'eth0': ULA})
-check('argv 里 dev 实参恰好是 [eth0, wan0]',
-      dev_names(argv) == ['eth0', 'wan0'], f'实参={dev_names(argv)}')
+check('argv 里 dev 实参只出现配置里的接口（无写死默认值）',
+      set(dev_names(argv)) == {'eth0', 'wan0'}, f'实参={dev_names(argv)}')
+check('br-lan / pppoe-wan 一个都没出现',
+      'br-lan' not in dev_names(argv) and 'pppoe-wan' not in dev_names(argv),
+      f'实参={dev_names(argv)}')
 check('WAN_PREFIX6 正确',
       det.get('WAN_PREFIX6') == '240e:abcd:ef01:2345::/64')
 check('ULA_PREFIX6 正确',
       det.get('ULA_PREFIX6') == 'fd12:3456:789a::/64')
+
+# ── 3b. IPv4 网段探测的 ip addr 兜底 ──────────────────────────────────
+# 2026-10-15：uci 里没有 network.lan.ipaddr/netmask 时（.224 就是这样，
+# uci 只有 network.lan=interface），旧实现恒空 → LAN_SUBNET4 一直用模板
+# 默认的 192.168.4.0/24，而真实 LAN 是 192.168.100.0/24。
+# 「检测失败」和「用默认值」被混为一谈了。
+sec('3b. uci 没有 ipaddr/netmask 时，LAN_SUBNET4 走 ip addr 兜底')
+V4 = '    inet 192.168.100.224/24 brd 192.168.100.255 scope global br-lan\n'
+
+
+def capture_argv_v4(mod_obj, config, v4_stdout):
+    """capture_argv 的 IPv4 版：同时喂 -4 addr 和 -6 addr 的输出。"""
+    argv_log = []
+
+    def fake_run(cmd, *a, **kw):
+        argv_log.append(list(cmd))
+        if isinstance(cmd, (list, tuple)) and 'addr' in cmd:
+            dev = cmd[cmd.index('dev') + 1] if 'dev' in cmd else ''
+            if '-4' in cmd:
+                return _FakeProc(v4_stdout if dev == config.get('lan_if') else '')
+            return _FakeProc({dev: ULA}.get(dev, ''))
+        return _FakeProc('')
+
+    orig_run = mod_obj.subprocess.run
+    orig_parse = mod_obj.parse_uci_config
+    mod_obj.subprocess.run = fake_run
+    mod_obj.parse_uci_config = lambda *a, **kw: {}
+    try:
+        detected = mod_obj._auto_detect_network(config)
+    finally:
+        mod_obj.subprocess.run = orig_run
+        mod_obj.parse_uci_config = orig_parse
+    return argv_log, detected
+
+
+argv, det = capture_argv_v4(mod, {'wan_if': 'eth1', 'lan_if': 'br-lan'}, V4)
+check('uci 无 ipaddr 时 LAN_SUBNET4 来自 ip -4 addr 而非模板默认值',
+      det.get('LAN_SUBNET4') == '192.168.100.0/24',
+      f"实际={det.get('LAN_SUBNET4')!r}（旧代码恒缺这个键，"
+      f"config_to_variables 回落到 192.168.4.0/24）")
+check('LAN_BROADCAST4 同步拿到',
+      det.get('LAN_BROADCAST4') == '192.168.100.255',
+      f"实际={det.get('LAN_BROADCAST4')!r}")
+check('IPv4 探测用的是配置里的 lan_if',
+      any('-4' in c and 'br-lan' in c for c in argv), f'argv={argv}')
+
+# 多地址 LAN 必须收敛成单值，否则下游 ip_network 拿到多行会炸
+V4_MULTI = (V4 + '    inet 10.8.0.1/24 brd 10.8.0.255 scope global br-lan\n')
+argv, det = capture_argv_v4(mod, {'wan_if': 'eth1', 'lan_if': 'br-lan'}, V4_MULTI)
+check('多地址 LAN 收敛成单值（不产生多行）',
+      '\n' not in str(det.get('LAN_SUBNET4', '')),
+      f"实际={det.get('LAN_SUBNET4')!r}")
+
+# ip 不可用时不能抛异常，也不能产出半吊子结果
+def capture_ip_missing(mod_obj, config):
+    argv_log = []
+
+    def fake_run(cmd, *a, **kw):
+        argv_log.append(list(cmd))
+        raise FileNotFoundError('ip')
+
+    orig_run = mod_obj.subprocess.run
+    orig_parse = mod_obj.parse_uci_config
+    mod_obj.subprocess.run = fake_run
+    mod_obj.parse_uci_config = lambda *a, **kw: {}
+    try:
+        return mod_obj._auto_detect_network(config)
+    finally:
+        mod_obj.subprocess.run = orig_run
+        mod_obj.parse_uci_config = orig_parse
+
+
+det = capture_ip_missing(mod, {'wan_if': 'eth1', 'lan_if': 'br-lan'})
+check('ip 不存在时不抛异常且不返回 LAN_SUBNET4',
+      isinstance(det, dict) and 'LAN_SUBNET4' not in det, f'返回={det}')
 
 # ── 4. 配置缺失 / 非法时的回落 ─────────────────────────────────────────
 sec('4. 配置缺失或非法时回落默认值（不能抛异常）')
