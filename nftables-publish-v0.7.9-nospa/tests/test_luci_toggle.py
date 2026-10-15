@@ -122,7 +122,7 @@ def fake_reload(what):
 
 mod._luci_reload_nginx = fake_reload
 mod._luci_ports_listening = lambda: set()
-mod._gateway_port_alive = lambda: True
+mod._gateway_port_alive = lambda port=None, config=None: True
 try:
     # 已关闭（配置里本来就没有那两段）
     with open(CONF, 'w') as f:
@@ -260,7 +260,7 @@ def fake_toggle(enabled):
     return toggle_result['r']
 
 
-def fake_gw():
+def fake_gw(port=None, config=None):
     return gw_ok['v']
 
 
@@ -365,7 +365,7 @@ mod.LUCI_SNAPSHOT_PATH = os.path.join(TD3, 'snap3')
 t3 = []
 og3 = (mod._apply_luci_toggle, mod._gateway_port_alive, mod._luci_ports_listening)
 mod._apply_luci_toggle = lambda e: (t3.append(bool(e)), (True, 'ok'))[1]
-mod._gateway_port_alive = lambda: True
+mod._gateway_port_alive = lambda port=None, config=None: True
 mod._luci_ports_listening = lambda: set()
 _h3 = list(mod.app.before_request_funcs[None])
 try:

@@ -470,6 +470,19 @@
 
         <!-- LuCI 80/443 开关 -->
         <div class="bg-gray-50 border rounded-lg p-5 mb-6">
+          <!-- 和认证网关同一个病：配置说一套、系统做另一套、没人收敛。
+               luci_enabled=False 而 80/443 照常在听，.224 上真的发生过，
+               当时面板显示「已关闭」，LuCI 却好好开着。 -->
+          <div x-show="luciActual !== null && !!config.luci_enabled !== luciActual"
+               class="mb-3 p-3 border border-amber-300 bg-amber-50 rounded text-sm text-amber-900">
+            <span class="font-semibold">配置与实际不一致：</span>
+            <span x-text="`配置为「${config.luci_enabled ? '开放' : '关闭'}」，`
+              + `而 80/443 当前${luciActual ? '仍在监听' : '确实已关闭'}`"></span>
+            <span x-show="luciPortsListening && luciPortsListening.length"
+                  class="block mt-1"
+                  x-text="`仍在监听的端口：${luciPortsListening.join('、')}`"></span>
+            <span class="block mt-1">点「保存配置」会按上面的勾选重新对齐实际状态。</span>
+          </div>
           <label class="flex items-start gap-3 cursor-pointer">
             <input type="checkbox" x-model="config.luci_enabled" class="mt-1">
             <span>
@@ -1919,24 +1932,43 @@
              v0.8.0 之前整个网关（开关/端口/超时/LAN 豁免）在界面上
              完全不存在，只能手工改配置文件 —— 现在补上。 -->
         <div class="bg-gray-50 border rounded-lg p-5 mb-6">
+          <!-- 配置说「已启用」而公网入口实际没人听：面板不能只显示前者。
+               .224 实测就是这个组合（conf 文件已删、8443 无人监听、界面显示已启用），
+               没有这条告警用户完全看不出来自己已经失联。 -->
+          <div x-show="gwActual && gw.gateway_enabled && !gwActual.enabled"
+               class="mb-4 p-3 border border-red-300 bg-red-50 rounded text-sm text-red-800">
+            <span class="font-semibold">配置与实际不一致：</span>
+            <span x-text="`配置为「已启用」，但 ${gwActual?.port} 端口当前没有监听`
+              + (gwActual?.nginx_conf_exists ? '' : '，且网关 nginx 配置文件已不存在') + '。'"></span>
+            <span class="block mt-1">点「保存网关配置」会重新下发并校验；点「刷新状态」只重新读取，不会改动任何东西。</span>
+          </div>
+
           <div class="flex items-start justify-between gap-4 flex-wrap">
             <div class="flex-1 min-w-[260px]">
               <label class="flex items-start gap-3 cursor-pointer">
-                <input type="checkbox" x-model="gw.gateway_enabled" class="mt-1">
+                <!-- 状态没加载完之前一律不可操作：表单里此刻是硬编码默认值，
+                     不是用户的意图，改它就等于替用户做了决定。 -->
+                <input type="checkbox" x-model="gw.gateway_enabled"
+                       :disabled="!gwLoaded || gwSaving" class="mt-1">
                 <span>
                   <span class="block font-semibold">启用认证网关</span>
                   <span class="block text-xs text-gray-400 mt-1">
                     下面每条服务都从这里进入。所有服务共用一个公网端口，
-                    访问前需要先登录。关掉网关则所有服务都不可访问。
+                    访问前需要先登录。<span class="text-red-600">关掉网关则所有服务都不可访问</span>，
+                    而且这是本项目唯一的公网入口 —— 不在局域网内就再也连不回来。
+                  </span>
+                  <span x-show="!gwLoaded" class="block text-xs text-amber-600 mt-1">
+                    状态加载中，暂不可修改…
                   </span>
                 </span>
               </label>
             </div>
             <div class="flex gap-2">
               <button @click="saveGatewayConfig()"
-                :disabled="gwSaving"
+                :disabled="gwSaving || !gwLoaded"
+                title="状态未加载完成时不可提交，避免把表单默认值当成你的意图发出去"
                 class="px-5 py-2 bg-black text-white rounded text-sm disabled:opacity-50">
-                <span x-text="gwSaving ? '保存中…' : '保存网关配置'"></span>
+                <span x-text="gwSaving ? '保存中…' : (gwLoaded ? '保存网关配置' : '加载中…')"></span>
               </button>
               <button @click="loadGatewayStatus()"
                 class="px-4 py-2 border rounded text-sm">刷新状态</button>

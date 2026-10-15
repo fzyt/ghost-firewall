@@ -1638,9 +1638,30 @@ def serve_static(filename):
 def get_config():
     """获取当前配置"""
     config = load_config()
-    # 不要往 config 本体里塞 success 键：这份 dict 会被前端原样回传 POST，
-    # 一旦污染就会把 success 写进磁盘配置
-    return jsonify(dict(config, success=True))
+    # 这三个只读视图的作用只有一个：让界面能显示「配置说一套、系统实际做另一套」。
+    #
+    # 全部包在 try 里 —— /api/config 是面板的主数据源，它为了三个锦上添花的
+    # 字段整个挂掉是不可接受的。读不到就给 None/空列表，界面少一条提示而已。
+    try:
+        luci_actual = _luci_actual_state()
+    except Exception as e:
+        luci_actual = None
+        print(f'[WARN] 读 LuCI 实际状态失败: {type(e).__name__}: {e}', flush=True)
+    try:
+        luci_ports = sorted(_luci_ports_listening())
+    except Exception as e:
+        luci_ports = []
+        print(f'[WARN] 读 LuCI 监听端口失败: {type(e).__name__}: {e}', flush=True)
+    try:
+        gw_actual = _gateway_actual_state(config)
+    except Exception as e:
+        gw_actual = None
+        print(f'[WARN] 读网关实际状态失败: {type(e).__name__}: {e}', flush=True)
+    return jsonify(dict(config,
+                       success=True,
+                       luci_actual=luci_actual,
+                       luci_ports_listening=luci_ports,
+                       gateway_actual=gw_actual))
 
 
 def _client_is_lan(client_ip):
@@ -1712,6 +1733,29 @@ def post_config():
     # merge 到现有配置，避免前端只发部分字段时清空其他配置
     old_cfg = load_config()
     incoming = {k: v for k, v in data.items() if k != 'confirm'}  # confirm 不入配置
+
+    # 只读键：GET 为了让前端能显示「实际状态」会多给几个字段，而前端是把
+    # 整个 config 对象原样回传的。这些键不是配置，绝不能落盘。
+    readonly_hits = sorted(k for k in incoming if k in READONLY_CONFIG_KEYS)
+    for k in READONLY_CONFIG_KEYS:
+        incoming.pop(k, None)
+
+    # 网关配置块不归这个端点管，原样剔除。
+    #
+    # 这个接口只落盘、不下发 nginx。留着 gateway_enabled 就会造出
+    # 「磁盘说开、8443 实际没人听」的状态（.224 实测），而面板各处都显示
+    # 「已启用」，没有任何一处会收敛。宁可前端传了也不生效 —— 生效路径只有
+    # /api/gateway/config，那边改完会真的下发并校验结果。
+    ignored = sorted(k for k in incoming if k in GATEWAY_OWNED_CONFIG_KEYS)
+    for k in GATEWAY_OWNED_CONFIG_KEYS:
+        incoming.pop(k, None)
+    if ignored:
+        print(f'[WARN] /api/config 忽略了网关专属字段 {ignored}（只能由 /api/gateway/config 修改）',
+              flush=True)
+    if readonly_hits:
+        print(f'[WARN] /api/config 丢弃了只读字段 {readonly_hits}（它们不是配置）',
+              flush=True)
+
     new_cfg = dict(old_cfg)
     new_cfg.update(incoming)
 
@@ -1788,7 +1832,7 @@ def post_config():
                 'message': f'LuCI 80/443 切换失败，已回滚配置项: {luci_msg}',
                 'data': {'risks': risks},
             }), 500
-        if not want_luci and not _gateway_port_alive():
+        if not want_luci and not _gateway_port_alive(config=new_cfg):
             # 关 LuCI 绝不能把网关带下去。这是本项目唯一的公网入口。
             new_cfg['luci_enabled'] = True
             try:
@@ -1799,15 +1843,18 @@ def post_config():
             return jsonify({
                 'success': False,
                 'code': 'GATEWAY_DOWN',
-                'message': (f'关闭 LuCI 后网关 {GATEWAY_PORT} 端口不可达，'
-                            f'已自动把 LuCI 重新打开并回滚配置项'),
+                'message': (f'关闭 LuCI 后网关 {_safe_port(new_cfg.get("gateway_port"), 8443)} '
+                            f'端口不可达，已自动把 LuCI 重新打开并回滚配置项'),
                 'data': {'risks': risks},
             }), 500
 
     return jsonify({
         'success': True,
         'message': '配置已保存' + (f'（{luci_msg}）' if luci_msg else ''),
-        'data': {'risks': risks, 'luci': luci_msg},  # 非 critical 风险通过这里告知前端
+        # 非 critical 风险通过这里告知前端
+        'data': {'risks': risks, 'luci': luci_msg,
+                 'ignored_gateway_fields': ignored,
+                 'ignored_readonly_fields': readonly_hits},
     })
 
 
@@ -5459,6 +5506,36 @@ GATEWAY_CONF_MARKER = "# Managed by nftables-web-v2 auth gateway"
 GATEWAY_SSL_ZONE = "SSLGATEWAY"
 GATEWAY_SSL_CACHE_SIZE = "10m"
 
+# 网关配置块由 /api/gateway/config **独占**。
+#
+# 为什么必须划清边界：/api/config（面板上到处都在点的「保存配置」）是无字段白名单的
+# 全量 merge，它写 gateway_enabled 时**不会**下发 nginx。.224 实测就是这么坏的：
+#   1) 反代管理页点「保存网关配置」，前端表单还是硬编码默认值 false
+#      → /api/gateway/config 删掉 00-nftables-web-gateway.conf 并 reload
+#      → 8443 无人监听，公网唯一入口没了，接口回 200「已停用」
+#   2) 别的页面点「保存配置」，把 gateway_enabled=true 写回磁盘，但不下发
+#   结果：磁盘 true、面板「已启用」、conf 文件不存在、8443 死，且无任何机制收敛
+#
+# 所以这块字段只认自己的端点：/api/config 一律剔除（并回报剔了哪些），
+# /api/gateway/config 才允许改 —— 那边改完会真的下发 nginx 并校验结果。
+GATEWAY_OWNED_CONFIG_KEYS = frozenset({
+    'gateway_enabled',
+    'gateway_port',
+    'auth_api_port',
+    'auth_session_timeout',
+    'auth_absolute_timeout',
+    'auth_lan_bypass',
+})
+
+# /api/config 的 GET 为了让前端显示「实际状态」会多给这几个键，而前端把整个
+# config 对象原样回传 POST。它们是**只读视图**，落盘就是污染配置。
+READONLY_CONFIG_KEYS = frozenset({
+    'success',
+    'luci_actual',
+    'luci_ports_listening',
+    'gateway_actual',
+})
+
 
 # ══════════════════════════════════════════════════════════════════════
 # LuCI 80/443 开关
@@ -5696,13 +5773,53 @@ def _apply_luci_toggle(enabled):
     return True, 'LuCI 80/443 已重新打开'
 
 
-def _gateway_port_alive():
-    """网关端口是否还在听 —— 关 LuCI 时绝不能把它带下去。"""
+def _gateway_port_alive(port=None, config=None):
+    """网关端口是否还在听 —— 关 LuCI 时绝不能把它带下去。
+
+    端口**必须取自配置**（gateway_port），不能写死 GATEWAY_PORT：
+    用户把公网入口改成 9443 之后，这里还去连 8443 会得到两个方向的错误答案 ——
+    8443 上恰好有别的东西在听就误判「网关健在」，没人听就把一个好好的
+    网关当成已经死了，然后触发 GATEWAY_DOWN 回滚，白白把 LuCI 又打开。
+    """
+    if port is None:
+        if config is None:
+            config = load_config()
+        port = _safe_port(config.get('gateway_port'), 8443)
     try:
-        with socket.create_connection(('127.0.0.1', GATEWAY_PORT), timeout=3):
+        with socket.create_connection(('127.0.0.1', int(port)), timeout=3):
             return True
-    except OSError:
+    except (OSError, ValueError, TypeError):
         return False
+
+
+def _gateway_conf_path():
+    return os.path.join(NGINX_CONF_DIR, GATEWAY_CONF_NAME)
+
+
+def _gateway_actual_state(config=None):
+    """网关当前**实际**是什么状态。
+
+    和 luci_enabled 的教训一模一样：配置文件里的 gateway_enabled 只是「期望」。
+    实测（.224）配置写着 true、面板也显示「已启用」，而
+    /etc/nginx/conf.d/00-nftables-web-gateway.conf 已经不在了 —— 8443 无人监听，
+    公网唯一入口是死的，界面却毫无提示。
+
+    判据给三项，因为三者会各自单独出错：
+      conf_exists   文件在不在（被谁删了 / 从没部署过）
+      port_listening 端口有没有人听（conf 在但 nginx 没 reload 也会是死的）
+      enabled       两者都成立才算真的开着
+    """
+    if config is None:
+        config = load_config()
+    exists = os.path.exists(_gateway_conf_path())
+    port = _safe_port(config.get('gateway_port'), 8443)
+    listening = _gateway_port_alive(port=port)
+    return {
+        'nginx_conf_exists': exists,
+        'port': port,
+        'port_listening': listening,
+        'enabled': bool(exists and listening),
+    }
 
 
 def _is_managed_conf(conf_path):
@@ -6368,10 +6485,23 @@ def gateway_status():
     except Exception as e:
         auth_msg = f"{type(e).__name__}: {e}"[:120]
 
+    # 网关实际状态（conf 在不在 / 端口有没有人听）。读不到就当"不确定但没开"，
+    # 宁可让面板报警也不要谎报健康 —— 这个接口的唯一价值就是不骗人。
+    try:
+        actual = _gateway_actual_state(config)
+    except Exception as e:
+        actual = {'nginx_conf_exists': False, 'port': gw_port,
+                  'port_listening': False, 'enabled': False,
+                  'error': f'{type(e).__name__}: {e}'[:120]}
+
     return jsonify({
         "success": True,
         "data": {
             "enabled": bool(config.get("gateway_enabled")),
+            # enabled 只是**期望**。面板必须能看见实际情况，否则就重演 .224 那一出：
+            # 磁盘 true、界面「已启用」、而公网唯一入口 8443 早就没人听了。
+            "actual": actual,
+            "divergent": bool(config.get("gateway_enabled")) != bool(actual.get("enabled")),
             "gateway_port": gw_port,
             "auth_api_port": api_port,
             "auth_alive": auth_alive,
@@ -6410,11 +6540,7 @@ def gateway_set_config():
     if not isinstance(data, dict):
         return jsonify({"success": False, "message": "请求体必须是 JSON 对象"}), 400
 
-    allowed = {
-        "gateway_enabled", "gateway_port", "auth_api_port",
-        "auth_session_timeout", "auth_absolute_timeout", "auth_lan_bypass",
-        "deploy_mode",
-    }
+    allowed = set(GATEWAY_OWNED_CONFIG_KEYS) | {'deploy_mode'}
     new_cfg = dict(config)
     changed = []
     for k, v in data.items():
@@ -6447,6 +6573,30 @@ def gateway_set_config():
     if not deploy_ok:
         return jsonify({"success": False,
                         "message": f"网关部署失败，配置未保存：{deploy_msg}"}), 500
+
+    # 装完必须**看一眼它到底起没起来**。
+    #
+    # _deploy_gateway_nginx 成功只代表「文件写了、nginx -t 过了、reload 没报错」。
+    # .224 实测过一种它看不见的失败：conf 在、reload 也成功，可端口没人听 ——
+    # 而接口照样回 200「认证网关已启用」。公网唯一入口是死的，
+    # 界面还告诉用户「已启用」，这个谎必须在这里就戳破。
+    #
+    # 关闭网关不做这项校验：那时候端口没人听才是预期结果。
+    if bool(new_cfg.get('gateway_enabled')):
+        actual = _gateway_actual_state(new_cfg)
+        if not actual['enabled']:
+            why = []
+            if not actual['nginx_conf_exists']:
+                why.append(f'配置 {_gateway_conf_path()} 不存在')
+            if not actual['port_listening']:
+                why.append(f'端口 {actual["port"]} 没有监听')
+            return jsonify({
+                "success": False,
+                "code": "GATEWAY_NOT_LISTENING",
+                "message": (f'网关配置已下发但 {actual["port"]} 端口没有真正监听'
+                            f'（{"；".join(why)}），已判定为未启用；配置未保存'),
+                "data": {"actual": actual},
+            }), 500
 
     save_config(new_cfg)
 

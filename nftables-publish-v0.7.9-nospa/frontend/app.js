@@ -189,13 +189,26 @@ function app() {
       dnsCredentials: {},
     },
     // 认证网关配置（v0.8.0 之前界面上完全没有这一块）
+    // 「系统设置」区 LuCI 开关用到的只读视图（不是配置，别回传给后端）
+    luciActual: null,
+    luciPortsListening: [],
+    gatewayActual: null,
+
     gw: {
+      // ↓ 这里的默认值是「表单还没从服务端加载时的占位」，不是用户的意图。
+      // 它曾经直接流进 saveGatewayConfig() 的 payload：用户（或 e2e）打开反代管理页
+      // 还没等 loadGatewayStatus() 回来就点「保存网关配置」，后端收到 false，
+      // 删掉 00-nftables-web-gateway.conf 并 reload —— 8443 当场没人听，
+      // 公网唯一入口没了，接口还回 200「认证网关已停用」。
+      // gwLoaded 就是为堵这个洞：状态没回来之前不许提交。
       gateway_enabled: false,
       gateway_port: 8443,
       auth_session_timeout: 1800,
       auth_absolute_timeout: 0,
       auth_lan_bypass: true,
     },
+    gwLoaded: false,
+    gwActual: null,       // 服务端报的实际状态，null = 还没读到
     gwSaving: false,
     gwStatus: '',
 
@@ -416,7 +429,17 @@ function app() {
       this.loading = true;
       try {
         const data = await api.get('/api/config');
+        // 只读视图先摘出来，再赋给 this.config。
+        // 留着的话它们会被 saveConfig() 原样回传（后端也会拦一层，
+        // 但前端就不该把非配置字段塞进配置对象）。这三个键的作用只有一个：
+        // 让界面能显示「配置说一套、系统实际做另一套」。
+        this.luciActual = (data.luci_actual === undefined) ? null : !!data.luci_actual;
+        this.luciPortsListening = data.luci_ports_listening || [];
+        this.gatewayActual = data.gateway_actual || null;
         delete data.success;
+        delete data.luci_actual;
+        delete data.luci_ports_listening;
+        delete data.gateway_actual;
         this.config = data;
         if (this.config.china_ip_block === undefined) this.config.china_ip_block = false;
         if (this.config.dns_lan_resolver_enabled === undefined) this.config.dns_lan_resolver_enabled = false;
@@ -1551,20 +1574,44 @@ function app() {
         if (sess !== undefined) this.gw.auth_session_timeout = sess;
         if (abs !== undefined) this.gw.auth_absolute_timeout = abs;
         if (bypass !== undefined) this.gw.auth_lan_bypass = !!bypass;
+        // 表单现在反映的是服务端值，才允许提交
+        this.gwLoaded = true;
+        this.gwActual = g.actual || null;
         const n = (g.services_count !== undefined) ? g.services_count
                                                     : (Array.isArray(g.services) ? g.services.length : 0);
+        const a = g.actual;
         this.gwStatus = `${enabled ? '已启用' : '已关闭'}`
           + ` · 端口 ${g.gateway_port || '-'}`
           + ` · 已接入服务 ${n} 条`
-          + (g.auth_alive ? ' · 认证服务运行中' : ' · ⚠️ 认证服务未响应');
+          + (g.auth_alive ? ' · 认证服务运行中' : ' · ⚠️ 认证服务未响应')
+          // 「已启用」+「端口没人听」= 面板正在骗人。.224 实测就是这个组合，
+          // 网关 conf 文件早没了，界面还绿着。
+          + (a ? (a.enabled ? ' · 公网入口在线' : ' · ⚠️ 公网入口实际未监听') : '');
       } catch (e) {
+        // 读失败就不能提交 —— 否则又回到「拿默认值当用户意图」
+        this.gwLoaded = false;
+        this.gwActual = null;
         this.gwStatus = '状态读取失败：' + e.message;
       }
     },
 
     async saveGatewayConfig() {
-      if (!this.gw.gateway_enabled && !this.rp.rules.length) {
-        if (!confirm('网关将关闭，且当前没有任何服务——确定吗？')) return;
+      if (!this.gwLoaded) {
+        this.showToast('网关状态还没加载完成，刷新状态后再保存', 'error');
+        return;
+      }
+      // 关闭网关 = 摘掉本项目唯一的公网入口，且这个操作**不可逆**：
+      // 人不在局域网内就再也回不来了。所以无论有没有服务，都必须显式确认，
+      // 并把「这是唯一入口」摆在字面上。原来的条件
+      // `if (!enabled && !this.rp.rules.length)` 只在没有任何服务时才问，
+      // 恰好漏掉了最危险的「有服务、有人在用」那一种。
+      if (!this.gw.gateway_enabled) {
+        if (!confirm(
+          '关闭认证网关会删除网关 nginx 配置并重载，'
+          + '8443 之类的公网入口将立即停止监听。\n\n'
+          + '它是本项目唯一的公网入口 —— 一旦关闭，除非你人在局域网内，'
+          + '否则将无法再连回这台机器。\n\n确定要关闭吗？'
+        )) return;
       }
       this.gwSaving = true;
       try {
