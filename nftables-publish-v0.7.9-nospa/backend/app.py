@@ -675,9 +675,50 @@ def _migrate_forward_rules(config):
     return config
 
 
-def _auto_detect_network():
-    """自动检测网络段配置"""
+def _ipv6_prefix(addr_with_plen):
+    """把 `240e:abcd:ef01:2345::1/64` 这样的地址转成它真正的 /64 前缀。
+
+    为什么不能用 `':'.join(p for p in ip.split(':') if p)[:4]`：
+    那种手工切段在「第 4 组为空」时会整体左移。实测（.224）：
+        输入 fd12:3456:789a::1/64
+        旧算法  fd12:3456:789a:1::/64   ← 第 4 组是空的，被过滤掉了，后面全部前移
+        正确    fd12:3456:789a::/64
+
+    而 ULA 的标准写法恰恰就是 `fdXX:XXXX:XXXX::/48`（第 4 组为空），
+    也就是**这个分支平时几乎总是算错**，且算错后不报错，只是生成一组
+    落在别人地址空间里的 IPv6 规则。
+
+    交给 ipaddress 处理压缩展开，不做字符串手术。格式非法返回 None。
+    """
+    try:
+        import ipaddress
+        return str(ipaddress.ip_interface(addr_with_plen).network)
+    except (ValueError, TypeError):
+        return None
+
+
+def _auto_detect_network(config=None):
+    """自动检测网络段配置。
+
+    接口名必须来自配置，不能写死 br-lan / pppoe-wan：
+    实测踩过（2026-10-15）—— 配置里 wan_if=pppoe-wan，而本机出口其实是 eth1
+    （uci 压根没有 network.wan 段），于是下面这条探测永远查不到任何地址：
+
+        ip -6 addr show dev pppoe-wan scope global
+
+    返回的 dict 里没有 WAN_PREFIX6，`config_to_variables` 就静默回落到
+    DEFAULT_CONFIG 的 `240e:390:4944:b191::/64` —— 那是别人家宽带的前缀。
+    IPv6 地址段生成规则全错，而且从检测到下发一路没有任何报错。
+
+    同理 lan_if 写死 br-lan：linux_gateway 部署模式下 LAN 侧根本不是 br-lan，
+    ULA 前缀探测同样恒空。
+
+    config 传 None 时不读盘（调用方手里通常已经有 config），直接用默认接口名。
+    """
     result = {}
+    cfg = config if isinstance(config, dict) else {}
+    lan_if = _safe_iface(cfg.get('lan_if'), 'br-lan')
+    wan_if = _safe_iface(cfg.get('wan_if'), 'pppoe-wan')
     try:
         uci = parse_uci_config('/etc/config/network')
         ipaddr = uci.get('lan_ipaddr', '')
@@ -687,26 +728,29 @@ def _auto_detect_network():
             net = ipaddress.ip_network(f"{ipaddr}/{netmask}", strict=False)
             result['LAN_SUBNET4'] = str(net)
             result['LAN_BROADCAST4'] = str(net.broadcast_address)
-        res = subprocess.run(['ip', '-6', 'addr', 'show', 'dev', 'br-lan'], capture_output=True, text=True, timeout=5)
+        res = subprocess.run(['ip', '-6', 'addr', 'show', 'dev', lan_if], capture_output=True, text=True, timeout=5)
         for line in res.stdout.splitlines():
             if 'inet6' in line and 'fd' in line:
                 addr = line.strip().split()[1]
-                ip, plen = addr.split('/')
-                parts = [p for p in ip.split(':') if p]  # 过滤空段
-                if len(parts) >= 4:
-                    result['ULA_PREFIX6'] = ':'.join(parts[:4]) + '::/' + plen
+                _pfx = _ipv6_prefix(addr)
+                if _pfx:
+                    result['ULA_PREFIX6'] = _pfx
                     break
-        res = subprocess.run(['ip', '-6', 'addr', 'show', 'dev', 'pppoe-wan', 'scope', 'global'], capture_output=True, text=True, timeout=5)
+        res = subprocess.run(['ip', '-6', 'addr', 'show', 'dev', wan_if, 'scope', 'global'], capture_output=True, text=True, timeout=5)
         for line in res.stdout.splitlines():
             if 'inet6' in line:
                 addr = line.strip().split()[1]
-                ip, plen = addr.split('/')
-                parts = [p for p in ip.split(':') if p]  # 过滤空段
-                if len(parts) >= 4:
-                    result['WAN_PREFIX6'] = ':'.join(parts[:4]) + '::/' + plen
+                _pfx = _ipv6_prefix(addr)
+                if _pfx:
+                    result['WAN_PREFIX6'] = _pfx
                     break
-    except:
-        pass
+    except Exception as e:
+        # 探测失败必须留痕：这条路径曾经因为接口名写死而恒空，
+        # WAN_PREFIX6 于是静默回落到 DEFAULT_CONFIG 里别人家宽带的前缀，
+        # IPv6 地址段生成规则全错且一路无报错。
+        print(f'[WARN] 自动检测网络段失败（接口名取自配置 '
+              f'lan_if={lan_if} wan_if={wan_if}）: {type(e).__name__}: {e}',
+              flush=True)
     return result
 
 # ======================= 配置校验 =======================
@@ -1242,8 +1286,8 @@ def config_to_variables(config):
         port_sets_block += f"        elements = {{ {udp_elems} }}\n"
     port_sets_block += "    }"
 
-    # 自动检测网络段
-    detected = _auto_detect_network()
+    # 自动检测网络段（接口名取自本份 config，不写死 br-lan / pppoe-wan）
+    detected = _auto_detect_network(config)
 
     variables = {
         "WAN_IF": f'"{_safe_iface(config.get("wan_if"), "pppoe-wan")}"',
@@ -1472,7 +1516,7 @@ def _client_is_lan(client_ip):
         return False
     candidates = []
     cfg = load_config()
-    for src in (cfg.get('lan_subnet4'), _auto_detect_network().get('LAN_SUBNET4')):
+    for src in (cfg.get('lan_subnet4'), _auto_detect_network(cfg).get('LAN_SUBNET4')):
         try:
             if src:
                 candidates.append(ipaddress.ip_network(str(src), strict=False))
