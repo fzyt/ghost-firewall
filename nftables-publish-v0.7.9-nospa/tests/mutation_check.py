@@ -17,7 +17,15 @@ FILES = {
     'tpl': os.path.join(ROOT, 'backend', 'templates', 'nftables.conf'),
     'eng': os.path.join(ROOT, 'backend', 'template_engine.py'),
 }
-TEST = os.path.join(ROOT, 'tests', 'test_review_fixes.py')
+# 变异基线。原来只有 test_review_fixes.py 一个，2026-10-15 补的
+# test_lists_concurrency.py（名单落盘并发 + 网关布尔校验 + 网关状态字段名）
+# 不在里面 —— 意味着「save_lists 不再被调用」这类变异只能靠
+# test_review_fixes.py 崩在 FileNotFoundError 上被算作捕获，报的是 0 条断言失败，
+# 信号很弱。基线越全，越要证明「新修复不会被悄悄改坏」。
+TESTS = [
+    os.path.join(ROOT, 'tests', 'test_review_fixes.py'),
+    os.path.join(ROOT, 'tests', 'test_lists_concurrency.py'),
+]
 
 # (描述, 文件键, 旧文本, 新文本, 期望出现次数)
 MUTATIONS = [
@@ -84,9 +92,13 @@ MUTATIONS = [
      '            except ValueError:\n                dropped += 1\n                continue',
      '            except ValueError:\n                lines.append(elem)\n                continue', 1),
 
+    # 锚点曾写死 4 空格缩进（_mutate_lists 裸跑的形状）。2026-10-15 修名单落盘
+    # 并发（P0-B）时给整个读-改-写套了 _lists_file_lock()，函数体多缩进一层，
+    # 锚点匹配 0 次导致这条变异被**静默跳过** —— 变异覆盖悄悄少一条比挂了更糟。
+    # 这里同步换锚点，变异代表的仍是同一个原始危害：save_lists 不再被调用。
     ('名单落盘变成空操作', 'app',
-     '    data[set_name] = cur\n    save_lists(data)\n    return data',
-     '    data[set_name] = cur\n    return data', 1),
+     '        data[set_name] = cur\n        save_lists(data)\n    return data',
+     '        data[set_name] = cur\n    return data', 1),
 
     ('配置损坏守卫去掉', 'app',
      '    refused = _config_corrupted_response()\n    if refused is not None:\n        return refused',
@@ -128,8 +140,14 @@ MUTATIONS = [
 
 
 def run_tests():
-    r = subprocess.run([sys.executable, TEST], capture_output=True, text=True, timeout=300)
-    return r.returncode, r.stdout
+    """跑完整条基线。任一条红就算捕获；断言数由调用方从合并输出里统计。"""
+    rc, out = 0, ''
+    for t in TESTS:
+        r = subprocess.run([sys.executable, t], capture_output=True, text=True, timeout=300)
+        out += r.stdout + r.stderr
+        if r.returncode != 0:
+            rc = 1
+    return rc, out
 
 
 def main():

@@ -1530,14 +1530,30 @@ function app() {
       try {
         const d = await api.get('/api/gateway/status');
         const g = d.gateway || d.data || d;
-        if (g.gateway_enabled !== undefined) this.gw.gateway_enabled = !!g.gateway_enabled;
+        // /api/gateway/status 返回的键是 enabled / lan_bypass / session_timeout /
+        // absolute_timeout，这里原来读的是 gateway_enabled / auth_lan_bypass /
+        // auth_session_timeout / auth_absolute_timeout —— 四个键一个都对不上，
+        // 于是全部落空，表单一直停在初始值（网关=关闭、两个超时=0）。
+        // 保存路径 /api/gateway/config 之前恒 400，把这个错配盖住了；
+        // 那个 400 修好之后，点一次「保存网关配置」就会照着这份空表单
+        // 把认证网关真的关掉，所以必须一起修。
+        // 两个名字都认，老配置/老后端仍能读。
+        const pick = (...names) => {
+          for (const n of names) if (g[n] !== undefined) return g[n];
+          return undefined;
+        };
+        const enabled = pick('enabled', 'gateway_enabled');
+        const sess = pick('session_timeout', 'auth_session_timeout');
+        const abs = pick('absolute_timeout', 'auth_absolute_timeout');
+        const bypass = pick('lan_bypass', 'auth_lan_bypass');
+        if (enabled !== undefined) this.gw.gateway_enabled = !!enabled;
         if (g.gateway_port) this.gw.gateway_port = g.gateway_port;
-        if (g.auth_session_timeout !== undefined) this.gw.auth_session_timeout = g.auth_session_timeout;
-        if (g.auth_absolute_timeout !== undefined) this.gw.auth_absolute_timeout = g.auth_absolute_timeout;
-        if (g.lan_bypass !== undefined) this.gw.auth_lan_bypass = !!g.lan_bypass;
+        if (sess !== undefined) this.gw.auth_session_timeout = sess;
+        if (abs !== undefined) this.gw.auth_absolute_timeout = abs;
+        if (bypass !== undefined) this.gw.auth_lan_bypass = !!bypass;
         const n = (g.services_count !== undefined) ? g.services_count
                                                     : (Array.isArray(g.services) ? g.services.length : 0);
-        this.gwStatus = `${g.gateway_enabled ? '已启用' : '已关闭'}`
+        this.gwStatus = `${enabled ? '已启用' : '已关闭'}`
           + ` · 端口 ${g.gateway_port || '-'}`
           + ` · 已接入服务 ${n} 条`
           + (g.auth_alive ? ' · 认证服务运行中' : ' · ⚠️ 认证服务未响应');

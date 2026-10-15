@@ -196,7 +196,12 @@ async function resetPage(page) {
   await sleep(500);
 }
 
-async function runClick(page) {
+async function runClick(page, errors) {
+  // errors 必须由调用方传进来共享同一个数组。原先这里读 report.errors，
+  // 而 report.errors 是 runClick 返回**之后**才被赋值的（report.errors = errors），
+  // 整个点击过程中它恒为 []，于是 before 恒为 0、newErrs 恒为空 ——
+  // 任何 HTTP>=400 都不会算作失败。「全部清空」返回 400、「保存网关配置」
+  // 返回 400 都曾被记成 ✅。
   const report = { mode: 'click', at: new Date().toISOString(), results: [], errors: [] };
   const retried = [];
   for (const [id, label] of NAV_ITEMS) {
@@ -256,12 +261,12 @@ async function runClick(page) {
         log(`  ⏭ ${desc}  (重载后仍找不到)`);
         continue;
       }
-      const before = report.errors.length;
+      const before = errors.length;
       try {
         await page.locator(`[data-e2e="${target.idx}"]`).click({ timeout: 6000, noWaitAfter: true });
         await sleep(700);
 
-        const newErrs = report.errors.slice(before);
+        const newErrs = errors.slice(before);
         if (newErrs.length) {
           report.results.push({ page: id, desc, status: 'error', errors: newErrs });
           log(`  ❌ ${desc}\n       ${newErrs.map(e => `${e.kind}: ${e.msg || (e.status + ' ' + e.url)}`).join(' | ')}`);
@@ -270,7 +275,7 @@ async function runClick(page) {
           log(`  ✅ ${desc}`);
         }
       } catch (e) {
-        const newErrs = report.errors.slice(before);
+        const newErrs = errors.slice(before);
         const msg = e.message.split('\n')[0];
         report.results.push({ page: id, desc, status: 'error', errors: newErrs.concat([{ kind: 'click', msg }]) });
         log(`  ❌ ${desc}\n       点击失败: ${msg}`);
@@ -408,7 +413,20 @@ async function runPortal(page) {
   page.on('pageerror', e => errors.push({ kind: 'pageerror', msg: e.message.split('\n')[0] }));
   page.on('console', m => { if (m.type() === 'error') errors.push({ kind: 'console', msg: m.text().slice(0, 200) }); });
   page.on('response', r => {
-    if (r.status() >= 400) errors.push({ kind: 'http', status: r.status(), url: r.url().replace(/\?.*/, '') });
+    if (r.status() < 400) return;
+    // 先同步入账（归因窗口靠数组下标，异步补 body 不影响），
+    // 再异步补上响应体 —— 否则报告里只有一个 400 和一个 URL，
+    // 还得手工重放一次才能知道到底是哪个校验拦下的。
+    const entry = { kind: 'http', status: r.status(), url: r.url().replace(/\?.*/, '') };
+    errors.push(entry);
+    r.text().then(t => {
+      try {
+        const j = JSON.parse(t);
+        entry.body = String((j && (j.message || j.code)) || t).slice(0, 200);
+      } catch (_) {
+        entry.body = t.slice(0, 200);
+      }
+    }).catch(() => {});
   });
   page.on('dialog', d => d.accept().catch(() => {}));
 
@@ -421,7 +439,7 @@ async function runPortal(page) {
       log('\n=== 面板登录 ===');
       await login(page);
       log(`\n=== ${MODE === 'probe' ? '逐页枚举对账' : '逐个点击'} ===`);
-      report = MODE === 'probe' ? await runProbe(page) : await runClick(page);
+      report = MODE === 'probe' ? await runProbe(page) : await runClick(page, errors);
       report.errors = errors;
     }
   } catch (e) {

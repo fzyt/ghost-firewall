@@ -1,6 +1,6 @@
 # Version: 0.7.9.1
 from flask import Flask, jsonify, request, send_from_directory, send_file, session
-import os, subprocess, shutil, json, time, re, hmac, hashlib, base64, datetime, uuid, fcntl, io, zipfile, secrets, ssl, ipaddress, socket, threading
+import os, subprocess, shutil, json, time, re, hmac, hashlib, base64, datetime, uuid, fcntl, io, zipfile, secrets, ssl, ipaddress, socket, threading, contextlib
 from template_engine import load_template, generate_rules
 
 # ======================= 认证配置 =======================
@@ -3861,6 +3861,44 @@ VALID_SET_NAMES = {"allowed4", "allowed6", "blacklist4", "blacklist6"}
 # 名单成员落盘路径。规则集以 `flush ruleset` 开头、每次应用都会整体重建，
 # 只存在于内核 set 里的成员会被静默清空 —— 必须落盘并在生成时回填。
 LISTS_PATH = '/etc/nftables/nftables-web-lists.json'
+LISTS_LOCK_PATH = LISTS_PATH + '.lock'
+# 锁降级告警只打一次，见 _lists_file_lock
+_LISTS_LOCK_WARNED = False
+
+
+@contextlib.contextmanager
+def _lists_file_lock():
+    """名单读-改-写的跨进程/跨线程排他锁（与 save_config 的 .lock 同一套做法）。
+
+    锁失败（文件系统不支持 flock、目录不可写等）时退化为无锁继续 —— 名单只是
+    便捷数据，不值得因为拿不到锁就把「加一个 IP」这种小操作整个拒掉。但每次都打
+    警告会把日志刷爆，所以只打第一次：之后仍在无锁运行（唯一 tmp 路径保证不会写坏
+    文件，丢的那一层只是并发时的更新丢失），状态没变就不必反复说。
+    """
+    global _LISTS_LOCK_WARNED
+    lock_fd = None
+    try:
+        os.makedirs(os.path.dirname(LISTS_LOCK_PATH), exist_ok=True)
+        lock_fd = os.open(LISTS_LOCK_PATH, os.O_CREAT | os.O_RDWR)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    except Exception as e:   # noqa: BLE001
+        if not _LISTS_LOCK_WARNED:
+            _LISTS_LOCK_WARNED = True
+            print(f'[WARNING] 名单加锁失败（{type(e).__name__}: {e}），本次起无锁执行', flush=True)
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+            lock_fd = None
+    try:
+        yield
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
 
 
 def load_lists():
@@ -3891,16 +3929,34 @@ def load_lists():
 
 
 def save_lists(data):
-    """原子写回名单文件（与 save_config 同样用临时文件 + replace）"""
+    """原子写回名单文件（与 save_config 同样用临时文件 + replace）
+
+    临时文件名必须每次唯一：白/黑名单的「全部清空」是前端 Promise.all **并发**发
+    allowed4 与 allowed6 两个请求，两个 save_lists 若共用一个固定 tmp 路径 ——
+      · 先后 open 同一个 tmp，先 replace 的把 tmp 挪走，后一个 os.replace 直接
+        FileNotFoundError → 用户看到「清空失败」，实测真机 2/2 稳定复现；
+      · 更糟的是两个 fd 交错写进同一个文件，产出「一份完整 JSON + 一段尾巴」的
+        残缺文件，load_lists 解析失败后按**空名单**处理 —— 白名单/黑名单被整体
+        静默清空，下次「应用规则」再把这个空状态写进内核。
+    并发丢失更新（两个请求各自读到旧快照、后写的把先写的覆盖回去）由 _mutate_lists
+    里的 flock 解决，两者缺一不可。
+    """
     os.makedirs(os.path.dirname(LISTS_PATH), exist_ok=True)
     payload = {n: sorted({str(x).strip() for x in (data.get(n) or []) if str(x).strip()})
                for n in sorted(VALID_SET_NAMES)}
-    tmp = LISTS_PATH + '.tmp'
-    with open(tmp, 'w') as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, LISTS_PATH)
+    tmp = f'{LISTS_PATH}.tmp.{os.getpid()}.{threading.get_ident()}'
+    try:
+        with open(tmp, 'w') as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, LISTS_PATH)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _mutate_lists(set_name, add=(), remove=(), clear=False):
@@ -3908,18 +3964,22 @@ def _mutate_lists(set_name, add=(), remove=(), clear=False):
 
     调用方必须先确认内核 nft 操作成功再调这里 —— 顺序不能反：
     先落盘再改内核，内核失败就会造成「磁盘说有、内核没有」。
+
+    整个读-改-写必须持排他锁：调用方是并发到达的（一次「全部清空」= 两个请求），
+    不加锁时两个请求都读到旧快照，后写的会把先写的覆盖回去。
     """
-    data = load_lists()
-    cur = list(data.get(set_name, []))
-    if clear:
-        cur = []
-    for ip in remove:
-        cur = [x for x in cur if x != ip]
-    for ip in add:
-        if ip not in cur:
-            cur.append(ip)
-    data[set_name] = cur
-    save_lists(data)
+    with _lists_file_lock():
+        data = load_lists()
+        cur = list(data.get(set_name, []))
+        if clear:
+            cur = []
+        for ip in remove:
+            cur = [x for x in cur if x != ip]
+        for ip in add:
+            if ip not in cur:
+                cur.append(ip)
+        data[set_name] = cur
+        save_lists(data)
     return data
 
 # 历史/预设容量上限
@@ -5647,8 +5707,15 @@ def gateway_set_config():
         if k not in allowed:
             return jsonify({"success": False,
                             "message": f"不支持的字段 {k!r}（可改: {', '.join(sorted(allowed))}）"}), 400
-        if isinstance(v, bool) or (k.endswith(("_port", "_timeout")) and not isinstance(v, (int, float))):
+        # isinstance(True, int) 在 Python 里为真，所以数字字段必须显式把 bool 挡掉 ——
+        # 但**只能对数字字段挡**。写成 `isinstance(v, bool) or (...)` 时这个判断在 or 的
+        # 左边、不受字段名约束，于是 gateway_enabled / auth_lan_bypass 这两个合法布尔项
+        # 也被一律拒绝：前端 saveGatewayConfig 每次都发这两个字段，于是「保存网关配置」
+        # 从 v0.8.0 落地起就永远 400，网关开关在面板上根本没法用。
+        if k.endswith(("_port", "_timeout")) and (isinstance(v, bool) or not isinstance(v, (int, float))):
             return jsonify({"success": False, "message": f"{k} 类型非法: {v!r}"}), 400
+        if not isinstance(v, (bool, int, float, str, type(None), list, dict)):
+            return jsonify({"success": False, "message": f"{k} 类型非法: {type(v).__name__}"}), 400
         new_cfg[k] = v
         changed.append(k)
 
