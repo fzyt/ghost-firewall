@@ -196,6 +196,47 @@ async function resetPage(page) {
   await sleep(500);
 }
 
+// 后端「按设计拒绝」的响应不算按钮缺陷。
+//
+// 判定口径原先是「归因窗口内有任何 HTTP>=400 就记 error」，这条太粗：
+// 2026-10-15 全量跑下来固定挂 2 条，查完都是后端在正确地拒绝非法输入，
+// 但报告分不出来，看起来像产品缺陷，每轮都要重新排查一遍。
+//
+// 白名单刻意做得很窄：只认「状态码 + 精确路径」，且必须逐条写明理由。
+// 同一个端点换个状态码（比如 /api/network/config 变成 500）仍然是真缺陷。
+const EXPECTED_REJECTIONS = [
+  {
+    status: 400, path: '/api/network/config',
+    why: '.224 没有 PPPoE 宽带账号，后端主动中止保存以免写出不可用的网络配置',
+  },
+  {
+    status: 404, path: '/api/network/wan-ipv6',
+    why: '.224 只有 link-local fe80::，没有全局 IPv6 地址，查不到公网地址是正确结果',
+  },
+];
+
+/** 把「后端按设计拒绝」和真实缺陷拆开。rest 非空才算按钮失败。 */
+function splitErrors(newErrs) {
+  const hit = new Set();
+  const rejected = [];
+  const rest = [];
+  for (const e of newErrs) {
+    if (e.kind === 'http') {
+      const url = String(e.url || '').split('?')[0];
+      const m = EXPECTED_REJECTIONS.find(x => x.status === e.status && url.endsWith(x.path));
+      if (m) { hit.add(e.status); rejected.push({ ...m, body: e.body || '' }); continue; }
+    }
+    rest.push(e);
+  }
+  if (!hit.size) return { rest, rejected };
+  // 浏览器为同一个失败请求补的那条 console 也要一起摘掉，
+  // 否则只消掉 http、留下一条 "Failed to load resource" 照样算失败。
+  return {
+    rest: rest.filter(e => e.kind !== 'console' || ![...hit].some(s => String(e.msg || '').includes(`status of ${s}`))),
+    rejected,
+  };
+}
+
 async function runClick(page, errors) {
   // errors 必须由调用方传进来共享同一个数组。原先这里读 report.errors，
   // 而 report.errors 是 runClick 返回**之后**才被赋值的（report.errors = errors），
@@ -262,14 +303,20 @@ async function runClick(page, errors) {
         continue;
       }
       const before = errors.length;
+      // 每个按钮都从空的 rejection 快照开始，否则页面侧记录会和 CDP 那条
+      // 对不上号 —— 上一个按钮攒下的未捕获 rejection 会被算到这一个头上。
+      await page.evaluate(() => { if (window.__e2eRejections) window.__e2eRejections.length = 0; }).catch(() => {});
       try {
         await page.locator(`[data-e2e="${target.idx}"]`).click({ timeout: 6000, noWaitAfter: true });
         await sleep(700);
 
-        const newErrs = errors.slice(before);
-        if (newErrs.length) {
-          report.results.push({ page: id, desc, status: 'error', errors: newErrs });
-          log(`  ❌ ${desc}\n       ${newErrs.map(e => `${e.kind}: ${e.msg || (e.status + ' ' + e.url)}`).join(' | ')}`);
+        const { rest, rejected } = splitErrors(errors.slice(before));
+        if (rest.length) {
+          report.results.push({ page: id, desc, status: 'error', errors: rest });
+          log(`  ❌ ${desc}\n       ${rest.map(e => `${e.kind}: ${e.msg || (e.status + ' ' + e.url)}`).join(' | ')}`);
+        } else if (rejected.length) {
+          report.results.push({ page: id, desc, status: 'reject-by-design', rejections: rejected });
+          log(`  🚫 ${desc}\n       后端按设计拒绝（非缺陷）: ${rejected.map(r => r.why).join(' / ')}`);
         } else {
           report.results.push({ page: id, desc, status: 'ok' });
           log(`  ✅ ${desc}`);
@@ -410,8 +457,48 @@ async function runPortal(page) {
   const ctx = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1680, height: 1050 } });
   const page = await ctx.newPage();
   const errors = [];
-  page.on('pageerror', e => errors.push({ kind: 'pageerror', msg: e.message.split('\n')[0] }));
+  // pageerror 的 msg 单独存着不够用。Playwright 的 getExceptionMessage 取 CDP 的
+  // exception.description(形如 "Uncaught (in promise) Object"),再被 splitErrorMessage
+  // 按第一个 ": " 拆成 name/message —— 非 Error 的抛出值最后只剩 msg="Object",
+  // 完全看不出是什么。实测「全部清空[黑名单]」报的就是这样,光看报告无法定位,
+  // 必须把 name 和 stack 一起留下,才有机会还原成可读信息。
+  page.on('pageerror', e => {
+    const entry = {
+      kind: 'pageerror',
+      msg: e.message.split('\n')[0],
+      name: e.name || '',
+      stack: String(e.stack || '').split('\n').slice(0, 10).join(' | ').slice(0, 1200),
+    };
+    errors.push(entry);
+    // 和 http body 一样：先入账保证归因窗口对得上，再异步补页面侧的完整快照。
+    page.evaluate(() => (window.__e2eRejections || []).slice(-3))
+      .then(d => { entry.reason = d; }).catch(() => {});
+  });
   page.on('console', m => { if (m.type() === 'error') errors.push({ kind: 'console', msg: m.text().slice(0, 200) }); });
+
+  // CDP 那条链路会把非 Error 的抛出值压成 "Object",等于把线索扔了。
+  // 这里在页面里自己留一份完整快照：构造器名、原始字符串、自身键、栈。
+  await page.addInitScript(() => {
+    window.__e2eRejections = [];
+    const describe = r => {
+      const out = { typeofValue: typeof r, ctor: (r && r.constructor && r.constructor.name) || null };
+      try {
+        if (r instanceof Error) {
+          out.message = r.message;
+          out.stack = String(r.stack || '').split('\n').slice(0, 10).join(' | ').slice(0, 1200);
+        } else if (r && typeof r === 'object') {
+          out.ownKeys = Object.keys(r);
+          try { out.json = JSON.stringify(r).slice(0, 600); } catch (e) { out.json = '<不可序列化: ' + e.message + '>'; }
+        } else {
+          out.value = String(r).slice(0, 300);
+        }
+      } catch (e) { out.describeFailed = e.message; }
+      return out;
+    };
+    window.addEventListener('unhandledrejection', ev => {
+      window.__e2eRejections.push({ from: 'unhandledrejection', ...describe(ev.reason) });
+    });
+  });
   page.on('response', r => {
     if (r.status() < 400) return;
     // 先同步入账（归因窗口靠数组下标，异步补 body 不影响），
@@ -455,6 +542,10 @@ async function runPortal(page) {
     const by = {};
     report.results.forEach(r => by[r.status] = (by[r.status] || 0) + 1);
     log(`\n汇总: ${JSON.stringify(by)}`);
+    const design = report.results.filter(r => r.status === 'reject-by-design');
+    if (design.length) {
+      log(`其中 ${design.length} 个是后端按设计拒绝（非缺陷）: ${design.map(r => r.desc.split(' [')[0]).join('、')}`);
+    }
     if (report.retried) log(`子页签重载后补测 ${report.retried} 个按钮`);
     if (report.errors.length) log(`页面级错误 ${report.errors.length} 条（已记入报告）`);
   }
