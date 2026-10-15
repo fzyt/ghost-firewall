@@ -99,57 +99,176 @@ def _is_authenticated() -> bool:
 
 
 # 登录失败计数（IP -> [timestamp, ...]），用于限流
-_failed_logins: dict = {}
-_MAX_FAILED_LOGINS_IPS = 50000  # IP 数硬上限（防恶意创建大量 IP 条目撑爆内存）
+#
+# 落盘，而不是内存 dict。
+#
+# 为什么：内存计数进程一重启就清零，攻击者只要能让面板重启（crash / 服务
+# 被 manage 脚本重启 / 定时任务 reload）就能把计数抹掉，然后按 5 次一组慢慢
+# 试 —— 5 分钟窗口 + 15 分钟锁定这个策略被绕开一半。
+#
+# 认证网关（auth_gateway.py，8443 的真正入口）早就是落盘的了，它的模块文档
+# 里明确点名了本文件这个内存 dict 是「不重复的错误」。这里跟齐。
+#
+# 落盘口径与网关保持一致：按 IP 记、5 次/5 分钟锁 15 分钟、成功即清空、
+# 过期条目顺手 GC。文件不可用时降级回内存（不能让限流文件的问题把登录
+# 整个搞挂），并如实打日志。
+PANEL_RATELIMIT_FILE = '/etc/nftables/nftables-web-panel-ratelimit.json'
+_MAX_FAILED_LOGINS_IPS = 50000  # IP 数硬上限（防恶意创建大量 IP 条目撑爆文件/内存）
 _request_counter = 0  # 用于触发定期 GC
+_RATELIMIT_DEGRADED = {'warned': False}   # 文件不可用时只警告一次，别刷屏
 
 
-def _gc_failed_logins():
-    """清理过期的 _failed_logins 记录（防内存泄漏）"""
+def _ratelimit_read():
+    """读限流表。返回 {ip: {'fails': [...], 'locked_until': t}}。"""
+    try:
+        with open(PANEL_RATELIMIT_FILE, 'r') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, ValueError, OSError):
+        return {}
+
+
+def _ratelimit_write(data):
+    """写限流表：唯一 tmp + 原子替换 + 600 权限。"""
+    d = os.path.dirname(PANEL_RATELIMIT_FILE)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    tmp = PANEL_RATELIMIT_FILE + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, PANEL_RATELIMIT_FILE)
+
+
+def _ratelimit_degrade(e):
+    """落盘不可用 → 降级到内存，并只警告一次。
+
+    不能因为限流文件写不了就把登录整个搞挂 —— 那等于把面板变成谁都进不去。
+    """
+    if not _RATELIMIT_DEGRADED['warned']:
+        _RATELIMIT_DEGRADED['warned'] = True
+        print(f'[WARNING] 登录限流落盘不可用（{type(e).__name__}: {e}），'
+              f'降级为内存计数 —— 面板重启后失败次数会清零', flush=True)
+
+
+def _ratelimit_state(ip):
+    """取某个 IP 的 (fails, locked_until)，顺手做过期清理。返回 None 表示该 IP 无记录。"""
+    rec = _ratelimit_read().get(ip)
+    if not isinstance(rec, dict):
+        return None
     now = time.time()
-    empty_ips = []
-    for ip, rec in _failed_logins.items():
-        rec[:] = [t for t in rec if now - t < AUTH_RATE_LIMIT_LOCKOUT]
-        if not rec:
-            empty_ips.append(ip)
-    for ip in empty_ips:
-        _failed_logins.pop(ip, None)
+    fails = [t for t in rec.get('fails', [])
+             if isinstance(t, (int, float)) and now - t < AUTH_RATE_LIMIT_LOCKOUT]
+    lu = rec.get('locked_until', 0)
+    lu = lu if isinstance(lu, (int, float)) else 0
+    if not fails and lu <= now:
+        return None
+    return fails, lu
 
 
 def _check_rate_limit(ip: str) -> tuple:
     """检查 IP 是否被限流。返回 (allowed: bool, retry_after: int|None)"""
     global _request_counter
     _request_counter += 1
-    # 每 100 次请求全局清理一次过期 IP（防止 _failed_logins 内存泄漏）
-    if _request_counter % 100 == 0:
-        _gc_failed_logins()
     now = time.time()
-    rec = _failed_logins.get(ip, [])
-    # 清理过期记录
-    rec = [t for t in rec if now - t < AUTH_RATE_LIMIT_LOCKOUT]
-    _failed_logins[ip] = rec
-    # 检查窗口内失败次数
-    recent = [t for t in rec if now - t < AUTH_RATE_LIMIT_WINDOW]
+    try:
+        st = _ratelimit_state(ip)
+    except OSError as e:
+        _ratelimit_degrade(e)
+        st = None
+    if st is None:
+        return True, None
+    fails, locked_until = st
+    # 已锁定：直接按 locked_until 算，不依赖 fails 是否还在
+    if locked_until > now:
+        return False, int(locked_until - now) + 1
+    recent = [t for t in fails if now - t < AUTH_RATE_LIMIT_WINDOW]
     if len(recent) >= AUTH_RATE_LIMIT_MAX_FAILS:
-        # 计算还需等待多久才能解锁
         oldest = min(recent)
-        retry_after = int(AUTH_RATE_LIMIT_LOCKOUT - (now - oldest)) + 1
-        return False, retry_after
+        return False, int(AUTH_RATE_LIMIT_LOCKOUT - (now - oldest)) + 1
     return True, None
 
 
 def _record_login_failure(ip: str):
-    """记录一次登录失败"""
-    # IP 数硬上限（防止恶意创建大量 IP 条目撑爆内存）
-    if ip not in _failed_logins and len(_failed_logins) >= _MAX_FAILED_LOGINS_IPS:
-        print(f"[WARNING] _failed_logins 已达上限 {_MAX_FAILED_LOGINS_IPS}，拒绝记录 {ip}", flush=True)
-        return
-    _failed_logins.setdefault(ip, []).append(time.time())
+    """记录一次登录失败（落盘 + fcntl 排他锁）。"""
+    try:
+        _ratelimit_mutate(ip, on_fail=True)
+    except OSError as e:
+        _ratelimit_degrade(e)
 
 
 def _clear_login_failures(ip: str):
-    """登录成功，清空记录"""
-    _failed_logins.pop(ip, None)
+    """登录成功，清空该 IP 的记录（落盘）。"""
+    try:
+        _ratelimit_mutate(ip, on_fail=False)
+    except OSError as e:
+        _ratelimit_degrade(e)
+
+
+def _ratelimit_mutate(ip: str, on_fail: bool):
+    """原子地读改写限流表。返回 (是否已锁, 失败次数)。
+
+    持排他锁：面板是 threaded 的，两个并发登录同时读改写会丢计数，
+    而「丢计数」正是这个机制要防的事。
+    """
+    d = os.path.dirname(PANEL_RATELIMIT_FILE)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    lock_path = PANEL_RATELIMIT_FILE + '.lock'
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        data = _ratelimit_read()
+        now = time.time()
+        rec = data.get(ip) if isinstance(data.get(ip), dict) else {}
+        locked_until = rec.get('locked_until', 0)
+        if not isinstance(locked_until, (int, float)):
+            locked_until = 0
+
+        if locked_until > now:
+            return True, len(rec.get('fails', []) or [])
+
+        if on_fail:
+            fails = [t for t in (rec.get('fails') or [])
+                     if isinstance(t, (int, float)) and now - t < AUTH_RATE_LIMIT_WINDOW]
+            if len(fails) >= _MAX_FAILED_LOGINS_IPS:
+                # 单个 IP 的时间戳列表也要有上限，别被同一 IP 灌爆
+                fails = fails[-_MAX_FAILED_LOGINS_IPS:]
+            fails.append(now)
+            if len(fails) >= AUTH_RATE_LIMIT_MAX_FAILS:
+                data[ip] = {'fails': [], 'locked_until': now + AUTH_RATE_LIMIT_LOCKOUT}
+                _ratelimit_gc(data)
+                _ratelimit_write(data)
+                return True, 0
+            rec['fails'] = fails
+            rec['locked_until'] = 0
+            data[ip] = rec
+        elif ip in data:
+            data.pop(ip, None)
+
+        # 顺手 GC 过期条目，防止表无限膨胀
+        _ratelimit_gc(data)
+        _ratelimit_write(data)
+        return False, len(data.get(ip, {}).get('fails', []) or [])
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+
+def _ratelimit_gc(data):
+    """删掉已完全过期的 IP 条目"""
+    now = time.time()
+    cutoff = now - (AUTH_RATE_LIMIT_LOCKOUT + AUTH_RATE_LIMIT_WINDOW)
+    for ip in [ip for ip, rec in data.items()
+               if not isinstance(rec, dict)
+               or max(list(rec.get('fails') or [0])
+                      + [rec.get('locked_until', 0)
+                         if isinstance(rec.get('locked_until'), (int, float)) else 0]) < cutoff]:
+        data.pop(ip, None)
 
 
 # 公开路径白名单（无需登录）
