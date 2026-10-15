@@ -452,6 +452,7 @@
             <label class="block text-sm font-medium mb-1">信任 IPv4 地址</label>
             <input type="text" x-model="config.trusted_ip4" placeholder="192.168.4.229"
               class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+            <p class="text-xs text-gray-500 mt-1">只支持一个 IP。填多个不会多放行 —— 规则只认第一个，其余会被丢弃。</p>
           </div>
           <div>
             <label class="block text-sm font-medium mb-1">信任 IPv6 地址</label>

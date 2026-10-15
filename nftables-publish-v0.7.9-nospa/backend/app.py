@@ -744,6 +744,10 @@ def _auto_detect_network(config=None):
                 if _pfx:
                     result['WAN_PREFIX6'] = _pfx
                     break
+    except FileNotFoundError:
+        # /etc/config/network 不存在 = 不是 OpenWrt（linux_gateway 部署模式），
+        # 属正常情况，不该刷警告。
+        pass
     except Exception as e:
         # 探测失败必须留痕：这条路径曾经因为接口名写死而恒空，
         # WAN_PREFIX6 于是静默回落到 DEFAULT_CONFIG 里别人家宽带的前缀，
@@ -1591,6 +1595,17 @@ def post_config():
 
     requester_ip = request.remote_addr or ''
     risks = _detect_risks(old_cfg, new_cfg, requester_ip)
+
+    # trusted_ip4 归一化成单值再落盘。
+    #
+    # 必须放在 _detect_risks **之后**：风险检测要看到未归一化的多值，才能报出
+    # 「有 N 个被丢弃」。先归一化的话这条告警就永远不触发了。
+    #
+    # 为什么要在保存时归一化：配置里存着数组、规则里只认第一个，而两者之间
+    # 没有任何东西提醒用户。存成单值，配置与执行就永远一致了。
+    _eff_trusted, _ignored_trusted = _trusted_ip_single(new_cfg.get('trusted_ip4'))
+    new_cfg['trusted_ip4'] = _eff_trusted or ''
+
     critical_risks = [r for r in risks if r.get('level') == 'critical']
 
     # critical 风险（如自锁）必须显式确认；绕过前端直接打 API 会被 409 拒绝
@@ -1700,21 +1715,58 @@ def _diff_nft_rules(old_text: str, new_text: str) -> dict:
     }
 
 
+def _ip_list(v):
+    """trusted_ip4 的原始写法（单串 / 逗号串 / 列表）拆成字符串列表。"""
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [p.strip() for p in v.replace('，', ',').split(',') if p.strip()]
+    if isinstance(v, (list, tuple, set)):
+        return [str(p).strip() for p in v if str(p).strip()]
+    s = str(v).strip()
+    return [s] if s else []
+
+
+def _trusted_ip_single(v):
+    """trusted_ip4 归一化成**单个** IP —— 与 build_rules 实际生效的口径一致。
+
+    为什么必须是单值：本项目从头到尾按「一个信任 IP」设计。
+      · build_rules 走 `_safe_ip(..., strict=True)`，注释写明「数组取第一个合法项」
+      · 前端是单个 `<input x-model="config.trusted_ip4">`
+      · 模板里 `ip saddr $TRUSTED_IP4 accept` 给这一个 IP 全端口全协议放行
+
+    .224 实测（2026-10-15）配置里是
+    `['192.168.100.224', '192.168.100.1', '192.168.100.249']` 三个，
+    生成的规则只有 `define TRUSTED_IP4 = 192.168.100.224`。
+    另外两个管理机在 policy drop 下被挡在外面，而且没有任何提示。
+
+    原来这里用 `_ip_set()` 归一化成**集合**，自锁告警按 3 个算，
+    而规则只认 1 个 —— 告警与实际执行的口径本身就不一致。
+
+    返回 (生效的单个 IP 或 None, 被忽略的其余项列表)。
+
+    生效值直接委托 _safe_ip(..., strict=True) —— 那是 build_rules 真正调用的
+    解析器。刻意不自己「智能」处理：一旦这里和它分叉，自锁告警就会和实际
+    执行的口径对不上，而那正是要修的东西。
+    （例：逗号串 'a,b' 在 _safe_ip 眼里是**一个**非法 IP → 整个信任白名单
+    不生成，而不是「取 a」。这里如实报「无 + 两个都被丢弃」，
+    与实际一致。validate_config 本来也会把这种写法 400 掉。）
+    """
+    effective = _safe_ip(v, 4, '', strict=True) or None
+    ignored = [x for x in _ip_list(v) if x != effective]
+    return effective, ignored
+
+
 def _ip_set(v):
     """把 trusted_ip4（单串/逗号串/列表）归一化成 IPv4 集合。
 
     必须显式切分：直接 set("192.168.100.2") 会把字符串拆成
     {'1','9','6','2','.','8','0'}，导致自锁告警恒不触发。
+
+    ⚠️ 只在真的需要「集合」语义的场景用。trusted_ip4 实际按单值生效，
+    判断自锁风险请用 _trusted_ip_single —— 口径必须和 build_rules 一致。
     """
-    if v is None:
-        return set()
-    if isinstance(v, str):
-        parts = [p.strip() for p in v.replace('，', ',').split(',')]
-    elif isinstance(v, (list, tuple, set)):
-        parts = [str(p).strip() for p in v]
-    else:
-        parts = [str(v).strip()]
-    return {p for p in parts if p and _valid_ip(p, 4)}
+    return {p for p in _ip_list(v) if _valid_ip(p, 4)}
 
 
 def _port_set(v):
@@ -1737,12 +1789,27 @@ def _detect_risks(old_cfg: dict, new_cfg: dict, requester_ip: str) -> list:
             'message': 'LAN 允许端口移除了 22（SSH），可能影响远程管理',
         })
     # 2. trusted_ip4 移除请求者自己的 IP
-    old_trusted = _ip_set(old_cfg.get('trusted_ip4', []))
-    new_trusted = _ip_set(new_cfg.get('trusted_ip4', []))
-    if requester_ip and requester_ip in old_trusted and requester_ip not in new_trusted:
+    #
+    # 口径必须是「实际生效的那个」，不是配置里写了几个就算几个。
+    # build_rules 用 _safe_ip(..., strict=True) 只取数组第一个合法项，
+    # 这里原来用 _ip_set() 按集合算 —— 告警说「你还在白名单里」，
+    # 而生成的规则里可能根本没有你，于是 critical 自锁拦不住。
+    old_trusted, _old_ignored = _trusted_ip_single(old_cfg.get('trusted_ip4'))
+    new_trusted, new_ignored = _trusted_ip_single(new_cfg.get('trusted_ip4'))
+    if requester_ip and requester_ip == old_trusted and requester_ip != new_trusted:
         risks.append({
             'level': 'critical',
-            'message': f'你的 IP {requester_ip} 不再在 trusted_ip4 白名单！保存后可能立即被锁在外面',
+            'message': f'你的 IP {requester_ip} 不再是 trusted_ip4（保存后立即被锁在外面）',
+        })
+    # 2b. 配了多个信任 IP —— 只有第一个生效，其余被静默丢弃。
+    # 这是 .224 上真实发生过的：配了 3 个，规则只认第 1 个。
+    if new_ignored:
+        risks.append({
+            'level': 'high',
+            'message': f'trusted_ip4 只支持一个 IP：当前生效的是 '
+                       f'{new_trusted or "（无）"}，以下将被丢弃 '
+                       f'{"、".join(new_ignored)}。'
+                       f'多写不会多放行，请改成单个 IP。',
         })
     # 3. access_mode 改了
     old_mode = old_cfg.get('access_mode', 'lan')
@@ -1756,11 +1823,11 @@ def _detect_risks(old_cfg: dict, new_cfg: dict, requester_ip: str) -> list:
     #    等同于自锁。只在「模式真正切到 trusted」的那一刻报，
     #    否则留在 trusted 模式下改别的字段时每次保存都误报。
     if (new_mode == 'trusted' and old_mode != 'trusted'
-            and requester_ip and requester_ip not in new_trusted):
+            and requester_ip and requester_ip != new_trusted):
         risks.append({
             'level': 'critical',
             'message': f'切到 trusted（信任）模式后内网默认全丢弃，而你的 IP {requester_ip} '
-                       f'不在 trusted_ip4 白名单里，保存后会被防火墙拦住',
+                       f'不是 trusted_ip4（{new_trusted or "未设置"}），保存后会被防火墙拦住',
         })
 
     # 5. 面板来源访问边界把请求者自己关在外面
