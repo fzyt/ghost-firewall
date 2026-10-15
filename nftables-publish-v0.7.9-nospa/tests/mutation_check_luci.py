@@ -54,8 +54,18 @@ APP_MUTANTS = [
      "        return True"),
 
     ('关 LuCI 时不检查网关是否还活着',
-     "        if not want_luci and not _gateway_port_alive():",
+     "        if (bool(new_cfg.get('gateway_enabled')) and not want_luci\n"
+     "                and not _gateway_port_alive(config=new_cfg)):",
      "        if False:"),
+
+    # 2026-10-15 外部代码审查抓到：守卫没先问「网关启用了没有」。
+    # 默认配置 gateway_enabled=False 时，勾掉 LuCI 恒被 500 GATEWAY_DOWN 拒绝，
+    # 且 luci_enabled 被改回 True —— 用户想收掉的公网监听口被重新打开。
+    ('去掉 gateway_enabled 前置条件（网关未启用时关 LuCI 恒失败并反转用户意图）',
+     "        if (bool(new_cfg.get('gateway_enabled')) and not want_luci\n"
+     "                and not _gateway_port_alive(config=new_cfg)):",
+     "        if (not want_luci\n"
+     "                and not _gateway_port_alive(config=new_cfg)):"),
 
     ('判据退回「配置变没变」（漏掉实际状态不一致的升级场景）',
      "    if luci_actual is not None and luci_actual != want_luci:",
@@ -97,9 +107,17 @@ SH_MUTANTS = [
     ('setup.sh 不再调 close_luci_ports',
      "    setup_nftables\n    close_luci_ports\n    show_summary",
      "    setup_nftables\n    show_summary"),
-    ('setup.sh 关完不兜底确认 8443',
-     'if ! netstat -lnt 2>/dev/null | grep -q \':8443 \'; then',
-     'if false; then'),
+    # 兜底从「无条件查 8443」改成「按配置的 gateway_port 查，且只在网关启用时查」。
+    # 锚点跟着源码走 —— 锚点对不上时变异会被静默跳过，等于让变异名存实亡。
+    ('setup.sh 关完不按配置的网关端口兜底确认',
+     'if ! netstat -lnt 2>/dev/null | grep -q ":$gw_port "; then',
+     'if ! netstat -lnt 2>/dev/null | grep -q \':8443 \'; then'),
+
+    # 这条正是外部代码审查抓出来的那个：默认 gateway_enabled=false 时
+    # 无条件检查 8443，会把刚关掉的 LuCI 又还原回去，部署期自动关闭静默失效。
+    ('setup.sh 去掉「网关启用才检查」的前置条件（刚关的 LuCI 会被自己还原）',
+     '    if [ "$gw_enabled" = "yes" ] && [ -f /etc/nginx/conf.d/00-nftables-web-gateway.conf ]; then',
+     '    if [ -f /etc/nginx/conf.d/00-nftables-web-gateway.conf ]; then'),
 ]
 
 HTML_MUTANTS = [

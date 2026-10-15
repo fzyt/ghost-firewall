@@ -870,13 +870,36 @@ close_luci_ports() {
         [ -f "$snap" ] && cp "$snap" "$conf"
     fi
 
-    # 兜底：网关 8443 是本项目唯一的公网入口，绝不能被一起带下去
-    if ! netstat -lnt 2>/dev/null | grep -q ':8443 '; then
-        warn "❌ 关闭 LuCI 后网关 8443 不在监听 —— 正在自动还原 LuCI"
-        cp "$snap" "$conf"
-        [ -f "$rendered" ] && rm -f "$rendered"
-        command -v nginx-util >/dev/null 2>&1 && nginx-util init_lan >/dev/null 2>&1
-        /etc/init.d/nginx reload >/dev/null 2>&1
+    # 兜底：网关端口是本项目唯一的公网入口，绝不能被一起带下去。
+    #
+    # **只在网关确实启用时才检查**。默认配置 gateway_enabled=false，
+    # 此时 8443 本来就没人听，无条件检查会把自己刚关掉的 LuCI 又还原回去 ——
+    # 等于「部署后自动关闭 80/443」这个功能在该路径上静默失效。
+    #
+    # 配置是 JSON 文件（CONFIG_FILE），不是 uci，所以用 python3 读。
+    gw_enabled=no
+    gw_port=8443
+    if [ -f "$CONFIG_FILE" ] && command -v python3 >/dev/null 2>&1; then
+        eval "$(python3 - "$CONFIG_FILE" <<'PYEOF'
+import json, sys
+try:
+    c = json.load(open(sys.argv[1]))
+except Exception:
+    c = {}
+print('gw_enabled=%s' % ('yes' if c.get('gateway_enabled') else 'no'))
+print('gw_port=%s' % (c.get('gateway_port') or 8443))
+PYEOF
+)" 2>/dev/null || gw_enabled=no
+    fi
+
+    if [ "$gw_enabled" = "yes" ] && [ -f /etc/nginx/conf.d/00-nftables-web-gateway.conf ]; then
+        if ! netstat -lnt 2>/dev/null | grep -q ":$gw_port "; then
+            warn "❌ 关闭 LuCI 后网关 $gw_port 不在监听 —— 正在自动还原 LuCI"
+            cp "$snap" "$conf"
+            [ -f "$rendered" ] && rm -f "$rendered"
+            command -v nginx-util >/dev/null 2>&1 && nginx-util init_lan >/dev/null 2>&1
+            /etc/init.d/nginx reload >/dev/null 2>&1
+        fi
     fi
 }
 

@@ -73,7 +73,7 @@ mod.save_config = lambda cfg, **kw: None
 # 开启网关时后端会校验端口**真的在听**（.224 上出现过「回 200 但 8443 已死」）。
 # 这里要断言的是字段校验，所以把实际状态打桩成"网关健在"。
 _gw_actual = mod._gateway_actual_state
-mod._gateway_actual_state = lambda cfg=None: {
+mod._gateway_actual_state = lambda cfg=None, settle=False: {
     'nginx_conf_exists': True, 'port': 8443,
     'port_listening': True, 'enabled': True,
 }

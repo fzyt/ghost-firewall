@@ -57,8 +57,13 @@ MUTATIONS = [
     ('FIX-4 改回「先 save_config 后部署」（部署失败时磁盘已是新配置）', 'app',
      '    deploy_ok, deploy_msg = _deploy_gateway_nginx(new_cfg)\n'
      '    if not deploy_ok:\n'
-     '        return jsonify({"success": False,\n'
-     '                        "message": f"网关部署失败，配置未保存：{deploy_msg}"}), 500\n'
+     '        # 端点只负责把失败翻译成稳定的错误码，具体判定在函数内部做。\n'
+     '        not_listening = deploy_msg.startswith(GATEWAY_NOT_LISTENING_MSG.split(\'{\')[0])\n'
+     '        return jsonify({\n'
+     '            "success": False,\n'
+     '            "code": "GATEWAY_NOT_LISTENING" if not_listening else None,\n'
+     '            "message": f"网关部署失败，配置未保存：{deploy_msg}",\n'
+     '        }), 500\n'
      '\n'
      '    save_config(new_cfg)',
      '    save_config(new_cfg)\n'

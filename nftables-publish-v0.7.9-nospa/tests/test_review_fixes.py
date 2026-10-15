@@ -55,6 +55,12 @@ app._nginx_test = lambda: (True, 'ok')
 app._nginx_reload = lambda: (True, 'reloaded')
 app._apply_ruleset = lambda cfg: (True, 'ok')
 app._nginx_reload = lambda: (True, 'stub')    # 本机没有 nginx，只测配置产物
+# _deploy_gateway_nginx 现在会在下发后校验「端口真的在听」（.224 上出现过
+# conf 写了、reload 也成功、可 8443 没人听的情况）。本机没有 nginx 起着，
+# 必须把这个实际状态打桩成"网关健在"，否则这里测的会是校验分支而非配置产物。
+app._gateway_actual_state = lambda cfg=None, settle=False: {
+    'nginx_conf_exists': True, 'port': 8443,
+    'port_listening': True, 'enabled': True}
 cfg = {**base_cfg(), 'gateway_enabled': True, 'gateway_port': 8443,
        'reverse_proxy': {'rules': [
            {'id': 'rp_001', 'name': 'NAS', 'enabled': True, 'path_prefix': '/nas',

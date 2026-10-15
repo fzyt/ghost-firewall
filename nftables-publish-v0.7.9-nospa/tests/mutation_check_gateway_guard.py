@@ -36,21 +36,41 @@ APP_MUTANTS = [
      "    pass"),
 
     # ── 下发后不校验端口：.224 那次「回 200 但入口已死」 ────────────────
-    ('下发后不再校验端口是否真的在听（缺陷本体第 1 步的漏网）',
-     "    if bool(new_cfg.get('gateway_enabled')):",
+    # 校验点在 _deploy_gateway_nginx 内部（两个调用点共用），端点只负责
+    # 把失败原因翻译成错误码。这两组变异分别打这两层。
+    ('_deploy_gateway_nginx 内部的端口校验被整个拿掉（反代 CRUD 那条路失守）',
+     "        if enabled:\n"
+     "            actual = _gateway_actual_state(config, settle=True)\n"
+     "            if not actual['enabled']:",
+     "        if False:\n"
+     "            actual = _gateway_actual_state(config, settle=True)\n"
+     "            if not actual['enabled']:"),
+
+    # 2026-10-15 外部代码审查抓到：紧挨 nginx -s reload 就探测端口会误报。
+    # 首次启用 / 改 gateway_port 时那是个**新增监听口**，master 还要
+    # 建 socket、起 worker，探测会撞在 ECONNREFUSED 窗口里，
+    # 把一次成功的部署误判成失败并回滚。
+    ('端口探测去掉退避重试（首次启用/改端口时会误报部署失败）',
+     "            actual = _gateway_actual_state(config, settle=True)\n"
+     "            if not actual['enabled']:",
+     "            actual = _gateway_actual_state(config, settle=False)\n"
+     "            if not actual['enabled']:"),
+
+    ('内部校验只认文件在不在（端口没人监听也算部署成功）',
+     "            if not actual['enabled']:\n"
+     "                why = []",
+     "            if not actual['nginx_conf_exists']:\n"
+     "                why = []"),
+
+    ('端点不检查 deploy 结果就落盘（分叉被固化）',
+     "    deploy_ok, deploy_msg = _deploy_gateway_nginx(new_cfg)\n"
+     "    if not deploy_ok:",
+     "    deploy_ok, deploy_msg = _deploy_gateway_nginx(new_cfg)\n"
      "    if False:"),
 
-    ('校验失败时不拦，直接放行落盘',
-     "            }), 500\n\n    save_config(new_cfg)",
-     "            }), 200\n\n    save_config(new_cfg)"),
-
-    ('下发成功后照样 save_config（分叉被固化）',
-     "    if bool(new_cfg.get('gateway_enabled')):\n"
-     "        actual = _gateway_actual_state(new_cfg)\n"
-     "        if not actual['enabled']:",
-     "    if False:\n"
-     "        actual = _gateway_actual_state(new_cfg)\n"
-     "        if not actual['enabled']:"),
+    ('端点不再把失败归类成 GATEWAY_NOT_LISTENING（前端看不出是哪种坏）',
+     "        not_listening = deploy_msg.startswith(GATEWAY_NOT_LISTENING_MSG.split('{')[0])",
+     "        not_listening = False"),
 
     # ── actual 判据：只看文件在不在，就会漏掉「文件在但没 reload」 ─────
     ('_gateway_actual_state 只看文件在就不算「文件在但没人听」（.224 那次）',

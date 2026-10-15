@@ -236,8 +236,11 @@ sec('5. /api/config 只在开关真变了时才动 nginx')
 TD2 = tempfile.mkdtemp()
 CFG2 = os.path.join(TD2, 'config.json')
 with open(CFG2, 'w') as f:
+    # gateway_enabled=True：网关启用时「关 LuCI 绝不能把公网入口带下去」
+    # 这条守卫才应该生效。下面这几条断言测的正是它。
     json.dump({**mod.DEFAULT_CONFIG, 'trusted_ip4': '192.168.100.1',
-               'luci_enabled': False}, f)
+               'luci_enabled': False, 'gateway_enabled': True,
+               'gateway_port': 8443}, f)
 mod.CONFIG_PATH = CFG2
 toggle_calls = []
 gw_ok = {'v': True}
@@ -403,13 +406,93 @@ check('main 里调用了它', re.search(r'setup_nftables\s*\n\s*close_luci_ports
 check('删的是渲染产物目标而非软链', 'rendered="/var/lib/nginx/uci.conf"' in sh)
 check('留了快照供面板还原', 'nginx-luci.snapshot' in sh)
 check('nginx -t 通过才 reload', 'nginx -t -c /etc/nginx/uci.conf' in sh)
-check('关完兜底确认 8443 还在听', ':8443 ' in sh)
+check('关完兜底确认网关端口还在听',
+      'grep -q ":$gw_port "' in sh,
+      '应按配置的 gateway_port 检查，而不是写死 8443')
+# 这条是 2026-10-15 外部代码审查抓出来的：兜底原来无条件检查 8443。
+# 默认配置 gateway_enabled=False 时 8443 本来就没人听，于是刚关掉的 LuCI
+# 会被自己还原回去 —— 「部署后自动关闭 80/443」在该路径上静默失效。
+check('兜底检查前先问网关是否启用',
+      'gateway_enabled' in sh and 'gw_enabled' in sh,
+      '必须只在网关启用时才把 8443 当保命绳')
+check('兜底不会在网关未启用时还原 LuCI',
+      re.search(r'if \[ "\$gw_enabled" = "yes" \]', sh) is not None)
 
 sec('7. 前端有开关')
 html = open(os.path.join(ROOT, 'frontend', 'index.html'), encoding='utf-8').read()
 check('有 luci_enabled 的复选框', 'x-model="config.luci_enabled"' in html)
 check('说明它不是本项目的端口',
       '不是本项目的反代' in html, '用户要能分清 80/443 和 8443')
+
+# ── 5b. 网关没启用时，关闭 LuCI 必须能成功 ─────────────────────────────
+# 2026-10-15 外部代码审查抓到：守卫原来只判「8443 在不在听」，没先问
+# 「网关到底启用了没有」。默认配置 gateway_enabled=False（绝大多数装机），
+# 此时 8443 本来就没人听 → 勾掉「开放 LuCI」恒被回 500 GATEWAY_DOWN 拒绝，
+# luci_enabled 被强行改回 True 落盘 —— 用户想收掉的公网监听口被重新打开，
+# 安全加固意图被反转。这条断言就是钉这个。
+sec('5b. 网关未启用时关 LuCI 不该被网关存活检查拦住')
+orig_gw2 = mod._gateway_port_alive
+orig_toggle2 = mod._apply_luci_toggle
+orig_actual2 = mod._luci_actual_state
+orig_cfg2 = mod.CONFIG_PATH
+luci_state = {'v': True}
+toggle_calls2 = []
+TD2B = tempfile.mkdtemp()
+CFG2B = os.path.join(TD2B, 'config.json')
+mod.CONFIG_PATH = CFG2B
+try:
+    # 模拟一台没启用认证网关的机器：LuCI 开着，8443 没人听
+    with open(CFG2B, 'w') as f:
+        json.dump({**mod.DEFAULT_CONFIG, 'trusted_ip4': '192.168.100.1',
+                   'gateway_enabled': False, 'gateway_port': 8443,
+                   'luci_enabled': True}, f)
+    mod._gateway_port_alive = lambda port=None, config=None: False
+    mod._luci_actual_state = lambda: luci_state['v']
+
+    def fake_toggle2(enabled):
+        toggle_calls2.append(bool(enabled))
+        luci_state['v'] = bool(enabled)
+        return True, 'LuCI 80/443 已关闭' if not enabled else 'LuCI 80/443 已重新打开'
+
+    mod._apply_luci_toggle = fake_toggle2
+
+    hooks2b = list(mod.app.before_request_funcs[None])
+    mod.app.before_request_funcs[None] = []
+    client = mod.app.test_client()
+    with client.session_transaction() as sess:
+        sess['authenticated'] = True
+    r = client.post('/api/config', json={
+        'trusted_ip4': '192.168.100.1', 'luci_enabled': False})
+    check('网关未启用时关 LuCI 返回 200', r.status_code == 200,
+          f'HTTP {r.status_code} {(r.get_json() or {}).get("message")}')
+    check('没有回滚成 GATEWAY_DOWN',
+          (r.get_json() or {}).get('code') != 'GATEWAY_DOWN',
+          f'实际={(r.get_json() or {}).get("code")}')
+    check('落盘为 False（用户意图没被反转）',
+          mod.load_config().get('luci_enabled') is False,
+          f'实际={mod.load_config().get("luci_enabled")!r}')
+    check('只调用了一次 toggle，且是关闭方向',
+          toggle_calls2 == [False], f'实际={toggle_calls2}')
+
+    # 对照：网关**启用**且端口真在听时，仍然应该正常关闭（守卫不误伤）
+    luci_state['v'] = True
+    toggle_calls2.clear()
+    mod._gateway_port_alive = lambda port=None, config=None: True
+    cfg = mod.load_config()
+    cfg['gateway_enabled'] = True
+    cfg['luci_enabled'] = True
+    mod.save_config(cfg)
+    r = client.post('/api/config', json={
+        'trusted_ip4': '192.168.100.1', 'luci_enabled': False})
+    check('网关启用且在听时，关 LuCI 同样返回 200', r.status_code == 200,
+          f'HTTP {r.status_code} {(r.get_json() or {}).get("message")}')
+    check('落盘为 False', mod.load_config().get('luci_enabled') is False)
+    mod.app.before_request_funcs[None] = hooks2b
+finally:
+    mod.CONFIG_PATH = orig_cfg2
+    (mod._gateway_port_alive, mod._apply_luci_toggle,
+     mod._luci_actual_state) = orig_gw2, orig_toggle2, orig_actual2
+    shutil.rmtree(TD2B, ignore_errors=True)
 
 print('\n' + '=' * 74)
 print(f'通过 {len(PASS)} / 失败 {len(FAIL)}')

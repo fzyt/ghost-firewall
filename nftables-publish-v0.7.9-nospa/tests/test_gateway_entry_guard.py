@@ -234,7 +234,7 @@ def set_actual(**kw):
     base.update(kw)
     enabled = bool(base['nginx_conf_exists'] and base['port_listening'])
     base['enabled'] = enabled
-    mod._gateway_actual_state = lambda cfg=None: dict(base)
+    mod._gateway_actual_state = lambda cfg=None, settle=False: dict(base)
 
 
 try:
@@ -243,9 +243,17 @@ try:
     with client.session_transaction() as sess:
         sess['authenticated'] = True
 
-    # 4a. 文件在、reload 成功、但端口没人听 —— 必须拒绝并且**不落盘**
-    mod._deploy_gateway_nginx = lambda cfg=None: (True, '认证网关已启用：端口 8443')
-    set_actual(nginx_conf_exists=False, port_listening=False, enabled=False)
+    # 端点这一层只做两件事：检查 deploy 结果、把失败翻译成稳定错误码。
+    # 「端口真的在听吗」的判定在 _deploy_gateway_nginx 内部（见 4b），
+    # 因为反代 CRUD 那条路也会经过它。所以这里桩的是 deploy 的返回值。
+    # 4a. 部署函数报告「配置没写上去」→ 拒绝、不落盘、错误码正确
+    def deploy_fail(msg):
+        return lambda cfg=None: (False, msg)
+
+    mod._deploy_gateway_nginx = deploy_fail(
+        mod.GATEWAY_NOT_LISTENING_MSG.format(port=8443)
+        + '（配置 /etc/nginx/conf.d/00-nftables-web-gateway.conf 不存在；端口 8443 没有监听）'
+          '（已回滚 nginx 配置）')
     r = client.post('/api/gateway/config', json={'gateway_enabled': True})
     check('端口没监听时返回 500', r.status_code == 500, f'HTTP {r.status_code}')
     b = r.get_json() or {}
@@ -258,12 +266,17 @@ try:
           json.load(open(CFG4)).get('gateway_enabled') is False,
           f'实际={json.load(open(CFG4)).get("gateway_enabled")!r}')
 
-    # 4b. 文件在但端口没人听 —— 也要拒
-    mod._deploy_gateway_nginx = lambda cfg=None: (True, 'ok')
-    set_actual(nginx_conf_exists=True, port_listening=False, enabled=False)
+    # 4a2. 与端口无关的部署失败 —— 错误码不能误报成 GATEWAY_NOT_LISTENING，
+    # 否则前端会把「语法错」当成「入口没起来」来提示，方向完全错了。
+    mod._deploy_gateway_nginx = deploy_fail('nginx 配置校验失败：syntax error')
     r = client.post('/api/gateway/config', json={'gateway_enabled': True})
-    check('文件在但端口没监听 → 同样 500', r.status_code == 500, f'HTTP {r.status_code}')
-    check('配置仍未落盘',
+    b = r.get_json() or {}
+    check('端口无关的失败返回 500', r.status_code == 500, f'HTTP {r.status_code}')
+    check('错误码不误报成 GATEWAY_NOT_LISTENING',
+          b.get('code') is None, f'实际={b.get("code")}')
+    check('原样透传部署层的错误原因',
+          'syntax error' in (b.get('message') or ''), f'实际={b.get("message")}')
+    check('同样没有落盘',
           json.load(open(CFG4)).get('gateway_enabled') is False)
 
     # 4c. 一切正常 → 放行并落盘
@@ -291,6 +304,127 @@ finally:
     mod._gateway_actual_state = _orig_actual_state
     mod.app.before_request_funcs[None] = _hooks
     shutil.rmtree(TD4, ignore_errors=True)
+
+# ── 4b. 校验点必须在 _deploy_gateway_nginx 内部，不能只在端点 ─────────
+# 端点 /api/gateway/config 只覆盖「保存网关配置」这一条路。反代规则增删改
+# 走的是 _deploy_all_rules → _deploy_gateway_nginx，那条路曾经完全没有校验：
+# 用户在网关开启时加一条服务，一样能拿到「成功」而公网入口已经没了。
+# 所以这里直接测那个共同点本身。
+sec('4b. 反代 CRUD 走的 _deploy_all_rules 也必须校验端口')
+TD4B = tempfile.mkdtemp()
+CONF_DIR_4B = os.path.join(TD4B, 'conf.d')
+os.makedirs(CONF_DIR_4B)
+
+_orig_dir = mod.NGINX_CONF_DIR
+_orig_nt = mod._nginx_test
+_orig_nr = mod._nginx_reload
+_orig_svcs = mod._gateway_services
+_orig_actual = mod._gateway_actual_state
+mod.NGINX_CONF_DIR = CONF_DIR_4B
+mod._nginx_test = lambda: (True, 'ok')
+mod._nginx_reload = lambda: (True, 'ok')
+mod._gateway_services = lambda cfg: [({'name': 'NAS', 'public_access': True},
+                                     '/nas', 'http', '10.0.0.2', 5000)]
+alive = {'v': True, 'conf': True}
+
+
+def fake_actual_4b(config=None, settle=False):
+    return {'nginx_conf_exists': alive['conf'], 'port': 8443,
+            'port_listening': alive['v'],
+            'enabled': bool(alive['conf'] and alive['v'])}
+
+
+mod._gateway_actual_state = fake_actual_4b
+try:
+    ok_, msg_ = mod._deploy_gateway_nginx({'gateway_enabled': True, 'gateway_port': 8443})
+    check('网关正常时下发成功', ok_ is True, f'msg={msg_}')
+
+    alive['v'] = False
+    alive['conf'] = False
+    ok_, msg_ = mod._deploy_gateway_nginx({'gateway_enabled': True, 'gateway_port': 8443})
+    check('端口没起来时返回失败（不是谎报成功）', ok_ is False, f'msg={msg_}')
+    check('失败原因用统一措辞，便于调用方归类',
+          msg_.startswith(mod.GATEWAY_NOT_LISTENING_MSG.split('{')[0]),
+          f'实际={msg_}')
+
+    # **conf 在、端口没监听** —— 这是 .224 那次的状态，也是最容易被漏判的一种：
+    # 文件写好了、nginx -t 过了、reload 没报错，但公网入口已经没人听。
+    # 只用「文件在不在」判定的实现会把这一种判成成功。
+    alive['conf'] = True
+    alive['v'] = False
+    ok_, msg_ = mod._deploy_gateway_nginx({'gateway_enabled': True, 'gateway_port': 8443})
+    check('conf 在但端口没监听时同样判失败（.224 那次的真实状态）',
+          ok_ is False, f'msg={msg_}')
+    check('这种失败的原因点名的是「端口没有监听」',
+          '没有监听' in msg_ and '不存在' not in msg_, f'实际={msg_}')
+
+    alive['v'] = True
+
+    # 关闭网关时不校验（那时端口没人听才是对的）
+    ok_, msg_ = mod._deploy_gateway_nginx({'gateway_enabled': False, 'gateway_port': 8443})
+    check('关闭网关不因端口无人监听而失败', ok_ is True, f'msg={msg_}')
+finally:
+    mod.NGINX_CONF_DIR = _orig_dir
+    mod._nginx_test = _orig_nt
+    mod._nginx_reload = _orig_nr
+    mod._gateway_services = _orig_svcs
+    mod._gateway_actual_state = _orig_actual
+    shutil.rmtree(TD4B, ignore_errors=True)
+
+# ── 4c. 端口探测必须退避重试，不能紧挨 reload 就下结论 ────────────────
+# 外部代码审查抓到：nginx -s reload 是异步的，返回只代表信号送达。
+# 首次启用网关或改 gateway_port 时那是个**新增监听口**，master 还要
+# 建 socket、起 worker。紧挨着就 connect 会撞在 ECONNREFUSED 窗口里，
+# 把一次成功的部署误判成失败 → 回滚 + 报 500，而 conf 已经在盘上。
+sec('4c. 端口探测带退避重试')
+_orig_alive = mod._gateway_port_alive
+_orig_sleep = mod.time.sleep
+_orig_dir = mod.NGINX_CONF_DIR
+TD4C = tempfile.mkdtemp()
+CONF_DIR_4C = os.path.join(TD4C, 'conf.d')
+os.makedirs(CONF_DIR_4C)
+mod.NGINX_CONF_DIR = CONF_DIR_4C
+mod._nginx_test = lambda: (True, 'ok')
+mod._nginx_reload = lambda: (True, 'ok')
+mod._gateway_services = lambda cfg: [({'name': 'NAS', 'public_access': True},
+                                     '/nas', 'http', '10.0.0.2', 5000)]
+mod.time.sleep = lambda s: None        # 不真的等，测试要快
+try:
+    # 端口在第 3 次探测才通（模拟 master 建 socket 的延迟）
+    probes = {'n': 0}
+
+    def slow_alive(port=None, config=None):
+        probes['n'] += 1
+        return probes['n'] >= 3
+
+    mod._gateway_port_alive = slow_alive
+    ok_, msg_ = mod._deploy_gateway_nginx({'gateway_enabled': True, 'gateway_port': 8443})
+    check('端口迟到时部署仍然成功（没有误报失败）', ok_ is True, f'msg={msg_}')
+    check('确实重试过，而不是一次就下结论',
+          probes['n'] >= 3, f'实际探测 {probes["n"]} 次')
+
+    # settle=False 时不许重试 —— 平时读状态不能每次都干等好几秒
+    probes2 = {'n': 0}
+
+    def slow_alive2(port=None, config=None):
+        probes2['n'] += 1
+        return probes2['n'] >= 3
+
+    mod._gateway_port_alive = slow_alive2
+    st = mod._gateway_actual_state({'gateway_port': 8443}, settle=False)
+    check('settle=False 时只探一次（打开状态页不能干等）',
+          probes2['n'] == 1, f'实际探测 {probes2["n"]} 次')
+    check('settle=False 且端口没通时如实报没通', st['port_listening'] is False,
+          f'实际={st}')
+finally:
+    mod._gateway_port_alive = _orig_alive
+    mod.time.sleep = _orig_sleep
+    mod.NGINX_CONF_DIR = _orig_dir
+    mod._nginx_test = _orig_nt
+    mod._nginx_reload = _orig_nr
+    mod._gateway_services = _orig_svcs
+    mod._gateway_actual_state = _orig_actual
+    shutil.rmtree(TD4C, ignore_errors=True)
 
 # ── 5. /api/gateway/status 必须能揭穿分叉 ─────────────────────────────
 sec('5. /api/gateway/status 暴露实际状态，面板才有机会不骗人')

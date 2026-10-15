@@ -1832,7 +1832,15 @@ def post_config():
                 'message': f'LuCI 80/443 切换失败，已回滚配置项: {luci_msg}',
                 'data': {'risks': risks},
             }), 500
-        if not want_luci and not _gateway_port_alive(config=new_cfg):
+        # 只有当认证网关**本该**守着这个端口时，关 LuCI 才需要拿它当保命绳。
+        #
+        # 少了 `gateway_enabled` 这一层判断，默认配置（gateway_enabled=False，
+        # 绝大多数装机都是）下这个开关恒失败：网关压根没启用、8443 本来就没人听，
+        # 用户勾掉「开放 LuCI」却被回 500 GATEWAY_DOWN 拒绝，
+        # luci_enabled 被强行改回 True 落盘 —— 用户想收掉的公网监听口
+        # 被重新打开，安全加固意图被反转。
+        if (bool(new_cfg.get('gateway_enabled')) and not want_luci
+                and not _gateway_port_alive(config=new_cfg)):
             # 关 LuCI 绝不能把网关带下去。这是本项目唯一的公网入口。
             new_cfg['luci_enabled'] = True
             try:
@@ -5500,6 +5508,10 @@ NGINX_INIT_PATH = '/etc/init.d/nginx'
 
 GATEWAY_CONF_NAME = "00-nftables-web-gateway.conf"
 GATEWAY_CONF_MARKER = "# Managed by nftables-web-v2 auth gateway"
+# 「配置写了但端口没起来」的标准说法。调用方靠这个前缀把失败归类成
+# GATEWAY_NOT_LISTENING —— 这段文案只由本模块自己拼，不含任何用户输入，
+# 所以用前缀匹配分类是安全的（不同于拿用户内容做子串判断）。
+GATEWAY_NOT_LISTENING_MSG = '网关配置已下发但 {port} 端口没有真正监听'
 # 网关专用 SSL 会话缓存区。名字必须与机器上其它 server 块（如 OpenWrt LuCI 的
 # shared:SSL:32k）不同 —— nginx 共享内存区名全局唯一，同名不同大小会让整份配置
 # 加载失败，表现为「网关端口起不来」而不是任何明确报错。
@@ -5796,7 +5808,7 @@ def _gateway_conf_path():
     return os.path.join(NGINX_CONF_DIR, GATEWAY_CONF_NAME)
 
 
-def _gateway_actual_state(config=None):
+def _gateway_actual_state(config=None, settle=False):
     """网关当前**实际**是什么状态。
 
     和 luci_enabled 的教训一模一样：配置文件里的 gateway_enabled 只是「期望」。
@@ -5808,12 +5820,27 @@ def _gateway_actual_state(config=None):
       conf_exists   文件在不在（被谁删了 / 从没部署过）
       port_listening 端口有没有人听（conf 在但 nginx 没 reload 也会是死的）
       enabled       两者都成立才算真的开着
+
+    settle=True 时对端口做退避重试。**只在「刚 reload 完要确认」时用**，
+    平时读状态不要加这个延迟 —— 每次打开状态页都干等好几秒是不可接受的。
     """
     if config is None:
         config = load_config()
     exists = os.path.exists(_gateway_conf_path())
     port = _safe_port(config.get('gateway_port'), 8443)
-    listening = _gateway_port_alive(port=port)
+    if settle and exists:
+        # 首次 0.2s 内就通 → 不额外等待；不通则 0.5 / 1.0 / 1.5 再各试一次。
+        for wait in (0.0, 0.5, 1.0, 1.5):
+            if wait:
+                time.sleep(wait)
+            if _gateway_port_alive(port=port):
+                return {
+                    'nginx_conf_exists': True, 'port': port,
+                    'port_listening': True, 'enabled': True,
+                }
+        listening = False
+    else:
+        listening = _gateway_port_alive(port=port)
     return {
         'nginx_conf_exists': exists,
         'port': port,
@@ -6218,6 +6245,30 @@ def _deploy_gateway_nginx(config=None):
         _r_ok, r_msg = _nginx_reload()
         if not _r_ok:
             return False, f"网关配置已写入，但 nginx 重载失败：{r_msg}"
+
+        # 装完必须**看一眼它到底起没起来**。
+        #
+        # nginx -t 通过 + reload 没报错 ≠ 端口在听。.224 实测过一种它看不见的
+        # 失败：conf 写了、reload 也成功，可端口没人听。
+        #
+        # 探测必须带退避重试：`nginx -s reload` 是异步的，返回只代表信号送达。
+        # 首次启用网关、或改 gateway_port 时，这个端口是**新增监听口**，
+        # master 还要解析配置 → 建监听 socket → 起 worker。紧挨着 reload 就去
+        # connect，会在 socket 还没 bind 的窗口里拿到 ECONNREFUSED，
+        # 于是把一次成功的部署误判成失败，回滚 + 报 500 —— 而 conf 已经在盘上。
+        # 本项目在 LuCI 那条路径上本来就 sleep(1.5)，这里是同一个道理。
+        if enabled:
+            actual = _gateway_actual_state(config, settle=True)
+            if not actual['enabled']:
+                why = []
+                if not actual['nginx_conf_exists']:
+                    why.append(f'配置 {_gateway_conf_path()} 不存在')
+                if not actual['port_listening']:
+                    why.append(f'端口 {actual["port"]} 没有监听')
+                return _undo(GATEWAY_NOT_LISTENING_MSG.format(port=actual['port'])
+                             + f'（{"；".join(why)}）')
+
+        # 快照到确认「真的起来了」之后再清
         shutil.rmtree(backup_dir, ignore_errors=True)
         if enabled:
             n = len(_gateway_services(config))
@@ -6569,34 +6620,18 @@ def gateway_set_config():
     # 而生效的是旧配置，两者从此不一致；用户看到「配置已保存但网关部署失败」，
     # 下次再动别的字段时又会基于这份落盘配置重新生成，静默放大问题。
     # _deploy_gateway_nginx 自己带快照与 _undo，失败不留痕。
+    # _deploy_gateway_nginx 自己带快照与 _undo，失败不留痕，并且**已经**做过
+    # 「端口真的在听吗」的校验 —— 那个检查放在函数内部，因为
+    # _deploy_all_rules（反代规则增删改走的路）也会调到这里。
     deploy_ok, deploy_msg = _deploy_gateway_nginx(new_cfg)
     if not deploy_ok:
-        return jsonify({"success": False,
-                        "message": f"网关部署失败，配置未保存：{deploy_msg}"}), 500
-
-    # 装完必须**看一眼它到底起没起来**。
-    #
-    # _deploy_gateway_nginx 成功只代表「文件写了、nginx -t 过了、reload 没报错」。
-    # .224 实测过一种它看不见的失败：conf 在、reload 也成功，可端口没人听 ——
-    # 而接口照样回 200「认证网关已启用」。公网唯一入口是死的，
-    # 界面还告诉用户「已启用」，这个谎必须在这里就戳破。
-    #
-    # 关闭网关不做这项校验：那时候端口没人听才是预期结果。
-    if bool(new_cfg.get('gateway_enabled')):
-        actual = _gateway_actual_state(new_cfg)
-        if not actual['enabled']:
-            why = []
-            if not actual['nginx_conf_exists']:
-                why.append(f'配置 {_gateway_conf_path()} 不存在')
-            if not actual['port_listening']:
-                why.append(f'端口 {actual["port"]} 没有监听')
-            return jsonify({
-                "success": False,
-                "code": "GATEWAY_NOT_LISTENING",
-                "message": (f'网关配置已下发但 {actual["port"]} 端口没有真正监听'
-                            f'（{"；".join(why)}），已判定为未启用；配置未保存'),
-                "data": {"actual": actual},
-            }), 500
+        # 端点只负责把失败翻译成稳定的错误码，具体判定在函数内部做。
+        not_listening = deploy_msg.startswith(GATEWAY_NOT_LISTENING_MSG.split('{')[0])
+        return jsonify({
+            "success": False,
+            "code": "GATEWAY_NOT_LISTENING" if not_listening else None,
+            "message": f"网关部署失败，配置未保存：{deploy_msg}",
+        }), 500
 
     save_config(new_cfg)
 
