@@ -580,7 +580,12 @@ captured = {}
 
 
 def cap(cmd, **kw):
-    captured['rules'] = kw.get('input', '')
+    # 只从 `nft -f -` 这一次调用里取规则文本。
+    # basic lockdown 现在会先跑 `nft flush table inet fw4`，装完还要
+    # `nft list chain inet fw4 input` 复查一次 —— 桩对每次调用都覆盖
+    # captured['rules'] 的话，最后一次复查（没有 input 参数）会把规则冲成空串。
+    if isinstance(cmd, (list, tuple)) and list(cmd)[:2] == ['nft', '-f']:
+        captured['rules'] = kw.get('input', '')
     return _sp.CompletedProcess(cmd, 0, '', '')
 
 

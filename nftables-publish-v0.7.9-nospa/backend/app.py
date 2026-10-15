@@ -7046,6 +7046,25 @@ def _apply_basic_lockdown(config=None):
     }}
 }}
 '''
+    # ⚠️ 必须先 flush 再装，不能直接 nft -f。
+    #
+    # nft -f 里的 `table X { chain Y { ... } }` 块是**追加**语义，不是替换。
+    # .224 真机实测（2026-10-15）：在完整规则集已经生效的状态下装这份 lockdown，
+    # input 链从 30 条变成 31 条 —— 原有那 30 条一条没少，`jump input_wan`
+    # 还在，`iifname "eth1"` 的 WAN 判定全都还在跑。所谓「降级」实际上什么
+    # 都没降，整个优先级 4 形同虚设。
+    #
+    # 项目自己的规则文件开头就是 `flush ruleset`，同一个道理。
+    #
+    # 只 flush inet fw4 这张表（不是整表集）：nft 表里还有别人放的规则，
+    # 兜底防火墙的任务只是接管防火墙判定，不必连 nat 之类一起掀掉。
+    try:
+        subprocess.run(['nft', 'flush', 'table', 'inet', 'fw4'],
+                       capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        # 表不存在时 flush 会失败，但下面的块会自己建表 —— 不是致命错误
+        print(f'[WARN] flush table inet fw4 异常（继续，lockdown 会新建表）: {e}',
+              flush=True)
     try:
         res = subprocess.run(['nft', '-f', '-'], input=rules,
                              capture_output=True, text=True, timeout=10)
@@ -7058,12 +7077,29 @@ def _apply_basic_lockdown(config=None):
               f'stderr={(res.stderr or res.stdout)[:200]}', flush=True)
         return False
 
-    # 二次验证
+    # 二次验证：不能只看「表在不在」—— 追加语义下表一直都在，等于永远通过。
+    # 必须确认 input 链里已经没有 jump input_wan，否则说明这次是追加不是替换，
+    # 降级没生效，却要报「已套用最小兜底防护」。
+    if _input_chain_still_references_wan():
+        print('[WARN] basic lockdown 装上后 input 链仍在引用 input_wan —— '
+              '规则是追加进去的，降级未真正生效', flush=True)
+        return False
+
     if _ruleset_is_empty():
         print('[WARN] basic lockdown returncode=0 但 fw4 表仍不存在，视为失败', flush=True)
         return False
 
     return True
+
+
+def _input_chain_still_references_wan():
+    """input 链里还有没有跳向 input_wan 的 jump（= 完整规则集仍在生效）。"""
+    try:
+        res = subprocess.run(['nft', 'list', 'chain', 'inet', 'fw4', 'input'],
+                             capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+    return 'jump input_wan' in (res.stdout or '')
 
 
 # ══════════════════════════════════════════════════════════════
@@ -7086,6 +7122,11 @@ FW_WATCHDOG_MIN_INTERVAL = 60
 FW_WATCHDOG_FAIL_THRESHOLD = 2           # 连续几次不健康才动手
 FW_WATCHDOG_COOLDOWN = 900               # 动手后冷却 15 分钟
 
+# 从 basic lockdown 切回完整规则集时，连续这么多次装不上就停手。
+# 规则文件本身残缺时，每 5 分钟反复 nft -f 一次只是白白抖动规则集，
+# 还不如如实报出来，让人手工「应用规则」重新生成一次。
+_PROMOTE_MAX_FAILS = 3
+
 # 与 _apply_ruleset 共用，防止看门狗和用户点击「应用规则」并发下发。
 # 用可重入锁：本函数持锁期间会调 _auto_recover_ruleset_if_empty，
 # 它内部又走 _apply_ruleset，会再次 acquire 同一把锁 —— 普通 Lock 直接死锁。
@@ -7094,6 +7135,7 @@ _FW_APPLY_LOCK = threading.RLock()
 _WATCHDOG = {
     'stop': False,
     'fails': 0,
+    'promote_fails': 0,
     'last_action_ts': 0.0,
     'last_check_ts': 0.0,
     'last_result': '尚未检查',
@@ -7116,17 +7158,100 @@ def _fw_watchdog_settings():
     return en, iv
 
 
+def _ruleset_is_degraded():
+    """当前生效的是 basic lockdown（兜底规则），而不是完整规则集。
+
+    判别标志：input 链里还有没有 `jump input_wan`（完整规则集一定有，
+    basic lockdown 装完就没有了）。
+
+    为什么必须有这个判据：`_ruleset_is_functional()` 的四条判据
+    （表在 + 有 hook input + 有 policy drop + 是 filter hook）
+    basic lockdown **全部满足**。所以降级一旦生效，看门狗就认定
+    「防火墙正常」，此后再也不会切回 —— 敲门没了、端口转发没了、
+    黑名单没了，而且没有任何自愈路径，只能人工点「应用规则」或重启。
+
+    返回 (bool, str)：第一个是是否处于降级态，第二个是给人看的说明。
+    """
+    try:
+        res = subprocess.run(['nft', 'list', 'table', 'inet', 'fw4'],
+                             capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        return False, f'无法查询规则集: {e}'
+    if res.returncode != 0:
+        return False, 'table inet fw4 不存在（不是降级态，是空）'
+    out = res.stdout or ''
+    # 判别标志：input 链里还有没有 `jump input_wan`。
+    #
+    # 刻意**不**用「input_wan 链存不存在」：basic lockdown 不会删掉那条链
+    # （nft 的 table 块是追加语义，孤儿链会原样留着），它替换掉的只是
+    # input 链的内容。.224 真机实测：装完 lockdown 后 `nft list table` 里
+    # `chain input_wan` 赫然还在，但 input 链里已经没有跳向它的 jump 了。
+    # 按链是否存在来判断，完整规则集和降级态会被判成同一个东西。
+    if 'jump input_wan' in out:
+        return False, '完整规则集'
+    return True, 'basic lockdown（input 链已不再引用 input_wan：敲门/转发/黑名单均未生效）'
+
+
+def _promote_lockdown_to_full():
+    """处于 basic lockdown 时，尝试切回完整规则集。
+
+    返回 (是否切回成功, 说明)。连续失败多次后停止重试 —— 规则文件本身
+    就是残缺的，每 5 分钟反复 nft -f 一次只是白白抖动规则集，不如如实
+    报出来让人手工重新应用一次。
+    """
+    if _WATCHDOG.get('promote_fails', 0) >= _PROMOTE_MAX_FAILS:
+        return False, (f'仍是 basic lockdown，且规则文件连续 '
+                       f'{_PROMOTE_MAX_FAILS} 次装不上（文件本身不完整），'
+                       f'已停止自动重试，请手工「应用规则」一次')
+
+    with _FW_APPLY_LOCK:
+        # 拿锁后再判一次：可能正好有人在点「应用规则」
+        degraded, _d = _ruleset_is_degraded()
+        if not degraded:
+            _WATCHDOG['promote_fails'] = 0
+            return False, '已切回完整规则集'
+
+        applied_from = None
+        for p in (RULES_PATH, RULES_PATH + '.lastgood'):
+            if os.path.exists(p) and _try_apply_rules_file(p):
+                applied_from = p
+                break
+
+        if not applied_from:
+            _WATCHDOG['promote_fails'] = _WATCHDOG.get('promote_fails', 0) + 1
+            print(f'[WATCHDOG] 仍在 basic lockdown：规则文件与 .lastgood 都装不上'
+                  f'（第 {_WATCHDOG["promote_fails"]} 次）', flush=True)
+            return False, '仍在 basic lockdown：规则文件不可用'
+
+        _WATCHDOG['promote_fails'] = 0
+        degraded_after, _d2 = _ruleset_is_degraded()
+        if degraded_after:
+            print(f'[WATCHDOG] {applied_from} 已装上但仍缺 input_wan 链 —— '
+                  f'该文件本身就是残缺的，需手工「应用规则」重新生成', flush=True)
+            return False, f'已装 {applied_from}，但它本身不含完整规则集'
+        print(f'[WATCHDOG] ✅ 已从 basic lockdown 切回完整规则集（{applied_from}）',
+              flush=True)
+        _WATCHDOG['actions'] = _WATCHDOG.get('actions', 0) + 1
+        _WATCHDOG['last_action_ts'] = time.time()
+        return True, f'已从 basic lockdown 切回完整规则集（{applied_from}）'
+
+
 def _recover_ruleset_if_unhealthy():
     """规则集不健康时恢复。返回 (是否动手了, 说明)。
 
-    两种不健康要分开处理：
-      · 表不在 / 表空      —— 走启动时那套四级恢复
-      · 表在但链没挂策略    —— fw4 表被建出来了却是空的，重新加载规则文件即可，
-                              没必要丢到 basic lockdown（那是降级，会丢端口转发）
+    三种状态要分开处理：
+      · 表不在 / 表空        —— 走启动时那套四级恢复
+      · 表在但链没挂策略      —— fw4 表被建出来了却是空的，重新加载规则文件即可，
+                                没必要丢到 basic lockdown（那是降级，会丢端口转发）
+      · 表健康但是降级态      —— basic lockdown 生效中。功能上「够用」，但敲门 /
+                                端口转发 / 黑名单全丢，必须能自愈回切，
+                                否则降级就是单向门。
     """
     functional, detail = _ruleset_is_functional()
     if functional:
-        return False, '正常'
+        if not _ruleset_is_degraded()[0]:
+            return False, '正常'
+        return _promote_lockdown_to_full()
 
     with _FW_APPLY_LOCK:
         # 拿到锁之后再判一次：可能正好是用户在点「应用规则」，别抢
@@ -7173,7 +7298,22 @@ def _watchdog_tick():
     functional, detail = _ruleset_is_functional()
     if functional:
         _WATCHDOG['fails'] = 0
-        _WATCHDOG['last_result'] = f'正常（{detail}）'
+        # 功能判据对 basic lockdown 是成立的（表在 + policy drop + filter hook
+        # 全都满足），所以这里必须再看一眼是不是降级态，否则
+        # _promote_lockdown_to_full 永远没有机会被调用 —— 降级就成了单向门。
+        degraded, degr = _ruleset_is_degraded()
+        if not degraded:
+            _WATCHDOG['promote_fails'] = 0
+            _WATCHDOG['last_result'] = f'正常（{detail}）'
+            return None
+        # 降级态走独立的重试预算，不占用 fails / 阈值 / 冷却那套
+        _WATCHDOG['last_result'] = f'降级运行中：{degr}'
+        acted, msg = _promote_lockdown_to_full()
+        if acted:
+            _WATCHDOG['last_result'] = msg
+            print(f'[WATCHDOG] 切回完整规则集：{msg}', flush=True)
+            return True
+        _WATCHDOG['last_result'] = msg
         return None
 
     _WATCHDOG['fails'] += 1
@@ -7271,7 +7411,19 @@ def _auto_recover_ruleset_if_empty():
         if _try_apply_rules_file(RULES_PATH):
             print(f'[INFO] ✅ 已从 {RULES_PATH} 恢复 ruleset', flush=True)
             return
-        print(f'[WARN] 从 {RULES_PATH} 恢复失败，尝试按当前配置重建...', flush=True)
+        # 文件在，但 nft -f 装不上 —— 它已经损坏了（被截断 / 语法错 / 磁盘满写残）。
+        # 这种情况必须和「文件不存在」同等对待：都靠当前配置重建兜底。
+        # 先把坏文件留一份证据：重建会把 RULES_PATH 覆盖掉。
+        try:
+            _quarantine = RULES_PATH + '.corrupted'
+            shutil.copy(RULES_PATH, _quarantine)
+            print(f'[WARN] 从 {RULES_PATH} 恢复失败（文件存在但装不上 = 已损坏），'
+                  f'坏文件留存到 {_quarantine}，尝试按当前配置重建...', flush=True)
+        except OSError as qe:
+            print(f'[WARN] 从 {RULES_PATH} 恢复失败（已损坏，且留存副本失败: '
+                  f'{qe}），尝试按当前配置重建...', flush=True)
+    else:
+        print('[WARN] 规则文件不存在，尝试按当前配置重建...', flush=True)
 
     # 优先级 2：按当前配置重新生成
     #
@@ -7281,35 +7433,44 @@ def _auto_recover_ruleset_if_empty():
     # 加进去的管理机 IP，于是 input 链 policy drop 把管理员自己的 SSH 和面板
     # 一起挡在门外，只能从另一台仍在白名单里的机器登进去救。
     # 「保险丝不能装在电表箱里」：恢复用的规则必须来自当前配置，而不是历史快照。
-    if not os.path.exists(RULES_PATH):
-        # 配置文件不在，就绝不按配置重建 —— 直接落到优先级 3 / 4。
-        #
-        # 这条比守卫更硬：守卫靠「存在历史产物」来区分全新安装，而实测场景里
-        # 配置和规则文件是被一起移走的，守卫此时判不出异常；只有直接检查
-        # 文件存不存在才靠得住。DEFAULT_CONFIG 的敲门端口是 1/2/3/4、
-        # trusted_ip 是 192.168.100.2 —— 拿它重建等于把陌生网段下发到真实网卡。
-        # 宁可退到 .backup 或 basic lockdown。
-        if not os.path.exists(CONFIG_PATH):
-            print('[ERROR] 配置文件缺失，跳过「按配置重建」，'
-                  '改用 .backup 或 basic lockdown 兜底', flush=True)
-        else:
-            try:
-                # 配置损坏时 load_config() 拿的是硬编码 DEFAULT_CONFIG（含他人网段）。
-                # 开机自动重建时用它，等于每次重启都把陌生网段写进防火墙 —— 必须在
-                # 这条路径上也拦住，否则「应用规则」那头的守卫形同虚设。
-                _cfg = load_config()
-                _bad, _err = _config_corrupted()
-                if _bad:
-                    print(f'[ERROR] 配置损坏（{_err}），拒绝按默认配置重建规则，'
-                          f'改用 backup 恢复', flush=True)
-                else:
-                    ok, msg = _apply_ruleset(_cfg)
-                    if ok:
-                        print(f'[INFO] ✅ 规则文件缺失，已按当前配置重新生成并加载: {msg}', flush=True)
-                        return
-                    print(f'[WARN] 按当前配置重建失败（{msg}），尝试 backup...', flush=True)
-            except Exception as e:
-                print(f'[WARN] 按当前配置重建异常（{e}），尝试 backup...', flush=True)
+    #
+    # 判据是「优先级 1 成功了吗」，**不是**「规则文件存不存在」。
+    # 原来这里写的是 `if not os.path.exists(RULES_PATH)`，于是规则文件
+    # 存在但已损坏时，守卫判「文件在」→ 整个重建块被跳过 → 直落 .backup。
+    # 而 .backup 是 nft list ruleset 的快照（不是规则文件副本），.224 实测
+    # 它的 md5 停在 4 天前、行数只有当前的一半，且带着 78a8fb3 修掉之前的
+    # 敲门限流老 bug（8 处 1/minute burst 1）。等于把「敲门从来没敲通过」
+    # 这个已修的 bug 又装回去。
+    #
+    # 配置文件不在，就绝不按配置重建 —— 直接落到优先级 3 / 4。
+    #
+    # 这条比守卫更硬：守卫靠「存在历史产物」来区分全新安装，而实测场景里
+    # 配置和规则文件是被一起移走的，守卫此时判不出异常；只有直接检查
+    # 文件存不存在才靠得住。DEFAULT_CONFIG 的敲门端口是 1/2/3/4、
+    # trusted_ip 是 192.168.100.2 —— 拿它重建等于把陌生网段下发到真实网卡。
+    # 宁可退到 .backup 或 basic lockdown。
+    if not os.path.exists(CONFIG_PATH):
+        print('[ERROR] 配置文件缺失，跳过「按配置重建」，'
+              '改用 .backup 或 basic lockdown 兜底', flush=True)
+    else:
+        try:
+            # 配置损坏时 load_config() 拿的是硬编码 DEFAULT_CONFIG（含他人网段）。
+            # 开机自动重建时用它，等于每次重启都把陌生网段写进防火墙 —— 必须在
+            # 这条路径上也拦住，否则「应用规则」那头的守卫形同虚设。
+            _cfg = load_config()
+            _bad, _err = _config_corrupted()
+            if _bad:
+                print(f'[ERROR] 配置损坏（{_err}），拒绝按默认配置重建规则，'
+                      f'改用 backup 恢复', flush=True)
+            else:
+                ok, msg = _apply_ruleset(_cfg)
+                if ok:
+                    print(f'[INFO] ✅ 规则文件不可用，已按当前配置重新生成并加载: {msg}',
+                          flush=True)
+                    return
+                print(f'[WARN] 按当前配置重建失败（{msg}），尝试 backup...', flush=True)
+        except Exception as e:
+            print(f'[WARN] 按当前配置重建异常（{e}），尝试 backup...', flush=True)
 
     # 优先级 3：.backup 文件
     backup_path = RULES_PATH + '.backup'
@@ -7368,6 +7529,7 @@ def rules_health():
     if not _is_authenticated():
         return jsonify({'success': False, 'code': 'AUTH_REQUIRED', 'message': '未登录'}), 401
     functional, detail = _ruleset_is_functional()
+    degraded, degrade_detail = _ruleset_is_degraded()
     return jsonify({
         'success': True,
         'data': {
@@ -7376,11 +7538,19 @@ def rules_health():
             # 新增：真正「防火墙生效」的判断
             'ruleset_functional': functional,
             'detail': detail,
+            # 降级态：basic lockdown 生效中。ruleset_functional 仍然是 true
+            # （表在、policy drop、filter hook 都满足），但敲门 / 端口转发 /
+            # 黑名单全都没生效 —— 前端必须能把它和「完全正常」区分开，
+            # 否则用户看到的永远是「正常」。
+            'ruleset_degraded': degraded,
+            'degraded_detail': degrade_detail,
             'watchdog': {
                 'enabled': _fw_watchdog_settings()[0],
                 'interval': _fw_watchdog_settings()[1],
                 'fail_threshold': FW_WATCHDOG_FAIL_THRESHOLD,
                 'cooldown': FW_WATCHDOG_COOLDOWN,
+                'promote_max_fails': _PROMOTE_MAX_FAILS,
+                'promote_fails': _WATCHDOG.get('promote_fails', 0),
                 'running': bool(_WATCHDOG.get('thread')
                                 and _WATCHDOG['thread'].is_alive()),
                 'consecutive_fails': _WATCHDOG['fails'],
