@@ -25,6 +25,7 @@ FILES = {
 TESTS = [
     os.path.join(ROOT, 'tests', 'test_review_fixes.py'),
     os.path.join(ROOT, 'tests', 'test_lists_concurrency.py'),
+    os.path.join(ROOT, 'tests', 'test_panel_binding.py'),
 ]
 
 # (描述, 文件键, 旧文本, 新文本, 期望出现次数)

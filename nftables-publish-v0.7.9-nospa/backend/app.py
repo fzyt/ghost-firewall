@@ -156,6 +156,126 @@ def _clear_login_failures(ip: str):
 _STATIC_EXTENSIONS = ('js', 'css', 'png', 'jpg', 'jpeg', 'gif', 'svg', 'ico', 'woff', 'woff2', 'ttf', 'map')
 
 
+# ══════════════════════════════════════════════════════════════════
+# 面板的来源访问边界
+#
+# 为什么写在应用层而不是 nftables：这条边界存在的全部意义，是在防火墙
+# 规则集丢失时（flush / 文件损坏 / 恢复链选错文件）还能挡住公网。写在
+# nft 里的话，它会和规则集一起消失，等于什么都没做。
+#
+# 为什么不能复用 trusted_ip4：那个字段是**信任名单**（免密码 + 防火墙
+# 优先放行），语义与「访问边界」相反；而且它的 _valid_ip() 用
+# ipaddress.ip_address() 校验，根本不接受 CIDR。
+# ══════════════════════════════════════════════════════════════════
+
+_NETS_CACHE = {'mtime': None, 'nets': None}
+
+
+def _parse_net_list(v):
+    """把 panel_allowed_nets 归一化成网络对象列表。
+
+    元素可以是 CIDR（192.168.100.0/24）、单个 IP（192.168.100.5，
+    按 /32 处理）、或把上面两种用逗号／中文逗号混在一根字符串里。
+    """
+    if v is None:
+        return []
+    if isinstance(v, (list, tuple, set)):
+        parts = [str(x).strip() for x in v]
+    else:
+        parts = [p.strip() for p in str(v).replace('，', ',').split(',')]
+    nets = []
+    for p in parts:
+        if not p:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(p, strict=False))
+        except ValueError:
+            continue      # 非法值由 validate_config 负责报错，这里跳过不影响兜底
+    return nets
+
+
+def _ip_in_nets(ip_str, nets):
+    """来源 IP 是否落在允许网段内。解析失败一律判否（宁可多挡）。"""
+    try:
+        addr = ipaddress.ip_address(str(ip_str).strip())
+    except ValueError:
+        return False
+    return any(addr.version == n.version and addr in n for n in nets)
+
+
+def _panel_allowed_networks():
+    """面板允许访问的来源网段。返回 [] 表示不限制（保持既有行为）。
+
+    优先级：
+      1. 配置里显式写了 panel_allowed_nets → 用它（要放行 VPN 之类就用这个）
+      2. 没写，但**真实配置文件存在** → 用 lan_subnet4（默认跟随，零配置）
+      3. 配置文件缺失/损坏，取不到 lan_subnet4 → 不限制
+
+    第 3 条不能省：DEFAULT_CONFIG 里 lan_subnet4 写的是 192.168.4.0/24，
+    那是别人的网段。真拿它去判定会把管理员自己锁在门外 —— 代码里
+    _config_lost_after_setup() 早就在防同一类问题了。
+
+    「文件存在」不等于「文件可用」：配置被写坏时 load_config() 会回落到
+    DEFAULT_CONFIG，而那个默认值里的 lan_subnet4 正是陌生网段。只判
+    os.path.exists 会让「文件存在但内容是坏的」这一种情况照样锁死管理员 ——
+    所以这里必须再问一次 _config_corrupted()。
+    """
+    try:
+        stamp = os.stat(CONFIG_PATH).st_mtime_ns
+    except OSError:
+        return []                       # 配置不存在 → 不限制
+    if _NETS_CACHE['mtime'] == stamp:
+        return _NETS_CACHE['nets']
+    try:
+        cfg = load_config()
+        bad, err = _config_corrupted()
+        if bad:
+            print(f'[WARN] 配置损坏（{err}），面板访问边界本次不限制', flush=True)
+            nets = []
+        else:
+            nets = _parse_net_list(cfg.get('panel_allowed_nets'))
+            if not nets:
+                nets = _parse_net_list(cfg.get('lan_subnet4'))
+    except Exception as e:              # noqa: BLE001
+        print(f'[WARN] 面板访问边界读取失败（{type(e).__name__}: {e}），本次不限制', flush=True)
+        nets = []
+    _NETS_CACHE.update(mtime=stamp, nets=nets)
+    return nets
+
+
+def _lan_bind_address(lan_if, retries=6, wait=2.0):
+    """探测 lan_if 上内核**此刻实际持有**的 IPv4 地址，供 HTTPS 绑定使用。
+
+    为什么不读配置里的 lan_ipaddr：绑定要的是内核当前有的地址。配置值可能
+    是 DHCP 拿地址之前的旧值，也可能压根没有（LAN 走 DHCP）。探测不到就
+    返回 ''，由调用方决定是拒绝启动还是降级 —— 本函数自己不做决定。
+    """
+    last = ''
+    for i in range(max(1, retries)):
+        try:
+            res = subprocess.run(['ip', '-4', 'addr', 'show', 'dev', lan_if],
+                                 capture_output=True, text=True, timeout=5)
+        except Exception as e:          # noqa: BLE001
+            last = f'{type(e).__name__}: {e}'
+        else:
+            if res.returncode == 0:
+                for line in res.stdout.splitlines():
+                    line = line.strip()
+                    if line.startswith('inet '):
+                        addr = line.split()[1].split('/')[0]
+                        try:
+                            ipaddress.ip_address(addr)
+                            return addr
+                        except ValueError:
+                            last = f'解析出的地址非法: {addr!r}'
+            else:
+                last = (res.stderr or res.stdout).strip()[:120]
+        if i + 1 < max(1, retries):
+            time.sleep(wait)
+    print(f'[WARN] {lan_if} 上探测不到 IPv4 地址（{last or "无输出"}），已尝试 {retries} 次', flush=True)
+    return ''
+
+
 @app.before_request
 def _require_auth():
     """全局认证拦截器
@@ -183,6 +303,15 @@ def _require_auth():
     # IPv6 客户端直接拒绝（管理界面只支持 IPv4）
     if ':' in client_ip:
         return jsonify({'success': False, 'code': 'IPV6_NOT_ALLOWED', 'message': '管理界面仅支持 IPv4 访问'}), 403
+
+    # 来源访问边界：不在允许网段内的请求，连登录页都不给。
+    # 放在 IPv6 判定之后 —— v6 已经在上一行拒了，白名单不必覆盖 v6，
+    # 否则会把原本的 IPV6_NOT_ALLOWED 变成 IP_NOT_ALLOWED，丢掉原有的可诊断性。
+    _allow_nets = _panel_allowed_networks()
+    if _allow_nets and not _ip_in_nets(client_ip, _allow_nets):
+        print(f'[WARN] 拒绝非白名单来源访问面板: {client_ip}', flush=True)
+        return jsonify({'success': False, 'code': 'IP_NOT_ALLOWED',
+                        'message': '来源地址不在面板允许的网段内'}), 403
 
     # 静态资源放行（前端 JS / CSS / 图片 / 字体）
     last = path.rsplit('/', 1)[-1]
@@ -764,6 +893,27 @@ def validate_config(cfg):
             continue
         if not _valid_ip(v, ver):
             errs.append(f'{key} IPv{ver} 地址非法: {v!r}')
+
+    # 面板来源访问边界。这里**必须**用 ip_network 而不是 _valid_ip：
+    # _valid_ip 走 ipaddress.ip_address()，不接受 CIDR，而访问边界要写的
+    # 就是网段（192.168.100.0/24）。另外 /0 与 /1 这类超大网段要挡掉 ——
+    # 它等价于「不设边界」，写在这里会让配置看起来有防护、实际没有。
+    if 'panel_allowed_nets' in cfg:
+        _pv = cfg.get('panel_allowed_nets')
+        _pitems = ([str(x).strip() for x in _pv] if isinstance(_pv, (list, tuple, set))
+                   else [p.strip() for p in str(_pv or '').replace('，', ',').split(',')])
+        _pitems = [x for x in _pitems if x]
+        if not _pitems and _pv not in (None, [], '', ()):
+            errs.append('panel_allowed_nets 解析后为空（分隔符写错了？）')
+        for it in _pitems:
+            try:
+                _n = ipaddress.ip_network(it, strict=False)
+            except ValueError:
+                errs.append(f'panel_allowed_nets 非法: {it!r}（应为 CIDR 如 192.168.100.0/24，或单个 IP）')
+                continue
+            if _n.prefixlen <= 1:
+                errs.append(f'panel_allowed_nets 网段过大: {it!r}（/{_n.prefixlen} 等于不设边界，'
+                            f'至少要 /2；本机 LAN 通常是 /24）')
 
     for key in ('knock1_port', 'knock2_port', 'knock3_port', 'knock4_port'):
         if key in cfg and not _is_port(cfg[key]):
@@ -1568,6 +1718,32 @@ def _detect_risks(old_cfg: dict, new_cfg: dict, requester_ip: str) -> list:
             'message': f'切到 trusted（信任）模式后内网默认全丢弃，而你的 IP {requester_ip} '
                        f'不在 trusted_ip4 白名单里，保存后会被防火墙拦住',
         })
+
+    # 5. 面板来源访问边界把请求者自己关在外面
+    #    只在「本来能进、改完不能进」时报，避免每次保存都误报。
+    def _panel_nets(cfg):
+        nets = _parse_net_list(cfg.get('panel_allowed_nets'))
+        if nets:
+            return nets
+        # 与 _panel_allowed_networks 同一套前提：只有真实配置**且没损坏**时
+        # 才敢用 lan_subnet4。配置坏了 load_config() 会回落 DEFAULT_CONFIG，
+        # 那里面的 lan_subnet4 是 192.168.4.0/24 —— 拿它判自锁会在本机
+        # 报一条根本不存在的「你把自己关在外面」。
+        if os.path.exists(CONFIG_PATH) and not _config_corrupted()[0]:
+            return _parse_net_list(cfg.get('lan_subnet4'))
+        return []
+
+    if requester_ip:
+        old_pn = _panel_nets(old_cfg)
+        new_pn = _panel_nets(new_cfg)
+        if (new_pn and old_pn and _ip_in_nets(requester_ip, old_pn)
+                and not _ip_in_nets(requester_ip, new_pn)):
+            risks.append({
+                'level': 'critical',
+                'message': f'面板访问边界改动后，你的 IP {requester_ip} 不在允许网段 '
+                           f'({", ".join(str(n) for n in new_pn)}) 内！'
+                           f'保存后将立即连不上面板，只能走 SSH 改配置',
+            })
     return risks
 
 
@@ -7228,12 +7404,34 @@ def _start_servers():
     debug = os.environ.get('FLASK_DEBUG', '0') == '1'
 
     # 单端口模式：面板本体 HTTPS。
-    # 监听 0.0.0.0 是既有行为，安全边界由防火墙承担 ——
-    # lan_allowed_ports 生成的 `iifname $LAN_IF tcp dport { ... 5443 } accept`
-    # 是唯一放行路径，WAN 侧 input_wan 链没有 5443，policy drop 直接吃掉。
-    https_server = make_server('0.0.0.0', HTTPS_PORT, app, ssl_context=ssl_ctx, threaded=True)
+    #
+    # 绑定到 LAN 地址而不是 0.0.0.0。原来的做法把「面板只在 LAN 可达」
+    # 这件事完全外包给了防火墙 —— 而防火墙和被保护方在同一台机器上，
+    # 规则集一旦丢失（flush / 文件损坏 / 恢复链选错），面板连同它的 root
+    # 权限一起变成公网服务。绑地址是唯一一道不依赖防火墙的防线。
+    #
+    # 探测不到 LAN 地址时**拒绝启动**，不回落 0.0.0.0：管理界面「打不开」
+    # 可以走 SSH 修（22 同样在 LAN 上），「降级成公网开放」则不可恢复。
+    # 逃生口是显式的：NFTABLES_WEB_BIND=0.0.0.0，且会打日志。
+    _bind = os.environ.get('NFTABLES_WEB_BIND', '').strip()
+    _bind_source = '环境变量 NFTABLES_WEB_BIND'
+    if not _bind:
+        _cfg = load_config()
+        _lan_if = str(_cfg.get('lan_if') or 'br-lan').strip() or 'br-lan'
+        _bind = _lan_bind_address(_lan_if)
+        _bind_source = f'探测 {_lan_if} 得到'
+    if not _bind:
+        print(f'[FATAL] 探测不到 LAN 接口地址，拒绝启动 —— 宁可打不开，也不能降级成公网开放。', flush=True)
+        print('         处理方式：', flush=True)
+        print(f'           1. SSH 登录本机（LAN 上任意未被防火墙关闭的 SSH 端口），确认 LAN 接口已拿到地址', flush=True)
+        print(f'           2. 或确认 config.json 里 lan_if 写对了（当前：{_cfg.get("lan_if")!r}）', flush=True)
+        print(f'           3. 实在要临时开放：export NFTABLES_WEB_BIND=0.0.0.0（会打日志，属显式降级）', flush=True)
+        _sys.exit(1)
 
-    print(f" * HTTPS 主服务  : https://0.0.0.0:{HTTPS_PORT}  (证书: {cert_files[0]})", flush=True)
+    https_server = make_server(_bind, HTTPS_PORT, app, ssl_context=ssl_ctx, threaded=True)
+
+    print(f" * HTTPS 主服务  : https://{_bind}:{HTTPS_PORT}  (证书: {cert_files[0]})", flush=True)
+    print(f" * 绑定来源      : {_bind_source}", flush=True)
     print(f" * 访问范围      : 仅 LAN（公网入口由独立网关端口承担，见 gateway_port 配置）", flush=True)
     print(f" * Cookie Secure : True（仅 HTTPS 传输，防 cookie 窃取）", flush=True)
 
