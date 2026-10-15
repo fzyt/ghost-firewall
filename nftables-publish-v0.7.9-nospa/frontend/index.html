@@ -467,8 +467,22 @@
             <p class="text-xs text-gray-400 mt-1">填写端口号，逗号分隔。这些端口允许内网所有设备无需敲门即可访问路由器自身的服务</p>
           </div>
         </div>
-        <button @click="config.access_mode === 'trusted' && !confirm('⚠️ 保存后，只有信任IP（' + (config.trusted_ip4 || config.trusted_ip6 || '未设置') + '）可以访问此管理页面，其他设备将被拒绝访问。确定继续？') ? null : saveConfig()" :disabled="saving"
-          class="px-5 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50 transition-colors">
+
+        <!-- LuCI 80/443 开关 -->
+        <div class="bg-gray-50 border rounded-lg p-5 mb-6">
+          <label class="flex items-start gap-3 cursor-pointer">
+            <input type="checkbox" x-model="config.luci_enabled" class="mt-1">
+            <span>
+              <span class="block text-sm font-medium">开放 LuCI 管理界面（80 / 443）</span>
+              <span class="text-xs text-gray-400">
+                80/443 属于 OpenWrt 自带的 LuCI，不是本项目的反代（本项目在 8443）。
+                个人宽带用不上 LuCI 时建议保持关闭，少两个公网监听口。
+                关闭后本面板（5443）和认证网关（8443）不受影响。
+              </span>
+            </span>
+          </label>
+        </div>
+        <button @click="config.access_mode === 'trusted' && !confirm('⚠️ 保存后，只有信任IP（' + (config.trusted_ip4 || config.trusted_ip6 || '未设置') + '）可以访问此管理页面，其他设备将被拒绝访问。确定继续？') ? null : saveConfig()" :disabled="saving"          class="px-5 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 disabled:opacity-50 transition-colors">
           <span x-text="saving ? '保存中...' : '保存配置'"></span>
         </button>
       </div>

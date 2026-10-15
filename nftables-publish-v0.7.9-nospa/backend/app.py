@@ -441,6 +441,11 @@ DEFAULT_CONFIG = {
     "auth_absolute_timeout": 0,
     # LAN 来源是否免认证。True = 认证只保护公网这一面（默认，符合「内网可信」）。
     "auth_lan_bypass": True,
+    # ── v0.8.1 新增：LuCI 80/443 开关 ─────────────────────────────────
+    # 80/443 属于 OpenWrt 自带的 LuCI（nginx._lan / nginx._redirect2ssl），
+    # 不是本项目的反代（本项目在 8443）。个人宽带用不上 LuCI，默认关掉，
+    # 需要时从面板重新打开。部署时 setup.sh 也会自动关一次。
+    "luci_enabled": False,
 }
 
 
@@ -909,6 +914,16 @@ def _rp_forward_conflicts(cfg):
                     f'会形成一条免登录的公网入口。建议删掉这条转发，'
                     f'改用反代访问该服务。'
                 )
+
+    # luci_enabled：布尔。必须显式挡掉非布尔值 —— 它直接决定要不要动
+    # /etc/config/nginx，收到 "false" 这种字符串时 Python 会当真值处理，
+    # 结果是用户明明选了关闭却被打开。
+    if 'luci_enabled' in cfg:
+        lv = cfg.get('luci_enabled')
+        if not isinstance(lv, bool):
+            errs.append(f'luci_enabled 必须是布尔 true/false，实际收到 '
+                        f'{type(lv).__name__}: {lv!r}')
+
     return errs
 
 
@@ -923,8 +938,7 @@ def validate_config(cfg):
 
     for key, ver, optional in (('router_ip4', 4, False), ('trusted_ip4', 4, False),
                                ('router_ip6', 6, True), ('trusted_ip6', 6, True)):
-        raw = cfg.get(key)
-        # trusted_ip4/trusted_ip6 历史上有字符串和数组两种写法（setup.sh 写的是数组），
+        raw = cfg.get(key)        # trusted_ip4/trusted_ip6 历史上有字符串和数组两种写法（setup.sh 写的是数组），
         # 这里必须都接受，否则老装机升级后每次保存配置都会被判 400
         if isinstance(raw, (list, tuple, set)):
             items = [str(x).strip() for x in raw if str(x).strip()]
@@ -1622,10 +1636,59 @@ def post_config():
     except OSError as e:
         # 磁盘满 / 权限不足时 save_config 会抛出，不能让异常冒泡成 500 裸栈
         return jsonify({'success': False, 'message': f'配置保存失败: {e}'}), 500
+
+    # LuCI 80/443 开关：只在**实际状态与期望不一致**时才动 nginx。
+    #
+    # 判据刻意用「实际 vs 期望」而不是「配置变没变」。后者会漏掉：
+    #   · 升级到带 luci_enabled 的版本时，老配置没这字段 → 取 DEFAULT False，
+    #     而机器上 LuCI 一直开着；此时「配置没变」，开关永远不会被触发
+    #   · 用户手工 uci 改过、或上次切换失败只回滚了配置项
+    # 这两种情况下 .224 实测都真的发生过：配置显示 False，80/443 照常在听。
+    #
+    # 每次保存都 reload 一次 nginx 会打断正在服务的连接，所以仍然要先比一次。
+    luci_msg = None
+    want_luci = bool(new_cfg.get('luci_enabled', False))
+    try:
+        luci_actual = _luci_actual_state()
+    except Exception as _se:
+        luci_actual = None
+        print(f'[WARN] 读 LuCI 实际状态失败: {_se}', flush=True)
+    if luci_actual is not None and luci_actual != want_luci:
+        ok, luci_msg = _apply_luci_toggle(want_luci)
+        if not ok:
+            # 配置已经落盘了（luci_enabled 的值是对的），但系统没跟上。
+            # 如实报失败并回滚这个字段，免得面板显示「已关闭」而 80/443 还在听。
+            new_cfg['luci_enabled'] = old_cfg.get('luci_enabled', False)
+            try:
+                save_config(new_cfg)
+            except OSError:
+                pass
+            return jsonify({
+                'success': False,
+                'code': 'LUCI_TOGGLE_FAILED',
+                'message': f'LuCI 80/443 切换失败，已回滚配置项: {luci_msg}',
+                'data': {'risks': risks},
+            }), 500
+        if not want_luci and not _gateway_port_alive():
+            # 关 LuCI 绝不能把网关带下去。这是本项目唯一的公网入口。
+            new_cfg['luci_enabled'] = True
+            try:
+                save_config(new_cfg)
+                _apply_luci_toggle(True)
+            except OSError:
+                pass
+            return jsonify({
+                'success': False,
+                'code': 'GATEWAY_DOWN',
+                'message': (f'关闭 LuCI 后网关 {GATEWAY_PORT} 端口不可达，'
+                            f'已自动把 LuCI 重新打开并回滚配置项'),
+                'data': {'risks': risks},
+            }), 500
+
     return jsonify({
         'success': True,
-        'message': '配置已保存',
-        'data': {'risks': risks},  # 非 critical 风险通过这里告知前端
+        'message': '配置已保存' + (f'（{luci_msg}）' if luci_msg else ''),
+        'data': {'risks': risks, 'luci': luci_msg},  # 非 critical 风险通过这里告知前端
     })
 
 
@@ -5278,6 +5341,251 @@ GATEWAY_SSL_ZONE = "SSLGATEWAY"
 GATEWAY_SSL_CACHE_SIZE = "10m"
 
 
+# ══════════════════════════════════════════════════════════════════════
+# LuCI 80/443 开关
+#
+# 80/443 不是本项目的：它们是 OpenWrt 自带 LuCI 的两个 server 段
+#     nginx._lan            listen 443 ssl   （带 restrict_locally，只放行内网段）
+#     nginx._redirect2ssl   listen 80        （302 跳转，**没有任何限制**）
+# 本项目的反代在 8443（conf.d/00-nftables-web-gateway.conf，模板里是无条件
+# include，与 LuCI 无关）。
+#
+# 为什么关：个人宽带用不上 LuCI，8443 已经承担管理入口。少两个监听口是净收益。
+# 为什么默认关：公网设备上「默认不监听」才是安全默认，需要时再从面板打开。
+#
+# 实现注意（都是 .224 真机踩出来的）：
+#   1. /etc/nginx/uci.conf 是**符号链接** → /var/lib/nginx/uci.conf。
+#      重新渲染要删的是链接的**目标**，删链接本身会让 nginx_init 的
+#      `if [ -e "${UCI_CONF}" ]` 判假、回落到 /etc/nginx/nginx.conf，
+#      结果是 LuCI 没了但日志里看不出原因。删目标就没事。
+#   2. 光 `uci set .../enabled=0` 没用 —— 这个 uci-nginx 不认 enabled 选项，
+#      实测毫无效果。只能把整个 section 拿掉。
+#   3. 改完必须 `nginx-util init_lan` 重新渲染，`/etc/init.d/nginx restart`
+#      自己也会调它，但保险起见显式先渲染再 reload。
+#   4. 关掉之后这台机器上只剩 SSH 和 5443 面板 —— 两者都不依赖 LuCI。
+# ══════════════════════════════════════════════════════════════════════
+
+LUCI_CONF_PATH = '/etc/config/nginx'
+LUCI_RENDERED_PATH = '/var/lib/nginx/uci.conf'   # /etc/nginx/uci.conf 指向它
+LUCI_SNAPSHOT_PATH = '/etc/nftables/nginx-luci.snapshot'
+NGINX_UTIL_PATH = '/usr/bin/nginx-util'
+LUCI_SECTIONS = ('_lan', '_redirect2ssl')
+# 本项目网关监听的端口：关 LuCI 时它必须照常在听，否则就是改坏了
+GATEWAY_PORT = 8443
+
+
+def _uci_conf_text(path=None):
+    # 默认值刻意写成 None：写成 `path=LUCI_CONF_PATH` 会在**函数定义时**求值，
+    # 之后改模块级常量不再生效 —— 测试改不动路径，线上换路径也换不掉。
+    path = path or LUCI_CONF_PATH
+    try:
+        with open(path, 'r', errors='ignore') as f:
+            return f.read()
+    except OSError:
+        return ''
+
+
+def _uci_section_names(text):
+    """列出 /etc/config/nginx 里所有 section 名字（按出现顺序）"""
+    names = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s.startswith('config '):
+            continue
+        parts = s.split(None, 2)
+        if len(parts) >= 3:
+            nm = parts[2].strip()
+            if nm.startswith("'") and nm.endswith("'") and len(nm) >= 2:
+                nm = nm[1:-1]
+            names.append(nm)
+    return names
+
+
+def _uci_strip_sections(text, drop):
+    """从 /etc/config/nginx 文本里删掉指定 section 整块。
+
+    刻意不碰 `uci delete` 子命令：uci 的 delete 在多行 option / list 场景下
+    容易留下半截配置，而这个文件的 section 结构简单（config 行为块首），
+    按行块切更可控。
+    """
+    out, skipping = [], False
+    for line in text.splitlines(keepends=True):
+        s = line.strip()
+        if s.startswith('config '):
+            parts = s.split(None, 2)
+            nm = parts[2].strip() if len(parts) >= 3 else ''
+            if nm.startswith("'") and nm.endswith("'") and len(nm) >= 2:
+                nm = nm[1:-1]
+            skipping = nm in drop
+        if not skipping:
+            out.append(line)
+    return ''.join(out)
+
+
+def _luci_snapshot():
+    """留一份原始 /etc/config/nginx，供「重新打开 LuCI」时还原。
+
+    只在快照不存在时写 —— 反复开关不能把被用户改过的配置覆盖成最初的版本。
+    """
+    if os.path.exists(LUCI_SNAPSHOT_PATH):
+        return True
+    try:
+        os.makedirs(os.path.dirname(LUCI_SNAPSHOT_PATH), exist_ok=True)
+        shutil.copy(LUCI_CONF_PATH, LUCI_SNAPSHOT_PATH)
+        os.chmod(LUCI_SNAPSHOT_PATH, 0o600)
+        return True
+    except OSError as e:
+        print(f'[WARN] LuCI 配置快照失败（关闭后无法自动还原）: {e}', flush=True)
+        return False
+
+
+def _luci_ports_listening():
+    """当前 80/443 是否真在监听。用真实端口状态判断，不看配置文件。"""
+    listening = set()
+    for fam in (socket.AF_INET, socket.AF_INET6):
+        try:
+            for info in socket.getaddrinfo('127.0.0.1', 0, fam,
+                                          socket.SOCK_STREAM, socket.SOL_TCP):
+                pass
+        except OSError:
+            pass
+    # 用 /proc/net/tcp(+6) 直读：不依赖 ss/netstat，BusyBox 也一样
+    for f in ('/proc/net/tcp', '/proc/net/tcp6'):
+        try:
+            with open(f) as fh:
+                next(fh, None)
+                for ln in fh:
+                    cols = ln.split()
+                    if len(cols) < 4 or cols[3] != '0A':   # 0A = LISTEN
+                        continue
+                    port = int(cols[1].split(':')[1], 16)
+                    if port in (80, 443):
+                        listening.add(port)
+        except (OSError, ValueError, IndexError):
+            continue
+    return listening
+
+
+def _luci_reload_nginx(what):
+    """重新渲染 uci.conf 并 reload nginx。返回 (ok, 说明)。"""
+    if not os.path.exists(NGINX_UTIL_PATH):
+        return False, f'{NGINX_UTIL_PATH} 不存在（非 OpenWrt / 未装 nginx-full）'
+    # 删的是渲染产物的**目标**，不是 /etc/nginx/uci.conf 那个符号链接
+    try:
+        if os.path.exists(LUCI_RENDERED_PATH):
+            os.unlink(LUCI_RENDERED_PATH)
+    except OSError as e:
+        return False, f'清理旧渲染产物失败: {e}'
+    try:
+        r = subprocess.run([NGINX_UTIL_PATH, 'init_lan'],
+                           capture_output=True, text=True, timeout=30)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        return False, f'nginx-util 失败: {type(e).__name__}: {e}'
+    if r.returncode != 0:
+        return False, f'nginx-util returncode={r.returncode}: {(r.stderr or r.stdout)[:160]}'
+    # nginx -t 通过才 reload —— 语法错的话宁可保持原状，也不要把 nginx 弄挂
+    try:
+        t = subprocess.run(['nginx', '-t', '-c', '/etc/nginx/uci.conf',
+                            '-g', 'daemon off;'],
+                           capture_output=True, text=True, timeout=15)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        return False, f'nginx -t 失败: {type(e).__name__}: {e}'
+    if t.returncode != 0:
+        return False, f'渲染结果语法错误，已保持原配置: {(t.stderr or t.stdout)[:200]}'
+    try:
+        subprocess.run([NGINX_INIT_PATH, 'reload'],
+                       capture_output=True, text=True, timeout=30)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        return False, f'reload 失败: {type(e).__name__}: {e}'
+    time.sleep(1.5)
+    return True, f'nginx 已重新渲染并 reload（{what}）'
+
+
+def _luci_actual_state():
+    """LuCI 当前**实际**是不是开着 —— 看 /etc/config/nginx 里那两段还在不在。
+
+    这才是「实际状态」；配置文件里的 luci_enabled 只是「期望状态」。
+    两者可能对不上，而且必然会对不上：
+      · 升级到带 luci_enabled 的版本时，老配置里根本没这个字段，
+        走 DEFAULT 取到 False，但机器上 LuCI 一直开着
+      · 用户手工 uci 改了、或在 LuCI 界面里改了什么
+      · 上一次切换失败，配置项已回滚而系统没跟上
+    只比「配置有没有变」会漏掉以上全部情形。
+    """
+    names = set(_uci_section_names(_uci_conf_text()))
+    return bool(names & set(LUCI_SECTIONS))
+
+
+def _luci_reconcile(desired):
+    """把 LuCI 实际状态调到期望状态。返回 (是否动过, 说明)。"""
+    want = bool(desired)
+    try:
+        actual = _luci_actual_state()
+    except Exception as e:
+        return False, f'读 LuCI 状态失败: {e}'
+    if actual == want:
+        return False, '实际状态已与配置一致'
+    return _apply_luci_toggle(want)
+
+
+def _apply_luci_toggle(enabled):
+    """按配置里的 luci_enabled 开关 LuCI 的 80/443。返回 (ok, 说明)。
+
+    enabled=False → 从 /etc/config/nginx 摘掉 _lan / _redirect2ssl 两段
+    enabled=True  → 从快照整份还原（用户中途改过 LuCI 配置也不会被覆盖，
+                    因为快照只在第一次关之前写一次）
+    """
+    text = _uci_conf_text()
+    if not text:
+        return False, f'读不到 {LUCI_CONF_PATH}，未改动 LuCI'
+    present = set(_uci_section_names(text))
+
+    if not enabled:
+        if not (present & set(LUCI_SECTIONS)):
+            return True, 'LuCI 80/443 本来就没在配置里，无需处理'
+        _luci_snapshot()
+        new_text = _uci_strip_sections(text, LUCI_SECTIONS)
+        tmp = LUCI_CONF_PATH + '.nftweb.tmp'
+        try:
+            with open(tmp, 'w') as f:
+                f.write(new_text)
+            os.replace(tmp, LUCI_CONF_PATH)
+        except OSError as e:
+            _unlink_quiet(tmp)
+            return False, f'写入 {LUCI_CONF_PATH} 失败: {e}'
+        ok, msg = _luci_reload_nginx('已摘除 LuCI 的 80/443')
+        if not ok:
+            return False, msg
+        left = _luci_ports_listening()
+        if left:
+            return False, f'已改配置但 {sorted(left)} 仍在监听，未达到预期（{msg}）'
+        return True, 'LuCI 80/443 已关闭'
+
+    # enabled=True
+    if present & set(LUCI_SECTIONS):
+        return True, 'LuCI 80/443 已经在配置里，无需处理'
+    if not os.path.exists(LUCI_SNAPSHOT_PATH):
+        return False, (f'没有 {LUCI_SNAPSHOT_PATH} 快照，无法自动还原 LuCI 配置。'
+                       f'请手工在 /etc/config/nginx 里补上 server 段后 reload nginx')
+    try:
+        shutil.copy(LUCI_SNAPSHOT_PATH, LUCI_CONF_PATH)
+    except OSError as e:
+        return False, f'从快照还原失败: {e}'
+    ok, msg = _luci_reload_nginx('已从快照还原 LuCI')
+    if not ok:
+        return False, msg
+    return True, 'LuCI 80/443 已重新打开'
+
+
+def _gateway_port_alive():
+    """网关端口是否还在听 —— 关 LuCI 时绝不能把它带下去。"""
+    try:
+        with socket.create_connection(('127.0.0.1', GATEWAY_PORT), timeout=3):
+            return True
+    except OSError:
+        return False
+
+
 def _is_managed_conf(conf_path):
     """判断某个 nginx conf 是否由本面板生成（只认文件头标记）"""
     try:
@@ -7668,6 +7976,19 @@ def _start_servers():
     except Exception as e:
         print(f'[WATCHDOG] 启动失败（不影响 Web 服务）: {type(e).__name__}: {e}',
               flush=True)
+
+    # ========== 启动时对齐 LuCI 80/443 ==========
+    # 配置里的 luci_enabled 是**期望**，/etc/config/nginx 里那两段在不在才是
+    # **实际**。升级上来时老配置没这字段（期望=False）而机器上 LuCI 一直开着，
+    # 不在这里对齐就永远是「配置说关了、端口还开着」。
+    # 失败不阻断启动：LuCI 开着只是多两个监听口，不是裸奔。
+    try:
+        _moved, _msg = _luci_reconcile(load_config().get('luci_enabled', False))
+        if _moved:
+            print(f'[LuCI] 启动对齐：{_msg}', flush=True)
+    except Exception as e:
+        print(f'[WARN] 启动时对齐 LuCI 80/443 失败（不影响启动）: '
+              f'{type(e).__name__}: {e}', flush=True)
 
     import sys as _sys
     from werkzeug.serving import make_server

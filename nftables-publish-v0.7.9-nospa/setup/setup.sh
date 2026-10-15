@@ -813,6 +813,74 @@ NFT
 }
 
 # ============================================================
+# 8b. 关闭 LuCI 的 80/443
+#
+# 80/443 属于 OpenWrt 自带的 LuCI（nginx._lan / nginx._redirect2ssl），
+# 不是本项目的反代 —— 本项目在 8443。个人宽带用不上 LuCI，部署时直接关掉，
+# 公网上就少两个监听口。之后仍可在面板里随时打开（配置项 luci_enabled）。
+#
+# 三个关键点（.224 真机踩出来的）：
+#   1. 这个 uci-nginx 不认 section 里的 enabled 选项，只能整段摘掉
+#   2. /etc/nginx/uci.conf 是软链到 /var/lib/nginx/uci.conf，
+#      重新渲染要删**目标**，删软链会让 nginx_init 判假并静默回落到
+#      /etc/nginx/nginx.conf
+#   3. 本项目网关的 8443 走 conf.d/*.conf（模板里无条件 include），
+#      与 LuCI 无关；关完必须确认 8443 还在听，否则立刻还原
+# ============================================================
+close_luci_ports() {
+    local conf="/etc/config/nginx"
+    local rendered="/var/lib/nginx/uci.conf"
+
+    if [ ! -f "$conf" ]; then
+        warn "⚠️ 找不到 $conf，跳过关闭 LuCI 80/443"
+        return 0
+    fi
+    if ! grep -q "config server '_lan'\|config server '_redirect2ssl'" "$conf" 2>/dev/null; then
+        ok "LuCI 80/443 本来就未启用"
+        return 0
+    fi
+
+    # 留一份原始配置，供面板上「重新打开 LuCI」时还原
+    local snap="/etc/nftables/nginx-luci.snapshot"
+    mkdir -p /etc/nftables
+    [ -f "$snap" ] || cp "$conf" "$snap" && chmod 600 "$snap"
+
+    # 摘掉两个 section 整块（config 行是块首，遇到下一个 config 行即结束）
+    awk '
+        /^[[:space:]]*config[[:space:]]/ {
+            n=$3
+            gsub(/'"'"'/, "", n)
+            skip = (n == "_lan" || n == "_redirect2ssl")
+        }
+        !skip { print }
+    ' "$conf" > "$conf.nftweb.tmp" || { warn "⚠️ 生成临时配置失败，LuCI 未改动"; return 0; }
+    mv "$conf.nftweb.tmp" "$conf"
+
+    # 重新渲染：删的是渲染产物的目标，不是软链本身
+    [ -f "$rendered" ] && rm -f "$rendered"
+    if command -v nginx-util >/dev/null 2>&1; then
+        nginx-util init_lan >/dev/null 2>&1
+    fi
+    if nginx -t -c /etc/nginx/uci.conf -g "daemon off;" >/dev/null 2>&1; then
+        /etc/init.d/nginx reload >/dev/null 2>&1
+        sleep 1
+        ok "✅ LuCI 80/443 已关闭（需要时可在面板里重新打开）"
+    else
+        warn "❌ nginx 配置校验失败，已保持原 LuCI 配置"
+        [ -f "$snap" ] && cp "$snap" "$conf"
+    fi
+
+    # 兜底：网关 8443 是本项目唯一的公网入口，绝不能被一起带下去
+    if ! netstat -lnt 2>/dev/null | grep -q ':8443 '; then
+        warn "❌ 关闭 LuCI 后网关 8443 不在监听 —— 正在自动还原 LuCI"
+        cp "$snap" "$conf"
+        [ -f "$rendered" ] && rm -f "$rendered"
+        command -v nginx-util >/dev/null 2>&1 && nginx-util init_lan >/dev/null 2>&1
+        /etc/init.d/nginx reload >/dev/null 2>&1
+    fi
+}
+
+# ============================================================
 # 9. 完成提示
 # ============================================================
 show_summary() {
@@ -862,6 +930,7 @@ main() {
     ensure_ubus
     setup_service
     setup_nftables
+    close_luci_ports
     show_summary
 
     ok "✅ 全部完成！"
