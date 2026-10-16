@@ -180,13 +180,19 @@ MUTATIONS = [
      '        return'),
 
     # ── logout 与 verify 取令牌方式不对称（.224 实测挖出）────────
-    ("logout：_extract_token 退回只读 cookie（Bearer 客户端永远登不掉）",
+    #
+    # 2026-10-16 把优先级翻成 Bearer 优先后，这条的锚点也跟着换了：
+    # 原来锚的是「cookie 优先」那版实现体，现在源里已经是 Bearer 优先，
+    # 锚点失配会让它被静默跳过。锚点必须跟着实现一起走，否则测试
+    # 会在你以为它还在盯着的时候悄悄失去覆盖。
+    # 下面这条是「完全不认 Bearer」，比同组的「退回 cookie 优先」更强一档：
+    # 它连兜底都没有，任何走 Bearer 的客户端一律登不掉。
+    ("logout：_extract_token 完全不认 Bearer（Bearer 客户端永远登不掉）",
      AG,
-     '    raw = request.cookies.get(COOKIE_TOKEN, "") or ""\n'
-     '    if raw:\n        return raw\n'
      '    authz = (request.headers.get("Authorization") or "").strip()\n'
-     '    if authz.lower().startswith("bearer "):\n        return authz[7:].strip()\n'
-     '    return ""',
+     '    if authz.lower().startswith("bearer "):\n'
+     '        return authz[7:].strip()\n'
+     '    return request.cookies.get(COOKIE_TOKEN, "") or ""',
      '    return request.cookies.get(COOKIE_TOKEN, "") or ""'),
 
     ("logout：装饰器被挪到 _extract_token 上（logout 路由返回裸字符串）",
@@ -256,6 +262,35 @@ MUTATIONS = [
      '                      exp=int(payload.get("exp", 0)), device=payload.get("dev"))',
      '            if not revoke_jti(payload.get("jti", ""), int(payload.get("exp", 0))):\n'
      '                return _deny("revocation_failed")'),
+
+    # ── 凭据优先级：Bearer 必须压过 cookie（4g 节）────────────────────
+    #
+    # 这条优先级原来一直是 cookie 在前、注释却写着「Bearer 优先」。把它翻过来
+    # 之后更要盯住：翻错了不会有任何报错，只会让脚本客户端拿着有效令牌拿 401。
+
+    ("凭据：退回 cookie 优先（注释说 Bearer，实现不跟）",
+     AG,
+     '    authz = (request.headers.get("Authorization") or "").strip()\n'
+     '    if authz.lower().startswith("bearer "):\n'
+     '        return authz[7:].strip()\n'
+     '    return request.cookies.get(COOKIE_TOKEN, "") or ""',
+     '    raw = request.cookies.get(COOKIE_TOKEN, "") or ""\n'
+     '    if raw:\n'
+     '        return raw\n'
+     '    authz = (request.headers.get("Authorization") or "").strip()\n'
+     '    if authz.lower().startswith("bearer "):\n'
+     '        return authz[7:].strip()\n'
+     '    return ""'),
+
+    ("凭据：verify 入口自己先看 cookie（绕过 _extract_token 的优先级）",
+     AG,
+     '        raw = _extract_token()',
+     '        raw = request.cookies.get(COOKIE_TOKEN, "") or _extract_token()'),
+
+    ("凭据：Bearer scheme 改成大小写敏感（RFC 7235 里它本该不敏感）",
+     AG,
+     '    if authz.lower().startswith("bearer "):',
+     '    if authz.startswith("bearer "):'),
 ]
 
 # 等价变异：行为不变，不计漏过。

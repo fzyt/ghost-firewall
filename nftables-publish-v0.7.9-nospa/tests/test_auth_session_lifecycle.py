@@ -913,6 +913,80 @@ check("续期确实签发了新令牌", bool(_newF) and _newF != _tokF)
 check("续期这件事留下审计", "token_refreshed" in _aud, f"实际={_aud}")
 check("续期时旧令牌没吊销掉也留下审计（否则线上无从判断）",
       "refresh_old_token_not_revoked" in _aud, f"实际={_aud}")
+
+# ── G. 同时带 cookie 和 Bearer 时，Bearer 必须胜出 ────────────────
+#
+# 2026-10-16 把优先级从「cookie 优先」翻成「Bearer 优先」。原因是原实现的
+# 顺序和它自己的注释（"Bearer 优先"）对不上：脚本客户端只要机器上还留着
+# 浏览器 cookie，Bearer 就被无视而拿 401 —— 明明带着有效令牌。
+#
+# 下面全部走**真实请求**，不直接调 _extract_token：直接调只能证明函数对，
+# 证明不了 verify/logout 真的用了它。
+sec("4g. 凭据优先级：Bearer 优先于 cookie")
+
+reset_revoked()
+write_cfg(auth_token_epoch=0)
+reload_cfg()
+
+# 两张都有效的令牌，用 jti 区分谁被选中
+_tokA = ag.issue_token("kirito", "devCookie", 1800)    # 放进 cookie jar
+_tokB = ag.issue_token("kirito", "devBearer", 1800)    # 放进 Authorization
+_jtiA, _jtiB = jti_of(_tokA), jti_of(_tokB)
+
+set_cookie(_tokA)
+_r_g1 = _c.get("/auth/verify", headers={"Host": HOST, "X-Real-IP": "8.8.8.8",
+                                        "Authorization": f"Bearer {_tokB}"})
+check("同时带两者时请求放行（200）", _r_g1.status_code == 200,
+      f"HTTP {_r_g1.status_code}")
+check("verify 选中的是 **Bearer 那张**（X-Auth-Device=devBearer）",
+      _r_g1.headers.get("X-Auth-Device") == "devBearer",
+      f"实际={_r_g1.headers.get('X-Auth-Device')!r} —— cookie 仍然在抢优先级")
+
+# 反向：Bearer 已吊销、cookie 仍有效。必须判 401 —— 不能「Bearer 失败就
+# 悄悄退回 cookie」。那等于让显式摆出来的凭据失效后自动降级到环境凭据。
+ag.revoke_jti(_jtiB, int(ag.parse_token(_tokB)["exp"]))
+_r_g2 = _c.get("/auth/verify", headers={"Host": HOST, "X-Real-IP": "8.8.8.8",
+                                        "Authorization": f"Bearer {_tokB}"})
+check("Bearer 已吊销 → 401（**不**退回仍然有效的 cookie）",
+      _r_g2.status_code == 401, f"HTTP {_r_g2.status_code}")
+
+# 只有 cookie 时照常走 cookie（浏览器正常访问不能被这次改动打到）
+_c.delete_cookie(ag.COOKIE_TOKEN, domain="192.168.100.224")
+set_cookie(_tokA)
+_r_g3 = _c.get("/auth/verify", headers={"Host": HOST, "X-Real-IP": "8.8.8.8"})
+check("不带 Authorization 时仍然正常用 cookie 放行（浏览器路径没被改坏）",
+      _r_g3.status_code == 200 and _r_g3.headers.get("X-Auth-Device") == "devCookie",
+      f"HTTP {_r_g3.status_code} device={_r_g3.headers.get('X-Auth-Device')!r}")
+
+# logout 走同一个优先级：同时带两者时，吊销的必须是 Bearer 那张
+_c.delete_cookie(ag.COOKIE_TOKEN, domain="192.168.100.224")
+set_cookie(_tokA)
+_c.post("/auth/logout", headers={"Host": HOST, "X-Real-IP": "8.8.8.8",
+                                 "Authorization": f"Bearer {_tokB}"})
+check("logout 同时带两者时精确吊销 Bearer 那张",
+      _jtiB in (ag.load_revoked() or {}),
+      f"要找 {_jtiB}，实际={list(ag.load_revoked() or {})[:5]}")
+check("logout 没有误吊 cookie 那张",
+      _jtiA not in (ag.load_revoked() or {}),
+      f"不该出现 {_jtiA}")
+check("cookie 那张令牌仍然有效（logout 没打错人）",
+      (set_cookie(_tokA),
+       _c.get("/auth/verify",
+              headers={"Host": HOST, "X-Real-IP": "8.8.8.8"}).status_code)[1] == 200)
+# 注意 logout 的响应会把 jar 里的 gw_token 一并清掉（Max-Age=0），
+# 所以上面必须重新 set_cookie —— 否则这次 verify 压根没带凭据，
+# 会把「令牌失效」和「没登录」混成同一个 401。
+
+# scheme 必须大小写不敏感（RFC 7235 §2.1）。不少客户端库发的是小写 bearer，
+# 一旦改成 startswith("bearer ") 这些客户端会静默地全部掉到 cookie 分支。
+_tokC = ag.issue_token("kirito", "devLower", 1800)
+_c.delete_cookie(ag.COOKIE_TOKEN, domain="192.168.100.224")
+_r_g4 = _c.get("/auth/verify", headers={"Host": HOST, "X-Real-IP": "8.8.8.8",
+                                        "Authorization": f"bearer {_tokC}"})
+check("Authorization 用小写 bearer 同样被认（RFC 7235 scheme 大小写不敏感）",
+      _r_g4.status_code == 200 and _r_g4.headers.get("X-Auth-Device") == "devLower",
+      f"HTTP {_r_g4.status_code} device={_r_g4.headers.get('X-Auth-Device')!r}")
+
 ag.audit = _audit_real
 
 print("\n" + "=" * 74)

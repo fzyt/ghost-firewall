@@ -61,13 +61,23 @@ RATELIMIT_FILE = os.environ.get(
     "AUTH_RATELIMIT_FILE", "/etc/nftables/nftables-web-auth-ratelimit.json")
 AUDIT_LOG = os.environ.get(
     "AUTH_AUDIT_LOG", "/var/log/nftables-web-auth.log")
+# 审计日志体积上限。日志落在 tmpfs 上（.224 的 /var -> /tmp），吃的是内存，
+# 所以必须有界；2 MiB ≈ 5900 条记录，轮转后总占用 ≤ 4 MiB。
+AUDIT_LOG_MAX_BYTES = int(os.environ.get("AUTH_AUDIT_LOG_MAX_BYTES", str(2 * 1024 * 1024)))
 
 BIND_HOST = os.environ.get("AUTH_BIND_HOST", "127.0.0.1")
 BIND_PORT = int(os.environ.get("AUTH_API_PORT", "8444"))
 
 # 安全参数
 TOKEN_TTL_DEFAULT = 1800        # 滑动窗口 30 分钟
-TOKEN_ABS_TTL_DEFAULT = 0       # 绝对上限，0 = 不启用
+# 绝对上限：无论多活跃，到点强制重登。
+#
+# 2026-10-16 从 0 改成 43200（12 小时）。原来默认 0 = 不启用，于是滑动续期
+# 可以无限续命 —— 一张被截获的令牌只要受害者还在用，攻击者那张就永不过期，
+# 登出也只吊销得到「受害者手上那一张」（Shannon AUTH-VULN-03）。
+# 12 小时的取舍：既保证一天至少重新认证一次，又不至于正常使用时被打断；
+# 需要更长的管理员可以调到 604800（7 天，上限由 _absolute_ttl 兜住）。
+TOKEN_ABS_TTL_DEFAULT = 43200
 TOKEN_REFRESH_RATIO = 0.5       # 剩余不足一半时才重新签发，避免每个资源都回 Set-Cookie
 DEVICE_COOKIE_TTL = 31536000    # 设备标识 cookie 一年
 PBKDF2_ITERATIONS_MIN = 100000  # 拒绝迭代数过低的存量哈希（等于没加固）
@@ -279,8 +289,23 @@ def _session_ttl(cfg) -> int:
 
 
 def _absolute_ttl(cfg) -> int:
+    """绝对上限。**取不到合法正值时回落到默认值，不再回落到 0。**
+
+    2026-10-16：原来这里 `else 0`，也就是「配置缺失/非法 → 绝对上限关闭」。
+    改成默认有上限之后，这条分支就成了漏洞的最后一道口子：存量配置的
+    auth_absolute_timeout 里躺着一个显式的 0（旧的出厂默认值），面板侧的
+    迁移要等它保存配置才会落盘，而网关是**直接读磁盘**的 —— 在那之前
+    这个 0 一直生效，风险一点没关。
+
+    所以在执行点兜底：任何非正数或越界的值一律取默认。真的需要更长的
+    上限就配一个 1..604800 的正数，语义清晰且是显式配置。
+
+    这里和 validate_config 的范围校验（0..604800）刻意不一致：校验要放过
+    存量的 0，否则老配置连保存都会被拒；执行则不能认 0。当校验侧把 0
+    迁走之后，两边自然收敛。
+    """
     ttl = _int(cfg.get("auth_absolute_timeout"), TOKEN_ABS_TTL_DEFAULT)
-    return ttl if 0 < ttl <= 604800 else 0
+    return ttl if 0 < ttl <= 604800 else TOKEN_ABS_TTL_DEFAULT
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -644,6 +669,47 @@ def _syslog(event: str, rec: dict):
         pass
 
 
+def _audit_maybe_rotate(path: str, incoming: int = 0) -> None:
+    """审计日志加上这一笔就会超上限就轮转。**任何失败都吞掉** —— 日志不能反过来阻断认证。
+
+    2026-10-16（Shannon AUTH-VULN-05）：`audit()` 原来是无脑 `open(path, "a")`
+    追加，没有任何上限。一条审计记录约 350 字节，被持续触发（爆破、认证
+    失败、异常）时文件只涨不落。
+
+    报告里把机制写成「占满磁盘」，这是**错的**：.224 上 `/var` 是 `/tmp`
+    的软链、落在 tmpfs 上（实测 490 MiB），所以吃的是 **RAM**，不是磁盘。
+    在一台只有 1 GB 内存的路由上，无上限的审计日志能把整机拖垮 ——
+    这是可用性问题，也顺带是取证问题（进程 OOM 被杀时日志可能一起没）。
+
+    判据是 `当前大小 + 这一行 > 上限` 而不是 `当前大小 >= 上限`：先判后写
+    的写法会让当前文件最多溢出**一整行**（实测 4004 > 4000），于是
+    「总占用 ≤ 2×上限」这条硬边界差一点点不成立。把这一行的长度算进去，
+    边界才是真的。
+
+    为什么单文件轮转、只留一代：
+      · 总占用恒定 ≤ 2× 上限。2 MiB × 2 = 4 MiB，占 .224 可用内存的 0.5%，
+        可以忽略；而留更多代在 tmpfs 上没有意义。
+      · 面板的日志视图读的是**当前文件的尾部若干行**（app.py 里
+        `raw_lines[-limit:]`），轮转后它照样读得到当前代，不受影响。
+    """
+    try:
+        if os.path.getsize(path) + incoming <= AUDIT_LOG_MAX_BYTES:
+            return
+    except OSError:
+        return          # 文件不存在：紧接着的写入会新建，无需轮转
+    try:
+        # 用 replace 而不是 rename —— 它是原子的，旧的 .1 不会和新内容混在一起，
+        # 且天然完成「新一代覆盖上一代」。
+        os.replace(path, path + ".1")
+    except OSError:
+        # 轮转不成（目录只读、跨设备等）就地截断：宁可丢历史，
+        # 也不能让文件继续无限长把 RAM 吃光。
+        try:
+            open(path, "w").close()
+        except OSError:
+            pass
+
+
 def audit(event: str, **fields):
     """写审计日志。任何失败都不能影响认证流程本身。"""
     try:
@@ -659,9 +725,11 @@ def audit(event: str, **fields):
                     or request.path or "")[:200],
         }
         rec.update(fields)
+        line = json.dumps(rec, ensure_ascii=False) + "\n"
         os.makedirs(os.path.dirname(AUDIT_LOG), exist_ok=True)
+        _audit_maybe_rotate(AUDIT_LOG, len(line.encode("utf-8")))
         with open(AUDIT_LOG, "a") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            f.write(line)
     except Exception:
         pass   # 审计失败不能反过来阻断认证
 
@@ -1026,21 +1094,32 @@ def auth_login():
 
 
 def _extract_token() -> str:
-    """从 cookie 或 Authorization 头里取原始令牌。
+    """从 Authorization: Bearer 或 cookie 里取原始令牌。**Bearer 优先。**
 
     **两个入口必须用同一个函数**，否则会出这种不对称：
     `_verify_or_deny` 认 Bearer（给脚本/客户端用），而 auth_logout 只读
     cookie —— 于是 Bearer 客户端调 logout 拿到 HTTP 200，看着像登出了，
     实际 revoke_jti 根本没被调用（payload 为空），令牌照样有效到过期；
     滑动续期下甚至可能永不过期。.224 实测就是这样复现的。
+
+    2026-10-16 把优先级从「cookie 优先」翻成「Bearer 优先」。
+    原先 cookie 在前、注释却写着「Bearer 优先」，两者对不上；实际后果是
+    脚本客户端只要机器上还留着浏览器 cookie，Bearer 就被无视而拿到 401 ——
+    明明带着有效令牌却登不进去。
+
+    为什么这样翻是安全的（不是把 CSRF 面放大）：
+      · 浏览器**无法**被诱导跨站发送 Authorization 头。它不是 CORS 安全列表
+        头，跨站 XHR 带它会触发预检；表单、`<img>`、`<script>` 更设不了。
+      · 本项目全链路没有任何 Access-Control-* 响应头（已全库确认），
+        预检拿不到放行。
+      · 浏览器正常访问不带该头，行为完全不变（走 cookie 分支）。
+    同时 Authorization 是客户端**显式**摆出来的凭据，优先级高于 cookie
+    这个「顺带带上」的东西，本就应当如此。
     """
-    raw = request.cookies.get(COOKIE_TOKEN, "") or ""
-    if raw:
-        return raw
     authz = (request.headers.get("Authorization") or "").strip()
     if authz.lower().startswith("bearer "):
         return authz[7:].strip()
-    return ""
+    return request.cookies.get(COOKIE_TOKEN, "") or ""
 
 
 @app.route("/auth/logout", methods=["POST"])
@@ -1083,12 +1162,9 @@ def _verify_or_deny():
                 "X-Auth-Via": "lan-bypass",
             })
 
-        # 凭据：_extract_token 先看 cookie、再看 Authorization: Bearer。
-        # （这行原来写的是「Bearer 优先」——2026-10-16 把 logout 也统一到
-        # _extract_token 之后，优先级就一直是 cookie 在前，注释却没跟上。
-        # 实际影响：同时带两样时 cookie 胜出，脚本客户端若机器上还留着
-        # 浏览器 cookie，Bearer 会被无视而拿到 401。不是安全洞，是可用性坑。
-        # 真要改成 Bearer 优先，是一次行为变更，不是这次顺手能带上的。）
+        # 凭据：Bearer 优先、cookie 兜底（见 _extract_token 的说明）。
+        # 2026-10-16 这里原来写的是「Bearer 优先」而实现是 cookie 优先，
+        # 注释与代码对不上；现在实现跟注释一致了。
         raw = _extract_token()
         payload = parse_token(raw)
         if not payload:

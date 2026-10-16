@@ -639,8 +639,14 @@ DEFAULT_CONFIG = {
     "auth_api_port": 8444,
     # 滑动窗口秒数：每次成功访问刷新。30 分钟 = 1800。
     "auth_session_timeout": 1800,
-    # 绝对上限秒数：无论多活跃，到点强制重登。0 = 不启用。
-    "auth_absolute_timeout": 0,
+    # 绝对上限秒数：无论多活跃，到点强制重登。
+    #
+    # 2026-10-16 从 0 改成 43200（12 小时）。原来出厂写 0 = 不启用，
+    # 滑动续期就能无限续命：一张被截获的令牌只要受害者还在用，攻击者那张
+    # 永不过期，而登出只吊销得到「受害者手上那一张」。
+    # 注意默认值改这里**不够** —— 存量配置里已经落着一个显式的 0，
+    # 迁移在 _migrate_auth_absolute_timeout() 里做。
+    "auth_absolute_timeout": 43200,
     # 令牌世代号。每改一次密码就 +1，之前签发的**所有**会话一律作废 ——
     # 面板自己的 session 和网关的 gw_token JWT 都读这个值。
     #
@@ -706,6 +712,10 @@ def load_config():
         result = _migrate_rp_rules(result)
         # 补回 setup.sh 旧版本丢掉的掩码。同样必须在合并之后。
         result = _migrate_lan_subnet(result)
+        # 绝对上限的旧出厂值 0（=不启用）提升为新默认。放最后：
+        # 它判的是「存量配置里恰好等于 0」，必须在合并默认值之后才说得清
+        # 「0 是存量的、不是默认值」。
+        result = _migrate_auth_absolute_timeout(result)
         return result
     # 配置文件不存在。**绝不能用它来重建防火墙**。
     #
@@ -747,6 +757,36 @@ def _config_lost_after_setup():
         CONFIG_PATH + '.backup',
     ]
     return any(os.path.exists(p) for p in markers)
+
+
+def _migrate_auth_absolute_timeout(config):
+    """把存量配置里的 auth_absolute_timeout=0 提升为默认值。
+
+    2026-10-16：绝对上限的**出厂默认值**从 0（不启用）改成 43200。
+    只改 DEFAULT_CONFIG 是不够的 —— 已经装过的机器配置里早就落着一个显式的
+    0，改默认值对它们完全没有影响，风险一点没关。
+
+    为什么可以认为存量 0 都不是管理员主动选的：
+      · 这个字段**前端从来没有输入框**（已全库确认，portal/login 的 html+js
+        里都没有 auth_absolute_timeout），用户没法在界面上把它设成 0；
+      · 旧版 DEFAULT_CONFIG 写的就是 0，setup 落盘时它就被原样存下来了。
+    也就是说，存量配置里的 0 几乎必然是「从来没被选过」，而不是一个决定。
+
+    保留其他取值：正数（已经显式配过的人）和缺字段（合并默认值后自然拿到新
+    默认值）都不碰。只处理**恰好等于 0** 这一种。
+
+    迁移只改内存里的 dict；要真正落盘得由调用方重新 save_config（和
+    _migrate_lan_subnet / _migrate_rp_rules 一样，不在这里偷偷写盘 ——
+    读配置的动作不该有副作用）。
+    """
+    if config.get('auth_absolute_timeout') != 0:
+        return config
+    config['auth_absolute_timeout'] = DEFAULT_CONFIG['auth_absolute_timeout']
+    print(f'[MIGRATE] auth_absolute_timeout 0 → '
+          f'{config["auth_absolute_timeout"]}：旧默认值是「不启用」，'
+          f'滑动续期下被截获的令牌可以永不过期（Shannon AUTH-VULN-03）。'
+          f'需要更长的绝对上限可调到 604800。', flush=True)
+    return config
 
 
 def _migrate_lan_subnet(config):
@@ -6791,7 +6831,10 @@ def gateway_status():
             "auth_error": auth_msg,
             "public_url": f"https://<你的域名或公网IP>:{gw_port}/" if config.get("gateway_enabled") else None,
             "session_timeout": _int_or(config.get("auth_session_timeout"), 1800),
-            "absolute_timeout": _int_or(config.get("auth_absolute_timeout"), 0),
+            # 兜底值必须和 DEFAULT_CONFIG 一致，否则配置缺这个键时
+            # 面板会向用户显示「绝对上限 0（不启用）」而实际生效的是 43200。
+            "absolute_timeout": _int_or(config.get("auth_absolute_timeout"),
+                                        DEFAULT_CONFIG["auth_absolute_timeout"]),
             "lan_bypass": bool(config.get("auth_lan_bypass", True)),
             "services": [
                 {
@@ -8523,6 +8566,26 @@ def _start_servers():
     """
     # ========== 启动时自动恢复 nftables ruleset ==========
     _auto_recover_ruleset_if_empty()
+
+    # ========== 启动时绝对上限的默认值迁移 ==========
+    # _migrate_auth_absolute_timeout 只改内存 —— 读配置不该有副作用。
+    # 但网关是直接读磁盘的，不落盘它就一直看着那个 0。启动时补一次保存。
+    #
+    # 判据是**磁盘上的原始值恰好等于 0**，不是「迁移后的值非 0」：后者在
+    # 本来就配好正数的机器上也成立，会让每次启动都无谓地重写配置并打一次
+    # 备份。只在真需要迁的那一刻动盘。
+    # 失败不阻断启动：网关侧 _absolute_ttl 已经兜底，执行不受影响。
+    try:
+        with open(CONFIG_PATH, 'r') as f:
+            _raw = json.load(f)
+        if isinstance(_raw, dict) and _raw.get('auth_absolute_timeout') == 0:
+            save_config(load_config())
+            print('[MIGRATE] auth_absolute_timeout 新默认值已落盘', flush=True)
+    except FileNotFoundError:
+        pass      # 全新安装：还没有配置，等首次保存时自然带上新默认值
+    except Exception as e:
+        print(f'[MIGRATE] auth_absolute_timeout 落盘失败（网关侧已兜底，'
+              f'不影响强制重登）: {type(e).__name__}: {e}', flush=True)
 
     # ========== 运行期防火墙自检 ==========
     # 启动恢复只覆盖「启动那一刻」。运行期规则集被清空（fw4 被别人 enable、
