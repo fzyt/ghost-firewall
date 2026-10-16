@@ -486,8 +486,18 @@ function app() {
       this.diffModal.risks = [];
       this.diffModal.newRulesText = '';
       try {
-        const data = await api.post('/api/rules/preview-changes',
+        const resp = await api.post('/api/rules/preview-changes',
           { proposed: this.config });
+        // 必须再剥一层 data：后端返回 {success, data:{diff,risks,new_rules_text}}，
+        // 而 api.request 只解构掉 success/message，剩给调用方的是 {data:{...}}。
+        // 之前这里直接读 data.diff —— 恒为 undefined，于是弹窗六个区块
+        // （摘要/新增/删除/完整规则）全部因 x-show 条件不成立而隐藏，
+        // 表现为「弹窗打开是空的」，且不报任何错。
+        //
+        // 同文件的 /api/rules/preview 返回的是 {success, rules}（平铺），
+        // 两个端点形状不一致正是这次 bug 的来源。所以这里做成两种形状都认：
+        // 有 data 就取 data，没有就直接用响应本身，将来后端改回平铺也不会再空。
+        const data = (resp && resp.data) || resp || {};
         this.diffModal.diff = data.diff;
         this.diffModal.risks = data.risks || [];
         this.diffModal.newRulesText = data.new_rules_text || '';
