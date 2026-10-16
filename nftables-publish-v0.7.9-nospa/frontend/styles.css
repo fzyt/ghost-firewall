@@ -884,6 +884,24 @@ body .hover\:bg-gray-300:hover       { background-color: rgba(255, 255, 255, .11
 body .hover\:text-gray-600:hover,
 body .hover\:text-gray-700:hover     { color: var(--nf-text-hi); }
 
+/* —— 弹窗遮罩 ——
+   为什么不能用 `bg-black bg-opacity-50`：兼容层（见上）把 `bg-black` 映射成
+   主色渐变，因为面板里 bg-black 的语义是「主按钮」和「开关开启态」。
+   但弹窗遮罩的语义是「压暗背景」，两者撞在一起 —— 整屏会变成纯水绿色。
+
+   .224 实测（Playwright 取计算样式 + 截图确认）：
+       遮罩 .bg-black  → rgb(79, 201, 192)   ← 主色，整屏铺满
+       卡片 .bg-white  → rgba(255,255,255,.045) ← 玻璃，压在水绿上等于隐形
+   即弹窗不是「太亮」，而是**整屏被涂成了主色**，卡片反而看不见。
+
+   遮罩是语义位（遮住后面的页面），不该复用「强调色」这个语义类，所以单列。
+   卡片继续用 bg-white：它在兼容层里映射成玻璃，压在暗遮罩上正是想要的效果。 */
+.nf-modal-mask {
+  background: rgba(3, 6, 12, .74);
+  -webkit-backdrop-filter: blur(3px);
+  backdrop-filter: blur(3px);
+}
+
 /* —— 边框 —— */
 body .border       { border-color: var(--nf-hairline); }
 body .border-gray-200, body .border-gray-300,
