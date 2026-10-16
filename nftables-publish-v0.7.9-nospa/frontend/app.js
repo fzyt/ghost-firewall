@@ -1623,6 +1623,26 @@ function app() {
           + '否则将无法再连回这台机器。\n\n确定要关闭吗？'
         )) return;
       }
+      // 启用侧的同类确认。
+      //
+      // 2026-10-16 fresh install 实测：DEFAULT_CONFIG 的 auth_lan_bypass 默认
+      // 是 True，setup.sh 又不写这个键，于是全新安装出来的机器天然是
+      // 「网关开着 + LAN 内免登录」。这个状态下同一个局域网里的任何设备
+      // （访客 Wi-Fi、客人的手机）访问公网入口都不用登录，直通所有已开放的服务 ——
+      // 而面板当时一个字都不提，用户根本不知道自己装出了什么。
+      //
+      // 判据是「本次保存后两个开关是否同时为真」，不是「用户勾了什么」：
+      // 只开 bypass 而网关本来就开着，同样要让用户看见这句话。
+      if (this.gw.gateway_enabled && this.gw.auth_lan_bypass) {
+        if (!confirm(
+          '你正在启用「LAN 内免登录」状态下的认证网关。\n\n'
+          + '这意味着：同一个局域网里的任何设备（包括访客 Wi-Fi 上的手机、'
+          + '临时连进来的访客）访问公网入口时**无需登录**，可直接使用所有已开放的服务。\n\n'
+          + '如果这台路由器不对外开放访客网络，这样可以保持现状；'
+          + '否则建议先关掉「LAN 内免登录」，让所有设备都需要登录。\n\n'
+          + '仍然按当前设置启用吗？'
+        )) return;
+      }
       this.gwSaving = true;
       try {
         const payload = {
@@ -1632,8 +1652,13 @@ function app() {
           auth_absolute_timeout: parseInt(this.gw.auth_absolute_timeout, 10) || 0,
           auth_lan_bypass: !!this.gw.auth_lan_bypass,
         };
-        await api.post('/api/gateway/config', payload);
-        this.showToast('网关配置已保存并下发', 'success');
+        const r = await api.post('/api/gateway/config', payload);
+        // 后端也会独立判一次（覆盖 API 客户端与这条 confirm 被绕过的路径），
+        // 两边都提示才不漏。
+        const warned = (r && r.data && r.data.warning)
+          || ((this.gw.gateway_enabled && this.gw.auth_lan_bypass)
+              ? '注意：LAN 内免登录仍处于开启状态。' : null);
+        this.showToast(warned || '网关配置已保存并下发', warned ? 'warning' : 'success');
         await this.loadGatewayStatus();
       } catch (e) {
         this.showToast('保存失败: ' + e.message, 'error');

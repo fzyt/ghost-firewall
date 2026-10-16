@@ -305,6 +305,83 @@ finally:
     mod.app.before_request_funcs[None] = _hooks
     shutil.rmtree(TD4, ignore_errors=True)
 
+
+# ── 4e. 「网关开着 + LAN 内免登录」必须在响应里明确警告 ─────────────────
+# .224 fresh install 实测（2026-10-16）：DEFAULT_CONFIG 的 auth_lan_bypass
+# 默认为 True，setup.sh 又不写这个键，于是全新安装出来的机器天然落在这个
+# 组合上 —— 直打 127.0.0.1:8444/auth/portal 无凭据返回 200 并吐出完整门户
+# 数据，而面板一个字都不提。
+#
+# 用户拍板：默认值不改（家用场景要的是免登录），但启用时必须明确警告。
+# 这一节钉住后端那一半（前端 confirm 只挡走面板的人，API 客户端看不到）。
+TD4E = tempfile.mkdtemp()
+CFG4E = os.path.join(TD4E, 'config.json')
+with open(CFG4E, 'w') as f:
+    json.dump({**mod.DEFAULT_CONFIG, 'trusted_ip4': '192.168.100.224',
+               'gateway_enabled': False, 'gateway_port': 8443,
+               'lan_subnet4': '192.168.100.0/24'}, f)
+
+_orig_cfg = mod.CONFIG_PATH
+_orig_deploy = mod._deploy_gateway_nginx
+_orig_apply = mod._apply_ruleset
+_orig_actual_state = mod._gateway_actual_state
+mod.CONFIG_PATH = CFG4E
+try:
+    # 上一段 finally 把鉴权钩子恢复了，这里再摘一次，否则请求全被 401 挡掉
+    mod.app.before_request_funcs[None] = []
+    mod._deploy_gateway_nginx = lambda cfg=None: (True, '认证网关已启用：端口 8443，0 个服务')
+    mod._apply_ruleset = lambda cfg=None: (True, 'ok')
+    mod._gateway_actual_state = lambda cfg=None, settle=False: {
+        'enabled': True, 'nginx_conf_exists': True,
+        'port': 8443, 'port_listening': True}
+    client = mod.app.test_client()
+    with client.session_transaction() as sess:
+        sess['authenticated'] = True
+
+    # 4e1. 默认配置里 auth_lan_bypass 就是 True → 启用网关必须带警告
+    check('DEFAULT_CONFIG 里 auth_lan_bypass 确实是 True（这是本节的前提）',
+          mod.DEFAULT_CONFIG.get('auth_lan_bypass') is True,
+          f'实际={mod.DEFAULT_CONFIG.get("auth_lan_bypass")!r}')
+
+    r = client.post('/api/gateway/config', json={'gateway_enabled': True})
+    b = (r.get_json() or {}).get('data') or {}
+    w = b.get('warning')
+    check('启用网关且免登录开着时返回 200', r.status_code == 200, f'HTTP {r.status_code}')
+    check('响应里带 warning', bool(w), f'warning={w!r}')
+    check('warning 点明局域网设备无需登录',
+          w and '无需登录' in w, f'warning={w!r}')
+    check('warning 写明受影响的是哪个网段',
+          w and '192.168.100.0/24' in w, f'warning={w!r}')
+    check('warning 指出要在面板里关掉它',
+          w and '本页面' in w, f'warning={w!r}')
+
+    # 4e2. 用户主动关掉免登录后再启用 → 不该有警告
+    r = client.post('/api/gateway/config', json={'auth_lan_bypass': False})
+    b = (r.get_json() or {}).get('data') or {}
+    check('关掉免登录后 warning 消失', not b.get('warning'),
+          f'warning={b.get("warning")!r}')
+
+    # 4e3. 关掉网关本身不该带这条警告（免登录开着但网关没开，无从谈起）
+    r = client.post('/api/gateway/config', json={'gateway_enabled': False})
+    b = (r.get_json() or {}).get('data') or {}
+    check('网关关闭时不报免登录警告', not b.get('warning'),
+          f'warning={b.get("warning")!r}')
+
+    # 4e4. 判据是「结果配置」，不是「本次请求改了什么」——
+    #      在已开的网关上单独打开免登录，同样要警告
+    mod._apply_ruleset = lambda cfg=None: (True, 'ok')
+    r = client.post('/api/gateway/config',
+                    json={'gateway_enabled': True, 'auth_lan_bypass': True})
+    b = (r.get_json() or {}).get('data') or {}
+    check('已开的网关上打开免登录，同样带警告', bool(b.get('warning')),
+          f'warning={b.get("warning")!r}')
+finally:
+    mod.CONFIG_PATH = _orig_cfg
+    mod._deploy_gateway_nginx = _orig_deploy
+    mod._apply_ruleset = _orig_apply
+    mod._gateway_actual_state = _orig_actual_state
+    shutil.rmtree(TD4E, ignore_errors=True)
+
 # ── 4b. 校验点必须在 _deploy_gateway_nginx 内部，不能只在端点 ─────────
 # 端点 /api/gateway/config 只覆盖「保存网关配置」这一条路。反代规则增删改
 # 走的是 _deploy_all_rules → _deploy_gateway_nginx，那条路曾经完全没有校验：

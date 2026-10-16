@@ -112,6 +112,21 @@ APP_MUTANTS = [
     ('/api/config GET 不再带 luci_actual',
      "                       luci_actual=luci_actual,",
      "                       luci_actual=None,"),
+
+    # ── 2026-10-16：「网关开着 + LAN 内免登录」的警告被拿掉 ────────────
+    # fresh install 实测：全新装出来的机器天然落在这个组合上（DEFAULT_CONFIG
+    # 的 auth_lan_bypass 默认 True，setup.sh 不写这个键），无凭据访问
+    # /auth/portal 返 200 并吐出完整门户数据。这条警告是用户拍板要的唯一防线，
+    # 拿掉它等于回到「装出来什么用户不知道」。
+    ('/api/gateway/config 不再对「LAN 内免登录」发出警告',
+     "    if new_cfg.get(\"gateway_enabled\") and new_cfg.get(\"auth_lan_bypass\"):",
+     "    if False:"),
+
+    # 只判 gateway_enabled、不看 bypass —— 会漏掉「已开的网关上单独打开
+    # 免登录」这一路，那才是更危险的一次（拿掉一层已经生效的保护）。
+    ('警告只判网关开没开，漏掉单独打开免登录的情况',
+     "    if new_cfg.get(\"gateway_enabled\") and new_cfg.get(\"auth_lan_bypass\"):",
+     "    if new_cfg.get(\"gateway_enabled\"):"),
 ]
 
 JS_MUTANTS = [
@@ -160,6 +175,19 @@ JS_MUTANTS = [
     ('gwStatus 不再点明公网入口未监听',
      "          + (a ? (a.enabled ? ' · 公网入口在线' : ' · ⚠️ 公网入口实际未监听') : '');",
      "          + '';"),
+
+    # ── 2026-10-16：启用侧的 LAN 免登录确认被拿掉 ──────────────────────
+    # 后端也会独立判一次，但那只是响应里多一句 warning —— 走面板的人
+    # 点一下保存就已经把网关开起来了，警告只是 toast。这道 confirm 才是
+    # 真正停下来让人看一眼的那一步。
+    ('saveGatewayConfig 不再就「LAN 内免登录」要求确认',
+     "      if (this.gw.gateway_enabled && this.gw.auth_lan_bypass) {",
+     "      if (false) {"),
+
+    # 只判 enabled 不判 bypass，warning 的 toast 也就不再触发
+    ('保存后不再显示后端返回的 warning',
+     "        const warned = (r && r.data && r.data.warning)",
+     "        const warned = null && (r && r.data && r.data.warning)"),
 ]
 
 HTML_MUTANTS = [

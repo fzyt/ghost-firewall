@@ -6916,8 +6916,26 @@ def gateway_set_config():
         return jsonify({"success": False,
                         "message": f"网关配置已下发，但防火墙放行更新失败：{fw_msg}"}), 500
 
+    # 「网关开着 + LAN 内免登录」这个组合本身不是错误，但它意味着
+    # **同一个局域网里的任何设备**（访客 Wi-Fi、客人的手机）访问公网入口
+    # 都不用登录，直接用上所有已开放的服务。2026-10-16 fresh install 实测：
+    # DEFAULT_CONFIG 的 auth_lan_bypass 默认为 True，且 setup.sh 不写这个键，
+    # 于是全新安装出来的机器天然落在这个组合上，而面板当时一个字都不提。
+    #
+    # 判据取**结果配置**而不是「本次请求改了什么」：在已开的网关上单独打开
+    # bypass，比一开始就两个都开着更危险 —— 那是在拿掉一层已经生效的保护，
+    # 但它不体现在 gateway_enabled 这个字段的变化里。
+    warning = None
+    if new_cfg.get("gateway_enabled") and new_cfg.get("auth_lan_bypass"):
+        subnet = new_cfg.get("lan_subnet4") or "局域网网段"
+        warning = (f"网关已启用，且「LAN 内免登录」保持开启："
+                   f"来自 {subnet} 的设备访问 {new_cfg.get('gateway_port')} 端口无需登录，"
+                   f"可直接使用所有已开放的服务。如果这台路由器对外来访客网络开放"
+                   f"（访客 Wi-Fi 等），请在本页面关闭「LAN 内免登录」。")
+
     return jsonify({"success": True,
-                    "data": {"changed": changed, "message": deploy_msg}})
+                    "data": {"changed": changed, "message": deploy_msg,
+                             "warning": warning}})
 
 
 # ======================= 反代规则 API =======================
