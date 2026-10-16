@@ -349,7 +349,7 @@ install_deps() {
         ddns-scripts \
         ddns-scripts-cloudflare ddns-scripts-dnspod \
         ddns-scripts-noip ddns-scripts-nsupdate \
-        ddns-scripts-godaddy ddns-scripts-namecheap \
+        ddns-scripts-godaddy \
         nginx-full \
         curl openssl-util socat \
         ca-certificates wget-ssl
@@ -436,9 +436,37 @@ setup_nginx() {
 
         if ! grep -q "include.*conf\.d/\*\.conf" "$nginx_conf" 2>/dev/null; then
             warn "主 nginx.conf 缺少 include conf.d/*.conf，尝试添加..."
-            # 在 http 块内最后一个 } 之前插入
-            if sed -i '/^http {/,/^}/{ /^}/i\    include conf.d/*.conf;\n' "$nginx_conf" 2>/dev/null; then
-                ok "已添加 include conf.d/*.conf 到主配置"
+            # 在 http 块闭合前插入 include conf.d/*.conf。
+            #
+            # 原来这里用的是
+            #     sed -i '/^http {/,/^}/{ /^}/i\    include conf.d/*.conf;\n'
+            # 三个缺陷叠在一起，**在 BusyBox sed 上必然失败**（2026-10-16 .224
+            # fresh install 实测复现，日志里稳定打「自动插入 include 失败」）：
+            #   1. 范围首端 `/^http {/` 里的 `{` 是裸花括号。BusyBox 的正则解析器
+            #      把它当区间量词的起始，直接报 `sed: unterminated {` 并放弃 ——
+            #      连「文件不需要改」都不是，是根本没执行。
+            #   2. 就算转义了，范围末端 `/^}/` 要求 `}` 在第 0 列，而 OpenWrt 的
+            #      nginx.conf 里 http 的闭合括号是缩进的（`  }`），区间同样匹配不上。
+            #   3. `i\` 文本里的 `\n` 和 `*.conf` 的 `*` 都没有按字面处理。
+            #
+            # 改用 awk 按花括号配平定位 http 的闭合位置，并且自带「已经插过就
+            # 不插」的判断 —— 不依赖调用方的 grep 守卫，写成幂等操作。
+            # 幂等与嵌套子块（http 里有 server{}）均在 .224 上实测通过。
+            if awk '
+                function bal(s,   t) { t = s; return gsub(/\{/, "{", t) - gsub(/\}/, "}", t) }
+                /^[[:space:]]*http[[:space:]]*\{/ { inhttp = 1; has = 0; depth = 0 }
+                {
+                    if (inhttp && $0 ~ /^[[:space:]]*include[^#]*conf\.d\/\*\.conf/) has = 1
+                    if (inhttp && !has && depth + bal($0) <= 0) { print "    include conf.d/*.conf;"; has = 1 }
+                    print
+                    if (inhttp) depth += bal($0)
+                }
+            ' "$nginx_conf" > "$nginx_conf.nftweb.tmp" 2>/dev/null && mv "$nginx_conf.nftweb.tmp" "$nginx_conf"; then
+                if grep -q "include.*conf\.d/\*\.conf" "$nginx_conf" 2>/dev/null; then
+                    ok "已添加 include conf.d/*.conf 到主配置"
+                else
+                    warn "自动插入后仍未找到 include conf.d/*.conf，请手动在 http 块内添加"
+                fi
             else
                 warn "自动插入 include 失败，请手动在 http 块内添加: include conf.d/*.conf;"
             fi
