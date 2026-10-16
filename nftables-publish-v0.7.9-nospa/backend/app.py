@@ -1261,6 +1261,27 @@ def validate_config(cfg):
     """校验配置中所有会进入 nft 规则的字段，返回错误列表（空列表 = 通过）"""
     errs = []
 
+    # ── access_mode ──────────────────────────────────────────────
+    # .224 真机实测（2026-10-16 功能面测试）：POST {"access_mode":"knock"}
+    # 返回 **200「配置已保存」**，值落盘；模板那行
+    #     ACCESS_MODE = cfg if cfg in ("lan","trusted") else "trusted"
+    # 于是把 knock 静默变成 trusted —— 内核里 input_lan 变成
+    #     tcp dport {22, 5443} accept; meta nfproto ipv4 drop
+    # 8443 等所有其它 LAN 服务当场不通，而接口只附了一条 medium 提示。
+    #
+    # 更糟的是它**绕开了自锁守卫**：_detect_risks 里那条 critical 检查判的是
+    # `new_mode == 'trusted'`，而这里 new_mode 是 'knock'，条件不成立，
+    # 「切到信任模式后你把自己关在门外」这条警告一次都不会触发。
+    #
+    # 'knock' 不是随便挑的旧值：setup.sh 的注释里明写它是「一个从未实现的
+    # 模式」，当初就是为了不让模板走 trusted 分支才删掉的。API 这条路上
+    # 它一直能重新进来。
+    _am = cfg.get('access_mode', 'lan')
+    if _am not in ('lan', 'trusted'):
+        errs.append(f'access_mode 非法: {_am!r}'
+                    f'（只允许 lan / trusted；trusted 表示内网默认全丢弃，'
+                    f'仅 trusted_ip4 白名单可达）')
+
     for key in ('wan_if', 'lan_if'):
         v = str(cfg.get(key, '') or '')
         if v and not _RE_IFACE.match(v):

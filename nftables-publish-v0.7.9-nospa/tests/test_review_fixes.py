@@ -729,6 +729,50 @@ check('forward 链的黑名单用独立日志前缀（能与 input 链的区分�
       and '[BLACKLIST6-FWD]' in (fwd[f_bl6] if f_bl6 >= 0 else ''))
 
 # ─────────────────────────────────────────────────────────────
+sec('FUNC-01  access_mode 必须被校验，非法值不能静默变 trusted')
+
+# .224 真机功能面测试（2026-10-16）跑出来的：
+#   POST /api/config {"access_mode":"knock"}  →  200「配置已保存」，值落盘
+# 模板那行 `cfg if cfg in ("lan","trusted") else "trusted"` 把它变成 trusted，
+# 内核 input_lan 变成 `tcp dport {22,5443} accept; meta nfproto ipv4 drop`，
+# 8443 等所有其它 LAN 服务当场不通 —— 接口只附了一条 medium 提示。
+# 实测对照：改回 lan 后 8443 立刻恢复。
+#
+# 关键在于它**绕开了自锁守卫**：_detect_risks 那条 critical 检查判的是
+# `new_mode == 'trusted'`，'knock' 不满足，于是「切信任模式会把自己关在门外」
+# 一次都不报。
+_app = fresh()
+_base = dict(_app.DEFAULT_CONFIG)
+_base.update({'trusted_ip4': ['192.168.100.224'],
+              'lan_subnet4': '192.168.100.0/24', 'lan_subnet6': '',
+              'router_ip4': '192.168.100.224', 'router_ip6': '',
+              'trusted_ip6': ['']})
+
+
+def _am_errs(val):
+    c = dict(_base)
+    c['access_mode'] = val
+    return [e for e in _app.validate_config(c) if 'access_mode' in e]
+
+
+check('access_mode=lan 通过', _am_errs('lan') == [], str(_am_errs('lan')))
+check('access_mode=trusted 通过', _am_errs('trusted') == [], str(_am_errs('trusted')))
+check("access_mode='knock' 被拒", _am_errs('knock') != [], '模板会把它当 trusted')
+check("access_mode='' 被拒", _am_errs('') != [])
+check('access_mode=None 被拒', _am_errs(None) != [])
+check("大小写不同的 'LAN' 被拒（模板不归一化大小写）", _am_errs('LAN') != [])
+check('拒绝信息里点名了合法值', all('lan' in e and 'trusted' in e
+                                for e in _am_errs('knock')), str(_am_errs('knock')))
+check('拒绝信息说明了 trusted 的后果',
+      any('丢弃' in e or '白名单' in e for e in _am_errs('knock')),
+      str(_am_errs('knock')))
+
+# 键缺失时走默认值，不该被自己的校验挡下
+check('键缺失时用默认值 lan，不报错',
+      'access_mode' not in [e for e in _app.validate_config(dict(_base))],
+      str([e for e in _app.validate_config(dict(_base)) if 'access_mode' in e]))
+
+# ─────────────────────────────────────────────────────────────
 print('\n' + '=' * 60)
 print(f'通过 {len(PASS)} / {len(PASS) + len(FAIL)}' + (f'，失败 {len(FAIL)}' if FAIL else ''))
 if FAIL:
