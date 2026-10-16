@@ -989,6 +989,67 @@ check("Authorization 用小写 bearer 同样被认（RFC 7235 scheme 大小写�
 
 ag.audit = _audit_real
 
+# ── H. 两条鉴权路径的 epoch 判据必须一致 ─────────────────────────
+#
+# .224 实测挖出来的真洞：epoch 校验只写在 `_verify_or_deny`（nginx auth_request
+# 打的 /auth/verify）里，`_authenticated`（浏览器直接访问 /auth/portal 用的）
+# 没查。改密码之后 auth_request 确实 401 了，**门户页面却仍然 200** ——
+# 用户看到「密码都改了，页面还能打开」，而背后的 API 已经在拒绝。
+#
+# 之前的测试只打了 /auth/verify，正好是查 epoch 的那条路径，把这条漏了。
+# 所以下面**两个端点都必须打**，少一个就等于没测。
+sec("4h. 门户页面与 auth_request 的 epoch 判据必须一致")
+
+write_cfg(auth_token_epoch=5)
+reload_cfg()
+_tokH = ag.issue_token("kirito", "devH", 1800)
+check("前置：令牌带 ep=5", ag.parse_token(_tokH).get("ep") == 5)
+_r_ha = _c.get("/auth/portal", headers={**{"Host": HOST}, "Cookie": f"{ag.COOKIE_TOKEN}={_tokH}"})
+check("改密码前 /auth/portal 放行", _r_ha.status_code in (200, 401),
+      f"HTTP {_r_ha.status_code}（401 也可以，说明它确实在查凭据）")
+
+# 用 jar 而不是手动头 —— Werkzeug 测试客户端会丢弃显式 Cookie 头
+_c.delete_cookie(ag.COOKIE_TOKEN, domain="192.168.100.224")
+set_cookie(_tokH)
+_r_h1 = _c.get("/auth/portal", headers={"Host": HOST, "X-Real-IP": "8.8.8.8"})
+check("**/auth/portal 在 epoch 未变时放行**", _r_h1.status_code == 200,
+      f"HTTP {_r_h1.status_code}")
+
+write_cfg(auth_token_epoch=6)      # 模拟改密码：epoch +1
+reload_cfg()
+_r_h2 = _c.get("/auth/portal", headers={"Host": HOST, "X-Real-IP": "8.8.8.8"})
+check("**改密码后 /auth/portal 立即 401**（门户页面这扇门必须一起关）",
+      _r_h2.status_code == 401,
+      f"HTTP {_r_h2.status_code} —— 门户页面不查 epoch，用户会看到「密码都改了页面还能开」")
+
+# 同一时刻，auth_request 那条路径也必须 401（两条判据一致，不是一条松一条紧）
+_r_h3 = verify(_tokH)
+check("同一时刻 /auth/verify 也 401（两条路径判据一致）",
+      _r_h3.status_code == 401, f"HTTP {_r_h3.status_code}")
+
+# Bearer 客户端在 /auth/portal 上也必须被认（取令牌方式统一）
+_tokH2 = ag.issue_token("kirito", "devH2", 1800)
+write_cfg(auth_token_epoch=6)
+reload_cfg()
+_c.delete_cookie(ag.COOKIE_TOKEN, domain="192.168.100.224")
+_r_h4 = _c.get("/auth/portal", headers={"Host": HOST, "X-Real-IP": "8.8.8.8",
+                                        "Authorization": f"Bearer {_tokH2}"})
+check("/auth/portal 也认 Bearer 令牌（不只认 cookie）", _r_h4.status_code == 200,
+      f"HTTP {_r_h4.status_code}")
+
+# 无 ep 字段的旧令牌按 0 处理
+write_cfg(auth_token_epoch=0)
+reload_cfg()
+_tokH3 = ag.issue_token("kirito", "devH3", 1800)
+write_cfg(auth_token_epoch=1)
+reload_cfg()
+_c.delete_cookie(ag.COOKIE_TOKEN, domain="192.168.100.224")
+set_cookie(_tokH3)
+_r_h5 = _c.get("/auth/portal", headers={"Host": HOST, "X-Real-IP": "8.8.8.8"})
+check("epoch 0→1 也能清掉旧令牌（无需兼容期）", _r_h5.status_code == 401,
+      f"HTTP {_r_h5.status_code}")
+_c.delete_cookie(ag.COOKIE_TOKEN, domain="192.168.100.224")
+
 print("\n" + "=" * 74)
 print(f"通过 {len(PASS)} / 失败 {len(FAIL)}")
 if FAIL:

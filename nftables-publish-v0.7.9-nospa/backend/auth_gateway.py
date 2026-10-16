@@ -567,59 +567,140 @@ RATE_LIMIT_LOCKOUT = 900    # 锁 15 分钟
 _STATUS_HITS = {}
 _STATUS_RATE_LOCK = threading.Lock()
 
+# 限流表不可用时的进程内兜底计数，以及「只警告一次」的闸门。
+_RATELIMIT_DEGRADED = {"warned": False}
+_RATE_FALLBACK = {}
+
+
+def _ratelimit_degrade(e):
+    """限流表落盘不可用 → 降级到进程内内存，并只警告一次。
+
+    2026-10-16 `.224` 实测（跑真实用户流程时撞上）：`/etc/nftables` 是
+    `drwxr-sr-x root:nftweb` —— **组只有 r-x，没有写权限**。网关降权后以
+    uid 1000 运行，建不了这张表。init 脚本以 root 预建了它，所以平时不暴露；
+    但表一旦缺失（误删、tmpfs 被清、`prepare_nftweb_files` 失败），
+    `open(path, "a+")` 抛 PermissionError，整个 auth_login 走 except Exception
+    → **HTTP 500**。
+
+    后果是「一张表被删 = 所有人永久登不进」，而且**没有任何自愈路径** ——
+    uid 1000 永远重建不出这张表。实测复现：移走表后连续两次登录都是 500，
+    表也不会被重建。
+
+    取舍：这里选 **fail-open**（放行 + 审计），不是 fail-closed。
+      · 代价：抗暴力破解能力暂时下降（失败次数不再跨重启累计）。
+      · 收益：不会把人锁在门外。
+    这也正是项目里既定的取舍 —— 「限流表损坏 fail-open、吊销表损坏
+    fail-closed」：限流表坏了顶多多试几次，吊销表坏了是已失效凭据重新可用。
+
+    面板侧早就有同样的降级（`app.py` 的 `_ratelimit_degrade`），网关这边是漏的。
+    """
+    if not _RATELIMIT_DEGRADED["warned"]:
+        _RATELIMIT_DEGRADED["warned"] = True
+        print(f'[WARNING] 登录限流落盘不可用（{type(e).__name__}: {e}），'
+              f'降级为内存计数 —— 网关重启后失败次数会清零', flush=True)
+    audit("ratelimit_degraded", error=type(e).__name__)
+
+
+def _ratelimit_fallback_mutate(ip: str, on_fail: bool):
+    """限流表不可用时的内存版，语义与落盘版一致。
+
+    同样要能真的挡住暴力破解 —— 降级不等于不设防，只是不跨重启累计。
+    """
+    now = time.time()
+    rec = _RATE_FALLBACK.get(ip)
+    rec = rec if isinstance(rec, dict) else {}
+    fails = [t for t in rec.get("fails", [])
+             if isinstance(t, (int, float)) and now - t < RATE_LIMIT_WINDOW]
+    locked_until = rec.get("locked_until", 0)
+    if isinstance(locked_until, (int, float)) and locked_until > now:
+        return True, len(fails)
+    if on_fail:
+        fails.append(now)
+        if len(fails) >= RATE_LIMIT_MAX_FAILS:
+            rec = {"locked_until": now + RATE_LIMIT_LOCKOUT, "fails": []}
+        else:
+            rec = {"locked_until": 0, "fails": fails}
+    else:
+        rec = {}                       # 成功登录：清空该 IP 的失败记录
+    _RATE_FALLBACK[ip] = rec
+    return False, len(rec.get("fails", []))
+
 
 def _mutate_ratelimit(ip: str, on_fail: bool):
-    """原子地读改写限流表。返回 (locked, fail_count)。"""
+    """原子地读改写限流表。返回 (locked, fail_count)。
+
+    整段包在 try 里：限流表写不了**绝不能**把登录整个搞挂。
+    见 `_ratelimit_degrade` 的说明（.224 实测：表缺失 = 永久 500）。
+    """
     path = RATELIMIT_FILE
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "a+") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            f.seek(0)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except Exception as e:  # noqa: BLE001
+        _ratelimit_degrade(e)
+        return _ratelimit_fallback_mutate(ip, on_fail)
+    try:
+        with os.fdopen(fd, "r+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
             try:
-                data = json.load(f)
-                if not isinstance(data, dict):
+                f.seek(0)
+                try:
+                    data = json.load(f)
+                    if not isinstance(data, dict):
+                        data = {}
+                except (json.JSONDecodeError, ValueError):
                     data = {}
-            except (json.JSONDecodeError, ValueError):
-                data = {}
 
-            now = time.time()
-            rec = data.get(ip) if isinstance(data.get(ip), dict) else {}
-            locked_until = rec.get("locked_until", 0)
-            if isinstance(locked_until, (int, float)) and locked_until > now:
-                return True, len(rec.get("fails", []))
+                now = time.time()
+                rec = data.get(ip) if isinstance(data.get(ip), dict) else {}
+                locked_until = rec.get("locked_until", 0)
+                if isinstance(locked_until, (int, float)) and locked_until > now:
+                    return True, len(rec.get("fails", []))
 
-            if on_fail:
-                fails = [t for t in rec.get("fails", [])
-                         if isinstance(t, (int, float)) and now - t < RATE_LIMIT_WINDOW]
-                fails.append(now)
-                rec["fails"] = fails
-                if len(fails) >= RATE_LIMIT_MAX_FAILS:
-                    rec["locked_until"] = now + RATE_LIMIT_LOCKOUT
-                    rec["fails"] = []
-                data[ip] = rec
-            elif ip in data:
-                # 成功登录：清空该 IP 的失败记录
-                data.pop(ip, None)
+                if on_fail:
+                    fails = [t for t in rec.get("fails", [])
+                             if isinstance(t, (int, float)) and now - t < RATE_LIMIT_WINDOW]
+                    fails.append(now)
+                    rec["fails"] = fails
+                    if len(fails) >= RATE_LIMIT_MAX_FAILS:
+                        rec["locked_until"] = now + RATE_LIMIT_LOCKOUT
+                        rec["fails"] = []
+                    data[ip] = rec
+                elif ip in data:
+                    # 成功登录：清空该 IP 的失败记录
+                    data.pop(ip, None)
 
-            # 顺手清理过期条目，防止表无限膨胀
-            cutoff = now - (RATE_LIMIT_LOCKOUT + RATE_LIMIT_WINDOW)
-            for k in [k for k, v in data.items()
-                      if not isinstance(v, dict)
-                      or max(list(v.get("fails", []) or [0]) + [v.get("locked_until", 0)]) < cutoff]:
-                data.pop(k, None)
+                # 顺手清理过期条目，防止表无限膨胀
+                cutoff = now - (RATE_LIMIT_LOCKOUT + RATE_LIMIT_WINDOW)
+                for k in [k for k, v in data.items()
+                          if not isinstance(v, dict)
+                          or max(list(v.get("fails", []) or [0]) + [v.get("locked_until", 0)]) < cutoff]:
+                    data.pop(k, None)
 
-            f.seek(0)
-            f.truncate()
-            json.dump(data, f)
-            f.flush()
-            os.fsync(f.fileno())
-            os.chmod(path, 0o600)
+                f.seek(0)
+                f.truncate()
+                json.dump(data, f)
+                f.flush()
+                os.fsync(f.fileno())
 
-            rec = data.get(ip, {})
-            return False, len(rec.get("fails", []))
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+                rec = data.get(ip, {})
+                return False, len(rec.get("fails", []))
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+    except Exception as e:  # noqa: BLE001
+        # 读改写中途失败：计数没落盘，退回内存版。**不能**当成「没失败过」
+        # 放行 —— 那等于把暴力破解防护悄悄关掉。
+        _ratelimit_degrade(e)
+        return _ratelimit_fallback_mutate(ip, on_fail)
+    finally:
+        # 已存在的文件可能还是 init 脚本之外的路径建出来的（0644）。
+        # 收紧是 best-effort：数据已经 fsync、计数已经生效，
+        # 收紧失败不该反过来把这次计数变成降级 —— 和 revoke_jti 同一个坑。
+        try:
+            if (os.stat(path).st_mode & 0o777) & 0o077:
+                os.chmod(path, 0o600)
+        except OSError:
+            audit("ratelimit_chmod_failed")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1172,13 +1253,10 @@ def _verify_or_deny():
         # 世代号对不上 = 改过密码（或配置被重置）之后签的旧令牌，一律拒。
         # 放在 is_revoked 之后：吊销表可能读不了（fail-closed 全体拒绝），
         # 先走它能让这类故障得到更准的 deny 原因。
-        try:
-            tok_epoch = int(payload.get("ep", 0) or 0)
-        except (TypeError, ValueError):
-            return _deny("epoch_malformed")
-        cur_epoch = int(cfg.get("auth_token_epoch", 0) or 0)
-        if tok_epoch != cur_epoch:
-            return _deny("epoch_changed")
+        # 判据与 `_authenticated` 共用 `_payload_epoch_ok` —— 两条鉴权路径
+        # 必须同一套判据，各写一份迟早会漏掉一边（.224 实测就漏过一次）。
+        if not _payload_epoch_ok(payload, cfg):
+            return _deny("epoch_changed" if "ep" in payload else "epoch_missing")
         if is_revoked(payload.get("jti", "")):
             return _deny("revoked")
 
@@ -1266,12 +1344,48 @@ def auth_portal():
                     "device_id": device_id_from_request()})
 
 
+def _payload_epoch_ok(payload, cfg) -> bool:
+    """令牌世代号是否与当前配置一致（改密码后旧令牌一律作废）。
+
+    **两个鉴权入口都必须用它。**
+      · `_verify_or_deny` —— nginx auth_request 打的 /auth/verify
+      · `_authenticated`  —— 浏览器直接访问 /auth/portal 等端点
+
+    2026-10-16 `.224` 实测踩过这个坑：epoch 校验**只**写在 `_verify_or_deny`
+    里，`_authenticated` 没查。结果改密码之后 nginx 的 auth_request 确实
+    401 了，但**门户页面照样 200** —— 用户看到的是「密码都改了，页面还能打开」，
+    而页面背后的 API 已经在拒绝。这种前后不一致比两边都失效更难排查，
+    而且门户页面本身就是最该被关掉的那一扇门。
+
+    旧令牌（无 `ep` 字段）按 0 处理，与 `_verify_or_deny` 的历史行为一致。
+    """
+    if not isinstance(payload, dict):
+        return False
+    try:
+        tok_epoch = int(payload.get("ep", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    try:
+        cur_epoch = int(cfg.get("auth_token_epoch", 0) or 0)
+    except (TypeError, ValueError):
+        cur_epoch = 0
+    return tok_epoch == cur_epoch
+
+
 def _authenticated() -> bool:
+    """端点级鉴权。与 `_verify_or_deny` 是**两条独立的路径**，判据必须一致。
+
+    取令牌同样走 `_extract_token`：Bearer 优先、cookie 兜底。直接读 cookie
+    会让带 Bearer 的脚本客户端在这个端点上被无视（和第二批修的 logout 同一个
+    类别的不对称）。
+    """
     cfg = load_gateway_config()
     if is_lan_source(cfg):
         return True
-    payload = parse_token(request.cookies.get(COOKIE_TOKEN, ""))
-    return bool(payload) and not is_revoked(payload.get("jti", ""))
+    payload = parse_token(_extract_token())
+    return (bool(payload)
+            and _payload_epoch_ok(payload, cfg)
+            and not is_revoked(payload.get("jti", "")))
 
 
 def _deny(reason: str):
@@ -1283,19 +1397,39 @@ def _deny(reason: str):
 # 辅助
 # ══════════════════════════════════════════════════════════════════════
 
-def _is_locked(ip: str) -> bool:
-    try:
-        with open(RATELIMIT_FILE, "r") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return False
-    if not isinstance(data, dict):
-        return False
-    rec = data.get(ip)
+def _ratelimit_fallback_is_locked(ip: str) -> bool:
+    """降级状态下该 IP 是否已被锁（只看内存计数）。"""
+    rec = _RATE_FALLBACK.get(ip)
     if not isinstance(rec, dict):
         return False
     lu = rec.get("locked_until", 0)
     return isinstance(lu, (int, float)) and lu > time.time()
+
+
+def _is_locked(ip: str) -> bool:
+    """该 IP 是否已被限流锁定。
+
+    **必须同时看落盘和内存两个来源。**
+    2026-10-16 实测踩过：限流表降级（`.224` 上表被移走 / 目录不可写）时，
+    `_mutate_ratelimit` 把计数写进 `_RATE_FALLBACK`，但这个判据只读文件，
+    于是**计数照记、锁定判定永远读到 False** —— 降级期间暴力破解防护等于
+    被悄悄关掉。实测 7 次连续错密码全是 401，一次 429 都没有。
+
+    而且只读文件还会漏掉「文件能读、但写不进去」这一种：那时文件里是
+    陈旧数据，内存里才是真实计数。所以规则是**任一来源说锁了就锁**。
+    """
+    try:
+        with open(RATELIMIT_FILE, "r") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            rec = data.get(ip)
+            if isinstance(rec, dict):
+                lu = rec.get("locked_until", 0)
+                if isinstance(lu, (int, float)) and lu > time.time():
+                    return True
+    except (OSError, json.JSONDecodeError):
+        pass
+    return _ratelimit_fallback_is_locked(ip)
 
 
 def _origin_host_mismatch(url: str) -> bool:

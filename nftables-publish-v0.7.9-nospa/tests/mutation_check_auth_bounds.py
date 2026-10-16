@@ -95,6 +95,73 @@ MUTATIONS = [
      AG,
      "        os.replace(path, path + \".1\")",
      "        os.rename(path, path + \".1\")"),
+
+    # ── 限流表不可用时不得把登录搞挂（.224 实测的真 bug）────────────
+    #
+    # 这组是「一张表被删 = 所有人永久登不进」的自伤式拒绝服务。
+    # /etc/nftables 是 drwxr-sr-x root:nftweb（组只有 r-x），
+    # 网关降权后以 uid 1000 根本建不出这张表 —— 移走它之后没有任何自愈路径。
+
+    ("限流表：打不开时直接抛（回到 .224 实测的 500 登录失败）",
+     AG,
+     "    except Exception as e:  # noqa: BLE001\n"
+     "        _ratelimit_degrade(e)\n"
+     "        return _ratelimit_fallback_mutate(ip, on_fail)\n"
+     "    try:\n"
+     "        with os.fdopen(fd, \"r+\") as f:",
+     "    try:\n"
+     "        with os.fdopen(fd, \"r+\") as f:"),
+
+    ("限流表：降级后放行但不计数（暴力破解防护被悄悄关掉）",
+     AG,
+     "    if on_fail:\n"
+     "        fails.append(now)\n"
+     "        if len(fails) >= RATE_LIMIT_MAX_FAILS:\n"
+     "            rec = {\"locked_until\": now + RATE_LIMIT_LOCKOUT, \"fails\": []}\n"
+     "        else:\n"
+     "            rec = {\"locked_until\": 0, \"fails\": fails}\n"
+     "    else:\n"
+     "        rec = {}                       # 成功登录：清空该 IP 的失败记录",
+     "    if on_fail:\n"
+     "        fails.append(now)\n"
+     "        rec = {\"locked_until\": 0, \"fails\": []}\n"
+     "    else:\n"
+     "        rec = {}"),
+
+    ("限流表：降级后永不上锁",
+     AG,
+     "        fails.append(now)\n"
+     "        if len(fails) >= RATE_LIMIT_MAX_FAILS:\n"
+     "            rec = {\"locked_until\": now + RATE_LIMIT_LOCKOUT, \"fails\": []}\n"
+     "        else:\n"
+     "            rec = {\"locked_until\": 0, \"fails\": fails}",
+     "        fails.append(now)\n"
+     "        if False:\n"
+     "            rec = {\"locked_until\": now + RATE_LIMIT_LOCKOUT, \"fails\": []}\n"
+     "        else:\n"
+     "            rec = {\"locked_until\": 0, \"fails\": fails}"),
+
+    ("限流表：降级时不置告警标志（线上无从判断限流已失效）",
+     AG,
+     "    if not _RATELIMIT_DEGRADED[\"warned\"]:\n"
+     "        _RATELIMIT_DEGRADED[\"warned\"] = True",
+     "    if False:\n"
+     "        _RATELIMIT_DEGRADED[\"warned\"] = True"),
+
+    ("限流表：上锁判定退回只读文件（降级期间暴力破解防护被悄悄关掉）",
+     AG,
+     "    except (OSError, json.JSONDecodeError):\n"
+     "        pass\n"
+     "    return _ratelimit_fallback_is_locked(ip)\n"
+     "\n"
+     "\n"
+     "def _origin_host_mismatch",
+     "    except (OSError, json.JSONDecodeError):\n"
+     "        pass\n"
+     "    return False\n"
+     "\n"
+     "\n"
+     "def _origin_host_mismatch"),
 ]
 
 # 等价变异：行为不变，不计漏过。

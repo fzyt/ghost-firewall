@@ -68,15 +68,19 @@ MUTATIONS = [
      '        "ep": _token_epoch(),\n',
      ''),
 
-    ("MISC-01：_verify_or_deny 不再比对 epoch",
+    # 这两条原先锚在 `_verify_or_deny` 内联的 `tok_epoch != cur_epoch` 上。
+    # 2026-10-16 把 epoch 判据抽成 `_payload_epoch_ok`（因为 `_authenticated`
+    # 漏查、两边必须共用同一套判据）之后锚点就失配了 —— 变异被静默跳过，
+    # 覆盖悄悄没了。所以两条都改锚到 helper 里，并新增一条盯住「helper 恒真」。
+    ("MISC-01：epoch 判据恒为真（令牌不再与配置比对世代号）",
      AG,
-     '        if tok_epoch != cur_epoch:\n            return _deny("epoch_changed")',
-     '        if False:\n            return _deny("epoch_changed")'),
+     "    return tok_epoch == cur_epoch",
+     "    return True"),
 
     ("MISC-01：epoch 比对反过来（改密码后旧令牌反而能用）",
      AG,
-     '        if tok_epoch != cur_epoch:',
-     '        if tok_epoch == cur_epoch:'),
+     "    return tok_epoch == cur_epoch",
+     "    return tok_epoch != cur_epoch"),
 
     ("MISC-01：_token_epoch 恒返回 0",
      AG,
@@ -291,6 +295,35 @@ MUTATIONS = [
      AG,
      '    if authz.lower().startswith("bearer "):',
      '    if authz.startswith("bearer "):'),
+
+    # ── 两条鉴权路径的 epoch 判据必须一致（.224 实测的真洞）────────
+    #
+    # epoch 校验曾经只写在 _verify_or_deny 里，_authenticated 没查。
+    # 于是改密码后 auth_request 401 了、门户页面仍然 200 —— 用户看到
+    # 「密码都改了，页面还能打开」。这类「一条路径查了、另一条没查」的洞
+    # 只有在**两个端点都打**的时候才暴露得出来。
+
+    ("门户：_authenticated 不查 epoch（改密码后页面照样 200）",
+     AG,
+     "    return (bool(payload)\n"
+     "            and _payload_epoch_ok(payload, cfg)\n"
+     "            and not is_revoked(payload.get(\"jti\", \"\")))",
+     "    return bool(payload) and not is_revoked(payload.get(\"jti\", \"\"))"),
+
+    ("门户：_authenticated 退回只读 cookie（Bearer 客户端被无视）",
+     AG,
+     "    payload = parse_token(_extract_token())\n"
+     "    return (bool(payload)",
+     "    payload = parse_token(request.cookies.get(COOKIE_TOKEN, \"\"))\n"
+     "    return (bool(payload)"),
+
+    ("epoch 判据被摘掉（两条路径都不再作废旧令牌）",
+     AG,
+     "        if not _payload_epoch_ok(payload, cfg):\n"
+     "            return _deny(\"epoch_changed\" if \"ep\" in payload else \"epoch_missing\")",
+     "        if False:\n"
+     "            return _deny(\"epoch_changed\")"),
+
 ]
 
 # 等价变异：行为不变，不计漏过。

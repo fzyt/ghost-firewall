@@ -102,6 +102,10 @@ _salt = "aabbccdd"
 _dig = "0" * 64
 json.dump({"hash": f"pbkdf2_sha256$200000${_salt}${_dig}"}, open(PWD, "w"))
 
+# 先抓真身再打桩。第 3b 节要测「限流表不可用时的降级」，用桩测等于什么都没测：
+# 桩恒返回 (0,0)，降级分支一次都进不去，所有断言会一起变成假红。
+# 顺序写反过一次（先打桩再抓），抓到的就是桩自己。
+_MUTATE_RATELIMIT_REAL = ag._mutate_ratelimit
 ag._mutate_ratelimit = lambda ip, on_fail=False: (0, 0)
 ag._password_hash = lambda: f"pbkdf2_sha256$200000${_salt}${_dig}"
 ag._verify_password = lambda p, s: True
@@ -390,6 +394,127 @@ with ag.app.test_request_context("/auth/login", headers={}):
 
 ag.AUDIT_LOG = _audit_real_log
 ag.AUDIT_LOG_MAX_BYTES = _audit_real_max
+
+sec("3b. 限流表不可用时不得把登录整个搞挂（.224 实测的真 bug）")
+
+# .224 实测（跑真实用户流程时撞上）：/etc/nftables 是 drwxr-sr-x root:nftweb，
+# **组只有 r-x、没有写权限**。网关降权后以 uid 1000 运行，建不了限流表。
+# init 脚本以 root 预建了它，所以平时不暴露；但表一旦缺失，
+# `open(path, "a+")` 抛 PermissionError → 整个 auth_login 走 except Exception
+# → **HTTP 500**，而且 uid 1000 永远重建不出这张表 —— 没有任何自愈路径。
+# 移走表后连续两次登录都是 500，表也不会被重建。
+ag._mutate_ratelimit = _MUTATE_RATELIMIT_REAL   # 恢复第 1 节打的桩
+RL = ag.RATELIMIT_FILE
+RL_REAL = ag._RATELIMIT_DEGRADED["warned"]
+ag._RATELIMIT_DEGRADED["warned"] = False
+ag._RATE_FALLBACK.clear()
+try:
+    # 注入「表打不开」：目录存在但不可写，等价于 .224 上那张被移走的表
+    _open_real3 = ag.os.open
+
+    def _open_deny(path, flags, mode=0o777, **k):
+        if str(path) == RL:
+            raise PermissionError(13, "模拟限流表不可写（.224 上 uid 1000 建不了）")
+        return _open_real3(path, flags, mode, **k)
+
+    ag.os.open = _open_deny
+    try:
+        _locked, _fails = ag._mutate_ratelimit("10.0.0.1", on_fail=True)
+        check("限流表打不开时 _mutate_ratelimit 不抛", True)
+        check("降级时返回的失败计数仍然是 1（降级不等于不设防）",
+              _fails == 1, f"实际={_fails}")
+        # 内存版必须真的能锁：连续失败到阈值应当锁上
+        for _ in range(ag.RATE_LIMIT_MAX_FAILS):
+            ag._mutate_ratelimit("10.0.0.2", on_fail=True)
+        _locked2, _ = ag._mutate_ratelimit("10.0.0.2", on_fail=True)
+        check("**降级状态下暴力破解仍然会被锁**（内存版语义与落盘版一致）",
+              _locked2 is True, f"实际 locked={_locked2}")
+        # 别的 IP 不受影响
+        _locked3, _ = ag._mutate_ratelimit("10.0.0.3", on_fail=True)
+        check("降级状态下不同 IP 各自计数（不共用计数器）",
+              _locked3 is False, f"实际={_locked3}")
+        check("降级留下告警（只警告一次）", ag._RATELIMIT_DEGRADED["warned"] is True)
+    finally:
+        ag.os.open = _open_real3
+
+    # 关键：真实登录链路必须仍然放行 —— 不能是「helper 不抛但路由 500」
+    _rl_dir_saved = ag.RATELIMIT_FILE
+    ag.RATELIMIT_FILE = "/proc/definitely-not-writable/rl.json"
+    try:
+        _r = _call("/auth/login", "POST", {"password": "x"})
+        check("**限流表完全不可用时登录仍然 200**（不是 500 = 不是把所有人锁在门外）",
+              _r.status_code == 200, f"HTTP {_r.status_code}")
+
+        # ── 上锁判定必须走真实登录链路，不能只测 helper ──────────
+        #
+        # 第一版只直接调 `_mutate_ratelimit` 检查「降级时也会锁」，全绿。
+        # 部署到 .224 一实测，7 次连续错密码全是 401、一次 429 都没有 ——
+        # 因为 `auth_login` 的上锁判据是 `_is_locked()`，它**只读文件**，
+        # 压根不看降级时写在内存里的计数。计数照记、锁定判定恒 False，
+        # 暴力破解防护在降级期间被悄悄关掉。
+        #
+        # 这正是「只判 helper 不验证接线」：helper 测得再对，接线断了照样绿。
+        # 所以这里必须打真实的 /auth/login。
+        ag._RATE_FALLBACK.clear()
+        # 必须让密码校验真的失败：第 1 节把 _verify_password 桩成了恒真，
+        # 于是每次登录都「成功」并清空计数，序列全是 200 —— 限流根本没被触发。
+        # 限流计数的清空规则是「成功登录即清空」，所以成功路径永远测不出锁定。
+        _vp_real = ag._verify_password
+        ag._verify_password = lambda p, s: False
+        _codes = []
+        try:
+            for _ in range(ag.RATE_LIMIT_MAX_FAILS + 3):
+                _codes.append(_call("/auth/login", "POST",
+                                    {"password": "wrong"}).status_code)
+        finally:
+            ag._verify_password = _vp_real
+        check("**降级状态下真实登录链路仍然会限流（出现 429）**",
+              429 in _codes,
+              f"序列={_codes} —— 计数记了但没人查，暴力破解防护等于被关掉")
+        check("限流生效前一直是 401（密码错，不是 200）",
+              all(c == 401 for c in _codes[:ag.RATE_LIMIT_MAX_FAILS - 1]),
+              f"序列={_codes}")
+    finally:
+        ag.RATELIMIT_FILE = _rl_dir_saved
+
+    # 恢复正常：表可用时不该降级
+    ag._RATELIMIT_DEGRADED["warned"] = False
+    _l, _f = ag._mutate_ratelimit("10.0.0.9", on_fail=True)
+    check("表恢复正常后不再降级", ag._RATELIMIT_DEGRADED["warned"] is False)
+    check("恢复正常后失败计数照常累加", _f == 1, f"实际={_f}")
+finally:
+    ag.RATELIMIT_FILE = RL
+    ag._RATELIMIT_DEGRADED["warned"] = RL_REAL
+    ag._RATE_FALLBACK.clear()
+
+# 建表权限：必须 0600（不能是按 umask 建出的 0644）
+_rl_new = f"{SBX}/newrl.json"
+_seen_mode = []
+_open_real4 = ag.os.open
+
+
+def _open_spy4(path, flags, mode=0o777, **k):
+    if str(path) == _rl_new and (flags & os.O_CREAT):
+        _seen_mode.append(mode)
+    return _open_real4(path, flags, mode, **k)
+
+
+_rl_save = ag.RATELIMIT_FILE
+ag.RATELIMIT_FILE = _rl_new
+try:
+    ag.os.open = _open_spy4
+    try:
+        ag._mutate_ratelimit("10.0.0.4", on_fail=True)
+    finally:
+        ag.os.open = _open_real4
+    check("限流表用 os.open(..., 0600) **建**出来（创建即收紧）",
+          _seen_mode == [0o600],
+          f"实测传入 mode={_seen_mode} —— 用 open(a+) 会是 0777&~umask=0644")
+    _rlm = os.stat(_rl_new).st_mode & 0o777 if os.path.exists(_rl_new) else None
+    check("限流表最终权限 0600", _rlm == 0o600,
+          f"实际={'没生成' if _rlm is None else format(_rlm, 'o')}")
+finally:
+    ag.RATELIMIT_FILE = _rl_save
 
 print("\n" + "=" * 74)
 print(f"通过 {len(PASS)} / 失败 {len(FAIL)}")
