@@ -24,6 +24,35 @@ RULES_PATH = '/etc/nftables.d/99-custom-rules.nft'
 HTTPS_PORT = int(os.environ.get("NFTABLES_WEB_HTTPS_PORT", "5443"))
 
 
+def _apply_shared_secret_perms(path):
+    """给共享机密文件套上 root:nftweb 640 —— 与 init 脚本 prepare_nftweb_files 一致。
+
+    2026-10-16 .224 实测踩到：**只 chmod 600 会让网关彻底登不上。**
+    init 脚本把 nftables-web-secret / nftables-web-password 设成
+    `chgrp nftweb` + `640`，而 auth_gateway 降权后以 uid 1000 运行。
+    面板这边 _init_app_secret 和 _write_password_hash 写完都 chmod 600，
+    一改密码/一重算密钥就把组读权限抹掉，网关再也读不到密码文件 ——
+    表现为「面板登录正常，但网关登录一律 401 AUTH_FAILED」，
+    而且改回去也没用，必须手工 chgrp + chmod 才能恢复。
+
+    640 对「其他」仍然完全关闭，暴露面与 600 等价，只是把组读权限还回去。
+    """
+    try:
+        import grp
+        os.chown(path, -1, grp.getgrnam('nftweb').gr_gid)
+    except (KeyError, OSError, ImportError):
+        # 组不存在或无权改属主：退回 600，至少不把文件放得更开
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return
+    try:
+        os.chmod(path, 0o640)
+    except OSError:
+        pass
+
+
 def _init_app_secret():
     """读取或生成 Flask SECRET_KEY（持久化到 /etc/nftables/nftables-web-secret）"""
     try:
@@ -39,7 +68,7 @@ def _init_app_secret():
         os.makedirs(os.path.dirname(AUTH_SECRET_FILE), exist_ok=True)
         with open(AUTH_SECRET_FILE, 'w') as f:
             f.write(secret)
-        os.chmod(AUTH_SECRET_FILE, 0o600)
+        _apply_shared_secret_perms(AUTH_SECRET_FILE)
     except Exception:
         pass
     return secret
@@ -91,11 +120,59 @@ def _write_password_hash(hash_str: str):
     os.makedirs(os.path.dirname(AUTH_PASSWORD_FILE), exist_ok=True)
     with open(AUTH_PASSWORD_FILE, 'w') as f:
         json.dump({'hash': hash_str, 'created_at': datetime.datetime.now().isoformat()}, f)
-    os.chmod(AUTH_PASSWORD_FILE, 0o600)
+    # 必须是 640 + root:nftweb，不是 600 —— 见 _apply_shared_secret_perms 的说明。
+    # 这一行以前写的是 chmod 600，改一次密码就让网关再也读不到密码文件。
+    _apply_shared_secret_perms(AUTH_PASSWORD_FILE)
+
+
+def _current_token_epoch() -> int:
+    """当前令牌世代号。配置读不到时回落 0 —— 与「从未改过密码」同义。
+
+    这里刻意不做「读不到就拒绝」：配置读取失败本来就有独立的降级处理
+    （_config_corrupted 会把面板切进安全模式），会话检查再叠一层只会
+    变成因为一次瞬时读失败把所有人踢下线。真正的失效保证来自
+    auth_change_password 里那次成功的 epoch 递增。
+    """
+    try:
+        return int(load_config().get('auth_token_epoch', 0) or 0)
+    except (TypeError, ValueError, AttributeError):
+        return 0
+
+
+def _bump_token_epoch() -> int:
+    """把世代号 +1 并落盘，让所有旧会话立刻作废。
+
+    先递增再改密码：万一密码写入失败，代价是「大家被登出」（安全、
+    可重新登录），反过来则是「密码没改成功但旧会话还活着」—— 方向错了。
+    """
+    cfg = load_config()
+    bad, err = _config_corrupted()
+    if bad:
+        raise ConfigCorruptedError(_CORRUPT_REFUSAL.format(err=err, path=CONFIG_PATH))
+    try:
+        new_ep = int(cfg.get('auth_token_epoch', 0) or 0) + 1
+    except (TypeError, ValueError):
+        new_ep = 1
+    cfg['auth_token_epoch'] = new_ep
+    save_config(cfg)
+    return new_ep
 
 
 def _is_authenticated() -> bool:
     return session.get('authenticated') is True
+
+
+def _session_epoch_ok() -> bool:
+    """面板会话绑定的世代号是否仍然有效。
+
+    改密码后所有设备的旧面板会话都要作废 —— 只 session.clear() 的话
+    只有当前浏览器被清，其它设备照旧能进。
+    """
+    try:
+        stamped = int(session.get('auth_epoch', 0) or 0)
+    except (TypeError, ValueError):
+        stamped = -1
+    return stamped == _current_token_epoch()
 
 
 # 登录失败计数（IP -> [timestamp, ...]），用于限流
@@ -451,6 +528,12 @@ def _require_auth():
 
     # 已登录：检查 idle 超时
     if _is_authenticated():
+        # 世代号对不上 = 改过密码之后旧会话还没失效。清掉并按未登录处理，
+        # 与 AUTH_EXPIRED 同一个出口，避免下游再多写一遍分支。
+        if not _session_epoch_ok():
+            session.clear()
+            return jsonify({'success': False, 'code': 'AUTH_EXPIRED',
+                            'message': '密码已修改，请重新登录'}), 401
         last_active = session.get('last_active', 0)
         if time.time() - last_active > AUTH_IDLE_TIMEOUT:
             session.clear()
@@ -558,6 +641,18 @@ DEFAULT_CONFIG = {
     "auth_session_timeout": 1800,
     # 绝对上限秒数：无论多活跃，到点强制重登。0 = 不启用。
     "auth_absolute_timeout": 0,
+    # 令牌世代号。每改一次密码就 +1，之前签发的**所有**会话一律作废 ——
+    # 面板自己的 session 和网关的 gw_token JWT 都读这个值。
+    #
+    # 为什么需要：登出只吊销自己那一个 jti；而改密码这个动作本该让所有设备
+    # 上的旧会话一起失效。原来的 auth_change_password 只做了 session.clear()
+    # （那只清当前浏览器自己的面板会话），网关 JWT 完全没动 ——
+    # 改完密码，所有设备上用旧密码拿到的令牌继续有效，滑动续期还意味着
+    # 只要一直用就可能永不过期。面板会话（session['authenticated']=True）
+    # 有完全一样的问题。
+    #
+    # 不要暴露成可由用户直接编辑的配置项：它是安全状态，不是设置项。
+    "auth_token_epoch": 0,
     # LAN 来源是否免认证。True = 认证只保护公网这一面（默认，符合「内网可信」）。
     "auth_lan_bypass": True,
     # ── v0.8.1 新增：LuCI 80/443 开关 ─────────────────────────────────
@@ -6174,6 +6269,11 @@ def _generate_gateway_nginx_conf(config):
         L.append("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
         L.append("        proxy_set_header X-Original-URI $request_uri;")
         L.append("        proxy_set_header Host $host;")
+        # TLS 在 nginx 这里终结，转给 Flask 的已经是明文 HTTP，
+        # 所以 request.is_secure 恒为 False。没有这一行，
+        # auth_gateway 的 after_request 判定不出 HTTPS，HSTS 永远不会下发
+        #（.224 线上实测踩过：其它安全头都齐了，唯独缺 HSTS）。
+        L.append("        proxy_set_header X-Forwarded-Proto $scheme;")
         L.append("    }")
         L.append("")
 
@@ -6183,6 +6283,7 @@ def _generate_gateway_nginx_conf(config):
     L.append(f"        client_max_body_size {GATEWAY_AUTH_MAX_BODY};")
     L.append("        proxy_set_header X-Real-IP $remote_addr;")
     L.append("        proxy_set_header Host $host;")
+    L.append("        proxy_set_header X-Forwarded-Proto $scheme;")
     L.append("    }")
     L.append("")
 
@@ -7472,10 +7573,12 @@ def rp_set_default_cert(cert_id):
 @app.route('/api/auth/status', methods=['GET'])
 def auth_status():
     """返回当前登录状态和系统是否已初始化密码"""
+    # /api/auth/* 是 before_request 的豁免路径，世代号检查不会替我们跑，
+    # 这里必须自己判 —— 否则改过密码之后前端还会拿到 authenticated=true。
     return jsonify({
         'success': True,
         'data': {
-            'authenticated': _is_authenticated(),
+            'authenticated': _is_authenticated() and _session_epoch_ok(),
             'password_set': _password_set(),
         }
     })
@@ -7510,6 +7613,8 @@ def auth_login():
     session['authenticated'] = True
     session.permanent = True
     session['last_active'] = time.time()
+    # 盖上当时的世代号：之后改密码会让这个值对不上，本会话自动失效。
+    session['auth_epoch'] = _current_token_epoch()
     return jsonify({'success': True, 'data': {'message': '登录成功'}})
 
 
@@ -7566,6 +7671,7 @@ def auth_setup():
     session['authenticated'] = True
     session.permanent = True
     session['last_active'] = time.time()
+    session['auth_epoch'] = _current_token_epoch()
     return jsonify({'success': True, 'data': {'message': '密码设置成功，已自动登录'}})
 
 
@@ -7592,14 +7698,29 @@ def auth_change_password():
         # 旧密码错误也记录失败（防暴力枚举）
         _record_login_failure(client_ip)
         return jsonify({'success': False, 'message': '旧密码错误'}), 401
+    # 先递增世代号，**再**写密码。顺序不能反：
+    #   先 epoch 后密码 → 密码写入失败时，代价只是大家被登出（安全、可重登）
+    #   先密码后 epoch → epoch 写入失败时，密码已经变了但旧会话全都还活着，
+    #                    用户以为改成功了，实际没有 —— 方向完全错了
+    try:
+        new_epoch = _bump_token_epoch()
+    except Exception as e:
+        return jsonify({'success': False,
+                        'message': f'无法作废旧会话（{type(e).__name__}），密码未修改'}), 500
+
     _write_password_hash(_hash_password(new_pw))
     _clear_login_failures(client_ip)  # 修改成功清掉该 IP 的失败记录
-    # 改完密码必须清掉当前会话：session 里只标记了 authenticated=True，
-    # 不清的话改密码后所有设备上的旧会话仍然有效，等于没改。
+    # 当前浏览器自己的面板会话也要清掉。
+    #
+    # 但**光靠 session.clear() 是不够的** —— 它只清当前这个浏览器，其它设备
+    # 上的面板会话和所有网关 gw_token JWT 都照样有效。真正让它们一起失效的
+    # 是上面那次 epoch 递增：面板会话比对 session['auth_epoch']，
+    # 网关令牌比对 payload 里的 ep 字段，对不上就拒。
     session.clear()
     return jsonify({'success': True, 'data': {
-        'message': '密码已修改，请重新登录',
+        'message': '密码已修改，所有设备上的旧会话已失效，请重新登录',
         'reauth': True,
+        'auth_token_epoch': new_epoch,
     }})
 
 

@@ -20,6 +20,33 @@ PORTAL = os.path.join(ROOT, 'backend', 'static', 'portal.js')
 LOGIN = os.path.join(ROOT, 'backend', 'static', 'login.js')
 TEST = os.path.join(ROOT, 'tests', 'test_security_fixes.py')
 
+# SEC-3 变体：把「吊销旧令牌」整块挪到 issue_token 之后。
+#
+# 这里刻意用正则按**结构**锚定（从 `if _old:` 一直吃到 `did = device_id_from_request()`
+# 之前的空行），而不是把整段源码逐字写死。写死的话，在这两行之间加一行注释就会
+# 让替换悄悄失配 —— 变异脚本会打印「变异未生效」并跳过，而跳过在肉眼扫一遍输出
+# 时非常容易看成「通过」。
+_SEC3_BLOCK_RE = re.compile(
+    r'(    _old = parse_token\(request\.cookies\.get\(COOKIE_TOKEN, ""\)\)\n'
+    r'    if _old:\n.*?\n\n)'
+    r'(?=    did = device_id_from_request\(\))',
+    re.S)
+_SEC3_ISSUE_ANCHOR = '    token = issue_token("kirito", did, ttl, abs_deadline)\n'
+
+
+def _mut_sec3_move_revocation_after_issue(s):
+    m = _SEC3_BLOCK_RE.search(s)
+    if not m:
+        return s
+    block = m.group(1)
+    stripped = s[:m.start()] + s[m.end():]
+    j = stripped.find(_SEC3_ISSUE_ANCHOR)
+    if j < 0:
+        return s
+    k = j + len(_SEC3_ISSUE_ANCHOR)
+    return stripped[:k] + block + stripped[k:]
+
+
 MUTATIONS = [
     ('SEC-1 DNS 校验改回「不检查」',
      APP,
@@ -54,35 +81,15 @@ MUTATIONS = [
 
     ('SEC-3 登录时不吊销旧令牌',
      GW,
-     lambda s: s.replace(
-         """    _old = parse_token(request.cookies.get(COOKIE_TOKEN, ""))
-    if _old:
-        revoke_jti(_old.get("jti", ""), int(_old.get("exp", 0)))
-
-    did = device_id_from_request()""",
-         """    did = device_id_from_request()"""),
+     lambda s: re.sub(
+         r'    _old = parse_token\(request\.cookies\.get\(COOKIE_TOKEN, ""\)\)\n'
+         r'    if _old:\n.*?\n\n(?=    did = device_id_from_request\(\))',
+         '', s, count=1, flags=re.S),
      '重新登录后旧令牌仍然有效'),
 
     ('SEC-3 吊销挪到签发之后（顺序反了）',
      GW,
-     lambda s: s.replace(
-         """    _old = parse_token(request.cookies.get(COOKIE_TOKEN, ""))
-    if _old:
-        revoke_jti(_old.get("jti", ""), int(_old.get("exp", 0)))
-
-    did = device_id_from_request()
-    ttl = _session_ttl(cfg)
-    abs_to = _absolute_ttl(cfg)
-    abs_deadline = int(time.time()) + abs_to if abs_to else 0
-    token = issue_token("kirito", did, ttl, abs_deadline)""",
-         """    did = device_id_from_request()
-    ttl = _session_ttl(cfg)
-    abs_to = _absolute_ttl(cfg)
-    abs_deadline = int(time.time()) + abs_to if abs_to else 0
-    token = issue_token("kirito", did, ttl, abs_deadline)
-    _old = parse_token(request.cookies.get(COOKIE_TOKEN, ""))
-    if _old:
-        revoke_jti(_old.get("jti", ""), int(_old.get("exp", 0)))"""),
+     _mut_sec3_move_revocation_after_issue,
      '新令牌已签发才吊销旧的'),
 
     ('SEC-4 /auth/status 限流阈值放到无穷大',

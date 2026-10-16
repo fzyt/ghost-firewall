@@ -154,7 +154,10 @@ check('吊销发生在 issue_token 之前（顺序不能反）',
 # 行为验证：用打桩的 issue_token / revoke_jti 跑一遍登录
 calls = []
 gw.issue_token = lambda *a, **k: calls.append(('issue', a)) or 'faketoken'
-gw.revoke_jti = lambda jti, exp: calls.append(('revoke', jti))
+# 桩必须返回 True —— revoke_jti 现在返回「是否真的落盘了」，login/verify 会
+# 用它决定要不要审计。桩返回 None（append 的返回值）会被当成「吊销失败」，
+# 让被测代码走进一条线上永远不会发生的分支。
+gw.revoke_jti = lambda jti, exp: (calls.append(('revoke', jti)), True)[1]
 gw._password_hash = lambda: 'pbkdf2_sha256$1000$aa$bb'
 gw._verify_password = lambda p, s: True
 gw._mutate_ratelimit = lambda ip, on_fail: (0, 0)
@@ -170,6 +173,8 @@ class _Req:
     # （2026-10-16 加的请求体上限防线）。这个桩对象必须补上，否则
     # 'content_length' 缺属性会把整份测试顶崩 —— 基线红着跑等于没有测试。
     content_length = 26
+    # auth_gateway 的 @app.after_request 会读 is_secure 来决定要不要发 HSTS。
+    is_secure = False
     def __init__(self, cookies=None):
         self.cookies = cookies if cookies is not None else {}
     def get_json(self, silent=True):

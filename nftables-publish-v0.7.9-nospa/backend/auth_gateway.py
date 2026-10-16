@@ -181,6 +181,33 @@ app.config["JSON_AS_ASCII"] = False
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024
 
 
+@app.after_request
+def _harden_response(resp):
+    """补齐各端点漏掉的安全响应头。
+
+    2026-10-16：此前只有静态资源、门户页、登录页三处**逐个手写**了
+    Cache-Control / nosniff / CSP，而 /auth/status、/auth/login(POST)、
+    /auth/logout、/auth/portal 这些同样带会话信息的端点一个都没有 ——
+    登录/登出的响应可能被 bfcache 或中间代理缓存下来。
+
+    这里用 setdefault 兜底：已经显式设过的（静态资源的 no-cache、
+    HTML 页的 CSP）保持原值不被覆盖。
+
+    为什么加 HSTS：8443 是 HTTPS-only（nginx 终结 TLS），缺 HSTS 时
+    首访降级到 http:// 不会被浏览器记住。max-age 取一年，不带
+    includeSubDomains —— 网关可能和路由器上其它服务共用域名，
+    把子域一起钉死会误伤它们。
+    """
+    resp.headers.setdefault("Cache-Control", "no-store")
+    resp.headers.setdefault("Pragma", "no-cache")
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    if request.is_secure or request.headers.get("X-Forwarded-Proto") == "https":
+        resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+    return resp
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 密钥派生
 # ══════════════════════════════════════════════════════════════════════
@@ -314,6 +341,21 @@ def _b64d(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + pad)
 
 
+def _token_epoch() -> int:
+    """当前令牌世代号。改一次密码就 +1，之前签发的令牌全部作废。
+
+    为什么需要它：登出只吊销**自己那一个** jti，而改密码这个动作
+    本该让所有设备上的旧会话一起失效。面板侧 auth_change_password 原来
+    只做了 session.clear()（那只清当前浏览器自己的面板会话），网关 JWT
+    完全没动 —— 改完密码，所有设备上用旧密码拿到的 gw_token 继续有效，
+    而且滑动续期意味着只要一直用，它可能永不过期。
+    """
+    try:
+        return int(load_gateway_config().get("auth_token_epoch", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def issue_token(user: str, device_id: str, ttl: int, abs_deadline: int = 0) -> str:
     now = int(time.time())
     exp = now + ttl
@@ -325,6 +367,9 @@ def issue_token(user: str, device_id: str, ttl: int, abs_deadline: int = 0) -> s
         "iat": now,
         "exp": exp,
         "jti": secrets.token_urlsafe(12),   # 每次续期换新，杜绝旧 token 重放
+        # 世代号：缺这个字段的旧令牌按 0 处理，所以第一次改密码
+        # （0 → 1）就能把它们一次性清掉，不需要额外的兼容期。
+        "ep": _token_epoch(),
     }
     body = _b64e(json.dumps(payload, separators=(",", ":")).encode())
     sig = _b64e(hmac.new(_token_key(), body.encode(), hashlib.sha256).digest())
@@ -359,50 +404,128 @@ def _revocation_path() -> str:
     return os.path.splitext(RATELIMIT_FILE)[0] + "-revoked.json"
 
 
-def load_revoked() -> dict:
+# 进程内的 last-known-good 吊销表。
+#
+# 吊销表落盘且可能被写坏（写一半、磁盘满、权限丢）。一旦读不出来就必须有个
+# 东西可退 —— 否则只能在「全部放行」和「全部拒绝」之间二选一。
+_REVOKED_LKG = None
+
+
+def load_revoked():
+    """读吊销表。
+
+    返回 None 表示「读不到、判不出来」—— 调用方**必须**按 fail-closed 处理。
+
+    2026-10-16：这里原来是
+        except (OSError, json.JSONDecodeError):
+            return {}
+    空字典会让 is_revoked 对所有 jti 返回 False —— 也就是**之前显式登出
+    吊销掉的令牌全部复活**。文件一次写坏就等于把吊销机制整个关掉，而且是
+    静默的。这和项目里「限流表损坏 fail-open、恢复链 fail-closed」的取舍
+    相反：限流表坏了顶多多试几次，吊销表坏了是已失效的凭据重新可用。
+    """
+    global _REVOKED_LKG
     try:
         with open(_revocation_path(), "r") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
+        if not isinstance(data, dict):
+            raise ValueError("吊销表不是 JSON 对象")
+    except FileNotFoundError:
+        # 文件不存在有两种完全不同的含义，必须分开：
+        #   · 进程启动至今**一次都没成功读到过** → 确实从未吊销过，正常初始状态
+        #   · 刚才还读得好好的，现在没了         → 故障（被删/被清/挂载掉了）
+        # 混为一谈会让「把吊销表删掉」这个动作**主动复活所有已吊销的令牌** ——
+        # .224 线上实测踩到过：unlink 掉吊销文件后，刚才登出吊销掉的
+        # token 立刻又能用了。所以第二种必须继续用 last-known-good。
+        if _REVOKED_LKG is None:
+            _REVOKED_LKG = {}
+            return {}
+        return _REVOKED_LKG
+    except (OSError, json.JSONDecodeError, ValueError):
+        # 退到 last-known-good；连它都没有（进程刚起、文件就是坏的），
+        # 返回 None 交给 is_revoked 判为已吊销。
+        if _REVOKED_LKG is None:
+            return None
+        return _REVOKED_LKG
+    _REVOKED_LKG = data
+    return data
 
 
-def revoke_jti(jti: str, exp: int):
-    """吊销一个 jti。exp 已过的条目不写盘，避免表无限增长。"""
+def revoke_jti(jti: str, exp: int) -> bool:
+    """吊销一个 jti。返回**是否真的落盘了**。exp 已过的不写盘，避免表无限增长。
+
+    返回值不是装饰性的：吊销没落盘 = 那个令牌在服务端还活着。调用方必须
+    据此决定是明确失败（logout）还是只留审计（login），不能静默当成功。
+
+    2026-10-16 .224 实测踩到两个坑，这里一并改掉：
+
+    1. 原来结尾是裸的 `os.chmod(path, 0o600)`。属主一旦被外部改动（我自己的
+       验证脚本 chown 成 root），chmod 抛 PermissionError，把**已经 fsync
+       落盘、吊销早已成立**的 logout 打成 500。收紧权限失败不等于吊销失败。
+    2. 原来用 `open(path, "a+")` 先按 umask 建文件（644）再 chmod，中间有一个
+       世界可读窗口。改成 os.open(..., 0o600) 在创建那一刻就是 0600。
+
+    写入失败仍然必须失败 —— 那是「登出看着成功了，其实令牌还活着」。
+    """
     if not jti or exp <= int(time.time()):
-        return
+        # 令牌本来就已过期，登不登销都不影响可用性
+        return True
     path = _revocation_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "a+") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            f.seek(0)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # O_CREAT 的 mode 只在**新建**时生效；已存在的文件保持原权限，
+        # 交给下面的收紧逻辑处理。
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as e:
+        # 典型触发：/etc/nftables 变成只读挂载，或吊销表被 chown 成了别人
+        audit("revocation_open_failed", error=type(e).__name__)
+        return False
+    try:
+        with os.fdopen(fd, "r+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
             try:
-                data = json.load(f)
-                if not isinstance(data, dict):
+                f.seek(0)
+                try:
+                    data = json.load(f)
+                    if not isinstance(data, dict):
+                        data = {}
+                except (json.JSONDecodeError, ValueError):
                     data = {}
-            except (json.JSONDecodeError, ValueError):
-                data = {}
-            data[jti] = exp
-            # 清掉已过期的，防止文件无限增长
-            now = int(time.time())
-            data = {k: v for k, v in data.items()
-                    if isinstance(v, int) and v > now}
-            f.seek(0)
-            f.truncate()
-            json.dump(data, f)
-            f.flush()
-            os.fsync(f.fileno())
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
-    os.chmod(path, 0o600)
+                data[jti] = exp
+                # 清掉已过期的，防止文件无限增长
+                now = int(time.time())
+                data = {k: v for k, v in data.items()
+                        if isinstance(v, int) and v > now}
+                f.seek(0)
+                f.truncate()
+                json.dump(data, f)
+                f.flush()
+                os.fsync(f.fileno())
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+    except (OSError, ValueError, TypeError) as e:
+        audit("revocation_write_failed", error=type(e).__name__)
+        return False
+    # 数据已 fsync 落盘、吊销成立，这里只负责把权限收回来。已经紧的**不动** ——
+    # 属主不对时 chmod 本来就大概率没权，白白抛一次把 logout 打成 500。
+    try:
+        if (os.stat(path).st_mode & 0o777) & 0o077:
+            os.chmod(path, 0o600)
+    except OSError:
+        audit("revocation_chmod_failed")
+    return True
 
 
 def is_revoked(jti: str) -> bool:
     if not jti:
         return False
     data = load_revoked()
+    if data is None:
+        # 吊销表读不了、又没有 last-known-good 可退：判不出来就当已吊销。
+        # 安全关键路径必须 fail-closed —— 代价是这次所有人被拒，
+        # 但「已登出的令牌复活」远比「临时登不出」严重。
+        audit("revocation_unreadable")
+        return True
     exp = data.get(jti)
     return isinstance(exp, int) and exp > int(time.time())
 
@@ -851,7 +974,18 @@ def auth_login():
         password = ""
 
     stored = _password_hash()
-    ok = bool(password) and bool(stored) and _verify_password(password, stored)
+    # 这里**不能**写成 `bool(stored) and _verify_password(password, stored)`。
+    #
+    # 2026-10-16 实测：stored 为空（密码文件缺失/不可读）时，`and` 会短路，
+    # _verify_password 一次都不跑 —— 0.001ms；而正常路径要跑 PBKDF2，
+    # 约 95ms。差 5 个数量级，攻击者发一个 {"password":"x"} 就能靠响应
+    # 时间枚举出「这台机器到底配没配密码」。
+    #
+    # _verify_password 内部本来就有 dummy 路径（stored 为空/畸形时照样真跑
+    # 一次 PBKDF2，见它自己的注释），但前提是它得被调用到。先算再判，
+    # 短路只留在最后的布尔表达式里。
+    _ok = _verify_password(password, stored)
+    ok = bool(password) and bool(stored) and _ok
 
     if not ok:
         _, fails = _mutate_ratelimit(ip, on_fail=True)
@@ -870,7 +1004,12 @@ def auth_login():
     # 实测：重新登录后旧令牌访问 /auth/portal 仍返回 200，剩余有效期 1799 秒。
     _old = parse_token(request.cookies.get(COOKIE_TOKEN, ""))
     if _old:
-        revoke_jti(_old.get("jti", ""), int(_old.get("exp", 0)))
+        # 旧令牌吊销失败**不能**拦住本次登录。吊销表一旦写不进去（只读挂载 /
+        # 属主被改），在这里抛异常等于「谁都登不进」的自伤式拒绝服务 ——
+        # 旧令牌多活一会儿的代价，远小于所有人被锁在门外。这里放行但留审计。
+        if not revoke_jti(_old.get("jti", ""), int(_old.get("exp", 0))):
+            audit("login_old_token_not_revoked",
+                  exp=int(_old.get("exp", 0)))
 
     did = device_id_from_request()
     ttl = _session_ttl(cfg)
@@ -886,15 +1025,46 @@ def auth_login():
     return resp
 
 
+def _extract_token() -> str:
+    """从 cookie 或 Authorization 头里取原始令牌。
+
+    **两个入口必须用同一个函数**，否则会出这种不对称：
+    `_verify_or_deny` 认 Bearer（给脚本/客户端用），而 auth_logout 只读
+    cookie —— 于是 Bearer 客户端调 logout 拿到 HTTP 200，看着像登出了，
+    实际 revoke_jti 根本没被调用（payload 为空），令牌照样有效到过期；
+    滑动续期下甚至可能永不过期。.224 实测就是这样复现的。
+    """
+    raw = request.cookies.get(COOKIE_TOKEN, "") or ""
+    if raw:
+        return raw
+    authz = (request.headers.get("Authorization") or "").strip()
+    if authz.lower().startswith("bearer "):
+        return authz[7:].strip()
+    return ""
+
+
 @app.route("/auth/logout", methods=["POST"])
 def auth_logout():
-    payload = parse_token(request.cookies.get(COOKIE_TOKEN, ""))
+    payload = parse_token(_extract_token())
+    ok = True
     if payload:
-        revoke_jti(payload.get("jti", ""), int(payload.get("exp", 0)))
-    audit("logout", device=device_id_from_request(), fp=fingerprint())
-    resp = jsonify({"success": True})
+        ok = revoke_jti(payload.get("jti", ""), int(payload.get("exp", 0)))
+    audit("logout", device=device_id_from_request(), fp=fingerprint(),
+          revocation=("ok" if ok else "FAILED"))
+    if ok:
+        resp = jsonify({"success": True})
+    else:
+        # 吊销没落盘 = 这个令牌在服务端仍然有效。**必须**明确失败：
+        # 清掉 cookie 就回 200 的话，用户以为登出了，令牌其实还能用满整个 TTL，
+        # 而滑动续期下可能永不过期 —— 这正是 AUTH-02 那类问题的复刻。
+        # cookie 仍然要清：本机的凭据先撤掉，别等用户重登。
+        audit("logout_revocation_failed")
+        resp = jsonify({
+            "success": False, "code": "REVOCATION_FAILED",
+            "message": "吊销令牌落盘失败，本机凭据已清除但令牌在有效期内仍可能可用；"
+                       "请改密码使全部令牌立即失效"})
     _set_cookies(resp, "", "", clear=True)
-    return resp
+    return (resp, 200) if ok else (resp, 500)
 
 
 def _verify_or_deny():
@@ -913,15 +1083,26 @@ def _verify_or_deny():
                 "X-Auth-Via": "lan-bypass",
             })
 
-        # Bearer 优先（给脚本/客户端用）
-        raw = request.cookies.get(COOKIE_TOKEN, "")
-        authz = (request.headers.get("Authorization") or "").strip()
-        if not raw and authz.lower().startswith("bearer "):
-            raw = authz[7:].strip()
-
+        # 凭据：_extract_token 先看 cookie、再看 Authorization: Bearer。
+        # （这行原来写的是「Bearer 优先」——2026-10-16 把 logout 也统一到
+        # _extract_token 之后，优先级就一直是 cookie 在前，注释却没跟上。
+        # 实际影响：同时带两样时 cookie 胜出，脚本客户端若机器上还留着
+        # 浏览器 cookie，Bearer 会被无视而拿到 401。不是安全洞，是可用性坑。
+        # 真要改成 Bearer 优先，是一次行为变更，不是这次顺手能带上的。）
+        raw = _extract_token()
         payload = parse_token(raw)
         if not payload:
             return _deny("no_token")
+        # 世代号对不上 = 改过密码（或配置被重置）之后签的旧令牌，一律拒。
+        # 放在 is_revoked 之后：吊销表可能读不了（fail-closed 全体拒绝），
+        # 先走它能让这类故障得到更准的 deny 原因。
+        try:
+            tok_epoch = int(payload.get("ep", 0) or 0)
+        except (TypeError, ValueError):
+            return _deny("epoch_malformed")
+        cur_epoch = int(cfg.get("auth_token_epoch", 0) or 0)
+        if tok_epoch != cur_epoch:
+            return _deny("epoch_changed")
         if is_revoked(payload.get("jti", "")):
             return _deny("revoked")
 
@@ -949,7 +1130,15 @@ def _verify_or_deny():
             # 攻击者那张是更早的、jti 从未被吊销的旧 token。
             # 结果是「登出」这个本该能一键切断的急停开关对已泄露凭据无效。
             # （Shannon 渗透测试 finding，实测确认调用链里确实缺这一句。）
-            revoke_jti(payload.get("jti", ""), int(payload.get("exp", 0)))
+            #
+            # 吊销失败不拦续期。注意这只针对「表**可读但不可写**」这一种故障
+            # （目录变只读、属主被改）。「表不可读」时 is_revoked 的 fail-closed
+            # 早就把请求拒了，压根走不到这里 —— 那是 MISC-02 刻意选的取舍。
+            # 这里抛异常同样糟：会被下面的 except Exception 接住变成 _deny()，
+            # 于是每一次需要续期的请求都 401，比「旧 token 多活一会儿」严重得多。
+            if not revoke_jti(payload.get("jti", ""), int(payload.get("exp", 0))):
+                audit("refresh_old_token_not_revoked",
+                      exp=int(payload.get("exp", 0)), device=payload.get("dev"))
             new_tok = issue_token(
                 str(payload.get("sub", "kirito")),
                 str(payload.get("dev", "")),
