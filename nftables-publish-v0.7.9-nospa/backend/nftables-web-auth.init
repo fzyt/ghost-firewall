@@ -154,20 +154,42 @@ start() {
         AUTH_DROP_UID="$NFTWEB_UID" AUTH_DROP_GID="$NFTWEB_GID" AUTH_DROP_USER="$NFTWEB_USER" \
         python3 auth_gateway.py >>"$AUTH_LOG" 2>&1 &
     echo $! > "$PID_FILE"
-    sleep 1
 
-    if kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-        # 进程活着不等于降权成功。auth_gateway.py 里降权失败是直接 exit 的，
-        # 这里再核一次实际身份 —— 万一将来有人改坏了那段代码，这里是最后一道闸。
-        local real_uid
-        real_uid=$(awk '/^Uid:/ {print $2}' "/proc/$(cat "$PID_FILE")/status" 2>/dev/null)
-        if [ "$real_uid" = "0" ]; then
-            echo "nftables-web-auth: 进程起来了但 uid 仍是 0，降权未生效 —— 停掉它" >&2
-            kill "$(cat "$PID_FILE")" 2>/dev/null
+    # 进程活着不等于降权成功。auth_gateway.py 里降权失败是直接 exit 的，
+    # 这里再核一次实际身份 —— 万一将来有人改坏了那段代码，这里是最后一道闸。
+    #
+    # 但必须**轮询等待**，不能固定 sleep 一次就下结论。
+    #
+    # 2026-10-16 .224 实测「进程启动 → 执行到 _drop_privileges()」的耗时：
+    #     空闲            0.372 ~ 0.390s
+    #     4 进程满载      0.790 ~ 0.857s   （距阈值只剩 0.14s 余量）
+    #     8 进程满载      1.443 ~ 1.636s   （稳定越过 1s 阈值）
+    # 原来的 `sleep 1` + 单次判定，在机器一忙时就会把完全健康的新进程当成
+    # 「降权没生效」杀掉。实测踩中过：刚 OOM 完、tmpfs 还在回写时执行
+    # restart，网关彻底起不来，只能人工处理；同一条命令在空闲时完全正常。
+    # 守卫本身是对的（它防的确实是降权失败），错的只是等待方式。
+    local pid real_uid waited=0
+    pid=$(cat "$PID_FILE")
+    while [ "$waited" -lt 150 ]; do
+        kill -0 "$pid" 2>/dev/null || break          # 进程自己退了，交给下面的失败分支
+        real_uid=$(awk '/^Uid:/ {print $2}' "/proc/$pid/status" 2>/dev/null)
+        # 非空且非 0 才算降权完成；空说明 /proc 还没建好，继续等
+        if [ -n "$real_uid" ] && [ "$real_uid" != "0" ]; then
+            break
+        fi
+        sleep 0.1 2>/dev/null || sleep 1              # BusyBox 老版本不支持小数 sleep
+        waited=$((waited + 1))
+    done
+
+    if kill -0 "$pid" 2>/dev/null; then
+        real_uid=$(awk '/^Uid:/ {print $2}' "/proc/$pid/status" 2>/dev/null)
+        if [ "$real_uid" = "0" ] || [ -z "$real_uid" ]; then
+            echo "nftables-web-auth: 等待 ${waited}0ms 后 uid 仍为 ${real_uid:-未知}，降权未生效 —— 停掉它" >&2
+            kill "$pid" 2>/dev/null
             rm -f "$PID_FILE"
             return 1
         fi
-        echo "Started nftables-web-auth (PID $(cat "$PID_FILE"), uid $real_uid)"
+        echo "Started nftables-web-auth (PID $pid, uid $real_uid)"
         # 认证服务必须能起来，否则 nginx 的 auth_request 会全部 502，
         # 公网入口等于全断。这里失败要说清楚，不要静默。
         return 0

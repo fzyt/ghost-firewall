@@ -166,6 +166,10 @@ gw.fingerprint = lambda: ''
 class _Req:
     remote_addr = '192.168.100.249'
     headers = {}
+    # auth_login 在读 body 之前会看 request.content_length 来判超限
+    # （2026-10-16 加的请求体上限防线）。这个桩对象必须补上，否则
+    # 'content_length' 缺属性会把整份测试顶崩 —— 基线红着跑等于没有测试。
+    content_length = 26
     def __init__(self, cookies=None):
         self.cookies = cookies if cookies is not None else {}
     def get_json(self, silent=True):

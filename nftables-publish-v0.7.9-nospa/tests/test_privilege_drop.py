@@ -308,9 +308,22 @@ check('密码/密钥用 640 组可读（对「其他」仍然全关）',
       '两个只读文件走同一循环统一 chmod 640')
 
 # 启动后复核：这是最后一道闸，防止将来 _drop_privileges 被改坏
+#
+# 2026-10-16：原来这里只判 `'降权未生效' in _init`（全文任意位置出现即可）。
+# 那天下面那个守卫改成了轮询 + 更长的报错文案，**注释里也写了「降权未生效」
+# 这四个字**，于是把真正的 kill + 报错整段删掉之后，这条断言照样通过 ——
+# mutation_check_privilege.py 的 M8 抓到过这个假测试（18/19）。
+#
+# 改成按结构检查：定位到守卫所在的代码块，要求 kill 与报错都在同一块里，
+# 注释里出现同样的字样不再算数。
+_g_l = _init.index('python3 auth_gateway.py')
+_g_r = _init.index('\n}\n', _g_l)          # 只截 start() 函数体，别把 stop() 圈进来
+_g = _init[_g_l:_g_r]
 check('启动后复核实际 uid，为 0 则杀掉并报错',
-      re.search(r'real_uid.*\n.*=.*0.*then', _init, re.S) is not None
-      and '降权未生效' in _init)
+      re.search(r'if\s+\[\s*"\$real_uid"\s*=\s*"0"\s*\]', _g) is not None
+      and re.search(r'kill\s+"\$pid"', _g) is not None
+      and '降权未生效' in _g,
+      '守卫块里没找到 uid 判断 / kill / 报错三者')
 
 # ─────────────────────────────────────────────────────────────
 sec('PD-9  降权后仍然具备正常工作所需的权限（不能降过头）')

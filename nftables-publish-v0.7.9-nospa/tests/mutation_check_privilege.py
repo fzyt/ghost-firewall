@@ -122,9 +122,9 @@ MUTATIONS = [
              'AUTH_DROP_USER="$NFTWEB_USER" \\\n', '')]),
 
     ('M8  init 去掉启动后的 uid 复核（最后一道闸被拆）',
-     INIT, [('''        if [ "$real_uid" = "0" ]; then
-            echo "nftables-web-auth: 进程起来了但 uid 仍是 0，降权未生效 —— 停掉它" >&2
-            kill "$(cat "$PID_FILE")" 2>/dev/null
+     INIT, [('''        if [ "$real_uid" = "0" ] || [ -z "$real_uid" ]; then
+            echo "nftables-web-auth: 等待 ${waited}0ms 后 uid 仍为 ${real_uid:-未知}，降权未生效 —— 停掉它" >&2
+            kill "$pid" 2>/dev/null
             rm -f "$PID_FILE"
             return 1
         fi''',

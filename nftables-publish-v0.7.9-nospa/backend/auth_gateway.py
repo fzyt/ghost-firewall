@@ -45,6 +45,7 @@ import time
 import fcntl
 
 from flask import (Flask, Response, jsonify, request, send_from_directory)
+from werkzeug.exceptions import RequestEntityTooLarge
 
 # ══════════════════════════════════════════════════════════════════════
 # 路径与常量（全部可用环境变量覆盖，便于沙箱测试）
@@ -171,6 +172,13 @@ RESERVED_PREFIXES = ("/_auth", "/auth")
 
 app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False
+# 请求体上限 —— nginx 层已经限了 GATEWAY_AUTH_MAX_BODY，这里是第二道。
+#
+# 不能只靠 nginx：这份配置会被面板重新生成，也可能被运维手工改过。
+# 没有这一层时，auth_login 里的 request.get_json() 会把整个 body 物化进内存
+# （100MB 的 body 实测把进程顶到 RSS 461MB，直接触发内核 OOM）。
+# 认证端点的请求体只有 {"password":"..."}，8K 远超所需。
+app.config["MAX_CONTENT_LENGTH"] = 8 * 1024
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -815,9 +823,30 @@ def auth_login():
         return jsonify({"success": False, "code": "RATE_LIMITED",
                         "message": "失败次数过多，请稍后再试"}), 429
 
+    # 请求体上限 —— 在**读之前**判，不依赖 get_json 的异常行为。
+    #
+    # 为什么不只靠 get_json 抛 RequestEntityTooLarge：silent=True 会把它
+    # 一并吞掉并返回 None，于是 password="" → 401 AUTH_FAILED。body 确实没被
+    # 物化（安全目标达成了），但对外伪装成「密码错误」，既误导排查，也让调用方
+    # 分不清「密码真的错了」和「包太大」。实测就是这个结果。
+    #
+    # 下面还有一道 except RequestEntityTooLarge。两道对「带 Content-Length 的
+    # 超限请求」确实是冗余的（各自单独都够，实测删掉任何一道客户端仍拿到
+    # 413），保留是纵深防御：前置检查不读 body，except 兜住 werkzeug 自己抛的
+    # 情况。两条都失效才会退化成 401 —— 那种变异在测试里是被抓着的。
+    _max_len = app.config.get("MAX_CONTENT_LENGTH") or 0
+    if _max_len and (request.content_length or 0) > _max_len:
+        audit("login_body_too_large")
+        return jsonify({"success": False, "code": "PAYLOAD_TOO_LARGE",
+                        "message": "请求体过大"}), 413
+
     try:
         body = request.get_json(silent=True) or {}
         password = str(body.get("password", ""))
+    except RequestEntityTooLarge:
+        audit("login_body_too_large")
+        return jsonify({"success": False, "code": "PAYLOAD_TOO_LARGE",
+                        "message": "请求体过大"}), 413
     except Exception:
         password = ""
 
@@ -1009,10 +1038,26 @@ def _origin_host_mismatch(url: str) -> bool:
     from urllib.parse import urlparse
     try:
         u = urlparse(url)
-        if not u.netloc:
-            return False
-        host = u.netloc.split(":")[0]
-        return host != request.host.split(":")[0]
+        # 解析不出 host 就是「判不出来」，按跨站处理，不能按「无跨站」放行。
+        #
+        # 2026-10-16 实测绕过：无 scheme 的 Origin
+        #     Origin: 192.168.100.224
+        # urlparse 得到 netloc=""，旧代码 `if not u.netloc: return False`
+        # 直接放行。带正确密码实测 HTTP 200，登录成功；
+        # 同一时刻对照组 `Origin: https://evil.example.com` 是 403。
+        #
+        # 浏览器不会为跨站请求发无 scheme 的 Origin，但脚本、浏览器扩展、
+        # 以及任何能自己设头的客户端都可以 —— 而这正是 CSRF 要防的那类来源。
+        host = (u.hostname or "").strip().lower()
+        if not host:
+            return True
+        # 必须比 hostname 而不是 netloc。netloc 里可以塞 userinfo：
+        #     Origin: https://192.168.100.224:x@evil/
+        # 旧代码 `u.netloc.split(":")[0]` 会取到 "192.168.100.224" 冒充通过，
+        # 实测同样 HTTP 200 登录成功（无冒号的 https://host@evil/ 则被正确
+        # 拦成 403，因为那时 split 拿到的是整个 netloc）。
+        # urlparse 的 .hostname 会正确剥掉 userinfo 和端口。
+        return host != (request.host or "").split(":")[0].strip().lower()
     except Exception:
         return True
 

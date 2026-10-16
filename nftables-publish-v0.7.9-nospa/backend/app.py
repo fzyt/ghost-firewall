@@ -1176,7 +1176,7 @@ def validate_config(cfg):
         if key in cfg and not _is_port(cfg[key]):
             errs.append(f'{key} 端口非法: {cfg[key]!r}（只允许 1-65535）')
 
-    # 网段必须是具体网段，不能是 /0。
+    # 网段必须是具体网段，不能是 /0 或 /1。
     #
     # 2026-10-07：Shannon 报 critical + 实测确认 —— 之前 _safe_cidr 只校验
     # 「是不是合法 CIDR」，0.0.0.0/0 与 ::/0 都合法，于是：
@@ -1185,6 +1185,17 @@ def validate_config(cfg):
     # 也就是说填错一个网段就让整个公网网关对全互联网免认证，保存时连风险
     # 提示都没有。认证服务侧现在也会忽略 /0（纵深防御），但配置入口不该
     # 放行它 —— 早失败、强提示，别把「全员免认证」交给一次手滑。
+    #
+    # 2026-10-16：上面这段只挡住了 /0，/1 是漏的。同一函数往上 50 行的
+    # panel_allowed_nets 用的就是 `prefixlen <= 1`，注释里也写着「/1 等于
+    # 不设边界」—— 同一个意图，两个守卫写成了 <= 1 和 == 0。
+    # 实测（本地调 validate_config，基线配置干净）：
+    #     lan_subnet4=0.0.0.0/0    -> REJECTED
+    #     lan_subnet4=0.0.0.0/1    -> ACCEPTED   ← 缺口
+    #     panel_allowed_nets=0.0.0.0/1 -> REJECTED
+    # 提交 /1 后所有 public=false 的反代 location（生成 allow <cidr>; deny all;
+    # 且不调 auth_request）对半个互联网免认证，且 _detect_risks 不会报警
+    # ——提交者本人仍在 /1 范围内，自锁检查照样通过。
     for key in ('lan_subnet4', 'lan_subnet6'):
         raw = str(cfg.get(key, '') or '').strip()
         if not raw:
@@ -1219,10 +1230,11 @@ def validate_config(cfg):
         except ValueError:
             errs.append(f'{key} 网段非法: {raw!r}')
             continue
-        if net.prefixlen == 0:
+        if net.prefixlen <= 1:
             errs.append(
-                f'{key} 不能是 {raw}：它匹配所有地址，保存后公网任何来源都会被'
-                f'当成内网而免认证。请填具体网段，如 192.168.100.0/24')
+                f'{key} 不能是 {raw}：/{net.prefixlen} 匹配半个地址空间，'
+                f'保存后公网会有大片来源被当成内网而免认证。请填具体网段，'
+                f'如 192.168.100.0/24')
 
     try:
         _split_ports(cfg.get('lan_allowed_ports', ''))
@@ -5619,6 +5631,22 @@ GATEWAY_NOT_LISTENING_MSG = '网关配置已下发但 {port} 端口没有真正�
 GATEWAY_SSL_ZONE = "SSLGATEWAY"
 GATEWAY_SSL_CACHE_SIZE = "10m"
 
+# 认证端点的请求体上限。
+#
+# 2026-10-16 .224 实测（未认证、6 条 curl 即可复现）：
+# /auth/* 这几个 location 原本都没有 client_max_body_size，落到 nginx 全局默认
+# 128M。登录请求体实际只有 {"password":"..."} 几百字节，于是 6 个并发 100M 的
+# POST /auth/login 就能把 auth_gateway 的 Python 进程顶到 RSS 461MB：
+#     Out of memory: Killed process (python3) anon-rss:461600kB
+# 进程被内核 OOM kill 之后**没有任何机制把它拉起来**，/auth/* 全部 502，
+# 公网入口彻底断掉，只能人工重启网关。
+#
+# 注意 OOM 吃掉的是 RAM 而不是那块 overlay：OpenWrt 的 /var 是指向 /tmp 的
+# 软链，nginx 的请求体临时文件落在 tmpfs 上。定位问题时别盯着 df / 看错盘。
+#
+# 8K 对认证端点绰绰有余（密码字段本身还有长度限制），且与真实用途差了三个数量级。
+GATEWAY_AUTH_MAX_BODY = "8K"
+
 # 网关配置块由 /api/gateway/config **独占**。
 #
 # 为什么必须划清边界：/api/config（面板上到处都在点的「保存配置」）是无字段白名单的
@@ -6141,6 +6169,7 @@ def _generate_gateway_nginx_conf(config):
         L.append(f"    # {_comment}")
         L.append(f"    location = {_ep} {{")
         L.append(f"        proxy_pass http://127.0.0.1:{api_port}{_ep};")
+        L.append(f"        client_max_body_size {GATEWAY_AUTH_MAX_BODY};")
         L.append("        proxy_set_header X-Real-IP $remote_addr;")
         L.append("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
         L.append("        proxy_set_header X-Original-URI $request_uri;")
@@ -6151,6 +6180,7 @@ def _generate_gateway_nginx_conf(config):
     L.append("    # 认证页面的 CSS/JS（白名单文件，见 auth_gateway.STATIC_ALLOWED）")
     L.append("    location /auth/static/ {")
     L.append(f"        proxy_pass http://127.0.0.1:{api_port};")
+    L.append(f"        client_max_body_size {GATEWAY_AUTH_MAX_BODY};")
     L.append("        proxy_set_header X-Real-IP $remote_addr;")
     L.append("        proxy_set_header Host $host;")
     L.append("    }")
