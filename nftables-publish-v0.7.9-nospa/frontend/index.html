@@ -1295,10 +1295,6 @@
                   class="px-3 py-1.5 border border-black rounded text-xs hover:bg-gray-50 transition-colors">
                   + 新增预设
                 </button>
-                <button x-show="ipPresets.length > 0" @click="confirm('管理预设：每个预设可点击加入对应名单。点击 OK 查看详情。')"
-                  class="px-3 py-1.5 border border-gray-300 rounded text-xs text-gray-500 hover:bg-gray-50 transition-colors">
-                  管理
-                </button>
               </div>
             </div>
 
@@ -1448,6 +1444,12 @@
                 全部清空
               </button>
             </div>
+            <!-- nft 不存在 = 环境固有，不是故障（Docker 测试环境刻意不装 nft）。
+                 所以这里给说明，而不是让「暂无数据」误导成"真的没有白名单"。 -->
+            <div x-show="listsNftUnavailable"
+              class="mb-3 px-3 py-2 bg-amber-50 border border-amber-200 rounded text-xs text-amber-700">
+              当前环境没有 nft 命令，无法读取防火墙规则集。这里显示为空是因为读不到，不代表真的没有。
+            </div>
             <div class="flex items-center gap-3 mb-4">
               <input type="text" x-model="listsNewIpWhitelist" @keydown.enter="addToList('whitelist')"
                 placeholder="输入 IP 地址"
@@ -1495,6 +1497,11 @@
                 class="px-4 py-1.5 bg-red-500 text-white text-xs rounded hover:bg-red-600 disabled:opacity-50 transition-colors">
                 全部清空
               </button>
+            </div>
+            <!-- 同白名单：nft 不存在是环境固有，给说明而不是误导成"真的没有黑名单" -->
+            <div x-show="listsNftUnavailable"
+              class="mb-3 px-3 py-2 bg-amber-50 border border-amber-200 rounded text-xs text-amber-700">
+              当前环境没有 nft 命令，无法读取防火墙规则集。这里显示为空是因为读不到，不代表真的没有。
             </div>
             <div class="flex items-center gap-3 mb-4">
               <input type="text" x-model="listsNewIpBlacklist" @keydown.enter="addToList('blacklist')"
@@ -2101,9 +2108,32 @@
 
               <div>
                 <label class="block text-sm font-medium mb-1">上传大小限制
-                  <span class="text-gray-400 font-normal">留空或填 0 = 不限制</span></label>
+                  <span class="text-gray-400 font-normal">默认 1M（1MB），填 0 = 不限制</span></label>
                 <input type="text" x-model="rpEditingRule.client_max_body_size"
                   placeholder="例如 10m / 512M / 2G" class="w-full nf-mono">
+              </div>
+
+              <div>
+                <label class="block text-sm font-medium mb-1">上游 API 路径前缀
+                  <span class="text-gray-400 font-normal">留空 = 不改写</span></label>
+                <div class="flex gap-2">
+                  <input type="text" x-model="rpEditingRule.api_path_prefix"
+                    placeholder="例如 /api/" class="flex-1 nf-mono">
+                  <button type="button" @click="detectRpApiPrefix()"
+                    :disabled="rpDetectingPrefix"
+                    class="px-3 py-1 border border-gray-300 rounded text-xs hover:bg-gray-50 disabled:opacity-50 transition-colors whitespace-nowrap">
+                    <span x-show="!rpDetectingPrefix">自动探测</span>
+                    <span x-show="rpDetectingPrefix">探测中…</span>
+                  </button>
+                </div>
+                <p class="text-xs text-gray-400 mt-1 leading-relaxed"
+                   x-show="rpApiPrefixHint" x-text="rpApiPrefixHint"></p>
+                <p class="text-xs text-gray-400 mt-1 leading-relaxed">
+                  上游页面里写死的绝对路径（如 <span class="nf-mono">/api/xxx</span>）会跑出
+                  本路径前缀，匹配不到任何转发规则 → 接口全 404。填上这一段，
+                  网关转发时会把这类路径改写成带前缀的版本。
+                  <strong class="text-gray-500">只填一段确定的前缀</strong>，填太宽会改坏应用。
+                </p>
               </div>
 
               <div>
@@ -2201,7 +2231,7 @@
                   <div>
                     <dt class="text-xs text-gray-400">上传限制</dt>
                     <dd class="nf-mono text-gray-700"
-                        x-text="rule.client_max_body_size || '不限制'"></dd>
+                        x-text="rule.client_max_body_size || '1M（默认）'"></dd>
                   </div>
                   <div>
                     <dt class="text-xs text-gray-400">公网访问</dt>
@@ -2212,6 +2242,11 @@
                     <dt class="text-xs text-gray-400">WebSocket</dt>
                     <dd :class="rule.websocket_enabled ? 'text-green-600' : 'text-gray-400'"
                         x-text="rule.websocket_enabled ? '已开启' : '已关闭'"></dd>
+                  </div>
+                  <div x-show="rule.api_path_prefix">
+                    <dt class="text-xs text-gray-400">API 路径改写</dt>
+                    <dd class="nf-mono text-gray-700"
+                        x-text="rule.api_path_prefix"></dd>
                   </div>
                 </dl>
               </div>

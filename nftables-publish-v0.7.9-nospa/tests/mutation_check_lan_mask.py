@@ -20,6 +20,11 @@ import os
 import subprocess
 import sys
 
+# 保险丝：被取消 / 被 kill 时也别把变异留在源码里（见 _mutation_guard.py）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _mutation_guard import MutationGuard  # noqa: E402
+
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP = os.path.join(ROOT, 'backend', 'app.py')
 SETUP = os.path.join(ROOT, 'setup', 'setup.sh')
@@ -142,6 +147,7 @@ def report(name, r):
 
 
 def main():
+    MutationGuard(ROOT).snapshot()   # 保险丝：中断也会还原源码
     print('=' * 74)
     print('变异验证：lan_subnet4 掩码丢失（4 处防线）')
     print('=' * 74)

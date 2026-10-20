@@ -49,10 +49,167 @@ pkg_install() {
                     info "已安装: ${pkg}"; continue
                 fi
                 info "安装: ${pkg}"
-                apk add "$pkg" || warn "安装失败: ${pkg}"
+                # --no-cache：apk 的下载缓存在 /var/cache/apk，那是在 **overlay** 上
+                # （不是 tmpfs）。不清理的话下载的包会再存一份 —— OpenWrt 的
+                # overlay 常常只有 80~90MB，一份 50MB 的缓存直接把它撑满。
+                apk add --no-cache "$pkg" || warn "安装失败: ${pkg}"
                 ;;
         esac
     done
+}
+
+# ============================================================
+# 下载器自愈（OpenWrt 25.x 的鸡生蛋问题）
+# ============================================================
+#
+# 现象（2026-10-20 在 .245 实测）：
+#   `apk add nginx-full ... wget-ssl` 同一个事务里，wget-ssl 的 postinst
+#   把 /usr/bin/wget 换成 SSL 版，而它依赖 libssl.so.3（libopenssl3 包）。
+#   libopenssl3 恰恰要靠 wget 下载 —— apk 用 wget 下到一半，wget 已经坏了：
+#       ERROR: wget: exited with error 127
+#       ERROR: unable to select packages: libopenssl3 (no such package)
+#   结果不是"少装一个包"，是**apk 的下载器自己被装坏了**，之后什么都下不来。
+#   nginx-full / wget-ssl / openssl-util / python3-openssl 全部依赖 libopenssl3。
+#
+# 解法：curl 在 OpenWrt 上链的是 **mbedTLS 而不是 OpenSSL**，不依赖 libssl.so.3
+# ⇒ 拿 curl 顶替 wget 把 libopenssl3 拉下来，wget-ssl 随即恢复正常。
+#
+# 为什么必须自愈而不是让用户手动处理：这一步失败时报的是
+# "unable to select packages"，完全看不出真正的原因是"下载器自己坏了"，
+# 用户只会反复重试安装，而重试永远失败。
+#
+# ⚠️ 判据必须是「输出特征」，**不能**拿 `wget --version` 的退出码当判据
+#   （2026-10-20 在 .147 全新机上踩过这个坑）：
+#   OpenWrt 25.x 原装的 /usr/bin/wget 是指向 /bin/uclient-fetch 的软链，
+#   而 uclient-fetch **不支持 --version**：
+#       $ wget --version
+#       wget: unrecognized option: version        （退出码 1）
+#   拿退出码当判据 ⇒ 把**好用的**下载器误判成坏掉 ⇒ 装上一堆依赖 curl 的
+#   shim，可全新机上 curl 还没装 ⇒ 整个安装全盘失败。
+#
+#   真坏掉（wget-ssl 缺 libssl.so.3）的特征是**动态链接失败**：
+#       /usr/libexec/wget-ssl: Error relocating ...: symbol not found: ...
+#   两种输出特征完全不同，不会混淆。
+#
+downloader_healthy() {
+    # 压根没有 wget = 坏
+    if ! command -v wget >/dev/null 2>&1; then
+        return 1
+    fi
+    local out
+    out="$(wget --version 2>&1 || true)"
+    # 动态链接失败 / 共享库缺失 —— wget-ssl 缺 libssl.so.3 的典型特征
+    if echo "$out" | grep -qE "Error relocating|symbol not found|error while loading shared libraries"; then
+        return 1
+    fi
+    return 0
+}
+
+repair_downloader() {
+    # 只在 apk 上有这个问题（opkg 的 wget 依赖关系不同）
+    [ "$PKG_MANAGER" = "apk" ] || return 0
+
+    # 下载器能用就不动它
+    if downloader_healthy; then
+        return 0
+    fi
+
+    warn "wget 不可用（多半是缺 libssl.so.3 —— libopenssl3 要靠 wget 下，wget-ssl 却依赖它）"
+    if [ -x /usr/bin/curl ]; then
+        info "临时用 curl 顶替 wget（curl 链的是 mbedTLS，不依赖 libssl.so.3）"
+    elif [ -x /bin/uclient-fetch ]; then
+        info "临时用 uclient-fetch 顶替 wget（curl 还没装，先用 busybox 自带的）"
+    else
+        die "wget 不可用，且既没有 curl 也没有 /bin/uclient-fetch —— 无法继续下载依赖"
+    fi
+
+    local shim=/usr/bin/wget
+    if [ -e "$shim" ]; then
+        mv "$shim" "${shim}.broken" 2>/dev/null || true
+    fi
+    cat > "$shim" <<'SHIM'
+#!/bin/sh
+# wget -> curl / uclient-fetch 兼容 shim（临时用，见 setup.sh 的 repair_downloader 注释）
+URL=""; OUT="-"; TMO=600; NOCHECK=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -q|--quiet|--no-verbose) shift ;;
+    --no-check-certificate) NOCHECK=1; shift ;;
+    -T) TMO="$2"; shift 2 ;;
+    --timeout=*) TMO="${1#--timeout=}"; shift ;;
+    --tries=*|--tries) shift ;;
+    -O) OUT="$2"; shift 2 ;;
+    --output-document=*) OUT="${1#--output-document=}"; shift ;;
+    -U|--user-agent) shift 2 ;;
+    -*) shift ;;
+    *) URL="$1"; shift ;;
+  esac
+done
+[ -z "$URL" ] && exit 1
+# apk 给的 -T 60 对慢速出口不够（实测 2.3MB/60s 就超时），放大并加断点续传
+[ "$TMO" -lt 600 ] 2>/dev/null && TMO=600
+# 没有 CA 证书库的时候没法校验，只能放弃校验
+[ -d /etc/ssl/certs ] || NOCHECK=1
+[ -n "$(ls -A /etc/ssl/certs 2>/dev/null)" ] || NOCHECK=1
+
+# 后端优先级：curl → /bin/uclient-fetch
+# ⚠️ 运行时才判断，不能写死在安装时 —— 全新机上装 curl 之前 shim 就得能用。
+if [ -x /usr/bin/curl ]; then
+  # ⚠️ 必须带 -f（--fail）：curl 默认对 HTTP 404 **也返回 exit 0**，
+  # 而 apk 只看退出码 —— 不加 -f 的话，apk 会把一个 146 字节的
+  # "404 Not Found" 错误页当成 .apk 装上去，报错信息完全对不上真正原因。
+  CK=""; [ "$NOCHECK" = "1" ] && CK="-k"
+  if [ "$OUT" = "-" ]; then
+    exec /usr/bin/curl -fsSL $CK --max-time "$TMO" --retry 8 --retry-delay 3 --retry-all-errors "$URL"
+  else
+    exec /usr/bin/curl -fsSL $CK --max-time "$TMO" --retry 8 --retry-delay 3 --retry-all-errors -C - -o "$OUT" "$URL"
+  fi
+elif [ -x /bin/uclient-fetch ]; then
+  # uclient-fetch 没有 --fail / --retry，但 HTTP 错误码它自己会返回非 0。
+  # ⚠️ 它不支持 `-O -`（会把 "-" 当成文件名），走 stdout 时干脆不传 -O。
+  UC=""; [ "$NOCHECK" = "1" ] && UC="--no-check-certificate"
+  if [ "$OUT" = "-" ]; then
+    exec /bin/uclient-fetch -q -T "$TMO" $UC "$URL"
+  else
+    exec /bin/uclient-fetch -q -T "$TMO" $UC --continue -O "$OUT" "$URL"
+  fi
+else
+  echo "wget shim: 找不到 curl，也没有 /bin/uclient-fetch" >&2
+  exit 127
+fi
+SHIM
+    chmod +x "$shim" 2>/dev/null || true
+}
+
+# 装完（且 libopenssl3 已就位）之后把 wget 换回原版
+restore_downloader() {
+    [ "$PKG_MANAGER" = "apk" ] || return 0
+    # ⚠️ 要检查 **wget-ssl 本体**能不能跑，不能检查 `wget --version` ——
+    # 那时 /usr/bin/wget 已经是我们装的 shim，它当然能跑，
+    # 用它当判据会把「还没修好」误判成「修好了」。
+    local ssl_bin=""
+    for cand in /usr/libexec/wget-ssl /usr/libexec/wget; do
+        if [ -x "$cand" ]; then ssl_bin="$cand"; break; fi
+    done
+    if [ -n "$ssl_bin" ] && "$ssl_bin" --version >/dev/null 2>&1; then
+        # 让 /usr/bin/wget 指向 wget-ssl —— apk 的 postinst 本来就是这么干的，
+        # 但如果中途被我们的 shim 顶掉了，这里补回来。
+        if [ -L /usr/bin/wget ] && [ "$(readlink /usr/bin/wget)" = "$ssl_bin" ]; then
+            ok "✅ wget 已是 wget-ssl"
+        else
+            mv -f /usr/bin/wget /usr/bin/wget.shim 2>/dev/null || true
+            ln -sf "$ssl_bin" /usr/bin/wget 2>/dev/null || true
+            ok "✅ wget 已指向 wget-ssl"
+        fi
+        # ⚠️ 旧的原件（.broken）**不回填** —— 回填会把「apk 刚装好的 SSL wget」
+        # 换回旧的 uclient-fetch 软链，等于把 https 支持又拆了。
+        # 留个 .orig 备份就行。
+        if [ -e /usr/bin/wget.broken ]; then
+            mv -f /usr/bin/wget.broken /usr/bin/wget.broken.orig 2>/dev/null || true
+        fi
+    else
+        info "wget-ssl 仍不可用，保留兼容 shim（不影响安装，但 wget 的 https 依赖它）"
+    fi
 }
 
 # ============================================================
@@ -64,6 +221,26 @@ pkg_install() {
 check_nginx_modules() {
     if ! command -v nginx >/dev/null 2>&1; then
         die "nginx 未安装成功 —— 网关无法工作，请检查网络后重试"
+    fi
+
+    # ⚠️ 先分清「nginx 跑不起来」和「nginx 起来了但缺模块」——
+    # 这两种的修法完全不同，报错混在一起会把人带沟里。
+    #
+    # 跑不起来的最常见原因：缺 libssl.so.3（libopenssl3 包）。
+    # 那台机器上 nginx -V 一行 configure 参数都不输出，只有一串
+    # "Error relocating /usr/sbin/nginx: symbol not found" ——
+    # 肉眼看过去跟"没装 auth_request"一模一样。
+    if ! nginx -V >/dev/null 2>&1; then
+        local why
+        why="$(nginx -V 2>&1 | head -1)"
+        if echo "$why" | grep -q "libssl.so.3\|libcrypto.so.3"; then
+            die "nginx 缺少 libssl.so.3 / libcrypto.so.3（libopenssl3 包）
+     多半是 apk 装 wget-ssl 时把自己的依赖 libopenssl3 顶掉了 ——
+     wget-ssl 的 postinst 替换了 /usr/bin/wget，而 apk 正是用 wget 下载包的。
+     修法见 README「OpenWrt 25.x 已知问题」一节。
+     原始报错: ${why}"
+        fi
+        die "nginx 无法执行（${why}）—— 请先修好 nginx 再重试"
     fi
 
     if ! nginx -V 2>&1 | grep -q "http_auth_request_module"; then
@@ -341,7 +518,48 @@ check_env() {
 install_deps() {
     info "========== 安装依赖 =========="
 
+    # 下载器先自愈 —— 见 repair_downloader 的注释。
+    # 不先修的话，apk 会在事务中途把 wget 换成坏的那个，之后什么都下不来。
+    repair_downloader
+
     pkg_update || warn "包列表更新失败，继续尝试安装..."
+
+    # ⚠️ 顺序有讲究，别随手调换：
+    #   1. libopenssl3（apk）必须**先**装 —— 它提供 libssl.so.3，
+    #      而 wget-ssl / nginx-full / openssl-util / python3-openssl 都依赖它。
+    #      它自己又要靠 wget 下载，所以得在 wget-ssl 之前到位
+    #      （否则就是那个鸡生蛋）。
+    #   2. wget-ssl 放**最后** —— 它的 postinst 会替换 /usr/bin/wget，
+    #      放前面的话后续包的下载就全靠坏掉的 wget 了。
+    case "$PKG_MANAGER" in
+        apk)  pkg_install libopenssl3 ;;
+        opkg) pkg_install libssl libcrypto ;;
+    esac
+
+    # ⚠️ libopenssl3 是硬前置：nginx-full / wget-ssl / openssl-util /
+    # python3-openssl 全都依赖它提供的 libssl.so.3。装不上就早点死，
+    # 不然后面每个包都失败，最后报一堆毫不相干的错。
+    #
+    # ⚠️ 判存在性**不能**用 `ls a b c` —— ls 只要有**任何一个**路径不存在
+    # 就返回非 0，哪怕其余的都在（2026-10-20 在 .147 踩过：
+    # libssl.so.3 明明装好了，却因为另外两个候选路径不存在被判成"没装"）。
+    if [ "$PKG_MANAGER" = "apk" ]; then
+        local ssl_lib=""
+        for cand in /usr/lib/libssl.so.3 /lib/libssl.so.3; do
+            [ -e "$cand" ] && { ssl_lib="$cand"; break; }
+        done
+        if [ -z "$ssl_lib" ]; then
+            ssl_lib="$(ls /usr/lib/libssl.so.3* /lib/libssl.so.3* 2>/dev/null | head -1)"
+        fi
+        if [ -z "$ssl_lib" ]; then
+            die "libopenssl3 安装失败（找不到 libssl.so.3）——
+     nginx-full / wget-ssl / openssl-util 都依赖它。
+     常见原因：apk 事务里 wget-ssl 的 postinst 抢先替换了 /usr/bin/wget，
+     把 apk 自己的下载器换成了缺 libssl.so.3 的坏版本。
+     修法：先单独 'apk add --no-cache libopenssl3'，再重跑 setup.sh"
+        fi
+        ok "✅ libssl.so.3 就位（$ssl_lib）"
+    fi
 
     pkg_install \
         nftables \
@@ -352,7 +570,19 @@ install_deps() {
         ddns-scripts-godaddy \
         nginx-full \
         curl openssl-util socat \
-        ca-certificates wget-ssl
+        ca-certificates
+
+    # wget-ssl 单独放最后（理由见上）
+    pkg_install wget-ssl
+
+    # ⚠️ 事务里 wget-ssl 的 postinst 可能把 wget 换成坏的那个 ——
+    # 再自愈一次（这时 curl 已经在上面的批次里装好了）。
+    if ! downloader_healthy; then
+        warn "安装过程中 wget 被换成了不可用的版本，重新自愈"
+        repair_downloader
+    fi
+
+    restore_downloader
 
     # v0.8.0 的单端口认证网关完全建立在 nginx 的 auth_request 之上：
     # 每个公网请求都要先问认证服务「这个人有 token 吗」，没有就 401。
@@ -360,20 +590,94 @@ install_deps() {
     # 一开网关就整片 500。所以这里必须用 nginx-full 并当场验模块。
     check_nginx_modules
 
-    # 安装 Python 依赖（pip）
+    # 安装 Python 依赖（blinker）
+    #
+    # ⚠️ OpenWrt 25.12 的仓库里**没有 blinker 包**，而 python3-flask 的依赖里
+    # 也不含它 —— 但 Flask 3.x 的代码 `from flask.signals import Namespace`
+    # 会 import blinker ⇒ 不装就 ImportError。
+    # 老办法是 `pip3 install blinker`，但 python3-pip 本身 52MB，
+    # 在 80MB 的 overlay 上根本装不下 ⇒ 改成**随包携带**：
+    # vendor/blinker/ 里有纯 Python 源码，直接放进 site-packages。
     if ! python3 -c "import blinker" 2>/dev/null; then
         info "安装 Python 依赖: blinker"
-        # 确保 pip 可用
-        if ! command -v pip3 >/dev/null 2>&1; then
-            case "$PKG_MANAGER" in
-                opkg) pkg_install python3-pip ;;
-                apk) pkg_install python3-pip ;;
-            esac
+        # 候选位置（按顺序找）：
+        #   setup/vendor/blinker  ← 随 setup.sh 一起分发（一键安装只下一个
+        #     setup.sh 时也能用，因为 vendor 在 setup/ 里）
+        #   ../vendor/blinker    ← 仓库根布局（--local 装整仓时）
+        local site_pkgs vendored=""
+        site_pkgs="$(python3 -c 'import site,sys; print((site.getsitepackages() or [sys.prefix+"/lib/site-packages"])[0])' 2>/dev/null)"
+        for cand in "$(dirname "$0")/vendor/blinker" "$(dirname "$0")/../vendor/blinker" \
+                    "$(dirname "$0")/vendor" "$(dirname "$0")/../vendor"; do
+            [ -d "$cand" ] || continue
+            # ⚠️ 候选可能指到 blinker 包本身（里面有 __init__.py），
+            # 也可能指到装着 blinker 的上级目录（里面有 blinker/__init__.py）。
+            # 两种布局都要认，否则 cp 会去拷一个不存在的
+            # "<dir>/blinker/blinker" —— 2026-10-20 在 .226 实测踩过：
+            #   cp: can't stat '/tmp/pkg5/setup/vendor/blinker/blinker':
+            #       No such file or directory
+            if [ -f "$cand/__init__.py" ]; then
+                vendored="$cand"; break
+            elif [ -f "$cand/blinker/__init__.py" ]; then
+                vendored="$cand/blinker"; break
+            fi
+        done
+        if [ -n "$site_pkgs" ] && [ -n "$vendored" ]; then
+            mkdir -p "$site_pkgs" 2>/dev/null
+            # ⚠️ 目标已存在时，cp -r 会把源拷成 <target>/blinker/blinker（套一层），
+            # 结果 import 照样失败。这里先清掉旧目标再拷。
+            # （走到这个分支说明 blinker 本来就 import 不了，留着旧目录没意义。）
+            if [ -d "$site_pkgs/blinker" ]; then
+                rm -rf "$site_pkgs/blinker" 2>/dev/null || true
+            fi
+            # ⚠️ cp 的错误**不能**吞掉（2>/dev/null）——
+            # 吞掉之后只剩一句"随包安装失败"，跟真正原因（路径拼错）完全对不上，
+            # 现场根本没法排查。失败时把 cp 的原话打出来。
+            local cp_err
+            cp_err="$(cp -r "$vendored" "$site_pkgs/" 2>&1)" || {
+                warn "  随包安装失败: ${cp_err}"
+                install_blinker_via_pip
+            }
+            if [ -z "$cp_err" ]; then
+                info "  已从随包源码安装到 $site_pkgs/blinker（省掉 python3-pip 的 52MB）"
+            fi
+        else
+            info "  未找到随包 blinker（setup/vendor/blinker），改为 pip"
+            warn "  ⚠️ pip 兜底需要 python3-pip（约 52MB），overlay 小于 100MB 的机器会装不下"
+            install_blinker_via_pip
         fi
-        pip3 install blinker --break-system-packages 2>/dev/null || pip3 install blinker 2>/dev/null || warn "blinker 安装失败"
+    fi
+
+    if ! python3 -c "import blinker" 2>/dev/null; then
+        warn "blinker 未能安装 —— Flask 会 ImportError，面板起不来"
+    else
+        ok "✅ blinker 就绪"
     fi
 
     ok "✅ 依赖安装完成"
+}
+
+# blinker 的 pip 兜底（随包安装失败时才走）
+install_blinker_via_pip() {
+    # ⚠️ 磁盘闸：python3-pip 自己就 52MB，overlay 只有 80~90MB 的机器上
+    # 装它会直接把根文件系统撑满 —— 撑满之后 apk 装不动、log 写不进去、
+    # 设备表现为一堆莫名其妙的失败。这里宁可直接报错，也别把盘塞爆。
+    local avail_kb avail_mb
+    avail_kb="$(df -k / | awk 'NR==2{print $4}')"
+    avail_mb=$((avail_kb / 1024))
+    if ! command -v pip3 >/dev/null 2>&1; then
+        if [ "${avail_mb:-0}" -lt 80 ]; then
+            die "磁盘空间不足（剩 ${avail_mb}MB），装不了 python3-pip（约 52MB）——
+     blinker 的随包源码也没能用上（setup/vendor/blinker）。
+     两条路都走不通时请手动放一份 blinker 到 site-packages。"
+        fi
+        case "$PKG_MANAGER" in
+            opkg) pkg_install python3-pip ;;
+            apk)  pkg_install python3-pip ;;
+        esac
+    fi
+    pip3 install blinker --break-system-packages 2>/dev/null \
+        || pip3 install blinker 2>/dev/null \
+        || warn "blinker 安装失败"
 }
 
 # ============================================================
@@ -1000,6 +1304,37 @@ NFT
 close_luci_ports() {
     local conf="/etc/config/nginx"
     local rendered="/var/lib/nginx/uci.conf"
+
+    # ── uhttpd 版 LuCI（OpenWrt 24.10+ / 25.12）──────────────
+    #
+    # 2026-10-20 在 .166（OpenWrt 25.12.5）实测：LuCI **不再由 nginx 提供**，
+    # 而是由 **uhttpd** 提供，80/443 全被 uhttpd 占着；
+    # /etc/config/nginx 里**根本没有** _lan / _redirect2ssl 段。
+    #
+    # ⇒ 下面那段「grep 不到 _lan ⇒ 本来就未启用」在这台机器上是**假的成功**：
+    # 它会打印「LuCI 80/443 本来就未启用」然后返回 0，
+    # 而 uhttpd 正开着 80/443，LuCI 界面照常能访问。
+    #
+    # 开关点（实测自 /etc/init.d/uhttpd）：
+    #     config_get_bool enabled "$cfg" 'enabled' 1
+    #     [ $enabled -gt 0 ] || return
+    # ⇒ enabled=0 + commit 之后 uhttpd 开机也不起；再 stop 掉当前实例。
+    local uhconf="/etc/config/uhttpd"
+    if [ -f "$uhconf" ] && grep -q "/cgi-bin/luci" "$uhconf" 2>/dev/null; then
+        info "检测到 uhttpd 版 LuCI（$uhconf 里有 /cgi-bin/luci）"
+        if uci set uhttpd.main.enabled=0 2>/dev/null && uci commit uhttpd 2>/dev/null; then
+            /etc/init.d/uhttpd stop >/dev/null 2>&1
+            sleep 1
+            # 复核：端口还在就是没关掉，不能报成功
+            if netstat -tln 2>/dev/null | grep -qE ':80[[:space:]]|:443[[:space:]]'; then
+                warn "⚠️ uhttpd 已停但 80/443 仍在监听，LuCI 未真正关闭"
+            else
+                ok "✅ LuCI 80/443 已关闭（uhttpd 已停，且开机不再启动）"
+            fi
+        else
+            warn "⚠️ 改 uhttpd.main.enabled 失败，LuCI 80/443 未关闭"
+        fi
+    fi
 
     if [ ! -f "$conf" ]; then
         warn "⚠️ 找不到 $conf，跳过关闭 LuCI 80/443"

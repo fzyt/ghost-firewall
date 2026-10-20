@@ -4,8 +4,10 @@ import os, subprocess, shutil, json, time, re, hmac, hashlib, base64, datetime, 
 from template_engine import load_template, generate_rules
 
 # ======================= 认证配置 =======================
-AUTH_PASSWORD_FILE = '/etc/nftables/nftables-web-password'
-AUTH_SECRET_FILE = '/etc/nftables/nftables-web-secret'
+AUTH_PASSWORD_FILE = os.environ.get(
+    "AUTH_PASSWORD_FILE", "/etc/nftables/nftables-web-password")
+AUTH_SECRET_FILE = os.environ.get(
+    "AUTH_SECRET_FILE", "/etc/nftables/nftables-web-secret")
 AUTH_COOKIE_NAME = 'nftables_web_session'
 AUTH_SESSION_LIFETIME = 12 * 3600   # 12 小时（最长生命周期）
 AUTH_IDLE_TIMEOUT = 3600            # 1 小时无操作自动登出
@@ -16,8 +18,10 @@ AUTH_RATE_LIMIT_MAX_FAILS = 5
 AUTH_RATE_LIMIT_LOCKOUT = 900  # 15 分钟
 
 app = Flask(__name__)
-CONFIG_PATH = '/etc/nftables/nftables-web-config.json'
-RULES_PATH = '/etc/nftables.d/99-custom-rules.nft'
+CONFIG_PATH = os.environ.get(
+    "AUTH_CONFIG_PATH", "/etc/nftables/nftables-web-config.json")
+RULES_PATH = os.environ.get(
+    "NFTABLES_WEB_RULES_PATH", "/etc/nftables.d/99-custom-rules.nft")
 
 # 面板 HTTPS 端口（仅 LAN 可达，防火墙侧由 lan_allowed_ports 放行）。
 # 定义在文件顶部：validate_config() 要用它做「网关端口不能占用面板端口」的交叉校验。
@@ -189,7 +193,15 @@ def _session_epoch_ok() -> bool:
 # 落盘口径与网关保持一致：按 IP 记、5 次/5 分钟锁 15 分钟、成功即清空、
 # 过期条目顺手 GC。文件不可用时降级回内存（不能让限流文件的问题把登录
 # 整个搞挂），并如实打日志。
-PANEL_RATELIMIT_FILE = '/etc/nftables/nftables-web-panel-ratelimit.json'
+PANEL_RATELIMIT_FILE = os.environ.get(
+    "AUTH_PANEL_RATELIMIT_FILE",
+    "/etc/nftables/nftables-web-panel-ratelimit.json")
+
+# 面板访问边界的**额外**放行网段（与配置里的取并集）。
+# Docker 测试环境用：容器里 lan_subnet4 探测到的是 OpenWrt 默认网段，
+# 而真实来源是 docker 网关，不在里面会被 IP_NOT_ALLOWED 挡在门外。
+PANEL_ALLOWED_NETS_ENV = os.environ.get(
+    "NFTABLES_WEB_PANEL_ALLOWED_NETS", "").strip()
 _MAX_FAILED_LOGINS_IPS = 50000  # IP 数硬上限（防恶意创建大量 IP 条目撑爆文件/内存）
 _request_counter = 0  # 用于触发定期 GC
 _RATELIMIT_DEGRADED = {'warned': False}   # 文件不可用时只警告一次，别刷屏
@@ -415,6 +427,13 @@ def _panel_allowed_networks():
     DEFAULT_CONFIG，而那个默认值里的 lan_subnet4 正是陌生网段。只判
     os.path.exists 会让「文件存在但内容是坏的」这一种情况照样锁死管理员 ——
     所以这里必须再问一次 _config_corrupted()。
+
+    ⚠️ 环境变量 NFTABLES_WEB_PANEL_ALLOWED_NETS 是**额外**放行的网段，
+    跟配置里的取并集。Docker 测试环境要用它：容器里探测到的 lan_subnet4
+    还是 OpenWrt 的 192.168.4.0/24，而实际来源是 docker 网关
+    （172.x.0.1），不在里面 → 面板会回 IP_NOT_ALLOWED 把人锁在门外。
+    注意：配置里本来就不限制（nets 为空）时保持不限制 ——
+    环境变量是「额外放行」，不是「收紧」。
     """
     try:
         stamp = os.stat(CONFIG_PATH).st_mtime_ns
@@ -435,6 +454,12 @@ def _panel_allowed_networks():
     except Exception as e:              # noqa: BLE001
         print(f'[WARN] 面板访问边界读取失败（{type(e).__name__}: {e}），本次不限制', flush=True)
         nets = []
+    if nets:
+        extra = _parse_net_list(PANEL_ALLOWED_NETS_ENV)
+        if extra:
+            for n in extra:
+                if n not in nets:
+                    nets.append(n)
     _NETS_CACHE.update(mtime=stamp, nets=nets)
     return nets
 
@@ -1637,6 +1662,93 @@ def _safe_path_prefix(v):
     if not s or s == '/':
         return None
     return s
+
+
+# ── 上游绝对 API 路径前缀（sub_filter 窄模式用）────────────────────────
+#
+# 这个值最终会变成 nginx 的 `sub_filter` 模式串，是**字面量**替换：
+# 只能改「页面里写死的绝对路径」，改不了运行时动态拼出来的 URL。
+#
+# 所以必须收窄：只允许一段确定的前缀（/api/、/api/v1/），
+# 绝不能是能匹配半个页面的宽泛模式 —— 通用规则实测会把页面里
+# 普通的路径字符串（"/var/log/syslog" 这种）也一起改掉，直接改坏应用。
+#
+# 末尾那个 `/?` 是必须的：用户最常填的就是带斜杠的 `/api/`，
+# 不允许的话「按提示抄一个 /api/」反而被拒 —— 这是实测踩到的。
+#（正则里没有尾斜杠时 '/api/' 直接不匹配，校验会抛 ValueError。）
+_RE_API_PATH_PREFIX = re.compile(
+    r"^/[A-Za-z0-9][A-Za-z0-9._~-]*(?:/[A-Za-z0-9][A-Za-z0-9._~-]*)*/?$")
+
+
+def _sanitize_api_path_prefix(value):
+    """规整「上游绝对 API 路径前缀」。空字符串 = 不做改写。
+
+    非法值抛 ValueError，由 _validate_rp_service 转成用户可见的报错。
+    空值是合法的（表示这条服务不需要改写），不能静默当成非法 ——
+    否则「清空这个字段」这个正常操作会报错。
+
+    ⚠️ 错误信息里的原值用 **repr** 而不是直接插值：
+    直接插值时，值里的换行会把这条信息拆成多行。而这条信息会被
+    回显进**生成的 nginx 注释**里 —— 换行会把注释劈开，
+    后半行变成一条 nginx 指令 ⇒ 这就是注入面。
+    repr 保证原值里的换行被转义成 \\n，信息恒为单行。
+    """
+    s = str(value or '').strip()
+    if not s:
+        return ''
+    if '..' in s or '//' in s:
+        raise ValueError(
+            f"无效的 API 路径前缀: {value!r}（不能含 .. 或 //）")
+    if not _RE_API_PATH_PREFIX.match(s):
+        raise ValueError(
+            f"无效的 API 路径前缀: {value!r}"
+            f"（必须形如 /api/ 或 /api/v1/，只允许字母数字与 . _ ~ -）")
+    return s.rstrip('/') + '/'
+
+
+def _detect_upstream_api_prefixes(host, port, protocol='http', timeout=3.0):
+    """探测上游应用**自己声明**的路由表，提取 API 路径前缀。
+
+    为什么读 openapi.json 而不是扫描首页 HTML：
+    扫 HTML 只能靠猜「哪些绝对路径是 API 前缀」，猜宽了会把页面里
+    普通的路径字符串（"/var/log/syslog"）也当成 API 前缀，
+    改写规则一宽就把应用改坏。openapi.json 是上游自己声明的路由表，
+    读它没有猜测成分 —— FastAPI / Flask / Django-REST 都有。
+
+    返回 (prefixes, error)。prefixes 形如 ['/api/']（已排序去重）。
+    探测不到就返回空列表 + 原因，不抛异常：上游可能压根没开这个端点。
+    """
+    if not host or not _is_port(port):
+        return [], "目标地址不合法"
+    proto = 'https' if str(protocol or '').lower() == 'https' else 'http'
+    url = f"{proto}://{host}:{port}/openapi.json"
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={'Accept': 'application/json'})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read(2 * 1024 * 1024)
+    except Exception as e:
+        return [], f"读取 {url} 失败：{type(e).__name__}: {e}"
+    try:
+        data = json.loads(body.decode('utf-8', 'replace'))
+    except Exception as e:
+        return [], f"解析 openapi.json 失败：{e}"
+    if not isinstance(data, dict):
+        return [], "openapi.json 不是合法的 JSON 对象"
+    paths = data.get('paths')
+    if not isinstance(paths, dict):
+        return [], "openapi.json 里没有 paths 字段（可能不是 OpenAPI 文档）"
+    segs = set()
+    for p in paths.keys():
+        if not isinstance(p, str) or not p.startswith('/'):
+            continue
+        parts = [x for x in p.split('/') if x]
+        # 只要两段以上才有「第一段是 API 前缀」的意义
+        if len(parts) >= 2:
+            segs.add(parts[0])
+    if not segs:
+        return [], "openapi.json 里没有多段路径，探测不到 API 前缀"
+    return sorted('/%s/' % s for s in segs), None
 
 
 def config_to_variables(config):
@@ -3080,7 +3192,8 @@ def apply_rules():
 # IPv6 自动更新脚本：安装路径与 cron 频率必须全局唯一。
 # 原来 _ensure_ipv6_cron 用 */10、install_ipv6_cron 用 0 * * * *，
 # 且各自只删「完全等于自己那行」的条目，两边都跑过就会留下重复 cron。
-IPV6_SCRIPT_PATH = '/opt/nftables-web/update-ipv6.sh'
+IPV6_SCRIPT_PATH = os.environ.get(
+    "NFTABLES_WEB_IPV6_SCRIPT", "/opt/nftables-web/update-ipv6.sh")
 IPV6_CRON_ENTRY = f'*/10 * * * * {IPV6_SCRIPT_PATH}'
 
 
@@ -3505,9 +3618,12 @@ DDNS_PROVIDER_NAMES = {
     "digitalocean.com": "DigitalOcean",
 }
 
-DDNS_PROVIDER_DIR = '/usr/share/ddns/default'
-DDNS_CONFIG_PATH = '/etc/config/ddns'
-DDNS_INIT_SCRIPT = '/etc/init.d/ddns'
+DDNS_PROVIDER_DIR = os.environ.get(
+    "NFTABLES_WEB_DDNS_PROVIDER_DIR", "/usr/share/ddns/default")
+DDNS_CONFIG_PATH = os.environ.get(
+    "NFTABLES_WEB_DDNS_CONFIG", "/etc/config/ddns")
+DDNS_INIT_SCRIPT = os.environ.get(
+    "NFTABLES_WEB_DDNS_INIT", "/etc/init.d/ddns")
 
 
 def _mask_password(pwd):
@@ -3846,7 +3962,9 @@ def ddns_status():
 
 # === 阿里云 DDNS ===
 
-ALIYUN_DDNS_CONFIG_PATH = '/etc/nftables/aliyun-ddns-config.json'
+ALIYUN_DDNS_CONFIG_PATH = os.environ.get(
+    "NFTABLES_WEB_ALIYUN_CONFIG",
+    "/etc/nftables/aliyun-ddns-config.json")
 
 
 def _aliyun_mask_secret(secret):
@@ -4253,7 +4371,8 @@ def aliyun_ddns_test():
 # ══════════════════════════════════════════════════════════════════════
 
 # 认证服务落盘的审计日志。路径写死，不接受请求参数 —— 见 _read_audit_events。
-AUTH_AUDIT_LOG = "/var/log/nftables-web-auth.log"
+AUTH_AUDIT_LOG = os.environ.get(
+    "AUTH_AUDIT_LOG", "/var/log/nftables-web-auth.log")
 
 # logread 输出： Tue Oct  6 18:52:41 2026 daemon.err dropbear[615]: Bad password ...
 #
@@ -4653,7 +4772,8 @@ VALID_SET_NAMES = {"allowed4", "allowed6", "blacklist4", "blacklist6"}
 
 # 名单成员落盘路径。规则集以 `flush ruleset` 开头、每次应用都会整体重建，
 # 只存在于内核 set 里的成员会被静默清空 —— 必须落盘并在生成时回填。
-LISTS_PATH = '/etc/nftables/nftables-web-lists.json'
+LISTS_PATH = os.environ.get(
+    "NFTABLES_WEB_LISTS_PATH", "/etc/nftables/nftables-web-lists.json")
 LISTS_LOCK_PATH = LISTS_PATH + '.lock'
 # 锁降级告警只打一次，见 _lists_file_lock
 _LISTS_LOCK_WARNED = False
@@ -4880,6 +5000,33 @@ def _parse_nft_set_output(output):
     return result
 
 
+def _nft_missing(action):
+    """nft 二进制不存在时的统一响应（503 + code='NFT_UNAVAILABLE'）。
+
+    为什么单独一个 code
+    -------------------
+    「nft 不存在」和「规则集读不到」是**两回事**：
+
+      · 前者是**环境固有**的 —— Docker 测试环境刻意不装 nft（规则集是
+        policy drop 且只认 br-lan/eth1，容器里接口叫 eth0，两条都不匹配，
+        流量会落到链尾的 limit rate 2/minute burst 5 packets drop，
+        发 5 个包容器就把自己锁死了），每次读都是这个结果，完全无害；
+      · 后者是**真故障** —— nft 在，但 set 读不出来。
+
+    混在一起报，前端只能弹一条红色的通用错误 —— 用户会以为面板坏了，
+    而实际上只是这台机器没有防火墙可读。所以给一个可识别的 code，
+    让前端把「环境固有」显示成说明，把「真故障」显示成报错。
+
+    action 传中文动词（'读取' / '修改'），拼进句子给用户看。
+    """
+    return jsonify({
+        "success": False,
+        "code": "NFT_UNAVAILABLE",
+        "message": f"当前环境没有 nft 命令，无法{action}防火墙规则集",
+        "hint": "这台机器没有安装 nft 命令，本次操作不会生效。",
+    }), 503
+
+
 @app.route('/api/lists/whitelist', methods=['GET'])
 def get_whitelist():
     """读取白名单 (allowed4 + allowed6)"""
@@ -4893,6 +5040,8 @@ def get_whitelist():
             "allowed4": _parse_nft_set_output(result4.stdout) if result4.returncode == 0 else {},
             "allowed6": _parse_nft_set_output(result6.stdout) if result6.returncode == 0 else {},
         })
+    except FileNotFoundError:
+        return _nft_missing('读取')
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 
@@ -4910,6 +5059,8 @@ def get_blacklist():
             "blacklist4": _parse_nft_set_output(result4.stdout) if result4.returncode == 0 else {},
             "blacklist6": _parse_nft_set_output(result6.stdout) if result6.returncode == 0 else {},
         })
+    except FileNotFoundError:
+        return _nft_missing('读取')
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 
@@ -4953,19 +5104,28 @@ def list_add():
     # 校验 IP 格式（标准库 ipaddress；防止协议层注入和数据合法性问题）
     if _detect_ip_version(ip) is None:
         return jsonify({"success": False, "message": f"无效的 IP 地址: {ip!r}（应为单个 IPv4/IPv6，不支持 CIDR）"}), 400
+    # try 的范围**只包住 nft 那一次调用**：FileNotFoundError 只可能来自
+    # "nft 二进制不存在"，而下面的 _mutate_lists / _record_list_history 写的是
+    # 磁盘配置 —— 它们的 FileNotFoundError 意思是"配置目录没了"，
+    # 混进 NFT_UNAVAILABLE 会把真故障说成环境固有。
     try:
         result = _nft_set_write(['add', 'element', 'inet', 'fw4', set_name, '{', ip, '}'])
-        if result.returncode != 0:
-            return jsonify({"success": False, "message": f"添加失败: {result.stderr.strip() or result.stdout.strip()}"}), 400
-        # 内核改成功之后再落盘。规则集以 flush ruleset 开头、每次应用都会重建，
-        # 只存在内核里的成员会在重建后静默消失 —— 用户以为还封着，其实已放行。
-        _mutate_lists(set_name, add=[ip])
-        _record_list_history('add', ip, _list_type_from_set(set_name))
-        return jsonify({"success": True, "message": f"已添加 {ip} 到 {set_name}"})
+    except FileNotFoundError:
+        return _nft_missing('修改')
     except subprocess.TimeoutExpired:
         return jsonify({"success": False, "message": "nft 命令执行超时"}), 400
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 400
+    if result.returncode != 0:
+        return jsonify({"success": False, "message": f"添加失败: {result.stderr.strip() or result.stdout.strip()}"}), 400
+    # 内核改成功之后再落盘。规则集以 flush ruleset 开头、每次应用都会重建，
+    # 只存在内核里的成员会在重建后静默消失 —— 用户以为还封着，其实已放行。
+    try:
+        _mutate_lists(set_name, add=[ip])
+        _record_list_history('add', ip, _list_type_from_set(set_name))
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 400
+    return jsonify({"success": True, "message": f"已添加 {ip} 到 {set_name}"})
 
 
 @app.route('/api/lists/delete', methods=['POST'])
@@ -4983,17 +5143,23 @@ def list_delete():
     # 校验 IP 格式（与 list_add 保持一致，防止绕过前端校验）
     if _detect_ip_version(ip) is None:
         return jsonify({"success": False, "message": f"无效的 IP 地址: {ip!r}（应为单个 IPv4/IPv6，不支持 CIDR）"}), 400
+    # try 的范围同 list_add：只包住 nft 那一次调用。
     try:
         result = _nft_set_write(['delete', 'element', 'inet', 'fw4', set_name, '{', ip, '}'])
-        if result.returncode != 0:
-            return jsonify({"success": False, "message": f"删除失败: {result.stderr.strip() or result.stdout.strip()}"}), 400
-        _mutate_lists(set_name, remove=[ip])
-        _record_list_history('delete', ip, _list_type_from_set(set_name))
-        return jsonify({"success": True, "message": f"已从 {set_name} 删除 {ip}"})
+    except FileNotFoundError:
+        return _nft_missing('修改')
     except subprocess.TimeoutExpired:
         return jsonify({"success": False, "message": "nft 命令执行超时"}), 400
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 400
+    if result.returncode != 0:
+        return jsonify({"success": False, "message": f"删除失败: {result.stderr.strip() or result.stdout.strip()}"}), 400
+    try:
+        _mutate_lists(set_name, remove=[ip])
+        _record_list_history('delete', ip, _list_type_from_set(set_name))
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 400
+    return jsonify({"success": True, "message": f"已从 {set_name} 删除 {ip}"})
 
 
 @app.route('/api/lists/flush', methods=['POST'])
@@ -5007,17 +5173,23 @@ def list_flush():
         return jsonify({"success": False, "message": "set_name 不能为空"}), 400
     if set_name not in VALID_SET_NAMES:
         return jsonify({"success": False, "message": f"无效的 set_name，允许值: {', '.join(sorted(VALID_SET_NAMES))}"}), 400
+    # try 的范围同 list_add：只包住 nft 那一次调用。
     try:
         result = _nft_set_write(['flush', 'set', 'inet', 'fw4', set_name])
-        if result.returncode != 0:
-            return jsonify({"success": False, "message": f"清空失败: {result.stderr.strip() or result.stdout.strip()}"}), 400
-        _mutate_lists(set_name, clear=True)
-        _record_list_history('flush', '-', _list_type_from_set(set_name))
-        return jsonify({"success": True, "message": f"已清空 {set_name}"})
+    except FileNotFoundError:
+        return _nft_missing('修改')
     except subprocess.TimeoutExpired:
         return jsonify({"success": False, "message": "nft 命令执行超时"}), 400
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 400
+    if result.returncode != 0:
+        return jsonify({"success": False, "message": f"清空失败: {result.stderr.strip() or result.stdout.strip()}"}), 400
+    try:
+        _mutate_lists(set_name, clear=True)
+        _record_list_history('flush', '-', _list_type_from_set(set_name))
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 400
+    return jsonify({"success": True, "message": f"已清空 {set_name}"})
 
 
 # ======================= 名单历史 / IP 预设 =======================
@@ -5167,6 +5339,8 @@ def list_apply_preset(preset_id):
                 'success': False,
                 'message': f'添加失败: {result.stderr.strip() or result.stdout.strip()}'
             }), 400
+    except FileNotFoundError:
+        return _nft_missing('修改')
     except subprocess.TimeoutExpired:
         return jsonify({'success': False, 'message': 'nft 命令超时'}), 400
 
@@ -5212,8 +5386,10 @@ def list_clear_history():
 # nftables-web v0.7.6 — HTTPS 反向代理管理
 
 ACME_SH_PATH = os.path.expanduser("~/.acme.sh/acme.sh")
-NGINX_SSL_DIR = "/etc/nginx/ssl"
-NGINX_CONF_DIR = "/etc/nginx/conf.d"
+NGINX_SSL_DIR = os.environ.get(
+    "NFTABLES_WEB_SSL_DIR", "/etc/nginx/ssl")
+NGINX_CONF_DIR = os.environ.get(
+    "NFTABLES_WEB_NGINX_CONF_DIR", "/etc/nginx/conf.d")
 
 # nftables-web 自身服务用证书（自签或导入）
 NFTABLES_WEB_SSL_DIR = os.path.join(NGINX_SSL_DIR, "nftables-web")
@@ -5377,7 +5553,7 @@ def _sanitize_name(name):
 
 def _sanitize_client_max_body_size(value):
     """净化 client_max_body_size 值
-    - 空值合法（表示不生成该指令，走 nginx 默认 1M）
+    - 空值合法（表示用默认值 DEFAULT_CLIENT_MAX_BODY = 1M）
     - 必须匹配 \\d+[KMG]?（如 '50M', '1G', '1024'）
     """
     if value is None:
@@ -5391,6 +5567,21 @@ def _sanitize_client_max_body_size(value):
     if not re.match(r'^\d+[kKmMgG]?$', value):
         raise ValueError(f"无效的 client_max_body_size: '{value}'（必须是数字，可选后缀 K/M/G，例如 10m、50M、1G）")
     return value.upper()
+
+
+# 反代服务的**默认**请求体上限。
+#
+# 为什么默认是 1M 而不是 0（不限）：
+#   0 = 不限。网关是公网入口，一个"不限"的请求体上限等于把 auth_gateway
+#   和上游服务一起暴露在「一个 POST 就能塞满内存」的攻击面下 ——
+#   第十八节那次 413 就是这个坑的另一头（上限太小把登录挡了）。
+#   1M = nginx 自己的默认值（nginx 编译期 client_max_body_size 默认就是 1m），
+#   足以覆盖绝大多数表单/JSON 提交；真要传大文件，用户在面板里改大即可
+#   （填 0 = 不限，填 100M / 1G 都行）。
+#
+# ⚠️ 这个值**不能**被"空 = 不生成该指令"偷换掉 —— nginx 的全局默认虽然
+# 也是 1m，但显式写出来才能让面板上的"实际生效值"跟配置对得上。
+DEFAULT_CLIENT_MAX_BODY = "1M"
 
 
 # 反代默认设置
@@ -5475,6 +5666,18 @@ def _validate_rp_service(data, existing=None, all_rules=None):
     except ValueError as e:
         return None, str(e)
 
+    # 上游绝对 API 路径前缀：留空 = 不做改写（大多数服务不需要）
+    #
+    # 这不是「上传限制」那类锦上添花的选项，而是**能不能用**的问题：
+    # 上游页面里写死的绝对路径（典型 /api/xxx）会逃出本 location，
+    # 网关按 path 前缀分发，/api/xxx 匹配不到任何 location → 直接 404。
+    # 填上这一段，nginx 会在转发时把这类绝对路径改写成带网关前缀的版本。
+    try:
+        clean["api_path_prefix"] = _sanitize_api_path_prefix(
+            pick("api_path_prefix", ""))
+    except ValueError as e:
+        return None, str(e)
+
     # WebSocket
     ws = pick("websocket_enabled", True)
     clean["websocket_enabled"] = bool(ws) if isinstance(ws, (bool, int)) else True
@@ -5539,6 +5742,7 @@ def _migrate_rp_rules(config):
             "target_protocol": str(r.get("target_protocol", "http") or "http").lower(),
             "public_access": bool(r.get("public_access", False)),
             "client_max_body_size": r.get("client_max_body_size", "") or "",
+            "api_path_prefix": r.get("api_path_prefix", "") or "",
             "websocket_enabled": bool(r.get("websocket_enabled", True)),
             "icon": _sanitize_name(str(r.get("icon", "") or ""))[:16],
             "updated_at": r.get("updated_at", ""),
@@ -5773,7 +5977,8 @@ RP_CONF_MARKER = "# Managed by nftables-web-v2"
 # nginx 服务控制脚本。集中成一个常量：OpenWrt 是 /etc/init.d/nginx，
 # 普通 Linux 发行版是 systemctl，散落硬编码会让非 OpenWrt 部署直接失败
 # （FileNotFoundError），也让测试无法替换。
-NGINX_INIT_PATH = '/etc/init.d/nginx'
+NGINX_INIT_PATH = os.environ.get(
+    "NFTABLES_WEB_NGINX_INIT", "/etc/init.d/nginx")
 
 GATEWAY_CONF_NAME = "00-nftables-web-gateway.conf"
 GATEWAY_CONF_MARKER = "# Managed by nftables-web-v2 auth gateway"
@@ -5858,11 +6063,37 @@ READONLY_CONFIG_KEYS = frozenset({
 #   4. 关掉之后这台机器上只剩 SSH 和 5443 面板 —— 两者都不依赖 LuCI。
 # ══════════════════════════════════════════════════════════════════════
 
-LUCI_CONF_PATH = '/etc/config/nginx'
-LUCI_RENDERED_PATH = '/var/lib/nginx/uci.conf'   # /etc/nginx/uci.conf 指向它
-LUCI_SNAPSHOT_PATH = '/etc/nftables/nginx-luci.snapshot'
-NGINX_UTIL_PATH = '/usr/bin/nginx-util'
+LUCI_CONF_PATH = os.environ.get(
+    "NFTABLES_WEB_LUCI_CONF", "/etc/config/nginx")
+LUCI_RENDERED_PATH = os.environ.get(
+    "NFTABLES_WEB_LUCI_RENDERED", "/var/lib/nginx/uci.conf")  # /etc/nginx/uci.conf 指向它
+LUCI_SNAPSHOT_PATH = os.environ.get(
+    "NFTABLES_WEB_LUCI_SNAPSHOT", "/etc/nftables/nginx-luci.snapshot")
+NGINX_UTIL_PATH = os.environ.get(
+    "NFTABLES_WEB_NGINX_UTIL", "/usr/bin/nginx-util")
 LUCI_SECTIONS = ('_lan', '_redirect2ssl')
+# ── uhttpd 版 LuCI（OpenWrt 24.10+ / 25.12）────────────────────────
+# 2026-10-20 在 .166（OpenWrt 25.12.5）实测：LuCI **不再由 nginx 提供**，
+# 而是由 uhttpd 提供 —— /etc/config/nginx 里根本没有 _lan / _redirect2ssl 段，
+# 80/443 全被 uhttpd 占着。
+#
+# ⇒ 上面那套「改 /etc/config/nginx 再 reload nginx」在这台机器上**完全无效**：
+#   · 找不到 _lan 段 → 面板判定「LuCI 本来就没开」→ 什么都不做
+#   · 面板的 luci_actual 报 False，但 80/443 其实在听 ⇒ **误报**
+# 而且 setup.sh 的 close_luci_ports() 报的「✅ LuCI 80/443 已关闭」是假的。
+#
+# uhttpd 这条路的开关点（实测自 /etc/init.d/uhttpd）：
+#     config_get_bool enabled "$cfg" 'enabled' 1
+#     [ $enabled -gt 0 ] || return
+# ⇒ `uci set uhttpd.<段>.enabled=0` + `uci commit uhttpd` ⇒ **开机也不起**；
+# 再 stop 掉当前实例，80/443 立刻释放。
+# 再加一句"没有这一项时默认是启用(=1)"，所以读不到时不能当"已关"。
+UHTTPD_CONF_PATH = os.environ.get(
+    "NFTABLES_WEB_UHTTPD_CONF", "/etc/config/uhttpd")
+UHTTPD_INIT_PATH = os.environ.get(
+    "NFTABLES_WEB_UHTTPD_INIT", "/etc/init.d/uhttpd")
+UCI_BIN_PATH = os.environ.get(
+    "NFTABLES_WEB_UCI_BIN", "/sbin/uci")
 # 本项目网关监听的端口：关 LuCI 时它必须照常在听，否则就是改坏了
 GATEWAY_PORT = 8443
 
@@ -5994,6 +6225,137 @@ def _luci_reload_nginx(what):
     return True, f'nginx 已重新渲染并 reload（{what}）'
 
 
+def _uhttpd_conf_text():
+    try:
+        with open(UHTTPD_CONF_PATH, 'r', errors='ignore') as f:
+            return f.read()
+    except OSError:
+        return ''
+
+
+def _uhttpd_sections():
+    """列出 /etc/config/uhttpd 里所有 `config uhttpd` 段的段名。
+
+    uhttpd 的 init 脚本是 `config_foreach start_instance uhttpd` ——
+    **每个** uhttpd 段都会起一个实例，所以要关就得**全关**，
+    只关 'main' 可能漏掉别的段。
+    """
+    names = []
+    for line in _uhttpd_conf_text().splitlines():
+        s = line.strip()
+        if not s.startswith('config '):
+            continue
+        parts = s.split(None, 2)
+        if len(parts) < 3 or parts[1] != 'uhttpd':
+            continue
+        nm = parts[2].strip()
+        if len(nm) >= 2 and nm[0] == nm[-1] and nm[0] in ("'", '"'):
+            nm = nm[1:-1]
+        if nm:
+            names.append(nm)
+    return names
+
+
+def _uhttpd_serves_luci():
+    """uhttpd 是不是 LuCI 的提供方。
+
+    OpenWrt 24.10 之后 LuCI 由 uhttpd 提供，/etc/config/uhttpd 里有：
+        option lua_prefix '/cgi-bin/luci=/usr/lib/lua/luci/sgi/uhttpd.lua'
+    nginx 版 LuCI 走的是 /etc/config/nginx 的 _lan 段 —— 两者互斥。
+    """
+    return '/cgi-bin/luci' in _uhttpd_conf_text()
+
+
+def _uci_get(path):
+    """读一个 uci 值。读不到（选项不存在 / 没有 uci 命令）返回 None。"""
+    if not os.path.exists(UCI_BIN_PATH):
+        return None
+    try:
+        r = subprocess.run([UCI_BIN_PATH, 'get', path],
+                           capture_output=True, text=True, timeout=10)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip().strip("'")
+
+
+def _uhttpd_enabled():
+    """uhttpd 现在是不是启用的。
+
+    init 脚本里是 `config_get_bool enabled "$cfg" 'enabled' 1`
+    ⇒ **没有这一项时默认是启用**。所以读不到必须返回 True ——
+    返回 False 会让面板误判「LuCI 已关」，而它其实还开着。
+    """
+    secs = _uhttpd_sections()
+    if not secs:
+        return False
+    vals = [v for v in (_uci_get(f'uhttpd.{s}.enabled') for s in secs)
+            if v is not None]
+    if not vals:
+        return True          # 没有 enabled 选项 ⇒ 按 init 脚本默认（启用）
+    return all(v.lower() in ('1', 'on', 'true', 'yes') for v in vals)
+
+
+def _uhttpd_set_enabled(enabled):
+    """把 uhttpd 各段的 enabled 改掉并 commit。返回 (ok, 说明)。"""
+    secs = _uhttpd_sections()
+    if not secs:
+        return False, f'没有 {UHTTPD_CONF_PATH}，或其中没有 uhttpd 段'
+    if not os.path.exists(UCI_BIN_PATH):
+        return False, f'没有 {UCI_BIN_PATH}（不是 OpenWrt？）'
+    for s in secs:
+        val = '1' if enabled else '0'
+        # ⚠️ uci set 的语法是 **`name=value` 一个参数**，
+        # 不是 `uci set name value` 两个参数（那样 uci 会直接打 usage 报错）。
+        # 这个错单测抓不到：测试里的假 uci 不校验参数个数 ——
+        # 2026-10-20 在 .166 真机上第一次保存配置才暴露出来。
+        try:
+            r = subprocess.run([UCI_BIN_PATH, 'set', f'uhttpd.{s}.enabled={val}'],
+                               capture_output=True, text=True, timeout=10)
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+            return False, f'uci set 失败: {type(e).__name__}: {e}'
+        if r.returncode != 0:
+            return False, (f'uci set uhttpd.{s}.enabled 失败: '
+                           f'{(r.stderr or r.stdout)[:160]}')
+    try:
+        r = subprocess.run([UCI_BIN_PATH, 'commit', 'uhttpd'],
+                           capture_output=True, text=True, timeout=10)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        return False, f'uci commit 失败: {type(e).__name__}: {e}'
+    if r.returncode != 0:
+        return False, f'uci commit uhttpd 失败: {(r.stderr or r.stdout)[:160]}'
+    return True, f'uhttpd.enabled = {1 if enabled else 0}（已 commit）'
+
+
+def _uhttpd_service(action):
+    """start / stop uhttpd。返回 (ok, 说明)。
+
+    实测 .166：`/etc/init.d/uhttpd stop` 与 `start` 的退出码都是 0
+    （走 procd 的 `procd_add_reload_trigger "uhttpd"`）。
+    """
+    if not os.path.exists(UHTTPD_INIT_PATH):
+        return False, f'{UHTTPD_INIT_PATH} 不存在'
+    try:
+        r = subprocess.run([UHTTPD_INIT_PATH, action],
+                           capture_output=True, text=True, timeout=30)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        return False, f'uhttpd {action} 失败: {type(e).__name__}: {e}'
+    if r.returncode != 0:
+        return False, (f'{UHTTPD_INIT_PATH} {action} returncode={r.returncode}: '
+                       f'{(r.stderr or r.stdout)[:160]}')
+    return True, f'uhttpd 已 {action}'
+
+
+def _uhttpd_luci_open():
+    """uhttpd 提供的 LuCI 此刻是不是开着。"""
+    if not _uhttpd_serves_luci():
+        return False
+    if not _uhttpd_enabled():
+        return False
+    return bool(_luci_ports_listening())
+
+
 def _luci_actual_state():
     """LuCI 当前**实际**是不是开着 —— 看 /etc/config/nginx 里那两段还在不在。
 
@@ -6004,9 +6366,18 @@ def _luci_actual_state():
       · 用户手工 uci 改了、或在 LuCI 界面里改了什么
       · 上一次切换失败，配置项已回滚而系统没跟上
     只比「配置有没有变」会漏掉以上全部情形。
+
+    ⚠️ **两种实现都要看**（2026-10-20 在 .166 实测踩到）：
+    OpenWrt 24.10 之后 LuCI 由 **uhttpd** 提供，/etc/config/nginx 里
+    根本没有 _lan / _redirect2ssl 段。只看 nginx 段会得到
+    「LuCI 没开」——而实际上 uhttpd 正占着 80/443，**误报**。
+    后果不只是显示难看：`_luci_reconcile()` 看到「实际 == 期望」就直接
+    什么都不做，于是**永远关不掉** uhttpd 版 LuCI。
     """
     names = set(_uci_section_names(_uci_conf_text()))
-    return bool(names & set(LUCI_SECTIONS))
+    if names & set(LUCI_SECTIONS):
+        return True
+    return _uhttpd_luci_open()
 
 
 def _luci_reconcile(desired):
@@ -6023,6 +6394,57 @@ def _luci_reconcile(desired):
 
 def _apply_luci_toggle(enabled):
     """按配置里的 luci_enabled 开关 LuCI 的 80/443。返回 (ok, 说明)。
+
+    **两种实现各管各的，都要处理**（2026-10-20 在 .166 实测踩到）：
+
+      · nginx 版 LuCI（OpenWrt ≤ 23.05）：改 /etc/config/nginx 摘/还原
+        _lan / _redirect2ssl 两段，再 reload nginx
+      · uhttpd 版 LuCI（OpenWrt 24.10+ / 25.12）：LuCI 由 uhttpd 提供，
+        80/443 全被 uhttpd 占着 ⇒ 改 nginx 配置**完全无效**
+        （.166 实测：面板 luci_actual 报 False、80/443 却在听）
+
+    以前只处理 nginx 那一套，在 uhttpd 机器上会走「LuCI 本来就没在配置里，
+    无需处理」这条分支 —— **关不掉，还报成功**。
+
+    两套机制都存在时（不常见，但装过 luci-ssl 之类插件可能出现）
+    也**两个都处理**，少一个就可能留一个口。
+
+    ⚠️ 分流规则（不是"都跑一遍"）：
+    **uhttpd 提供 LuCI 时，nginx 那一套整个不适用** ——
+    /etc/config/nginx 里没有 _lan 段，nginx 管的本来就不是 LuCI 的 80/443。
+    这时候跑 nginx 分支会出两个错：
+      · 关闭时它报「本来就没在配置里，无需处理」（无害，但会掩盖 uhttpd 那条路）
+      · **打开时它报「没有快照，无法自动还原」⇒ 假失败** ——
+        uhttpd 明明能开，nginx 分支却报失败
+    所以只有"uhttpd 不提供 LuCI"或"nginx 里确实还有 _lan 段（两套并存）"
+    时才走 nginx 分支。
+    """
+    msgs = []
+    ok_all = True
+    text = _uci_conf_text()
+    present = set(_uci_section_names(text))
+    uhttpd_luci = _uhttpd_serves_luci()
+
+    # ── 机制一：nginx 版 LuCI ──
+    if present & set(LUCI_SECTIONS) or not uhttpd_luci:
+        ok, msg = _nginx_luci_toggle(enabled)
+        ok_all = ok_all and ok
+        msgs.append(msg)
+
+    # ── 机制二：uhttpd 版 LuCI ──
+    if uhttpd_luci:
+        ok, msg = _uhttpd_luci_toggle(enabled)
+        ok_all = ok_all and ok
+        msgs.append(msg)
+
+    if not msgs:
+        return True, ('本机没检测到 LuCI（既不是 nginx 版也不是 uhttpd 版），'
+                      '无需处理')
+    return ok_all, '；'.join(msgs)
+
+
+def _nginx_luci_toggle(enabled):
+    """nginx 版 LuCI 的开关（OpenWrt ≤ 23.05）。
 
     enabled=False → 从 /etc/config/nginx 摘掉 _lan / _redirect2ssl 两段
     enabled=True  → 从快照整份还原（用户中途改过 LuCI 配置也不会被覆盖，
@@ -6068,6 +6490,54 @@ def _apply_luci_toggle(enabled):
     if not ok:
         return False, msg
     return True, 'LuCI 80/443 已重新打开'
+
+
+def _uhttpd_luci_toggle(enabled):
+    """uhttpd 版 LuCI 的开关（OpenWrt 24.10+ / 25.12）。
+
+    机制（实测自 .166 的 /etc/init.d/uhttpd）：
+
+        config_get_bool enabled "$cfg" 'enabled' 1
+        [ $enabled -gt 0 ] || return
+
+    ⇒ `uci set uhttpd.<段>.enabled=0` + `uci commit uhttpd` 之后，
+    uhttpd 的 start_service **直接 return**，所以**开机也不会起**；
+    再 stop 掉当前实例，80/443 立刻释放。
+    重新打开就是 enabled=1 + commit + start。
+
+    为什么不用 ubus 的 `luci.setInitAction`：
+    它是 LuCI「系统 → 启动」页面的后端，功能上等价，但**只能走本地 ubus
+    socket**（`ubus call luci setInitAction ...`）——
+    走 `POST /ubus` 会被 rpcd 的 ACL 挡住（Access denied），
+    因为 /usr/share/rpcd/acl.d/ 下**没有任何规则**授权 luci.* 这个对象。
+    面板本来就在机器上、就是 root，直接调 uci + init 脚本更直白，
+    也不依赖 rpcd 的 ACL 配置。
+    """
+    if enabled:
+        ok, msg = _uhttpd_set_enabled(True)
+        if not ok:
+            return False, msg
+        ok, msg2 = _uhttpd_service('start')
+        if not ok:
+            return False, msg2
+        time.sleep(1.0)
+        if not _luci_ports_listening():
+            return False, (f'uhttpd 已启动但 80/443 没在监听'
+                           f'（uhttpd 可能没装 lua_prefix 指向 luci 的配置）')
+        return True, 'uhttpd 提供的 LuCI 80/443 已重新打开'
+
+    # enabled=False
+    ok, msg = _uhttpd_set_enabled(False)
+    if not ok:
+        return False, msg
+    ok, msg2 = _uhttpd_service('stop')
+    if not ok:
+        return False, msg2
+    time.sleep(1.0)
+    left = _luci_ports_listening()
+    if left:
+        return False, f'已改配置但 {sorted(left)} 仍在监听，未达到预期（{msg2}）'
+    return True, 'uhttpd 提供的 LuCI 80/443 已关闭（且开机不再启动）'
 
 
 def _gateway_port_alive(port=None, config=None):
@@ -6372,11 +6842,13 @@ def _generate_gateway_nginx_conf(config):
     for rule, prefix, protocol, host, tport in services:
         name = _sanitize_name(rule.get("name") or prefix)
         try:
-            cmbs = _sanitize_client_max_body_size(rule.get("client_max_body_size", "")) or "0"
+            cmbs = (_sanitize_client_max_body_size(rule.get("client_max_body_size", ""))
+                    or DEFAULT_CLIENT_MAX_BODY)
         except ValueError:
-            # 配置被手工改坏时退回「不限」，但不能因此让整份配置生成失败
-            print(f'[WARN] 服务 {name} 的 client_max_body_size 非法，已按不限处理', flush=True)
-            cmbs = "0"
+            # 配置被手工改坏时退回默认值，但不能因此让整份配置生成失败
+            print(f'[WARN] 服务 {name} 的 client_max_body_size 非法，'
+                  f'已按默认 {DEFAULT_CLIENT_MAX_BODY} 处理', flush=True)
+            cmbs = DEFAULT_CLIENT_MAX_BODY
         L.append(f"    # ---- {name} ----")
         L.append(f"    location {prefix}/ {{")
         L.append(f"        proxy_pass {protocol}://{host}:{tport}/;")
@@ -6428,8 +6900,66 @@ def _generate_gateway_nginx_conf(config):
         # 上传体积限制：用户配的值在这里**真正生效**。
         # v0.8.0 这里硬编码 0（不限），界面上填的 client_max_body_size
         # 只对已废弃的独立站点生效，网关这一侧被完全忽略 —— 配了没反应。
-        # 0 是 nginx 的「不限」，仍作为空值时的默认。
-        L.append(f"        client_max_body_size {cmbs};   # 上传体积限制（0=不限）")
+        # 现在空值 = DEFAULT_CLIENT_MAX_BODY（1M，nginx 自己的默认值），
+        # 显式填 0 才是「不限」，填 100M/1G 都能放大。
+        L.append(f"        client_max_body_size {cmbs};   "
+                 f"# 上传体积限制（0=不限，空值默认 {DEFAULT_CLIENT_MAX_BODY}）")
+
+        # ── 上游绝对路径改写（窄模式）─────────────────────────────
+        # 上游页面里写死的绝对路径（典型 /api/xxx）会**逃出本 location**：
+        # 网关按 path 前缀分发，/api/xxx 匹配不到任何 location → 直接 404，
+        # 表现就是「页面能打开、数据接口全挂」。
+        #
+        # 这里用 nginx sub_filter 把「上游自己声明的那一段前缀」改写成
+        # 「带网关前缀的同一段」，浏览器再请求就落回本 location。
+        #
+        # ⚠️ 只做**窄模式**：只替换 api_path_prefix 这一段字面量。
+        # 通用规则（任何根绝对路径都加前缀）实测会把页面里普通的路径字符串
+        # （"/var/log/syslog" 这种）也一起改掉，直接改坏应用。
+        # 窄模式的失败模式是「没改写 → 404（跟改之前一样）」，
+        # 绝不会比不装更糟 —— 这是选它不选通用规则的根本原因。
+        #
+        # 这个值最终会进 nginx 的**引号字符串**里，所以这里**必须再净化一次**：
+        # 校验只在保存时做，而配置文件可能被手工改过。带引号/分号/换行的值
+        # 拼进 sub_filter 就能逃出引号 → nginx 指令注入。
+        # （与 client_max_body_size 同样的道理：生成期也要净化，不信任落盘值。）
+        try:
+            api_prefix = _sanitize_api_path_prefix(rule.get("api_path_prefix", ""))
+        except ValueError as e:
+            # 非法值：**只放弃「改写」这一项，不放弃整条服务**。
+            #
+            # 这里刻意不像 client_max_body_size 那样让异常冒泡 ——
+            # 那会让整份网关配置生成失败，**所有**服务一起挂，
+            # 那比一个 404 严重得多，也违背上面「窄模式降级安全」的承诺。
+            # 正确做法：跳过改写（该服务退回今天的行为），并在生成的
+            # 配置里留一行说明，让运维能看见「有人填了非法值」。
+            #
+            # 原始值与错误信息都回显，但**必须强制单行**：
+            # nginx 注释到行尾为止，值里一个换行就能把注释劈开，
+            # 后半行变成一条 nginx 指令 ⇒ 注入面。
+            # repr() 本身已转义换行，这里再 collapse 一次做双保险
+            # （错误信息是第三方拼的，不保证单行）。
+            _bad = repr(rule.get('api_path_prefix')).replace('\n', '\\n')
+            _why = str(e).replace('\n', ' ').replace('\r', ' ')
+            L.append("        # ⚠️ api_path_prefix 非法，已跳过路径改写"
+                     f"（原始值 {_bad}）")
+            L.append(f"        #    原因：{_why}")
+            api_prefix = ""
+        if api_prefix:
+            L.append(f"        # ── 上游绝对路径改写：{api_prefix}... -> "
+                     f"{prefix}{api_prefix}... ──")
+            L.append("        # 窄模式：只替换这一段字面量，避免改坏应用里的其它路径")
+            # sub_filter 必须在明文正文上做：上游若压缩了正文就匹配不到
+            L.append('        proxy_set_header Accept-Encoding "";')
+            L.append("        sub_filter_once off;")
+            # ⚠️ 这里**不能**再写 text/html：nginx 的 sub_filter_types 默认
+            # 已经含 text/html，指令是「在默认之外追加」，重复写会报
+            #   [warn] duplicate MIME type "text/html"
+            # 每次 nginx -t / reload 都刷一行。真机实测确认：省掉 text/html
+            # 后 text/html 照样被替换（nginx 文档原文：in addition to "text/html"）。
+            L.append("        sub_filter_types application/javascript text/css;")
+            L.append(f'        sub_filter "\'{api_prefix}" "\'{prefix}{api_prefix}";')
+            L.append(f'        sub_filter "\\"{api_prefix}" "\\"{prefix}{api_prefix}";')
         L.append("    }")
         L.append("")
 
@@ -6981,6 +7511,38 @@ def rp_get_rules():
     return jsonify({"success": True,
                     "data": {"rules": rules_out, "total": len(rules_out)}})
 
+
+
+@app.route('/api/reverse-proxy/detect-api-prefix', methods=['POST'])
+def rp_detect_api_prefix():
+    """探测目标应用**自己声明**的 API 路径前缀（读它的 openapi.json）。
+
+    为什么要有这个端点：让用户手填「上游的 API 前缀」是可行的，但
+    没人知道上游到底用什么前缀，填错了就是 404 照旧。
+    openapi.json 是上游自己声明的路由表，读它既不用猜，也不会把
+    「页面里普通的路径字符串」误当成 API 前缀（那是扫 HTML 的老办法
+    会犯的错，实测会把应用改坏）。
+
+    只探测、不落盘 —— 探测结果由前端填进表单，用户确认后才保存。
+    这样「探测」不会在保存规则的路径上引入网络依赖。
+    """
+    data = request.get_json(silent=True) or {}
+    addr = str(data.get('target_address', '') or '').strip()
+    proto = str(data.get('target_protocol', 'http') or 'http').strip().lower()
+    if '://' in addr:
+        proto, _, addr = addr.partition('://')
+        proto = proto.lower()
+    host, _, port = addr.rpartition(':')
+    host, port = host.strip(), port.strip()
+    if proto not in ('http', 'https'):
+        return jsonify({"success": False,
+                        "message": "target_protocol 只允许 http 或 https"}), 400
+    if not host or not _is_port(port):
+        return jsonify({"success": False,
+                        "message": "target_address 必须是 内网IP:端口"}), 400
+    prefixes, err = _detect_upstream_api_prefixes(host, port, proto)
+    return jsonify({"success": True,
+                    "data": {"prefixes": prefixes, "error": err}})
 
 
 @app.route('/api/reverse-proxy/rules', methods=['POST'])

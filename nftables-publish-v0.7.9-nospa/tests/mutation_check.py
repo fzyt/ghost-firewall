@@ -11,6 +11,11 @@ import subprocess
 import sys
 import tempfile
 
+# 保险丝：被取消 / 被 kill 时也别把变异留在源码里（见 _mutation_guard.py）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _mutation_guard import MutationGuard  # noqa: E402
+
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FILES = {
     'app': os.path.join(ROOT, 'backend', 'app.py'),
@@ -43,9 +48,23 @@ MUTATIONS = [
     ('统一校验：重复前缀检测去掉', 'app',
      '        if other == prefix:', '        if False:', 1),
 
+    # ⚠️ 锚点必须**自带上下文**（指明是 client_max_body_size 那块），
+    # 不能只写 'except ValueError as e: return None, str(e)' + '# WebSocket'。
+    # 2026-10-19 真踩过：在那个 except 块**前面**插入一个新的校验块
+    # （api_path_prefix），这个变异就打到新块上去了 ——
+    # client_max_body_size 的净化根本没被去掉，测试自然全绿，
+    # 变异变成空转（报告里显示「无效变异」）。
+    # 教训：锚点越泛，越容易被后来的插入劫持。
     ('统一校验：client_max_body_size 净化去掉', 'app',
-     '    except ValueError as e:\n        return None, str(e)\n\n    # WebSocket',
-     '    except ValueError:\n        pass\n\n    # WebSocket', 1),
+     '    try:\n'
+     '        clean["client_max_body_size"] = _sanitize_client_max_body_size(\n'
+     '            pick("client_max_body_size", ""))\n'
+     '    except ValueError as e:\n'
+     '        return None, str(e)',
+     '    try:\n'
+     '        clean["client_max_body_size"] = str(pick("client_max_body_size", "") or "")\n'
+     '    except ValueError:\n'
+     '        pass', 1),
 
     ('网关上传限制改回硬编码 0（用户配置再次失效）', 'app',
      'client_max_body_size {cmbs};', 'client_max_body_size 0;', 1),
@@ -152,6 +171,7 @@ def run_tests():
 
 
 def main():
+    MutationGuard(ROOT).snapshot()   # 保险丝：中断也会还原源码
     backup = tempfile.mkdtemp()
     for key, path in FILES.items():
         shutil.copy(path, os.path.join(backup, key))

@@ -167,6 +167,9 @@ function app() {
 
     listsData: { whitelist: { ipv4: [], ipv6: [] }, blacklist: { ipv4: [], ipv6: [] } },
     listsLoading: false,
+    // 当前环境没有 nft 命令（Docker 测试环境刻意不装）⇒ 读不到规则集。
+    // 这是**环境固有**不是故障，所以不弹红色 toast，只在卡片里显示说明。
+    listsNftUnavailable: false,
     listsNewIpWhitelist: '',
     listsNewIpBlacklist: '',
     // IP 预设 + 历史
@@ -216,6 +219,8 @@ function app() {
     rpUploading: false,
     rpUploadDomain: '',
     rpRequestDomain: '',
+    rpDetectingPrefix: false,
+    rpApiPrefixHint: '',
 
     ddns: {
       services: [],
@@ -1154,28 +1159,79 @@ function app() {
 
     async loadLists() {
       this.listsLoading = true;
+      // 每个子请求**独立**兜底，不能一个 Promise.all 了事。
+      //
+      // 为什么：白名单/黑名单要读 nft 规则集。读不到时（nft 没装、规则集
+      // 临时不可读、正在重载）这两个请求会抛错，而 Promise.all 是
+      // **一错全错** —— 整个 Promise.all 直接 reject，下面那四行赋值
+      // **一行都不执行**，ipPresets 也就永远停在初始的 []。
+      //
+      // 结果：预设明明在后端存着，界面上却是「暂无预设」——
+      // 和第十七节那个 bug 的**症状一模一样**，根因却完全无关。
+      // 用户没法从界面分辨「没有预设」和「没读到预设」，
+      // 而这两件事的处理方式完全相反。
+      //
+      // 所以：逐个兜底 + 把失败明确说出来（toast）。
+      // 绝不让「读不到」伪装成「没有」—— 那个才是真正骗人的地方。
+      const failed = [];
+      // nft 二进制不存在 = **环境固有**，不是故障。
+      // 后端用 code='NFT_UNAVAILABLE' 明确区分（见 backend/app.py 的
+      // get_whitelist / get_blacklist 的 FileNotFoundError 分支）。
+      //
+      // 为什么必须分开：Docker 测试环境刻意不装 nft（规则集是 policy drop
+      // 且只认 br-lan/eth1，容器里接口叫 eth0，会把自己锁死），
+      // 所以每次进名单管理都会读不到白/黑名单。
+      // 如果一律当"失败"弹红色 toast，用户会以为面板坏了 ——
+      // 而实际上只是这台机器没有防火墙可读。
+      //
+      // 所以：环境固有 → 只在卡片里显示一句说明，不报错；
+      //       其它失败 → 照旧弹 toast（真机上 nft 真出问题时仍会报警）。
+      let nftUnavailable = false;
+      const guard = (name, fallback) => (e) => {
+        if (e && e.code === 'NFT_UNAVAILABLE') {
+          nftUnavailable = true;
+          return fallback;
+        }
+        failed.push(name + '（' + (e.message || e) + '）');
+        return fallback;
+      };
+      // ⚠️ 这里刻意用 `api.get(...).catch(...)` 的直白写法，**不要**抽成
+      // `loadOne('/api/lists/xxx', fallback)` 这种包装函数 ——
+      // 契约测试（tests/test_api_contract.py）是靠扫源码里的
+      // `api.get('/api/...')` 字面量来对账「读哪一层」的。
+      // 一旦包起来，扫描器就看不见这些调用点了，于是「读错一层」会重新
+      // 变成零不匹配的假绿（2026-10-20 实测踩过：变异脚本 2 处漏过）。
       try {
         const [whitelist, blacklist, presets, history] = await Promise.all([
-          api.get('/api/lists/whitelist'),
-          api.get('/api/lists/blacklist'),
-          api.get('/api/lists/presets').catch(() => ({ presets: [] })),
-          api.get('/api/lists/history?limit=20').catch(() => ({ history: [] })),
+          api.get('/api/lists/whitelist')
+            .catch(guard('whitelist', { allowed4: {}, allowed6: {} })),
+          api.get('/api/lists/blacklist')
+            .catch(guard('blacklist', { blacklist4: {}, blacklist6: {} })),
+          api.get('/api/lists/presets')
+            .catch(guard('presets', { presets: [] })),
+          api.get('/api/lists/history?limit=20')
+            .catch(guard('history', { history: [] })),
         ]);
         this.listsData.whitelist = { ipv4: whitelist.allowed4 || {}, ipv6: whitelist.allowed6 || {} };
         this.listsData.blacklist = { ipv4: blacklist.blacklist4 || {}, ipv6: blacklist.blacklist6 || {} };
-        this.ipPresets = presets.presets || [];
-        this.listHistory = history.history || [];
+        this.ipPresets = unwrap(presets).presets || [];
+        this.listHistory = unwrap(history).history || [];
+        this.listsNftUnavailable = nftUnavailable;
       } catch (e) {
         this.showToast('加载名单失败: ' + e.message, 'error');
       } finally {
         this.listsLoading = false;
+        if (failed.length) {
+          this.showToast('部分名单读取失败，界面上可能是空的而不是真的没有：'
+            + failed.join('；'), 'error');
+        }
       }
     },
 
     async loadListPresets() {
       try {
         const data = await api.get('/api/lists/presets');
-        this.ipPresets = data.presets || [];
+        this.ipPresets = unwrap(data).presets || [];
       } catch (e) {
         console.warn('加载预设失败:', e);
       }
@@ -1184,7 +1240,7 @@ function app() {
     async loadListHistory() {
       try {
         const data = await api.get('/api/lists/history?limit=20');
-        this.listHistory = data.history || [];
+        this.listHistory = unwrap(data).history || [];
       } catch (e) {
         console.warn('加载历史失败:', e);
       }
@@ -1353,15 +1409,16 @@ function app() {
       this.rulesHealth.loading = true;
       try {
         const d = await api.get('/api/rules/health');
+        const h = unwrap(d);
         this.rulesHealth = {
           ...this.rulesHealth,
-          ruleset_loaded: !!d.ruleset_loaded,
-          ruleset_functional: !!d.ruleset_functional,
-          rules_file_exists: !!d.rules_file_exists,
-          backup_file_exists: !!d.backup_file_exists,
-          rules_file: d.rules_file || '',
-          detail: d.detail || '',
-          watchdog: d.watchdog || null,
+          ruleset_loaded: !!h.ruleset_loaded,
+          ruleset_functional: !!h.ruleset_functional,
+          rules_file_exists: !!h.rules_file_exists,
+          backup_file_exists: !!h.backup_file_exists,
+          rules_file: h.rules_file || '',
+          detail: h.detail || '',
+          watchdog: h.watchdog || null,
           loaded: true,
         };
       } catch (e) {
@@ -1394,7 +1451,7 @@ function app() {
           old_password: m.old_password,
           new_password: m.new_password,
         });
-        this.showToast(r.message || '密码已修改', 'success');
+        this.showToast(unwrap(r).message || '密码已修改', 'success');
         m.show = false;
       } catch (e) {
         m.error = e.message || '修改失败';
@@ -1720,6 +1777,49 @@ function app() {
       this.saveRpRules();
     },
 
+    // ── 反代规则：上游 API 路径前缀探测 ──────────────────────────
+    //
+    // 上游页面里写死的绝对路径（典型 /api/xxx）会逃出网关的 path 前缀
+    // location → 匹配不到任何 location → 404。这一段填上之后，
+    // 网关在转发时会把这类路径改写成带前缀的版本。
+    //
+    // 探测读的是上游自己的 openapi.json（路由表），不是扫 HTML ——
+    // 扫 HTML 只能靠猜，猜宽了会把应用里普通的路径字符串也改掉。
+    async detectRpApiPrefix() {
+      const r = this.rpEditingRule;
+      if (!r) return;
+      const addr = String(r.target_address || '').trim();
+      if (!addr) {
+        this.rpApiPrefixHint = '请先填写目标地址';
+        return;
+      }
+      this.rpDetectingPrefix = true;
+      this.rpApiPrefixHint = '';
+      try {
+        const res = await api.post('/api/reverse-proxy/detect-api-prefix', {
+          target_address: addr,
+          target_protocol: r.target_protocol || 'http',
+        });
+        // 后端返回 {success, data:{prefixes, error}} —— api.request 只剥
+        // 顶层的 success/message，data 信封原样留着，所以要读 res.data.*。
+        const prefixes = (res.data && res.data.prefixes) || [];
+        const err = (res.data && res.data.error) || '';
+        if (prefixes.length === 1) {
+          r.api_path_prefix = prefixes[0];
+          this.rpApiPrefixHint = '已填入 ' + prefixes[0] + '（保存后生效）';
+        } else if (prefixes.length > 1) {
+          this.rpApiPrefixHint = '探测到多个前缀：' + prefixes.join('、')
+            + '，请自行填写其中一个';
+        } else {
+          this.rpApiPrefixHint = '没探测到：' + (err || '上游未暴露 openapi.json');
+        }
+      } catch (e) {
+        this.rpApiPrefixHint = '探测失败: ' + e.message;
+      } finally {
+        this.rpDetectingPrefix = false;
+      }
+    },
+
     // 新建一条服务。字段名必须与 _validate_rp_service 的 clean 输出一致，
     // 之前这里内联写了 domain / listen_port / ssl_cert_id —— v0.8.1 已砍掉这三个，
     // 再带着它们提交会被后端忽略，而 path_prefix 反而缺省成 undefined。
@@ -1729,7 +1829,10 @@ function app() {
         path_prefix: '',
         target_address: '',
         target_protocol: 'http',
-        client_max_body_size: '',
+        // 默认 1M（nginx 自己的默认值）—— 公网入口的请求体上限不宜默认「不限」。
+        // 需要传大文件时在表单里改大（填 0 = 不限）。
+        client_max_body_size: '1M',
+        api_path_prefix: '',
         icon: '',
         enabled: true,
         public_access: false,
@@ -1739,7 +1842,8 @@ function app() {
 
     editRpRule(index) {
       const r = { ...this.rp.rules[index], _editIndex: index };
-      r.client_max_body_size = r.client_max_body_size || '';
+      r.client_max_body_size = r.client_max_body_size || '1M';
+      r.api_path_prefix = r.api_path_prefix || '';
       r.path_prefix = r.path_prefix || '';
       r.name = r.name || '';
       r.target_address = r.target_address || '';
@@ -1776,9 +1880,12 @@ function app() {
             await api.put('/api/reverse-proxy/rules/' + clean.id, clean);
           } else {
             const resp = await api.post('/api/reverse-proxy/rules', clean);
-            // api.request 已解构 {success, message, ...data}，resp 就是 data
-            if (resp && resp.rule_id) {
-              this.rp.rules[i].id = resp.rule_id;  // 同步后端分配的 id
+            // 后端返回 {success, data:{rule_id, ...}}，api.request 只剥顶层，
+            // 所以 rule_id 在信封里 —— 直接读 resp.rule_id 永远是 undefined，
+            // 新建的规则拿不到后端分配的 id（第十七节）。
+            const created = unwrap(resp);
+            if (created && created.rule_id) {
+              this.rp.rules[i].id = created.rule_id;  // 同步后端分配的 id
             }
           }
         }
@@ -1806,7 +1913,7 @@ function app() {
       }
       try {
         const data = await api.post('/api/reverse-proxy/rules/' + rule.id + '/test');
-        this.showToast(data.message || '连通性测试成功', 'success');
+        this.showToast(unwrap(data).message || '连通性测试成功', 'success');
       } catch (e) {
         this.showToast('测试失败: ' + e.message, 'error');
       }
@@ -1816,7 +1923,7 @@ function app() {
       this.rp.loading = true;
       try {
         const data = await api.post('/api/reverse-proxy/nginx/test');
-        this.showToast(data.message || 'Nginx 配置测试通过', 'success');
+        this.showToast(unwrap(data).message || 'Nginx 配置测试通过', 'success');
       } catch (e) {
         this.showToast('配置测试失败: ' + e.message, 'error');
       } finally {
@@ -1828,7 +1935,7 @@ function app() {
       this.rp.loading = true;
       try {
         const data = await api.post('/api/reverse-proxy/nginx/reload');
-        this.showToast(data.message || 'Nginx 已重载', 'success');
+        this.showToast(unwrap(data).message || 'Nginx 已重载', 'success');
       } catch (e) {
         this.showToast('重载失败: ' + e.message, 'error');
       } finally {
@@ -1877,7 +1984,7 @@ function app() {
           body.dns_credentials = this.rp.dnsCredentials;
         }
         const data = await api.post('/api/reverse-proxy/certificates/request', body);
-        this.showToast(data.message || '证书申请成功', 'success');
+        this.showToast(unwrap(data).message || '证书申请成功', 'success');
         this.rpRequestDomain = '';
         await this.loadReverseProxy();
       } catch (e) {
@@ -1892,7 +1999,7 @@ function app() {
       this.rpUploading = true;
       try {
         const data = await api.post('/api/reverse-proxy/certificates/' + cert.id + '/renew');
-        this.showToast(data.message || '证书续期成功', 'success');
+        this.showToast(unwrap(data).message || '证书续期成功', 'success');
         await this.loadReverseProxy();
       } catch (e) {
         this.showToast('续期失败: ' + e.message, 'error');
@@ -2078,6 +2185,37 @@ function app() {
     },
   };
 }
+
+// 解包后端的 data 信封。
+//
+// 为什么需要它（第十七节）
+// ----------------------
+// 后端的返回结构分两种，**逐端点不一致**：
+//     信封式  {"success": true, "data": {"presets": [...]}}
+//     平铺式  {"success": true, "presets": [...]}
+//
+// 而 api.request 只剥掉**顶层**的 success/message，data 信封原样留在返回值里。
+// 于是前端必须知道每个端点是哪一种：
+//     信封式 → x.data.presets
+//     平铺式 → x.presets
+//
+// 写错一层的**后果不是报错**，而是 undefined 被 `|| []` 兜成空值 ——
+// 页面上安静地显示「暂无预设」，而数据其实好好地躺在后端。
+// 第十七节真机复现过：用户加了预设、toast 也提示「预设已添加」，列表永远空。
+//
+// unwrap 对两种形状**都**对：有 data 信封就钻进去，没有就原样返回。
+// ⚠️ 不要在 api.request 里全局拍平 —— 现在有 5 处（:1537/:1564/:1655/:1977/:2041）
+// 正确地写着 `x.data.y`，全局拍平会把它们弄坏。
+//
+// 契约由 tests/test_api_contract.py 把关：后端每个 (路由,方法) 的返回形状，
+// 与前端每个调用点实际取的字段逐一对账，对不上就红。
+const unwrap = (r) => {
+  if (r && typeof r === 'object' && r.data !== undefined && r.data !== null
+      && typeof r.data === 'object') {
+    return r.data;
+  }
+  return r || {};
+};
 
 const api = {
   async request(url, options = {}) {

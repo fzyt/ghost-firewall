@@ -10,3 +10,7 @@ test_*.py
 check_ip.py
 aliyun-ddns-update.py
 update-china-ips.sh
+
+# Docker 测试环境的本机配置（放行网段等）—— 每台机器不一样，不进版本库。
+# 模板是 docker/.env.example，那个要跟踪。
+docker/.env

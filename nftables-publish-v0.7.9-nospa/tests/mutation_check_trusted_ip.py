@@ -7,6 +7,11 @@ import os
 import subprocess
 import sys
 
+# 保险丝：被取消 / 被 kill 时也别把变异留在源码里（见 _mutation_guard.py）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _mutation_guard import MutationGuard  # noqa: E402
+
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP = os.path.join(ROOT, 'backend', 'app.py')
 HTML = os.path.join(ROOT, 'frontend', 'index.html')
@@ -90,6 +95,7 @@ def report(name, r):
 
 
 def main():
+    MutationGuard(ROOT).snapshot()   # 保险丝：中断也会还原源码
     print('=' * 74)
     print('变异验证：trusted_ip4 单值语义')
     print('=' * 74)

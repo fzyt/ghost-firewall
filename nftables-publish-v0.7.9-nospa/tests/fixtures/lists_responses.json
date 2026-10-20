@@ -1,0 +1,81 @@
+{
+  "_comment": [
+    "名单面板接线测试用的响应样本。",
+    "presets / history / nft_unavailable 抓自 Docker 测试环境（do 主机 192.168.100.218:5443，2026-10-19）。",
+    "whitelist_ok / blacklist_ok 由后端自己的 _parse_nft_set_output() 解析真实 nft set 输出生成，",
+    "所以形状与代码一致（{ip: expires|null}），不是手编的假结构。",
+    "⚠️ 里面必须有**非空**内容：空内容和兜底值长得一样，测试就分辨不出",
+    "「读到了」和「读失败退化成空」—— 那样的 fixture 会让变异脚本漏过。",
+    "nft_unavailable = 后端 FileNotFoundError 分支的返回（code=NFT_UNAVAILABLE，环境固有的「没有 nft」，不是故障）；generic_failure = 真故障，前端应当报警。"
+  ],
+  "presets": {
+    "success": true,
+    "data": {
+      "presets": [
+        {
+          "auto_expire": true,
+          "created_at": "2026-10-19T18:10:28.804954",
+          "id": "p_0001",
+          "ip": "203.0.113.10",
+          "is_active": false,
+          "label": "测试预设",
+          "type": "whitelist"
+        },
+        {
+          "auto_expire": true,
+          "created_at": "2026-10-19T18:15:00.658355",
+          "id": "p_0002",
+          "ip": "198.51.100.77",
+          "is_active": false,
+          "label": "docker测试",
+          "type": "blacklist"
+        }
+      ],
+      "total": 2
+    }
+  },
+  "whitelist_ok": {
+    "success": true,
+    "allowed4": {
+      "203.0.113.10": "3h500s",
+      "198.51.100.77": null
+    },
+    "allowed6": {
+      "2001:db8::1": "1h"
+    }
+  },
+  "blacklist_ok": {
+    "success": true,
+    "blacklist4": {
+      "192.0.2.66": "1h30m"
+    },
+    "blacklist6": {}
+  },
+  "history": {
+    "success": true,
+    "data": {
+      "history": [
+        {
+          "id": "h_a1b2c3d4e5f6",
+          "ts": "2026-10-19T18:15:00.123456",
+          "action": "add",
+          "ip": "198.51.100.77",
+          "type": "blacklist",
+          "label": "docker测试",
+          "preset_id": "p_0002"
+        }
+      ],
+      "total": 1,
+      "limit": 20
+    }
+  },
+  "nft_unavailable": {
+    "success": false,
+    "code": "NFT_UNAVAILABLE",
+    "message": "当前环境没有 nft 命令，无法读取防火墙规则集"
+  },
+  "generic_failure": {
+    "success": false,
+    "message": "读取超时"
+  }
+}

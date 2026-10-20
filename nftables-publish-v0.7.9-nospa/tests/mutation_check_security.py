@@ -13,6 +13,11 @@ import subprocess
 import sys
 import tempfile
 
+# 保险丝：被取消 / 被 kill 时也别把变异留在源码里（见 _mutation_guard.py）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _mutation_guard import MutationGuard  # noqa: E402
+
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP = os.path.join(ROOT, 'backend', 'app.py')
 GW = os.path.join(ROOT, 'backend', 'auth_gateway.py')
@@ -138,6 +143,7 @@ def run_tests():
 
 
 def main():
+    MutationGuard(ROOT).snapshot()   # 保险丝：中断也会还原源码
     backups = {}
     try:
         print('════ 安全修复变异验证 ════\n')

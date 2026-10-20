@@ -34,17 +34,18 @@
 | 包名 | opkg | apk | 说明 |
 |------|------|-----|------|
 | nftables | nftables | nftables-json | 防火墙核心 |
+| **libopenssl3** | libssl libcrypto | **libopenssl3** | **OpenSSL 共享库**。apk 上必须**先于** `wget-ssl` 安装 —— 它提供 `libssl.so.3`，而 `wget-ssl` 依赖它、`wget-ssl` 又要靠 wget 下载自己的依赖（鸡生蛋） |
 | python3 | python3 | python3 | 运行环境 |
 | python3-light | python3-light | python3-light | 精简版 |
 | python3-requests | python3-requests | python3-requests | HTTP 库 |
 | python3-flask | python3-flask | python3-flask | Web 框架 |
 | nginx-full | nginx-full | nginx-full | 反向代理 + SSL + `auth_request`（**认证网关硬依赖**） |
-| curl | curl | curl | HTTP 工具 |
+| curl | curl | curl | HTTP 工具。**apk 上它链的是 mbedTLS 而不是 OpenSSL**，所以在 libssl.so.3 缺失时它照样能下 https —— 安装期的 wget 顶替就靠它 |
 | openssl-util | openssl-util | openssl-util | SSL 工具 |
 | socat | socat | socat | 端口转发 |
 | ca-certificates | ca-certificates | ca-certificates | CA 证书 |
-| wget-ssl | wget-ssl | wget-ssl | 下载工具 |
-| blinker | `pip3 install blinker` | `pip3 install blinker` | Flask 依赖（apk 需额外安装 python3-pip） |
+| wget-ssl | wget-ssl | wget-ssl | 下载工具。**apk 上必须最后装**（它的 postinst 会替换 /usr/bin/wget） |
+| blinker | `pip3 install blinker` | `pip3 install blinker` | Flask 依赖。**25.x 仓库里没有这个包**，本项目改为**随包携带**（`setup/vendor/blinker/`），不需要 pip |
 
 > ⚠️ **必须用 `nginx-full`，不能用 `nginx-ssl`。** v0.8.0 的单端口认证网关
 > 每个公网请求都要经 `auth_request` 子请求向认证服务核对 token，而 OpenWrt 的
@@ -193,9 +194,26 @@ setup.sh 自动完成以下步骤：
 | 问题 | 说明 | 解决方案 |
 |------|------|----------|
 | OpenWrt 25.x 包管理器 | 25.x 使用 apk 替代 opkg | setup.sh 已自动兼容，无需手动处理 |
+| **25.x 的 `wget-ssl` 鸡生蛋** | `wget-ssl` 依赖 `libssl.so.3`（`libopenssl3`），而 `libopenssl3` 要靠 wget 下载。apk 在同一事务里把 wget 换成坏的那个后，就再也下不来任何包 | setup.sh 会**自愈**：检测到 wget 不可用就用 curl 顶替（curl 链 mbedTLS，不依赖 libssl.so.3），装完再把 wget 换回原版 |
+| **⚠️ 别拿 `wget --version` 的退出码判 wget 好坏** | 25.x 原装的 `/usr/bin/wget` 是指向 `/bin/uclient-fetch` 的软链，而 **uclient-fetch 不支持 `--version`**（输出 `wget: unrecognized option: version`，退出码 1）。拿退出码当判据会把**好用的**下载器误判成坏掉 | setup.sh 改成按**输出特征**判坏：真坏掉（wget-ssl 缺 `libssl.so.3`）的输出含 `Error relocating` / `symbol not found`；`unrecognized option` 不算坏 |
+| **顶替 wget 的 shim 不能只认 curl** | 全新机上 curl 还没装，shim 只认 curl 就必然 `exit 127` | setup.sh 的 shim **运行时**选后端：优先 `/usr/bin/curl`，退回 `/bin/uclient-fetch`（后者不支持 `-O -`，走 stdout 时不传 `-O`；也没有 `--fail`/`--retry`，但 HTTP 错误码自身返回非 0） |
+| **25.x 仓库没有 blinker** | `python3-flask` 的依赖里也没有它，但 Flask 3.x 的代码会 `import blinker` | blinker **随包携带**（`setup/vendor/blinker/`，32KB 纯 Python），不需要 `python3-pip`（那要 52MB）。装不上时 pip 兜底前有**磁盘闸**：剩 <80MB 直接报错，不会把根文件系统撑爆 |
+| **apk 缓存写在 overlay 上** | `/var/cache/apk` 不是 tmpfs，下载的包会**再存一份** | setup.sh 用 `apk add --no-cache` |
+| **25.x busybox 没有 wget applet** | OpenWrt 用 `uclient-fetch` 替代，所以「换回 busybox wget」这条路走不通 | 只能用 curl（链 mbedTLS）或 `uclient-fetch` |
+| **dropbear 没有 sftp-server** | `scp` 默认走 SFTP ⇒ `ash: /usr/libexec/sftp-server: not found` | 用 `tar czf - ... \| ssh host 'tar xzf -'` 传文件 |
+| 磁盘空间偏紧 | OpenWrt 常见 overlay 只有 80~90MB；python3 + nginx-full 就占 ~55MB | 装完通常剩 ~28MB；**不要**再装 python3-pip 之类的大包 |
 | ddns-scripts-namecheap | 在 apk 下不可用 | 使用 opkg 的 OpenWrt 23.05，或跳过该 DDNS provider |
 | itsdangerous 版本过旧 | Flask 会产生 warning | 不影响运行，可忽略 |
 | GitHub 下载失败 | 网络不稳定时可能发生 | setup.sh 内置重试机制，建议在网络较好时安装 |
+
+> **25.x 排障提示**：如果安装卡在「安装依赖」并且日志里出现
+> ```
+> ERROR: wget: exited with error 127
+> ERROR: unable to select packages: XXX (no such package)
+> ```
+> 那**不是**「仓库里没有这个包」，而是**apk 的下载器自己坏了**
+> （wget-ssl 把 wget 换成了缺 libssl.so.3 的版本）。
+> 照 `repair_downloader()` 的注释手工做一次即可。
 
 ---
 

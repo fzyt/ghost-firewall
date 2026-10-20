@@ -21,6 +21,11 @@ import os
 import subprocess
 import sys
 
+# 保险丝：被取消 / 被 kill 时也别把变异留在源码里（见 _mutation_guard.py）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _mutation_guard import MutationGuard  # noqa: E402
+
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEST = os.path.join(ROOT, "tests", "test_auth_policy_bounds.py")
 AG = os.path.join(ROOT, "backend", "auth_gateway.py")
@@ -180,6 +185,7 @@ def run_test():
 
 
 def main():
+    MutationGuard(ROOT).snapshot()   # 保险丝：中断也会还原源码
     print("=" * 74)
     print("变异验证：认证边界两项（绝对上限 / 审计日志体积）")
     print("=" * 74)

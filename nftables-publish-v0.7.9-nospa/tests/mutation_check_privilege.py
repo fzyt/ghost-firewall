@@ -26,6 +26,11 @@ import shutil
 import subprocess
 import sys
 
+# 保险丝：被取消 / 被 kill 时也别把变异留在源码里（见 _mutation_guard.py）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _mutation_guard import MutationGuard  # noqa: E402
+
+
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -201,6 +206,7 @@ fi''', ':')]),
 
 
 def main():
+    MutationGuard(ROOT).snapshot()   # 保险丝：中断也会还原源码
     print('=== 基线：未变异时测试必须全绿 ===')
     restore()
     rc, out = run_tests()

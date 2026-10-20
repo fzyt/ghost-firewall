@@ -1,0 +1,80 @@
+# nftables-web-v2 面板 —— 本地 Docker 测试环境
+#
+# 用途：不碰任何路由器，在本地把面板跑起来点一遍基本功能。
+#       部署到真机之前先把 UI 层的 bug 验完。
+#
+# 用法（在 nftables-publish-v0.7.9-nospa/ 目录下）：
+#
+#   docker compose -f docker/docker-compose.yml up -d --build
+#
+#   # 面板
+#   https://localhost:5443        ← 自签证书，浏览器会警告，手动信任
+#
+#   # 看日志
+#   docker compose -f docker/docker-compose.yml logs -f
+#   docker compose -f docker/docker-compose.yml exec nftweb tail -f /data/log/panel.log
+#
+#   # 停掉（保留数据）
+#   docker compose -f docker/docker-compose.yml down
+#
+#   # 停掉并清空数据（重新测「首次设置密码」流程）
+#   docker compose -f docker/docker-compose.yml down -v
+
+services:
+  nftweb:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: nftables-web-v2:test
+    container_name: nftweb-test
+    restart: unless-stopped
+    ports:
+      # 面板（Flask 自己监听 HTTPS）
+      - "5443:5443"
+      # 认证网关（nginx；面板里启用网关后才有内容）
+      - "8443:8443"
+    volumes:
+      # 所有可变状态都在这儿，容器随时可以重建
+      - nftweb-data:/data
+    environment:
+      # 容器里没有 br-lan/eth1，探测不到 LAN 地址会**拒绝启动**（那是刻意的：
+      # 宁可打不开也不能降级成公网开放）。这里显式放行。
+      NFTABLES_WEB_BIND: "0.0.0.0"
+      NFTABLES_WEB_HTTPS_PORT: "5443"
+      # 面板与认证服务必须指向同一批文件
+      AUTH_CONFIG_PATH: "/data/nftables/nftables-web-config.json"
+      AUTH_PASSWORD_FILE: "/data/nftables/nftables-web-password"
+      AUTH_SECRET_FILE: "/data/nftables/nftables-web-secret"
+      AUTH_RATELIMIT_FILE: "/data/nftables/nftables-web-auth-ratelimit.json"
+      AUTH_PANEL_RATELIMIT_FILE: "/data/nftables/nftables-web-panel-ratelimit.json"
+      AUTH_AUDIT_LOG: "/data/log/nftables-web-auth.log"
+      AUTH_BIND_HOST: "127.0.0.1"
+      AUTH_API_PORT: "8444"
+      NFTABLES_WEB_LISTS_PATH: "/data/nftables/nftables-web-lists.json"
+      NFTABLES_WEB_RULES_PATH: "/data/nftables.d/99-custom-rules.nft"
+      NFTABLES_WEB_SSL_DIR: "/data/nginx/ssl"
+      NFTABLES_WEB_NGINX_CONF_DIR: "/data/nginx/conf.d"
+      NFTABLES_WEB_NGINX_INIT: "/usr/local/bin/nginx-reload.sh"
+      NFTABLES_WEB_LUCI_CONF: "/data/luci/nginx"
+      NFTABLES_WEB_LUCI_RENDERED: "/data/luci/uci.conf"
+      NFTABLES_WEB_LUCI_SNAPSHOT: "/data/nftables/nginx-luci.snapshot"
+      NFTABLES_WEB_ALIYUN_CONFIG: "/data/nftables/aliyun-ddns-config.json"
+      # 面板的来源访问边界。
+      #
+      # 容器里探测不到 OpenWrt 的 br-lan/eth1，配置里的 lan_subnet4 还是
+      # 默认的 192.168.4.0/24 —— 那是**别人家**的网段。局域网里的机器
+      # 访问面板时，容器看到的是那台机器的真实 IP，不在 192.168.4.0/24 里，
+      # 会被 IP_NOT_ALLOWED（403）挡在门外。
+      #
+      # 这里显式放行整个 RFC1918（192.168/16 + 172.16/12 + 10/8）——
+      # 这是**本地测试环境**，面板本身有密码兜底，优先保证「点得开」。
+      #
+      # 要收紧就在 docker/.env 里写（compose 自动读取）：
+      #     PANEL_ALLOWED_NETS=192.168.100.0/24
+      # entrypoint.sh 还会自己追加容器网段，这里配的是宿主侧的。
+      NFTABLES_WEB_PANEL_ALLOWED_NETS: "${PANEL_ALLOWED_NETS:-192.168.0.0/16,172.16.0.0/12,10.0.0.0/8}"
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+
+volumes:
+  nftweb-data:

@@ -7,6 +7,11 @@ import os
 import subprocess
 import sys
 
+# 保险丝：被取消 / 被 kill 时也别把变异留在源码里（见 _mutation_guard.py）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _mutation_guard import MutationGuard  # noqa: E402
+
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP = os.path.join(ROOT, 'backend', 'app.py')
 TEST = os.path.join(ROOT, 'tests', 'test_panel_ratelimit.py')
@@ -14,7 +19,13 @@ SRC = open(APP, encoding='utf-8').read()
 
 MUTANTS = [
     ('退回内存 dict（重启清零，这条 bug 就回来了）',
-     "PANEL_RATELIMIT_FILE = '/etc/nftables/nftables-web-panel-ratelimit.json'",
+     # 锚点必须匹配**当前**的赋值形态。路径常量已改成 os.environ.get(...)，
+     # 锚点还停在旧的字面量上 → 变异根本没被应用，脚本会报「锚点未命中」。
+     # 这里替换**整条**赋值语句（而不是只改默认值），语义跟改造前完全一致，
+     # 且不依赖环境变量里有没有设 AUTH_PANEL_RATELIMIT_FILE。
+     "PANEL_RATELIMIT_FILE = os.environ.get(\n"
+     "    \"AUTH_PANEL_RATELIMIT_FILE\",\n"
+     "    \"/etc/nftables/nftables-web-panel-ratelimit.json\")",
      "PANEL_RATELIMIT_FILE = '/dev/null'\n_failed_logins = {}   # 变异：内存版"),
 
     ('锁定状态不落盘（只存计数）',
@@ -73,6 +84,7 @@ def run_test():
 
 
 def main():
+    MutationGuard(ROOT).snapshot()   # 保险丝：中断也会还原源码
     print('=' * 74)
     print('变异验证：面板登录限流落盘')
     print('=' * 74)

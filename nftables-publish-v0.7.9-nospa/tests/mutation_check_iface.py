@@ -8,6 +8,11 @@ import subprocess
 import sys
 import tempfile
 
+# 保险丝：被取消 / 被 kill 时也别把变异留在源码里（见 _mutation_guard.py）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _mutation_guard import MutationGuard  # noqa: E402
+
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP = os.path.join(ROOT, 'backend', 'app.py')
 TEST = os.path.join(ROOT, 'tests', 'test_iface_from_config.py')
@@ -64,6 +69,7 @@ def run_test():
 
 
 def main():
+    MutationGuard(ROOT).snapshot()   # 保险丝：中断也会还原源码
     print('=' * 74)
     print('变异验证：接口名配置化')
     print('=' * 74)

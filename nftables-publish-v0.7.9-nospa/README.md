@@ -80,7 +80,16 @@ frontend/
 ## 已知限制
 
 - **ddns-scripts-namecheap**：OpenWrt 25.x 仓库中暂无此包，Namecheap DDNS 功能暂不可用
-- **OpenWrt 25.x**：包管理器从 opkg 切换到 apk，setup.sh 已做兼容处理
+- **OpenWrt 25.x**：包管理器从 opkg 切换到 apk，setup.sh 已做兼容处理。另有几处
+  25.x 生态特有的坑也已处理（详见 `setup/SETUP.md` 的「已知问题」）：
+  ① `wget-ssl` 与它自己的依赖 `libopenssl3` 的鸡生蛋（会让 apk 的下载器中途坏掉，
+  之后什么都下不来）—— setup.sh 会用 curl 顶替 wget 自愈。⚠️ 判"wget 坏了"必须看
+  **输出特征**（`Error relocating` / `symbol not found`），**不能**拿
+  `wget --version` 的退出码：25.x 原装的 wget 是指向 `uclient-fetch` 的软链，
+  而 uclient-fetch 不支持 `--version`（退出码 1），会被误判成坏掉；
+  ② 25.x 仓库没有 blinker 包（但 Flask 3.x 必须它）—— 改为随包携带，不用 pip
+  （pip 兜底前有磁盘闸，overlay 装不下就直接报错，不会把根文件系统撑爆）；
+  ③ apk 的下载缓存在 overlay 上 —— 统一用 `apk add --no-cache`
 - **Linux 部署**：已预留 `deploy_mode=linux_gateway`（只重建自有表，不清空宿主机
   ruleset），但接口名、端口敲门（NAT 源 IP 下失效）、WAN IP 获取等完整适配尚未实现
 - **单网卡机器不能开 PPPoE**（已做拦截，见 CHANGELOG）。像 Proxmox 虚拟机这种只有

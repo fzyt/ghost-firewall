@@ -15,6 +15,11 @@ import subprocess
 import sys
 import tempfile
 
+# 保险丝：被取消 / 被 kill 时也别把变异留在源码里（见 _mutation_guard.py）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _mutation_guard import MutationGuard  # noqa: E402
+
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FILES = {'app': os.path.join(ROOT, 'backend', 'app.py')}
 TEST = os.path.join(ROOT, 'tests', 'test_fw_recovery.py')
@@ -111,6 +116,7 @@ def run_tests():
 
 
 def main():
+    MutationGuard(ROOT).snapshot()   # 保险丝：中断也会还原源码
     backup = tempfile.mkdtemp()
     for key, path in FILES.items():
         shutil.copy(path, os.path.join(backup, key))
