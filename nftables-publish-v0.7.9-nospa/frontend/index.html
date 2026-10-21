@@ -2136,6 +2136,45 @@
                 </p>
               </div>
 
+              <div class="nf-switch-row">
+                <label class="flex items-start gap-3 cursor-pointer">
+                  <input type="checkbox" x-model="rpEditingRule.rewrite_root_paths" class="mt-1">
+                  <span>
+                    <span class="block text-sm font-medium">根绝对路径改写</span>
+                    <span class="block text-xs text-gray-400">
+                      开启：把上游页面里的 <span class="nf-mono">href="/x"</span>、
+                      <span class="nf-mono">src="/x"</span>、
+                      <span class="nf-mono">action="/x"</span> 改写成带本路径前缀的版本
+                    </span>
+                  </span>
+                </label>
+              </div>
+              <p class="text-xs text-gray-400 mt-1 mb-3 leading-relaxed">
+                上游页面里写死的<strong class="text-gray-500">根绝对路径</strong>
+                （以 <span class="nf-mono">/</span> 开头）被浏览器按 absolute-path
+                语义解析时会<strong class="text-gray-500">丢掉本路径前缀</strong>
+                （RFC 3986 §5.2.2）⇒ 样式表、脚本、页面链接全跑到别的服务去 →
+                404，页面变成没样式的裸文本。开启后网关会在转发时补回前缀。
+                <br>
+                <strong class="text-gray-500">只对「属性值紧跟」这一种形态生效</strong>，
+                不会去动 JS 里普通的字符串。用相对路径的应用
+                （多数前端框架）本来就不需要开。
+                <br>
+                <strong class="text-gray-500">已知边界</strong>：协议相对 URL
+                （<span class="nf-mono">href="//cdn.example.com/x.css"</span>）
+                也会被改坏 —— nginx 的 <span class="nf-mono">sub_filter</span>
+                只支持字面量，没法把 <span class="nf-mono">//</span> 排除掉。
+                开启前建议先探一下：
+                <button type="button" @click="detectRpProtocolRelative()"
+                  :disabled="rpDetectingProtoRel"
+                  class="mt-1 px-3 py-1 border border-gray-300 rounded text-xs hover:bg-gray-50 disabled:opacity-50 transition-colors">
+                  <span x-show="!rpDetectingProtoRel">检测协议相对 URL</span>
+                  <span x-show="rpDetectingProtoRel">检测中…</span>
+                </button>
+              </p>
+              <p class="text-xs mt-1 mb-3 leading-relaxed"
+                 x-show="rpProtoRelHint" x-text="rpProtoRelHint"></p>
+
               <div>
                 <label class="block text-sm font-medium mb-1">图标
                   <span class="text-gray-400 font-normal">门户页显示，可留空</span></label>
@@ -2247,6 +2286,11 @@
                     <dt class="text-xs text-gray-400">API 路径改写</dt>
                     <dd class="nf-mono text-gray-700"
                         x-text="rule.api_path_prefix"></dd>
+                  </div>
+                  <div x-show="rule.rewrite_root_paths">
+                    <dt class="text-xs text-gray-400">根绝对路径改写</dt>
+                    <dd :class="rule.rewrite_root_paths ? 'text-green-600' : 'text-gray-400'"
+                        x-text="rule.rewrite_root_paths ? '已开启' : '已关闭'"></dd>
                   </div>
                 </dl>
               </div>

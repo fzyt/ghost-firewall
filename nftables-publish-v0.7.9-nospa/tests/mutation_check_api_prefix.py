@@ -88,9 +88,10 @@ APP_MUTANTS = [
 
     # 通用规则：实测会把页面里 /var/log/syslog 这类普通路径也改掉
     ('sub_filter 退化成通用规则（把页面里普通路径一起改坏）',
-     "            L.append(f'        sub_filter \"\\'{api_prefix}\" \"\\'{prefix}{api_prefix}\";')\n"
-     "            L.append(f'        sub_filter \"\\\\\"{api_prefix}\" \"\\\\\"{prefix}{api_prefix}\";')",
-     "            L.append('        sub_filter \"/\" \"' + prefix + '/\";')"),
+     """            sf_rules.append((f"'{api_prefix}", f"'{prefix}{api_prefix}"))
+            sf_rules.append((f'"{api_prefix}', f'"{prefix}{api_prefix}'))""",
+     """            sf_rules.append((f"'/", f"'{prefix}/"))
+            sf_rules.append((f'"/', f'"{prefix}/'))"""),
 
     # ── 生成期二次净化：落盘值不可信 ──────────────────────────────
     # 配置文件可能被手工改过；这个值要拼进 nginx 的引号字符串，
@@ -120,9 +121,9 @@ APP_MUTANTS = [
      "            _bad = f\"{rule.get('api_path_prefix')}\""),
 
     ('sub_filter 只改单引号形式（双引号写的 API 路径漏改 → 照样 404）',
-     "            L.append(f'        sub_filter \"\\'{api_prefix}\" \"\\'{prefix}{api_prefix}\";')\n"
-     "            L.append(f'        sub_filter \"\\\\\"{api_prefix}\" \"\\\\\"{prefix}{api_prefix}\";')",
-     "            L.append(f'        sub_filter \"\\'{api_prefix}\" \"\\'{prefix}{api_prefix}\";')"),
+     """            sf_rules.append((f"'{api_prefix}", f"'{prefix}{api_prefix}"))
+            sf_rules.append((f'"{api_prefix}', f'"{prefix}{api_prefix}'))""",
+     """            sf_rules.append((f"'{api_prefix}", f"'{prefix}{api_prefix}"))"""),
 
     # 默认 sub_filter_once on = 只改第一处，页面里第二处引用还是裸路径
     ('sub_filter_once off 被拿掉（页面里只有第一处被改）',

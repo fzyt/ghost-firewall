@@ -2,6 +2,143 @@
 
 所有重要更改均记录在此文件中。
 
+## [v0.8.5] - 2026-10-21
+
+一次「保存配置」把整棵反代配置清空 —— 2026-10-21 `.1` 主路由真机事故的定案与修复。
+同批带上网关「根绝对路径改写」功能与协议相对 URL 预检。
+
+### P0-1  点一次「保存配置」，反代规则与证书被静默清成 0
+
+`.1`（主路由）上，13:41 建好的 2 条反代规则 + 13:42 传的 1 张阿里云证书
+（`fzyto.top`，DigiCert），在 14:06:22 的一次「保存配置」之后变成 **0 条 0 张**。
+用户侧表现是「我操作一下，所有内容就没了，包括证书」。
+
+全链路日志佐证（`.1` 面板访问日志逐行可查）：
+
+| 时刻 | 客户端 | 动作 | 磁盘 `reverse_proxy` |
+|---|---|---|---|
+| 13:20:31 | .110 | `GET /api/config` | **0 规则 0 证书**（这就是那份快照） |
+| 13:41:37 | .105 | `POST /api/reverse-proxy/rules` | 1 条 |
+| 13:42:01 | .105 | `PUT rp_001` + `POST /rules` | 2 条 |
+| 13:42:38 | .105 | `certificates/upload` + `set-default` | 2 条 + 1 张证书 |
+| **14:06:22** | **.110** | **`POST /api/config`**（带 13:20 的旧快照） | **→ 0 条 0 张** ❌ |
+| 14:11:49 | .110 | `GET /api/config` | （下一次 GET 已在 POST 之后） |
+
+交叉验证不依赖推断：`save_config` 落盘前会先 `shutil.copy` 一份 `.backup`，
+14:12 现场主文件是 0 规则 0 证书、`.backup` 是 2 规则 1 证书 ——
+那段时间里唯一的写者就是那一次 `POST /api/config`。
+
+根因链（四环，缺一不可）：
+
+1. **前端把整份 config 当 blob 带着走** —— `GET /api/config` 返回
+   `dict(config, ...)`，`reverse_proxy` 全量在里面；`loadConfig()` 原样
+   `this.config = data`。
+2. **反代页改了数据但从不回写这份 blob** —— `loadReverseProxy()` 只动
+   `this.rp.rules` / `this.rp.certificates`。硬证据：
+   `grep reverse_proxy frontend/` **命中 0 处** —— 前端根本不认识这个词，
+   它只是作为 `this.config` 里一个**不透明附带物**被动跟着整份配置回传。
+3. **配置页把整份快照原样 POST 回去** —— `pendingConfig = { ...this.config }`。
+4. **后端无条件整份覆盖** —— `new_cfg = dict(old_cfg); new_cfg.update(incoming)`，
+   前端快照里的 `reverse_proxy`（旧）直接盖掉磁盘上最新的那份。
+
+后端四道护栏一道都没拦住：`READONLY_CONFIG_KEYS`（5 键）与
+`GATEWAY_OWNED_CONFIG_KEYS`（6 键）**都不含 `reverse_proxy`**；
+`_detect_risks` 只看会进 nft 规则的字段；`preview-changes` 算的是 nft 规则 diff，
+用户看不到「你正在抹掉 2 条反代规则和 1 张证书」。
+
+⇒ **必然复现，不是偶发事故**：只要「反代页改动 → 不刷新页面 → 配置页点保存」
+这个顺序发生一次，反代数据就回滚到快照时刻的状态。
+
+**修法（主防线在后端，不指望前端「别带」）**
+
+- `RP_OWNED_CONFIG_KEYS = frozenset({'reverse_proxy'})`：
+  `/api/config` **无条件**剔除 `reverse_proxy`，响应回报 `ignored_rp_fields`。
+  安全性依据：`index.html` 里没有 `config.reverse_proxy` 的任何绑定，
+  配置页本来就不编辑反代数据。
+- 新增 `config_rev` 版本闸：`GET` 带回内容哈希，`POST` 必须带回来，
+  对不上直接 **409 `CONFIG_STALE`** 拒收。三个设计决定：
+  - **只算 `/api/config` 拥有的字段** —— `reverse_proxy` 不参与，
+    否则反代页改一条规则就让配置页莫名 409（而那份数据本来就不会被写）；
+  - **不带 `config_rev` 的调用不拦**（curl / 第三方脚本 / 旧版前端），
+    主防线是无条件剔除，版本闸只是纵深防御，不该变成破坏性变更；
+  - **保存成功后必须把新版本号带回前端**，否则连点两次保存第二次就撞 409。
+- `preview-changes` 同样剔除 ⇒ 预览 = 实际会保存的内容。
+- 前端识别 `CONFIG_STALE`：说清原因、问用户要不要重新加载；
+  用户选择**不**重载时不偷换版本号 ⇒ 下次保存仍会被拒。
+
+### P0-2  上传证书 / 设为默认证书，从不生效
+
+`rp_upload_cert` 与 `rp_set_default_cert` 只落盘，**不调 `_deploy_all_rules`、
+不 reload nginx**；而同文件的 `reupload` 会部署。
+
+`.1` 实测：13:42 传了阿里云证书并设为默认，8443 一直用自签证书
+（`/etc/nginx/ssl/nftables-web/fullchain.pem`），而面板显示
+「默认证书 = cert_001」—— 两边对不上。`nginx/reload` 只重载旧 conf、
+不重新生成，所以也救不了。
+
+修法：两个端点落盘后都调 `_deploy_all_rules`，沿用 `reupload` 的既有约定
+（**先落盘、再部署**，部署失败只改文案、不改成功状态 —— 证书文件已经原子
+写进磁盘，落盘与否不造成反复失败；硬套规则 CRUD 的「先部署后落盘」反而会让
+「网关已启用但 0 条规则」这种状态下连证书都设不了）。响应新增 `nginx_reloaded`。
+
+### P1-1  损坏的配置被直接删掉
+
+`load_config()` 的损坏兜底是 `shutil.copy` + `os.remove` —— 原文件没了，
+只剩一份同样损坏的副本。两个后果叠加：
+① 一次瞬时损坏 + 一次保存，`DEFAULT_CONFIG`（**里面没有 `reverse_proxy` 键**）
+被写回磁盘 ⇒ 反代子树从磁盘上彻底消失，全程只有一条 `[WARNING]`；
+② `_config_lost_after_setup()` 不认 `.corrupted.*` ⇒ 移走后被判定为
+「全新安装」⇒ 守卫从此永远满足，一次损坏被固化成永久配置。
+
+修法：改成 `os.replace` **改名移走**为 `.broken.<ts>`（原子 rename，
+不出现「副本写了一半」的窗口），并让 `_config_lost_after_setup()` 认得
+`.broken.*` / `.corrupted.*`。
+
+### P1-2  `_migrate_rp_rules` 白名单漏 `created_at`
+
+它是**字段白名单**，没列出的键无声丢弃，而它被 `load_config()` 和
+`_deploy_all_rules()` 各调一次 ⇒ 每一次 load→save 都会抹掉这个时间戳。
+（`rewrite_root_paths` 当初也是这样丢过一次，注释里还留着那次事故的记录。）
+
+### feat-1  网关「根绝对路径改写」
+
+上游页面里写死的**根绝对路径**（`href="/x"` / `src="/x"` / `action="/x"`）
+被浏览器按 absolute-path 语义解析时会**丢掉本路径前缀**（RFC 3986 §5.2.2）
+⇒ 样式表、脚本、页面链接全跑到别的服务去 → 404，页面变成没样式的裸文本。
+
+- 后端 `_generate_gateway_nginx_conf` 按规则生成 `sub_filter`，
+  只改写「属性值紧跟」这一种形态，不动 JS 里普通的字符串
+- 新增 `_nginx_regex_literal` / `_nginx_dquote` / `_nginx_host_literal`
+  三个辅助函数做字面量转义
+- 前端反代页新增「根绝对路径改写」开关（默认关）
+- **已知边界**：协议相对 URL（`href="//cdn.example.com/x.css"`）会被改坏 ——
+  nginx 的 `sub_filter` 只支持字面量，没法把 `//` 排除掉
+  ⇒ 新增 `POST /api/reverse-proxy/detect-protocol-relative` 预检，
+  开关前先探一下
+
+### fix-1  回归断言总数不可复现
+
+`test_auth_gateway.py` 里 PBKDF2 闸门大小来自启动探针
+`_probe_pbkdf2_parallelism()` —— 它要真跑一遍 PBKDF2 才能判断本机并发有没有
+收益，结果**随机器负载浮动**。于是 `_size` 在 1 与 >1 之间来回跳，
+if/else 两个分支打印的 ✅ 条数不一样 ⇒ 回归的「断言总数」不可复现
+（实测 1609 与 1608 来回跳）。else 分支改成一条**确定性**的断言。
+
+### 测试
+
+| 文件 | 内容 |
+|---|---|
+| `tests/test_config_ownership.py` | 43 条断言，含 **.1 事故原样复现** |
+| `tests/test_config_ownership_frontend.js` | 23 条，把 `confirmSaveConfig` **在沙箱里真的求值一遍**（不是只 grep 源码） |
+| `tests/mutation_check_config_ownership.py` | 11 处变异，**捕获 11** |
+| `tests/test_gateway_path_rewrite.py` | 73 条 |
+| `tests/test_gateway_path_rewrite_frontend.js` | 30 条 |
+| `tests/mutation_check_gateway_path_rewrite.py` | 25 处变异，**捕获 25** |
+
+全量回归（`bash tests/run_all.sh`，唯一权威入口）：
+**断言 ✅ 1675 · ❌ 0**；22 个变异脚本全通、锚点未命中 0、漏过 0；
+源码指纹开始/结束 sha256 对账一致（变异已还原干净）。
+
 ## [v0.8.4] - 2026-10-13
 
 首次在真实 WAN 侧路径上做端到端实测（.224 OpenWrt 测试机 + netns 模拟外网

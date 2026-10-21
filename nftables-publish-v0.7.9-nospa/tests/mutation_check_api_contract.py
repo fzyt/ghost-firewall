@@ -138,9 +138,12 @@ APP_MUTANTS = [
      '                    "data": {"prefixes": prefixes, "error": err}})',
      'return jsonify({"success": True,\n'
      '                    "prefixes": prefixes, "error": err})'),
+    # 2026-10-21：set-default 的返回多了 nginx_reloaded、message 变成变量
+    # （证书部署失败时要如实说），**envelope 形状没变** —— 前端仍读
+    # data.data.message，所以这个变异依然成立。
     ('证书设默认改成平铺式（前端 data.data.message 读不到）',
-     'return jsonify({"success": True, "data": {"message": "默认证书已设置", "default_cert_id": cert_id}})',
-     'return jsonify({"success": True, "message": "默认证书已设置", "default_cert_id": cert_id})'),
+     'return jsonify({"success": True, "data": {"message": msg, "default_cert_id": cert_id, "nginx_reloaded": nginx_reloaded}})',
+     'return jsonify({"success": True, "message": msg, "default_cert_id": cert_id, "nginx_reloaded": nginx_reloaded})'),
 ]
 
 

@@ -221,6 +221,8 @@ function app() {
     rpRequestDomain: '',
     rpDetectingPrefix: false,
     rpApiPrefixHint: '',
+    rpDetectingProtoRel: false,
+    rpProtoRelHint: '',
 
     ddns: {
       services: [],
@@ -527,8 +529,13 @@ function app() {
         this.showToast('配置已保存', 'success');
         this.diffModal.show = false;
         this.diffModal.pendingConfig = null;
+        // 保存成功后必须换掉手里那份版本号 ——
+        // 这次保存已经改过磁盘上的配置了，还拿旧版本号的话，
+        // 连点两次保存第二次就会撞上 409 CONFIG_STALE。
+        const rdata = (resp && resp.data) || {};
+        if (rdata.config_rev) this.config.config_rev = rdata.config_rev;
         // 如果保存路径检测到非 critical 风险，前端可选择提示（暂只用 toast 兜底）
-        const risks = resp && resp.data && resp.data.risks ? resp.data.risks : [];
+        const risks = rdata.risks || [];
         if (risks.length > 0) {
           const high = risks.filter(r => r.level === 'high');
           if (high.length > 0) {
@@ -536,6 +543,24 @@ function app() {
           }
         }
       } catch (e) {
+        // 后端 409 CONFIG_STALE：页面打开之后配置被别人改过
+        //（反代页操作、另一台设备、另一个标签页），这次保存会把那些改动
+        // 覆盖掉 —— 后端直接拒收，前端负责说清楚并让用户重新加载。
+        //
+        // 2026-10-21 .1 事故：整份旧快照覆盖新数据，反代规则和证书被清空。
+        // 版本闸 + 后端剔除 reverse_proxy 才是主防线，这里只是把拒绝
+        // 变成用户看得懂的话。
+        if (e.code === 'CONFIG_STALE') {
+          this.diffModal.show = false;
+          this.diffModal.pendingConfig = null;
+          this.showToast('配置已被其他操作修改，本次保存已拒绝', 'error');
+          if (confirm('配置在你打开页面之后被改过（比如在反代页加过规则，或换了设备操作）。\n' +
+                      '继续保存会覆盖掉那些改动，后端已经拒绝。\n\n' +
+                      '是否重新加载最新配置？\n（当前页面上未保存的修改会丢失）')) {
+            await this.loadConfig();
+          }
+          return;
+        }
         // 后端 409 CRITICAL_RISK：再次展示让用户二次确认
         if (e.code === 'CRITICAL_RISK' && e.data && e.data.data && Array.isArray(e.data.data.risks)) {
           const detail = e.data.data.risks.map(r => `[${r.level}] ${r.message}`).join('\n');
@@ -1820,6 +1845,47 @@ function app() {
       }
     },
 
+    // ── 反代规则：协议相对 URL 预检 ──────────────────────────────
+    //
+    // 「根绝对路径改写」用的 sub_filter 是字面量匹配（nginx 不支持正则），
+    // 它会把协议相对 URL（href="//cdn.example.com/x.css"）一起改坏。
+    // 开启前先探一下，探到了就明确告诉用户。
+    async detectRpProtocolRelative() {
+      const r = this.rpEditingRule;
+      if (!r) return;
+      const addr = String(r.target_address || '').trim();
+      if (!addr) {
+        this.rpProtoRelHint = '先填目标地址';
+        return;
+      }
+      this.rpDetectingProtoRel = true;
+      this.rpProtoRelHint = '';
+      try {
+        const res = await api.post('/api/reverse-proxy/detect-protocol-relative', {
+          target_address: addr,
+          target_protocol: r.target_protocol || 'http',
+        });
+        const d = (res && res.data) || {};
+        const count = d.count || 0;
+        const samples = d.samples || [];
+        const err = d.error || '';
+        if (err) {
+          this.rpProtoRelHint = '探测失败：' + err;
+        } else if (count === 0) {
+          this.rpProtoRelHint = '✅ 没发现协议相对 URL —— 开启「根绝对路径改写」是安全的。';
+        } else {
+          this.rpProtoRelHint = '⚠️ 发现 ' + count + ' 处协议相对 URL：'
+            + samples.join('、')
+            + ' —— 开启「根绝对路径改写」会把它们改坏（nginx sub_filter 只支持字面量，'
+            + '排除不掉 //）。请先确认这些资源能不能改成 https:// 绝对地址。';
+        }
+      } catch (e) {
+        this.rpProtoRelHint = '探测失败: ' + e.message;
+      } finally {
+        this.rpDetectingProtoRel = false;
+      }
+    },
+
     // 新建一条服务。字段名必须与 _validate_rp_service 的 clean 输出一致，
     // 之前这里内联写了 domain / listen_port / ssl_cert_id —— v0.8.1 已砍掉这三个，
     // 再带着它们提交会被后端忽略，而 path_prefix 反而缺省成 undefined。
@@ -1833,6 +1899,8 @@ function app() {
         // 需要传大文件时在表单里改大（填 0 = 不限）。
         client_max_body_size: '1M',
         api_path_prefix: '',
+        // 根绝对路径改写：默认关。用相对路径的应用不需要它。
+        rewrite_root_paths: false,
         icon: '',
         enabled: true,
         public_access: false,
@@ -1844,6 +1912,9 @@ function app() {
       const r = { ...this.rp.rules[index], _editIndex: index };
       r.client_max_body_size = r.client_max_body_size || '1M';
       r.api_path_prefix = r.api_path_prefix || '';
+      // 布尔必须用 === true 归一：后端只认 true/false，
+      // undefined / "false" 这类杂值传过去会被当成关（安全侧降级）。
+      r.rewrite_root_paths = r.rewrite_root_paths === true;
       r.path_prefix = r.path_prefix || '';
       r.name = r.name || '';
       r.target_address = r.target_address || '';

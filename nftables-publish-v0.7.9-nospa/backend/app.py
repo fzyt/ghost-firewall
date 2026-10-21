@@ -713,12 +713,19 @@ def load_config():
                 config = json.load(f)
         except (json.JSONDecodeError, OSError) as e:
             _LAST_LOAD_ERROR = str(e)
-            # JSON 损坏或读失败：备份损坏文件并返回默认值（避免 Web UI 不可用）
+            # JSON 损坏或读失败：**移走**而不是删除。
+            #
+            # 原来这里是 shutil.copy + os.remove，两个后果叠加起来很致命：
+            #   1. 原文件被删掉，只剩一份同样损坏的 .corrupted 副本；
+            #   2. 紧接着任何一次 save_config 都会把 DEFAULT_CONFIG 写回磁盘，
+            #      而 DEFAULT_CONFIG 里**没有 reverse_proxy 键**（607-694 行确认过）
+            #      ⇒ 反代子树从磁盘上彻底消失，全程只有一条 [WARNING]。
+            # 移走（os.replace）既保留现场，又让「配置曾经存在过」这件事
+            # 还能被 _config_lost_after_setup() 认出来。
             try:
-                backup_path = CONFIG_PATH + f'.corrupted.{int(time.time())}'
-                shutil.copy(CONFIG_PATH, backup_path)
-                os.remove(CONFIG_PATH)
-                print(f"[WARNING] 配置损坏已备份: {backup_path} ({e})", flush=True)
+                broken_path = CONFIG_PATH + f'.broken.{int(time.time())}'
+                os.replace(CONFIG_PATH, broken_path)
+                print(f"[WARNING] 配置损坏已移走: {broken_path} ({e})", flush=True)
             except Exception:
                 pass
             return dict(DEFAULT_CONFIG)
@@ -781,7 +788,21 @@ def _config_lost_after_setup():
         RULES_PATH + '.backup',
         CONFIG_PATH + '.backup',
     ]
-    return any(os.path.exists(p) for p in markers)
+    if any(os.path.exists(p) for p in markers):
+        return True
+    # 损坏后被移走的原文件（load_config 里的 .broken.*）也是「配过」的证据。
+    # 不认它的话：损坏 → 移走 → 下次 load 看到「文件不存在 + 没有历史产物」
+    # → 判定为「全新安装」→ 返回 DEFAULT_CONFIG（里面没有 reverse_proxy）
+    # → 再一次保存就把它写回磁盘。等于一次瞬时损坏被固化成永久配置。
+    try:
+        d = os.path.dirname(CONFIG_PATH) or '.'
+        base = os.path.basename(CONFIG_PATH)
+        for name in os.listdir(d):
+            if name.startswith(base + '.broken.') or name.startswith(base + '.corrupted.'):
+                return True
+    except OSError:
+        pass
+    return False
 
 
 def _migrate_auth_absolute_timeout(config):
@@ -1664,6 +1685,60 @@ def _safe_path_prefix(v):
     return s
 
 
+# ── nginx 指令字面量工具 ─────────────────────────────────────────
+#
+# 生成期不信任落盘值（与 client_max_body_size 同样的道理）：配置可能被
+# 手工改坏。path_prefix 已经过 _safe_path_prefix 净化，字符集是
+# [A-Za-z0-9_-/]，但这里**再校验一次**而不是直接拼进正则 ——
+# 万一将来 _RE_PATH_PREFIX 放宽了字符集，一个带括号的 path_prefix
+# 就能改写整条正则的语义（变成 nginx 指令注入面）。
+_RE_NGINX_LITERAL = re.compile(r'^[A-Za-z0-9_\-/]+$')
+
+
+def _nginx_regex_literal(s):
+    """返回可安全拼进 nginx 正则的字面量；不安全时返回 None。
+
+    这些字符在 PCRE 里全是字面量，所以直接拼即可，**不用 re.escape** ——
+    Python 3.6 与 3.7+ 对 '/' 的转义行为不同，会让生成的配置逐字不稳定，
+    测试写不死。
+    """
+    if not s or not _RE_NGINX_LITERAL.match(s):
+        return None
+    return s
+
+
+def _nginx_dquote(s):
+    """把字符串变成 nginx 双引号字符串的内容（转义内部反斜杠与双引号）。
+
+    生成的 sub_filter 一律用双引号包裹，这样两种模式（窄模式的 '...' 与
+    "...\"..."）可以统一输出，测试也能逐字写死。
+    """
+    return str(s).replace('\\', '\\\\').replace('"', '\\"')
+
+
+# 上游主机名转 nginx 正则字面量时的允许字符集。
+# 与 path 前缀不同：主机名里**允许有点**（192.168.100.218 / ght.internal）。
+_RE_NGINX_HOST = re.compile(r'^[A-Za-z0-9_.\-]+$')
+
+
+def _nginx_host_literal(host):
+    """把上游主机名转成可安全拼进 nginx 正则的字面量；不安全时返回 None。
+
+    与 _nginx_regex_literal 分开，是因为主机名的字符集不同，而且
+    **点必须转义**：192.168.100.218 里的 '.' 若不转义，在 PCRE 里是
+    「任意字符」—— 于是 192x168x100x218 这种根本不存在的主机也能匹配，
+    匹配面被悄悄放大。转义成 '\\.' 后才是真正的字面量。
+
+    生成期不信任落盘值：字符集之外一律返回 None —— 宁可不生成这条规则，
+    也不能生成一条匹配面比预期宽的规则。
+    """
+    if not isinstance(host, str) or not host:
+        return None
+    if not _RE_NGINX_HOST.match(host):
+        return None
+    return host.replace('.', '\\.')
+
+
 # ── 上游绝对 API 路径前缀（sub_filter 窄模式用）────────────────────────
 #
 # 这个值最终会变成 nginx 的 `sub_filter` 模式串，是**字面量**替换：
@@ -1749,6 +1824,56 @@ def _detect_upstream_api_prefixes(host, port, protocol='http', timeout=3.0):
     if not segs:
         return [], "openapi.json 里没有多段路径，探测不到 API 前缀"
     return sorted('/%s/' % s for s in segs), None
+
+
+# 协议相对 URL（属性值以 // 开头，如 href="//cdn.example.com/x.css"）。
+# 只认这三个属性 —— 宽模式的 sub_filter 也只改这三个，别的属性不会被碰到。
+_RE_PROTO_RELATIVE = re.compile(
+    r'(?:href|src|action)\s*=\s*["\']//[^"\'\s>]{0,120}')
+
+
+def _detect_upstream_protocol_relative(host, port, protocol='http', timeout=3.0,
+                                       path='/'):
+    """检测上游首页里有没有「协议相对 URL」。
+
+    为什么需要它：宽模式（rewrite_root_paths）用的 sub_filter 模式是
+    `href="/` 这种**字面量**，它会连 `href="//cdn.example.com/x.css`
+    （协议相对 URL）一起改掉 —— 改成 /ght//cdn.example.com/x.css，
+    浏览器就会去请求一个根本不存在的地址，页面照样崩。
+
+    nginx 的 sub_filter **不支持正则**（只能字面量替换），所以没法用
+    负向断言把 // 排除掉；而多条 sub_filter 之间是**各自独立作用于
+    原文**的（真机实测确认，不是链式），所以「先保护再改写再还原」
+    那套也走不通。
+
+    ⇒ 只能靠**告知用户**：检测到就明确警告，由用户自己决定要不要开这个开关。
+    检测不到（=没有协议相对 URL）时，开关是安全的。
+
+    返回 (count, samples, error)。count=0 且 error=None 表示干净。
+    """
+    if not host or not _is_port(port):
+        return 0, [], "目标地址不合法"
+    proto = 'https' if str(protocol or '').lower() == 'https' else 'http'
+    url = f"{proto}://{host}:{port}{path}"
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={'Accept': 'text/html'})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read(2 * 1024 * 1024)
+    except Exception as e:
+        return 0, [], f"读取 {url} 失败：{type(e).__name__}: {e}"
+    try:
+        text = body.decode('utf-8', 'replace')
+    except Exception as e:
+        return 0, [], f"解码失败：{e}"
+    hits = _RE_PROTO_RELATIVE.findall(text)
+    samples = []
+    for h in hits:
+        if h not in samples:
+            samples.append(h)
+        if len(samples) >= 5:
+            break
+    return len(hits), samples, None
 
 
 def config_to_variables(config):
@@ -2042,7 +2167,10 @@ def get_config():
                        success=True,
                        luci_actual=luci_actual,
                        luci_ports_listening=luci_ports,
-                       gateway_actual=gw_actual))
+                       gateway_actual=gw_actual,
+                       # 版本号：前端保存时必须带回来，服务端据此判断
+                       # 「这份快照是不是已经过期了」（见 _config_rev）
+                       config_rev=_config_rev(config)))
 
 
 def _client_is_lan(client_ip):
@@ -2115,11 +2243,45 @@ def post_config():
     old_cfg = load_config()
     incoming = {k: v for k, v in data.items() if k != 'confirm'}  # confirm 不入配置
 
+    # ── 版本闸：整份覆盖之前，先确认这份快照不是过期的 ─────────────────
+    # 前端回传的是「页面打开那一刻」的整份配置。这期间配置如果被改过
+    # （另一台设备、另一个标签页、或者反代页的写操作），
+    # 这次保存会把那些改动静默覆盖掉 —— 2026-10-21 .1 事故就是这么发生的。
+    # 前端把 GET /api/config 拿到的 config_rev 带回来，对不上就拒收。
+    #
+    # 没带 config_rev 的调用**不拦**（第三方脚本、curl、旧版前端）：
+    # 主防线是下面「无条件剔除 reverse_proxy」，版本闸只是纵深防御。
+    sent_rev = str(data.get('config_rev') or '').strip()
+    incoming.pop('config_rev', None)     # 版本号不是配置字段，绝不能落盘
+    if sent_rev:
+        cur_rev = _config_rev(old_cfg)
+        if sent_rev != cur_rev:
+            return jsonify({
+                'success': False,
+                'code': 'CONFIG_STALE',
+                'message': ('配置在你打开页面之后被改过，本次保存会覆盖掉那些改动，'
+                            '已拒绝。请刷新页面后重新编辑。'),
+                'data': {'config_rev': cur_rev},
+            }), 409
+
     # 只读键：GET 为了让前端能显示「实际状态」会多给几个字段，而前端是把
     # 整个 config 对象原样回传的。这些键不是配置，绝不能落盘。
     readonly_hits = sorted(k for k in incoming if k in READONLY_CONFIG_KEYS)
     for k in READONLY_CONFIG_KEYS:
         incoming.pop(k, None)
+
+    # 反代配置块有独立写路径（/api/reverse-proxy/*），一律不收。
+    #
+    # 2026-10-21 .1 事故根因：前端那份 reverse_proxy 是**页面加载时的旧快照**，
+    # 而 new_cfg.update(incoming) 是整份覆盖 ⇒ 磁盘上刚建好的规则和证书
+    # 被旧快照静默清空（2 条规则 + 1 张阿里云证书 → 0 + 0）。
+    # 详见 RP_OWNED_CONFIG_KEYS 的注释。
+    rp_hits = sorted(k for k in incoming if k in RP_OWNED_CONFIG_KEYS)
+    for k in RP_OWNED_CONFIG_KEYS:
+        incoming.pop(k, None)
+    if rp_hits:
+        print(f'[WARN] /api/config 忽略了反代专属字段 {rp_hits}'
+              f'（只能由 /api/reverse-proxy/* 修改）', flush=True)
 
     # 网关配置块不归这个端点管，原样剔除。
     #
@@ -2211,7 +2373,9 @@ def post_config():
                 'success': False,
                 'code': 'LUCI_TOGGLE_FAILED',
                 'message': f'LuCI 80/443 切换失败，已回滚配置项: {luci_msg}',
-                'data': {'risks': risks},
+                # 回滚也改了磁盘 → 版本号变了，必须告诉前端，
+                # 否则用户再点一次保存会撞上 CONFIG_STALE
+                'data': {'risks': risks, 'config_rev': _config_rev(new_cfg)},
             }), 500
         # 只有当认证网关**本该**守着这个端口时，关 LuCI 才需要拿它当保命绳。
         #
@@ -2234,7 +2398,7 @@ def post_config():
                 'code': 'GATEWAY_DOWN',
                 'message': (f'关闭 LuCI 后网关 {_safe_port(new_cfg.get("gateway_port"), 8443)} '
                             f'端口不可达，已自动把 LuCI 重新打开并回滚配置项'),
-                'data': {'risks': risks},
+                'data': {'risks': risks, 'config_rev': _config_rev(new_cfg)},
             }), 500
 
     return jsonify({
@@ -2243,7 +2407,11 @@ def post_config():
         # 非 critical 风险通过这里告知前端
         'data': {'risks': risks, 'luci': luci_msg,
                  'ignored_gateway_fields': ignored,
-                 'ignored_readonly_fields': readonly_hits},
+                 'ignored_readonly_fields': readonly_hits,
+                 'ignored_rp_fields': rp_hits,
+                 # 新版本号：前端必须换掉手里那份，否则连点两次保存
+                 # 第二次会拿旧版本号撞上 CONFIG_STALE
+                 'config_rev': _config_rev(new_cfg)},
     })
 
 
@@ -2496,9 +2664,18 @@ def preview_rules_changes():
     proposed = data.get('proposed', {})
     if not isinstance(proposed, dict):
         return jsonify({'success': False, 'message': 'proposed 必须是对象'}), 400
+    proposed = dict(proposed)
 
     old_cfg = load_config()
     new_cfg = dict(old_cfg)
+    # 预览必须反映**实际会被保存的内容**。reverse_proxy 由 /api/reverse-proxy/*
+    # 管，/api/config 一律不收它；不剔除的话预览会按前端的旧快照算 diff，
+    # 而真正保存时那份数据根本不会落盘 —— 预览与结果对不上，
+    # 用户在弹窗里看到的「变更」是假的（2026-10-21 .1 事故的形态之一）。
+    # config_rev 同理：它只是版本凭据，不是配置。
+    for k in RP_OWNED_CONFIG_KEYS:
+        proposed.pop(k, None)
+    proposed.pop('config_rev', None)
     new_cfg.update(proposed)
 
     try:
@@ -5678,6 +5855,23 @@ def _validate_rp_service(data, existing=None, all_rules=None):
     except ValueError as e:
         return None, str(e)
 
+    # 根绝对路径改写（sub_filter 宽模式）：默认关，按需打开
+    #
+    # 与 api_path_prefix 的区别：那个填的是**一段确定的前缀字面量**
+    # （/api/、/api/v1/），只覆盖引号紧跟的位置；这个改的是
+    # **HTML 属性值紧跟**的位置（href="/x"、src="/x"、action="/x"），
+    # 一条规则就能盖住一个应用的全部页面链接与静态资源。
+    #
+    # 两者不是替代关系：API 调用（fetch('/api/x')）走 api_path_prefix，
+    # 页面链接与资源走这里。两者可同时开。
+    #
+    # 为什么默认关：sub_filter 改写的是**整个响应正文**，
+    # 打开它等于让网关去动应用吐出来的每一个字符串。
+    # 用相对路径的应用（reader、siyuan 之外的多数前端框架）
+    # 根本不需要它 —— 相对路径在路径前缀下天然正确。
+    rrp = pick("rewrite_root_paths", False)
+    clean["rewrite_root_paths"] = bool(rrp) if isinstance(rrp, (bool, int)) else False
+
     # WebSocket
     ws = pick("websocket_enabled", True)
     clean["websocket_enabled"] = bool(ws) if isinstance(ws, (bool, int)) else True
@@ -5743,9 +5937,20 @@ def _migrate_rp_rules(config):
             "public_access": bool(r.get("public_access", False)),
             "client_max_body_size": r.get("client_max_body_size", "") or "",
             "api_path_prefix": r.get("api_path_prefix", "") or "",
+            # 根绝对路径改写开关。**必须显式列在这里** ——
+            # 本函数是**字段白名单**：没列出来的键会被无声丢弃。
+            # 而它被 load_config() 和 _deploy_all_rules() 各调一次，
+            # 漏列的后果是：配置存进去了、界面也显示开了，
+            # 但生成器读到的是迁移后的规则，开关已被抹掉 ⇒ sub_filter 不生成。
+            # 新增规则字段时**必须同步加到这份白名单里**。
+            "rewrite_root_paths": bool(r.get("rewrite_root_paths", False)),
             "websocket_enabled": bool(r.get("websocket_enabled", True)),
             "icon": _sanitize_name(str(r.get("icon", "") or ""))[:16],
             "updated_at": r.get("updated_at", ""),
+            # created_at 同理：漏了它，每次 load→save 都会把这个时间戳抹掉。
+            # 证书条目里就有这个字段（rp_upload_cert 写的），
+            # 规则这边漏掉会让「这条规则什么时候建的」永远查不到。
+            "created_at": r.get("created_at", ""),
         }
         out.append(migrated)
     rp["rules"] = out
@@ -6029,6 +6234,24 @@ GATEWAY_OWNED_CONFIG_KEYS = frozenset({
     'auth_lan_bypass',
 })
 
+# reverse_proxy 有独立的写路径（/api/reverse-proxy/*），不归 /api/config 管。
+#
+# 2026-10-21 .1 实测事故（根因）：
+#   前端把整份 config（含 reverse_proxy）原样回传 POST /api/config，
+#   而它那份 reverse_proxy 是**页面加载时的旧快照**。
+#   post_config 里 `new_cfg.update(incoming)` 是整份覆盖，
+#   于是磁盘上刚建好的反代规则和证书被旧快照**静默清空**：
+#   .1 上 14:06:22 那次保存，把 13:41–13:42 建的 2 条规则 + 1 张阿里云证书
+#   变成了 0 条 0 张（14:12 现场：主文件 0+0，.backup 2+1，.backup 是
+#   save_config 落盘前拷的 ⇒ 唯一写者就是那一次 POST）。
+#
+# 责任在后端**接受了**它，不在前端「顺手带上了」：
+# reverse_proxy 有自己的 CRUD 端点、有自己的部署逻辑，
+# /api/config 这条路径根本不该碰它。
+RP_OWNED_CONFIG_KEYS = frozenset({
+    'reverse_proxy',
+})
+
 # /api/config 的 GET 为了让前端显示「实际状态」会多给这几个键，而前端把整个
 # config 对象原样回传 POST。它们是**只读视图**，落盘就是污染配置。
 READONLY_CONFIG_KEYS = frozenset({
@@ -6036,7 +6259,35 @@ READONLY_CONFIG_KEYS = frozenset({
     'luci_actual',
     'luci_ports_listening',
     'gateway_actual',
+    # 版本号不是配置字段，只是「这份快照是什么时候拿的」的凭据
+    'config_rev',
 })
+
+
+def _config_rev(config):
+    """配置版本号 —— 给 /api/config 的整份覆盖加一道防呆闸。
+
+    2026-10-21 .1 事故的第二个环节：前端提交的是**页面加载那一刻**的整份快照。
+    这期间如果配置被改过（另一台设备、另一个标签页、或者反代页的写操作），
+    这次保存会把那些改动静默覆盖掉，而且没有任何提示。
+    config_rev 让前端把它拿到的版本号带回来，服务端比对不一致就拒收（409），
+    逼前端重新加载。
+
+    **只对「/api/config 拥有的字段」算版本号**：reverse_proxy 这类有独立
+    写路径的子树不参与计算。否则反代页改一条规则就会让配置页的快照失效，
+    保存时莫名 409 —— 而那份数据本来就不会被 /api/config 写。
+
+    没带 config_rev 的调用（第三方脚本、curl、旧版前端）**不拦**：
+    主防线是「无条件剔除 reverse_proxy」，版本闸只是纵深防御，
+    不该变成一个让老调用方直接 409 的破坏性变更。
+    """
+    payload = {k: v for k, v in (config or {}).items()
+               if k not in RP_OWNED_CONFIG_KEYS}
+    try:
+        blob = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        blob = repr(sorted(payload.keys()))
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -6671,6 +6922,9 @@ def _generate_gateway_nginx_conf(config):
 
     port = _safe_port(config.get("gateway_port"), 8443)
     api_port = _safe_port(config.get("auth_api_port"), 8444)
+    # 对外地址里的端口部分：443 是默认端口，URL 里不写。
+    # 与下面 @to_login 的写法保持一致。
+    _gw_port = "" if port == 443 else f":{port}"
     services = _gateway_services(config)
     settings = {}
     # reverse_proxy 必须是 dict，不能只在下面取 settings 时才判类型。
@@ -6945,10 +7199,41 @@ def _generate_gateway_nginx_conf(config):
                      f"（原始值 {_bad}）")
             L.append(f"        #    原因：{_why}")
             api_prefix = ""
+        # ── 正文里的绝对路径改写（sub_filter）────────────────────
+        #
+        # 两种模式，可同时开：
+        #   窄模式（api_path_prefix）：替换「引号紧跟」的一段字面量
+        #   宽模式（rewrite_root_paths）：替换「HTML 属性值紧跟」的根绝对路径
+        #
+        # 两者都只改**正文**。302 跳转的 Location 在**响应头**里，
+        # sub_filter 管不到 —— 那部分由下面的 proxy_redirect 负责。
+        #
+        # ⚠️ 窄模式的失败模式是「没改写 → 404（跟改之前一样）」，
+        # 绝不会比不装更糟 —— 这是选它不选通用规则的根本原因。
+        sf_rules = []
         if api_prefix:
             L.append(f"        # ── 上游绝对路径改写：{api_prefix}... -> "
                      f"{prefix}{api_prefix}... ──")
             L.append("        # 窄模式：只替换这一段字面量，避免改坏应用里的其它路径")
+            sf_rules.append((f"'{api_prefix}", f"'{prefix}{api_prefix}"))
+            sf_rules.append((f'"{api_prefix}', f'"{prefix}{api_prefix}'))
+
+        # 生成期不信任落盘值（与 client_max_body_size 同样的道理）：
+        # 配置可能被手工改坏，非布尔值一律按「不改写」处理。
+        _rrp = rule.get("rewrite_root_paths")
+        if isinstance(_rrp, (bool, int)) and _rrp:
+            L.append("        # ── 根绝对路径改写（宽模式）─────────────────")
+            L.append("        # 应用吐出的 href=\"/x\" / src=\"/x\" / action=\"/x\" 是"
+                     "**根绝对路径**，")
+            L.append("        # 浏览器按 absolute-path 语义解析时会丢掉本路径前缀"
+                     "（RFC 3986 §5.2.2）")
+            L.append("        # ⇒ 资源与链接跑出本 location → 404。")
+            L.append("        # 只改「属性值紧跟」这一种形态，"
+                     "不碰 JS 里普通的字符串字面量。")
+            for _attr in ("href", "src", "action"):
+                sf_rules.append((f'{_attr}="/', f'{_attr}="{prefix}/'))
+
+        if sf_rules:
             # sub_filter 必须在明文正文上做：上游若压缩了正文就匹配不到
             L.append('        proxy_set_header Accept-Encoding "";')
             L.append("        sub_filter_once off;")
@@ -6958,8 +7243,52 @@ def _generate_gateway_nginx_conf(config):
             # 每次 nginx -t / reload 都刷一行。真机实测确认：省掉 text/html
             # 后 text/html 照样被替换（nginx 文档原文：in addition to "text/html"）。
             L.append("        sub_filter_types application/javascript text/css;")
-            L.append(f'        sub_filter "\'{api_prefix}" "\'{prefix}{api_prefix}";')
-            L.append(f'        sub_filter "\\"{api_prefix}" "\\"{prefix}{api_prefix}";')
+            for _old, _new in sf_rules:
+                L.append(f'        sub_filter "{_nginx_dquote(_old)}" '
+                         f'"{_nginx_dquote(_new)}";')
+
+        # ── 302/301 跳转的 Location 补回路径前缀 ──────────────────
+        #
+        # 上游返回 `Location: /check-auth?to=%2F` 时，浏览器按 absolute-path
+        # 语义解析：base 的 path（/siy/）被整个丢弃 ⇒ 跳到 /check-auth ⇒
+        # 网关无此 location ⇒ 404。这是「子路径反代」最常见的翻车点。
+        #
+        # ⚠️ nginx 的 **default proxy_redirect 救不了这个**：它加的是
+        # **proxy_pass 的 URI 部分**，而 proxy_pass 末尾的 "/" 是「替换」语义
+        # —— location 前缀根本没进 proxy_pass ⇒ 加上去的还是 "/" ⇒ 前缀照丢。
+        # 必须显式写，而且要用 location 前缀。
+        #
+        # 负向先行断言避免给「已经带前缀」的 Location 重复加前缀。
+        #
+        # ⚠️ **只改写能证明是「我们自己的」的 Location**：
+        #   ① 相对路径 —— 思源实测就是这种：`Location: /check-auth?to=%2F`
+        #   ② host 是**上游自己**的绝对 URL
+        # 其余一律**原样放过**。特别是「跳到外站」的绝对 URL
+        # （OAuth 跳转、跳到邮件/支付/其它站点的验证页）——
+        # 真机实测过：用 `[^/]+` 匹配任意 host 的写法会把外站跳转
+        # **劫持到网关自己**（external.example.com/page → 网关/ght/page），
+        # 用户再也跳不回原站。宁可漏改，也不能劫持。
+        _lit = _nginx_regex_literal(prefix)
+        if _lit:
+            # 负向先行断言里的前缀**不能带开头的斜杠**。
+            # 正则里 ^/ 已经把那个斜杠吃掉了，断言落在斜杠**之后**的位置上，
+            # 那里剩下的是 "siy/check-auth" 而不是 "/siy/check-auth" ——
+            # 写成 (?!/siy/) 的话断言恒成立，已经带前缀的 Location
+            # 会被**重复加前缀**（/siy/siy/check-auth → 404）。
+            _bare = _lit[1:] if _lit.startswith('/') else _lit
+            L.append("        # ── 302 跳转的 Location 补回路径前缀 ──")
+            L.append(f"        proxy_redirect ~^/(?!{_bare}/)(.*)$ {prefix}/$1;")
+            # 上游自己 host 的绝对 URL：host 换成对外地址 + 补前缀。
+            # 端口用**非捕获**组 (?::[0-9]+)? —— 用捕获组的话 $1 取到的是端口
+            # 而不是路径，替换结果会变成 ".../siy/:8095"。
+            # 端口可选：上游可能带端口也可能不带。
+            # 对外地址用 $host（nginx 校验过的）+ 配置里的端口，
+            # 不用 $http_host：后者是客户端可控的 Host 头，
+            # 拼进重定向就是 Host Header 注入。
+            _host_lit = _nginx_host_literal(host)
+            if _host_lit:
+                L.append(f"        proxy_redirect ~^https?://{_host_lit}(?::[0-9]+)?"
+                         f"/(?!{_bare}/)(.*)$ $scheme://$host{_gw_port}{prefix}/$1;")
         L.append("    }")
         L.append("")
 
@@ -7545,6 +7874,36 @@ def rp_detect_api_prefix():
                     "data": {"prefixes": prefixes, "error": err}})
 
 
+@app.route('/api/reverse-proxy/detect-protocol-relative', methods=['POST'])
+def rp_detect_protocol_relative():
+    """检测上游首页里有没有「协议相对 URL」（属性值以 // 开头）。
+
+    这是「根绝对路径改写」开关的**预检**：宽模式用的 sub_filter 是
+    字面量匹配，会把协议相对 URL 一起改坏（nginx 的 sub_filter 不支持
+    正则，也没法用负向断言排除 //）。所以开启前先探一下，
+    探到了就明确告诉用户这个开关会改坏哪些东西。
+
+    只探测、不落盘 —— 探测结果由前端显示，用户自己决定要不要开。
+    """
+    data = request.get_json(silent=True) or {}
+    addr = str(data.get('target_address', '') or '').strip()
+    proto = str(data.get('target_protocol', 'http') or 'http').strip().lower()
+    if '://' in addr:
+        proto, _, addr = addr.partition('://')
+        proto = proto.lower()
+    host, _, port = addr.rpartition(':')
+    host, port = host.strip(), port.strip()
+    if proto not in ('http', 'https'):
+        return jsonify({"success": False,
+                        "message": "target_protocol 只允许 http 或 https"}), 400
+    if not host or not _is_port(port):
+        return jsonify({"success": False,
+                        "message": "target_address 必须是 内网IP:端口"}), 400
+    count, samples, err = _detect_upstream_protocol_relative(host, port, proto)
+    return jsonify({"success": True,
+                    "data": {"count": count, "samples": samples, "error": err}})
+
+
 @app.route('/api/reverse-proxy/rules', methods=['POST'])
 def rp_create_rule():
     """新建一条反代服务。
@@ -7865,8 +8224,30 @@ def rp_upload_cert():
         replaced = False
 
     _save_rp_config(config)
+
+    # 上传完必须真的下发 nginx，否则这张证书不会生效。
+    #
+    # 2026-10-21 .1 实测：13:42:38 传了阿里云证书（cert_001），
+    # 而 8443 一直用自签证书（/etc/nginx/ssl/nftables-web/），
+    # 面板却显示证书列表里有它、默认证书也是它 —— 两边对不上，
+    # 原因就是这里只 _save_rp_config、不部署。
+    #
+    # 沿用 reupload 的约定：先落盘再部署，部署失败只改文案、不改成功状态
+    # （文件与配置已经更新，nginx reload 失败不推翻这件事）。
+    nginx_reloaded = True
+    deploy_msg = ''
+    try:
+        deploy_ok, deploy_msg = _deploy_all_rules(config)
+        if not deploy_ok:
+            nginx_reloaded = False
+    except Exception as e:
+        nginx_reloaded = False
+        deploy_msg = f'{type(e).__name__}: {e}'
+
     msg = "证书已重新上传（替换同域名旧证书）" if replaced else "证书上传成功"
-    return jsonify({"success": True, "data": {"cert_id": new_id, "domain": domain, "cert_path": fullchain_path, "key_path": key_path, "expires_at": expires_at, "replaced": replaced, "message": msg}})
+    if not nginx_reloaded:
+        msg += f"，但 nginx 未生效: {deploy_msg}"
+    return jsonify({"success": True, "data": {"cert_id": new_id, "domain": domain, "cert_path": fullchain_path, "key_path": key_path, "expires_at": expires_at, "replaced": replaced, "nginx_reloaded": nginx_reloaded, "message": msg}})
 
 
 @app.route('/api/reverse-proxy/certificates/<cert_id>/download', methods=['GET'])
@@ -8209,7 +8590,29 @@ def rp_set_default_cert(cert_id):
     settings = rp.setdefault("settings", dict(RP_DEFAULT_SETTINGS))
     settings["default_cert_id"] = cert_id
     _save_rp_config(config)
-    return jsonify({"success": True, "data": {"message": "默认证书已设置", "default_cert_id": cert_id}})
+
+    # 换默认证书必须真的下发 nginx —— 只落盘的话用户永远看不到效果。
+    #
+    # 2026-10-21 .1 实测：13:42:38 传了阿里云证书并设为默认，
+    # 8443 一直用自签证书（/etc/nginx/ssl/nftables-web/fullchain.pem），
+    # 而面板显示「默认证书 = cert_001」—— 两边对不上，
+    # 原因就是这里只 _save_rp_config、不部署。
+    #
+    # 沿用 reupload 的约定：先落盘再部署，部署失败只改文案、不改成功状态。
+    nginx_reloaded = True
+    deploy_msg = ''
+    try:
+        deploy_ok, deploy_msg = _deploy_all_rules(config)
+        if not deploy_ok:
+            nginx_reloaded = False
+    except Exception as e:
+        nginx_reloaded = False
+        deploy_msg = f'{type(e).__name__}: {e}'
+
+    msg = "默认证书已设置"
+    if not nginx_reloaded:
+        msg += f"，但 nginx 未生效: {deploy_msg}"
+    return jsonify({"success": True, "data": {"message": msg, "default_cert_id": cert_id, "nginx_reloaded": nginx_reloaded}})
 
 
 # ======================= 认证 API =======================
