@@ -139,6 +139,29 @@ MUTATIONS = [
 
     ('M9  /etc/nftables 不再 setgid（root 重建文件后网关读不到）',
      INIT, [('    chmod g+s "$_cfgdir" || return 1', '    :')]),
+
+    # ── 密钥分离（Shannon 渗透测试 finding）─────────────────────────
+    #
+    # 面板的会话签名密钥必须 0600 root:root —— 网关（公网可达的降权
+    # 进程）读不到它，攻陷网关才签不出面板管理员 session。
+    ('M10 init 把面板会话密钥也放进 nftweb 组可读的循环（网关能读面板签名密钥）',
+     INIT, [('    for f in nftables-web-password; do',
+             '    for f in nftables-web-password nftables-web-session-secret; do')]),
+
+    ('M11 init 把面板会话密钥改成 640（组可读 → 网关能读）',
+     INIT, [('    chmod 600 "$_sesssecret" || return 1',
+             '    chmod 640 "$_sesssecret" || return 1')]),
+
+    ('M12 init 不再把面板会话密钥属主设成 root（属组随目录继承 nftweb）',
+     INIT, [('    chown 0:0 "$_sesssecret" || return 1',
+             '    chgrp "$NFTWEB_USER" "$_sesssecret" || return 1')]),
+
+    ('M13 init 不再生成面板会话密钥（面板启动时自己兜底 → 网关仍可读旧文件）',
+     INIT, [('''    if [ ! -s "$_sesssecret" ]; then
+        dd if=/dev/urandom bs=32 count=1 2>/dev/null \\
+            | hexdump -v -e '32/1 "%02x"' > "$_sesssecret" || return 1
+        [ -s "$_sesssecret" ] || return 1
+    fi''', '    :')]),
 ]
 
 

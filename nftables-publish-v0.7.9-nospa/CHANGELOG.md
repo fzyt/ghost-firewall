@@ -2,6 +2,39 @@
 
 所有重要更改均记录在此文件中。
 
+## [v0.8.7] - 2026-10-29
+
+**Shannon 渗透测试 P0 修复批次**（8443 网关，5 轮测试 / 119 条 finding /
+93 个独立问题；本条覆盖 11 条 P0，P1/P2 另计）。
+
+| 编号 | 问题 | 修复 |
+|---|---|---|
+| P0-1 | 滑动续期在 auth_request 子请求里签新令牌 + 吊销旧 jti，但子请求响应头到不了浏览器 ⇒ 用户每 15 分钟被踢回登录页 | 续期搬到 `/auth/status`（普通 proxy_pass，Set-Cookie 能到浏览器）；`auth_request` 路径退回**纯校验、无副作用**。**补**：续期前必须校验世代号，否则旧令牌能靠 `/auth/status` 换到新世代令牌，绕过「改密码作废全部会话」 |
+| P0-2 | 登录页 `next` 参数开放重定向（`//evil.com`、`\t` 等控制字符） | `safeNext()` **第一条**就挡控制字符；表单补 `method="post"` |
+| P0-3 | 面板 Flask SECRET_KEY 与网关令牌密钥**共用同一个文件**，而该文件对降权后的网关进程可读 | 拆成两个文件、权限相反：`nftables-web-secret`（0640 root:nftweb，网关令牌密钥，**已存在则原样保留**）与 `nftables-web-session-secret`（0600 root:root，面板会话密钥）。网关攻陷也签不出面板 session |
+| P0-4 | `POST /api/config` 能写 `auth_token_epoch` ⇒ 改密码「作废全部会话」可被绕过 | `auth_token_epoch` 进 `READONLY_CONFIG_KEYS` |
+| P0-5 | 锁定触发时清空 fails ⇒ `remaining` 被算成 5（错报还剩 5 次）；限流表读写无锁 | 锁定返 **429 + `remaining=0`**；读端加 `flock(LOCK_SH)`（写端本就有 `LOCK_EX`）⇒ 不会读到 truncate 后的半截 JSON |
+| P0-6 | PBKDF2 校验失败路径不迭代 ⇒ 响应时间可区分「用户存在/不存在」 | dummy 路径用 `max(存储 iters, MIN, 200000)` |
+| P0-7 | 共享配置 `0644` world-readable | `save_config` 落 **0640**（含 `.backup`）。选 0640 而非 0600：网关是独立进程读同一份配置，目录 `2755 root:nftweb` |
+| P0-8 | `linux_gateway` 模式只 flush `table inet fw4`，`table ip nat` 里的端口转发规则**永久残留**（用户在面板删了转发，内核里还在跑） | 前导块改为「先建空表再 flush fw4；把本项目自己那两条 nat 链 delete 后由模板重建」。**不用 `flush table ip nat`** —— 那是宿主机标准 NAT 表，flush 会连 Docker 的规则一起清掉（实测） |
+| P0-9 | DDNS `ipv6_source` 可注入（`../../etc/hostname` 路径穿越、`x;id` 分号注入） | 白名单 `router` / `rule_<N>` + **删现有 service 之前**预校验 + 用 `fullmatch` 推导 idx |
+| P0-10 | `crontab -l` 失败时仍用空列表继续写 ⇒ **整个 root crontab 被覆盖**（实测 3 条变 1 条，acme 续期与证书续期脚本双双被抹） | 两处（`_upsert_cron_for` / `install_china_ips`）**fail-closed** |
+| P0-11 | 反代 test 端点回显原始异常 + 响应时间可区分 ⇒ 内网端口扫描 oracle | 错误归一化 + 不可达时等满最小时间 + 每次探测记审计 |
+
+### 验证
+
+- **回归**：全量 Python + 前端 + 变异脚本；变异锚点随代码搬家同步更新
+- **真机语义**：`tests/nft_semantic_check.sh` —— 在隔离 netns 里验 nft 语义
+  （`flush table X` 表不存在时报错 / ruleset 是合并语义 / 同事务 delete+重建可行 /
+  `flush table ip nat` 会误伤 Docker / `nft -f` 整文件一个事务无空档窗口）。
+  **正测 10/10，负测（原版规则集）11 项红**
+- **原子性**：反复 apply 期间实测「违规连接成功 0 次、长连接中断 0 次」，
+  并用「独立一次 nft 调用制造真实空档」做正控制，证明检测有效
+- **独立审查**：DeepSeek（deepseek-v4-pro）24 轮带工具独立审查 ⇒ 结论**可接受**，
+  无必须修项；其 6 条建议已全部落实
+
+> 本次只覆盖 8443 网关侧；面板侧（5443）另有 49 条问题未纳入本批次。
+
 ## [v0.8.6] - 2026-10-28
 
 泛域名体系落地：**泛域名证书**（签发 / SAN / 定时续期）+ **host 分发**

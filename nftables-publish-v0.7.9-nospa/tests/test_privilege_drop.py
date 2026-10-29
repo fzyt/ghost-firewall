@@ -302,10 +302,38 @@ check('审计日志预建（降权后进程建不出 /var/log 里的文件）',
       '/var/log/nftables-web-auth.log' in _init)
 check('限流/吊销文件属主交给 nftweb',
       re.search(r'chown "\$\{NFTWEB_UID\}:\$\{NFTWEB_GID\}"', _init) is not None)
-check('密码/密钥用 640 组可读（对「其他」仍然全关）',
-      re.search(r'for f in [^;]*nftables-web-secret[^;]*nftables-web-password', _init) is not None
+check('密码文件用 640 组可读（对「其他」仍然全关）',
+      re.search(r'for f in [^;]*nftables-web-password', _init) is not None
       and re.search(r'chmod 640 "\$_cfgdir/\$f"', _init) is not None,
-      '两个只读文件走同一循环统一 chmod 640')
+      '密码文件走同一循环统一 chmod 640')
+
+# ── 密钥分离（Shannon 渗透测试 finding）─────────────────────────────
+#
+# 以前面板的 Flask SECRET_KEY 和网关的令牌密钥读**同一个文件**
+# nftables-web-secret（0640 root:nftweb）⇒ 降权后的网关进程（公网可达）
+# 能读到面板的会话签名密钥。网关侧虽有域分离（HMAC 派生），但它的
+# _load_secret() 是**直接读原文件**再派生的 ⇒ 攻陷网关 = 拿到面板
+# 管理员 session 的签名能力。
+#
+# 现在必须拆成两个文件，权限相反：
+#   nftables-web-secret          0640 root:nftweb  ← 网关的令牌密钥
+#   nftables-web-session-secret  0600 root:root    ← 面板的会话签名密钥
+check('网关令牌密钥走单独语句：640 + chgrp nftweb（网关要读它派生令牌密钥）',
+      re.search(r'chmod 640 "\$_toksecret"', _init) is not None
+      and re.search(r'chgrp "\$NFTWEB_USER" "\$_toksecret"', _init) is not None,
+      'nftables-web-secret 必须是 root:nftweb 640')
+check('面板会话密钥：0600 + chown root:root（网关读不到）',
+      re.search(r'chmod 600 "\$_sesssecret"', _init) is not None
+      and re.search(r'chown 0:0 "\$_sesssecret"', _init) is not None,
+      'nftables-web-session-secret 必须是 0600 root:root')
+check('面板会话密钥**不**落在 nftweb 组可读的循环里',
+      re.search(r'for\s+f\s+in[^;]*nftables-web-session-secret', _init) is None,
+      'session-secret 绝不能和网关共享的文件走同一个 chgrp nftweb 循环')
+check('面板会话密钥与网关令牌密钥是两个不同的文件',
+      'nftables-web-session-secret' in _init
+      and re.search(r'_sesssecret="[^"]*nftables-web-session-secret"', _init) is not None
+      and re.search(r'_toksecret="[^"]*nftables-web-secret"', _init) is not None,
+      '两个密钥必须落在两个不同的文件上')
 
 # 启动后复核：这是最后一道闸，防止将来 _drop_privileges 被改坏
 #

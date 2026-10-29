@@ -47,8 +47,18 @@
     <span class="df-ornament__line df-ornament__line--r"></span>
   </div>
 
-  <!-- 密码闸：门脸页上的门。 -->
-  <form class="pw-form" id="form" autocomplete="on" novalidate>
+  <!-- 密码闸：门脸页上的门。
+       ⚠️ 必须写 method="post"：不写默认是 GET，密码会进 URL
+       （浏览器历史 / Referer / 代理日志）。正常路径走 login.js 的
+       preventDefault → fetch POST，但那个监听器注册在 IIFE 末尾，
+       而 IIFE 前面有一句顶层 `window.DevFingerprint.fetch(...)` ——
+       fingerprint.js 加载失败时 DevFingerprint 是 undefined，
+       那里抛 TypeError，**后面的 submit 监听器根本没注册**，
+       浏览器就退回原生 GET 提交。
+       而网关 CSP 是 `script-src 'self'`（没有 unsafe-inline），
+       login.js 一旦加载失败就正好退到 GET。加一个 method 属性
+       就能把这条退路彻底堵死。 -->
+  <form class="pw-form" id="form" method="post" autocomplete="on" novalidate>
     <div class="pw-labelrow">
       <label class="pw-label" for="pw">访问密码</label>
       <!-- 电平刻度：一位亮一格，最多 8 位。亮灭由 login.js 挂 class 控制。 -->

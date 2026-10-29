@@ -398,6 +398,49 @@ check('login.js 用 class 驱动校验中 / 出错 / 抖动三个态',
 check('login.js 只用 getElementById + children（最小 DOM 桩里没有 querySelectorAll）',
       'querySelector' not in _login_code and 'getElementById' in _login_code)
 
+# ── P0-2 登录页开放重定向（Shannon 渗透测试 finding，实测坐实）──────
+#
+# safeNext() 原来的四条守卫（首字符 /、次字符非 /、无反斜杠、无 scheme）
+# **一个都不看控制字符**。而 WHATWG URL 解析器会把 tab(0x09) / LF(0x0a) /
+# CR(0x0d) 从 URL 里**剥掉**再解析 —— 于是 "/\t/evil.com" 解析完就是
+# "//evil.com"（协议相对外链），四条守卫全都拦不住。
+#
+# 真机 Playwright 端到端实测：/%09/ 、/%0a/ 、/%0d/ 三种载荷**全部**跳到
+# https://evil.invalid/ ；对照组 "//evil.invalid" 与 "/safe/path" 正确留
+# 在站内。Shannon 三次独立发现同一条（#30 / #98 / #112）。
+sec('P0-2 登录页开放重定向')
+
+_safe_m = re.search(r'function\s+safeNext\s*\(\s*\)\s*\{(.*?)\n\s*\}',
+                     _login_code, re.S)
+_safebody = _safe_m.group(1) if _safe_m else ''
+check('找到了 safeNext() 函数', bool(_safebody))
+check('safeNext() 挡掉控制字符（U+0000-U+001F 与 U+007F）',
+      re.search(r'\[[\s]*\\u0000-\\u001f\\u007f[\s]*\]', _safebody) is not None,
+      '守卫必须覆盖 U+0000-U+001F 与 U+007F（含 tab/LF/CR）')
+# 控制字符检查必须排在其它守卫**之前** —— 顺序反了守卫就白写
+_ctrl_i = _safebody.find('\\u0000')
+_scheme_i = _safebody.find('a-z0-9+.-')
+check('控制字符检查排在其它守卫之前（不是摆设）',
+      _ctrl_i >= 0 and (_scheme_i < 0 or _ctrl_i < _scheme_i),
+      f'控制字符位置={_ctrl_i}，scheme 位置={_scheme_i}')
+check('safeNext() 仍然保留原有四条守卫（没被改坏）',
+      all(k in _safebody for k in ("charAt(0)", "charAt(1)", "indexOf('\\\\')")))
+
+# 登录表单必须写 method="post"
+#
+# 不写默认是 GET，密码会进 URL（浏览器历史 / Referer / 代理日志）。
+# 正常路径走 login.js 的 preventDefault → fetch POST，但那个监听器注册在
+# IIFE **末尾**，而 IIFE 前面有一句顶层 `window.DevFingerprint.fetch(...)`
+# —— fingerprint.js 加载失败时 DevFingerprint 是 undefined，那里抛
+# TypeError，**后面的 submit 监听器根本没注册**，浏览器就退回原生 GET。
+# 而网关 CSP 是 script-src 'self'（没有 unsafe-inline），login.js 一旦加载
+# 失败就正好退到 GET。加一个 method 属性就能把这条退路彻底堵死。
+_login_html = html_files.get('login.html', '')
+_form_m = re.search(r'<form[^>]*\bid="form"[^>]*>', _login_html)
+check('登录表单写了 method="post"（JS 挂了也不会退到 GET）',
+      _form_m is not None and re.search(r'method\s*=\s*"post"', _form_m.group(0)) is not None,
+      f'form 标签={_form_m.group(0) if _form_m else "没找到"}')
+
 print()
 print(f'  合计: ✅ {len(PASS)}   ❌ {len(FAIL)}')
 if FAIL:

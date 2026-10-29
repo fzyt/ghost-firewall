@@ -70,15 +70,99 @@ def generate_rules(variables, log_switches, list_elements=None):
     # 2. 替换动态规则块（IPv6 集合、转发、拒绝规则，需在 FORWARD/NAT 之前）
     # RULESET_PREAMBLE 决定「清空到什么程度」，由 deploy_mode 决定：
     #   openwrt       → flush ruleset：接管整机规则集（项目核心设计，见审查记录 N-1）
-    #   linux_gateway → flush table inet fw4：只重建本项目自己的表，
-    #                   绝不碰宿主机上 Docker / 管理员自建的其他规则
+    #   linux_gateway → 只重建本项目自己的表/链，绝不碰宿主机上 Docker /
+    #                   管理员自建的其他规则
     # 默认走 openwrt 分支：即使变量缺失也不会退化成「不清理」导致重复应用失败。
+    #
+    # ⚠️ linux_gateway 分支的三条硬约束（Shannon 渗透测试 P0-8，2026-10-29
+    #    在 .233 的隔离 netns 里用产品真实输出实测得出）：
+    #
+    # ① 必须先 `table inet fw4 { }` 再 flush。
+    #    `flush table X` 在表**不存在**时报错：
+    #      Error: No such file or directory; did you mean table 'fw4' in family inet?
+    #    ⇒ 原版 preamble（只有一句 flush table inet fw4）在**首次部署**时
+    #      整个规则集加载失败。这是原版里一直没被发现的问题。
+    #
+    # ② `table ip nat` 也必须清。
+    #    nft 的 ruleset 文件里写 `table ip nat { chain prerouting { ... } }`
+    #    是**往已有表里合并**，不是替换 —— 只有显式 flush/delete 才清空。
+    #    原版只 flush 了 fw4，于是 `table ip nat` 里那些
+    #      iifname $WAN_IF tcp dport { 41820 } dnat to 192.168.100.10
+    #    之类的端口转发规则**永久残留**：用户在面板上删了转发规则、面板也
+    #    显示已移除，内核里的 DNAT 还在跑 → 外网照样能连进内网。
+    #    同理 postrouting 链里的 masquerade / MSS 钳制每 apply 叠加一份。
+    #
+    # ③ **不能**用 `flush table ip nat`。
+    #    `table ip nat` 是宿主机上的**标准 NAT 表**，Docker / iptables-nft
+    #    的规则都在里面（Docker 用大写 PREROUTING/DOCKER/POSTROUTING 链）。
+    #    flush 整张表会把 Docker 的端口转发一起清掉 —— 实测：
+    #      chain PREROUTING { ... }   ← Docker 的 dnat 规则没了
+    #      chain POSTROUTING { ... }  ← Docker 的 masquerade 没了
+    #    这与 linux_gateway 分支的设计原则（只重建本项目自己的东西，
+    #    见 README「已预留 deploy_mode=linux_gateway（只重建自有表）」）
+    #    直接冲突。
+    #
+    # ⇒ 采用「只重建本项目自己那两条链」的写法：
+    #      先把这两条链**建出来**（delete 要求链存在，否则报错），
+    #      再 delete 掉（连同里面的陈旧规则），模板正文随后重新定义它们。
+    #
+    #    为什么用 delete 而不是 flush chain：
+    #      · flush chain 保留链对象和 hook ⇒ **preamble 里的 hook 声明
+    #        才是最终生效的那个**。模板里 hook 一改（优先级/类型）而
+    #        preamble 没跟上，实测直接 `Error: File exists` → 整个规则集
+    #        apply 失败。
+    #      · delete 把链整个删掉再由模板重建 ⇒ **模板永远是权威**，
+    #        preamble 里那几行只是「让 delete 不报错」的脚手架，写错了
+    #        也没有任何副作用。
+    #
+    #    同事务内 delete + 重建实测无空档：`nft -f` 整个文件是一个
+    #    netlink 事务，实测 60 次连续 apply 违规连接 0 次、长连接中断 0 次
+    #    （用「独立一次 nft 调用制造真实空档」做正控制，证明检测有效）。
+    #    已建立的 TCP 连接也不受影响 —— conntrack 表不会因为规则集
+    #    替换而清空，规则只作用于新的包。
+    #
+    # ⚠️ 下面 preamble 里那两条链的 hook 声明必须与
+    #    templates/nftables.conf 里 `table ip nat` 的定义保持一致。
+    #    tests/test_linux_gateway_preamble.py 里有断言盯着这件事
+    #    （包括「模板里 table ip nat 的每一条链都必须被 preamble delete」，
+    #    否则将来加第三条链忘了 delete，累积 bug 就复活了）。
+    #
+    # ⚠️ **链所有权假设**（DeepSeek 独立审查提出，已写进 README）：
+    #    linux_gateway 模式**声称拥有 `table ip nat` 里这两条小写链** ——
+    #    应用规则时它们会被整条删除再重建。
+    #    Docker / iptables-nft 用的是**大写**链名（PREROUTING / DOCKER /
+    #    POSTROUTING），大小写敏感，不会被碰到。
+    #    但 nftables 官方示例里的经典 NAT 用例同样是**小写** `postrouting`
+    #    —— 宿主机管理员手写的 ruleset 或其它 nft 原生工具若也用了小写
+    #    链名，首次 apply 时那些规则会被一起删掉。宿主机有自定义 nft
+    #    规则时请先确认。大版本可考虑改用专属链名（如 nftweb_prerouting）
+    #    彻底消除共享命名空间。
     deploy_mode = variables.get("DEPLOY_MODE", "openwrt")
     if deploy_mode == "linux_gateway":
         preamble = (
-            "# deploy_mode=linux_gateway: 仅重建本项目自己的表，\n"
+            "# deploy_mode=linux_gateway: 仅重建本项目自己的表和链，\n"
             "# 不清空宿主机全局 ruleset（否则会连带清掉 Docker 等其他规则）\n"
-            "flush table inet fw4"
+            "#\n"
+            "# ① 先建空表再 flush：flush table X 在表不存在时报错，\n"
+            "#    原版在这里会「首次部署整个规则集加载失败」。\n"
+            "table inet fw4 { }\n"
+            "flush table inet fw4\n"
+            "#\n"
+            "# ② 只重建本项目自己那两条链：table ip nat 是宿主机标准 NAT 表，\n"
+            "#    Docker 的规则也在里面（flush 整张表会打断 Docker 转发）。\n"
+            "#    先建出来（delete 要求链存在），再 delete —— 连同里面\n"
+            "#    用户早已删除、但仍留在内核里继续生效的端口转发规则。\n"
+            "#    模板正文随后重新定义这两条链。\n"
+            "table ip nat {\n"
+            "    chain prerouting {\n"
+            "        type nat hook prerouting priority dstnat;\n"
+            "    }\n"
+            "    chain postrouting {\n"
+            "        type nat hook postrouting priority srcnat;\n"
+            "    }\n"
+            "}\n"
+            "delete chain ip nat prerouting\n"
+            "delete chain ip nat postrouting"
         )
     else:
         preamble = (

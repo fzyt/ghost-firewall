@@ -91,7 +91,14 @@ frontend/
   （pip 兜底前有磁盘闸，overlay 装不下就直接报错，不会把根文件系统撑爆）；
   ③ apk 的下载缓存在 overlay 上 —— 统一用 `apk add --no-cache`
 - **Linux 部署**：已预留 `deploy_mode=linux_gateway`（只重建自有表，不清空宿主机
-  ruleset），但接口名、端口敲门（NAT 源 IP 下失效）、WAN IP 获取等完整适配尚未实现
+  ruleset），但接口名、端口敲门（NAT 源 IP 下失效）、WAN IP 获取等完整适配尚未实现。
+  ⚠️ 该模式**声称拥有 `table ip nat` 里的两条小写链**（`prerouting` /
+  `postrouting`）—— 应用规则时它们会被整条删除再重建，这是为了清掉用户早已
+  删除、却仍留在内核里继续生效的端口转发规则（P0-8）。Docker / iptables-nft 用的是
+  **大写**链名（`PREROUTING` / `DOCKER` / `POSTROUTING`），大小写敏感，不会被碰到。
+  但 nftables 官方示例里的经典 NAT 用例同样是**小写** `postrouting` —— 如果宿主机
+  管理员手写的 ruleset 或其它 nft 原生工具也在 `table ip nat` 里用了小写链名，
+  首次应用规则时那些规则会被一起删掉。宿主机上有自定义 nft 规则时请先确认。
 - **单网卡机器不能开 PPPoE**（已做拦截，见 CHANGELOG）。像 Proxmox 虚拟机这种只有
   一张物理网卡的设备，`eth0` 已经是 br-lan 的唯一从属端口，再把 WAN 绑上去会让
   桥塌掉、整机失联。面板会检测不到独立 WAN 网卡并拒绝保存（返回

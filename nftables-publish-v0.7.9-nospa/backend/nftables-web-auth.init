@@ -86,9 +86,54 @@ prepare_nftweb_files() {
     chgrp "$NFTWEB_USER" "$_cfgdir" || return 1
     chmod g+s "$_cfgdir" || return 1
 
+    # 密钥文件。两个，权限**相反** —— 别弄混：
+    #
+    #   nftables-web-secret          0640 root:nftweb  ← 网关的令牌密钥
+    #   nftables-web-session-secret  0600 root:root    ← 面板的会话签名密钥
+    #
+    # 为什么必须分开（Shannon 渗透测试 finding）：
+    # 以前面板的 Flask SECRET_KEY 和网关的令牌密钥读的是**同一个文件**
+    # nftables-web-secret（0640 root:nftweb）—— 降权后的网关进程
+    # （公网可达的那个）能读它。网关侧确实做了域分离
+    # （HMAC(secret, "nftables-web/auth-token/v1")），日常不会拿它签面板
+    # session，但域分离挡不住「攻陷后横向」：网关的 _load_secret() 是
+    # **直接读原文件**再派生的 ⇒ 网关进程内存里就握着面板的会话签名密钥
+    # ⇒ 网关一旦被攻陷，攻击者立刻能签出面板管理员 session。
+    #
+    # 拆开之后网关只拿得到令牌密钥，签不出面板 session。
+    #
+    # 两个文件都必须在**降权前**以 root 身份准备好（网关降权后建不了
+    # /etc/nftables 下的新文件 —— 那个目录是 root 属组 nftweb 的 2755，
+    # 组里没有写权限）。
+
+    # ── 网关令牌密钥：不存在就生成 ────────────────────────────────
+    # 已存在则**原样保留** —— 换了它所有已签发的令牌立刻作废，
+    # 用户得重新登录网关。
+    _toksecret="$_cfgdir/nftables-web-secret"
+    if [ ! -s "$_toksecret" ]; then
+        dd if=/dev/urandom bs=32 count=1 2>/dev/null \
+            | hexdump -v -e '32/1 "%02x"' > "$_toksecret" || return 1
+        [ -s "$_toksecret" ] || return 1
+    fi
+    chgrp "$NFTWEB_USER" "$_toksecret" || return 1
+    chmod 640 "$_toksecret" || return 1
+
+    # ── 面板会话签名密钥：不存在就生成，且**不给 nftweb 组任何权限** ──
+    # 面板（root）读它，网关读不到 ⇒ 攻陷网关也签不出面板 session。
+    _sesssecret="$_cfgdir/nftables-web-session-secret"
+    if [ ! -s "$_sesssecret" ]; then
+        dd if=/dev/urandom bs=32 count=1 2>/dev/null \
+            | hexdump -v -e '32/1 "%02x"' > "$_sesssecret" || return 1
+        [ -s "$_sesssecret" ] || return 1
+    fi
+    chown 0:0 "$_sesssecret" || return 1
+    chmod 600 "$_sesssecret" || return 1
+
     # 只读类：root 拥有、nftweb 组可读。640 对「其他」仍然完全关闭，
     # 暴露面和原来的 600 等价，但网关读得到。
-    for f in nftables-web-secret nftables-web-password; do
+    # ⚠️ 这里**不能**包含 nftables-web-session-secret —— 那是面板的
+    # 会话签名密钥，给了组读权限就等于把面板管理员会话的能力递给网关。
+    for f in nftables-web-password; do
         [ -f "$_cfgdir/$f" ] || continue
         chgrp "$NFTWEB_USER" "$_cfgdir/$f" || return 1
         chmod 640 "$_cfgdir/$f" || return 1

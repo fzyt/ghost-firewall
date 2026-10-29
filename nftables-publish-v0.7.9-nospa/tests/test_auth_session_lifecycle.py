@@ -283,14 +283,46 @@ check("epoch 变成 1 后无 ep 的旧令牌失效",
       r.status_code == 401, f"HTTP {r.status_code}")
 
 # 配置里 epoch 不是数字时不能把认证链路搞崩
+#
+# ⚠️ 这条断言原来的期望值是错的，而且它一直是**靠巧合通过**的：
+#
+# 修复前，滑动续期在 `_verify_or_deny()` 里，每次请求都会**吊销旧 jti**
+# 并签一张新令牌（而新令牌到不了客户端）。于是第一次请求之后，
+# 这个 legacy 令牌的 jti 已经被吊销 → 后面每次 verify 都是
+#   verify_denied / reason=revoked
+# 也就是说：当时那条 401 来自「令牌被续期顺手吊销了」，**不是**来自
+# epoch 判定。断言名字写着「按不放行处理」，实际测的是另一个东西。
+#
+# 现在续期搬走了（auth_request 路径纯校验、无副作用），legacy 令牌不再
+# 被凭空吊销 —— 于是真实行为暴露出来：配置里的 epoch 是垃圾值时，
+# `_payload_epoch_ok` 把它回落成 0（cur_epoch=0），与「从未改过密码」
+# 同义 → ep=0 的令牌仍然放行 → **200**。
+#
+# 这个语义是**刻意**的，和面板侧完全一致（app.py 的
+# `_current_token_epoch()` 里写着「这里刻意不做「读不到就拒绝」：
+# 配置读取失败本来就有独立的降级处理」）。两条路径必须同一套判据 ——
+# 面板那边回落 0、网关这边拒绝所有人，会出现「面板放行、网关全拒」
+# 的分裂。
+#
+# 所以这条断言现在测的是**真正该测的东西**：不抛异常、不 500，
+# 且与面板侧语义一致（垃圾值 → 当成 0）。
 write_cfg(auth_token_epoch="garbage")
 reload_cfg()
 try:
     r = verify(_legacy)
-    check("epoch 是垃圾值时不抛异常（按不放行处理）", r.status_code == 401,
-          f"HTTP {r.status_code}")
+    check("epoch 是垃圾值时不抛异常（回落成 0，与面板侧一致）",
+          r.status_code == 200,
+          f"HTTP {r.status_code}（500 = 认证链路被搞崩了）")
 except Exception as e:
     check("epoch 是垃圾值时不抛异常", False, f"{type(e).__name__}: {e}")
+
+# 垃圾值回落成 0 不等于「epoch 判定失效」：换成**合法**的不同世代号
+# 依然必须拒（否则上面那条就成了摆设）。
+write_cfg(auth_token_epoch=7)
+reload_cfg()
+r = verify(_legacy)
+check("epoch 是合法值但不匹配时仍然拒绝（垃圾值回落没有把判定搞松）",
+      r.status_code == 401, f"HTTP {r.status_code}")
 
 write_cfg(auth_token_epoch=0)
 reload_cfg()
@@ -616,21 +648,31 @@ try:
     check("_write_password_hash 确实把属组 chgrp 成 nftweb",
           any(g == 4242 for _, _, g in _seen1), f"chown 调用={_seen1}")
 
-    # 2) _init_app_secret 的真实路径（密钥文件同理，网关靠它派生签名子密钥）
-    _orig_secret_file = panel.AUTH_SECRET_FILE
-    _secret_probe = f"{_tmpdir}/secret-probe"
-    panel.AUTH_SECRET_FILE = _secret_probe
+    # 2) _init_app_secret 的真实路径
+    #
+    # ⚠️ 语义在 Shannon 渗透测试修复里变过：面板的会话签名密钥现在写
+    # **独立的** AUTH_SESSION_SECRET_FILE，权限 0600 root:root ——
+    # **不给 nftweb 组读权限**。
+    #
+    # 以前它和网关的令牌密钥共用一个文件（0640 root:nftweb），等于把
+    # 「签出面板管理员 session」的能力递给了公网可达的降权网关进程。
+    # 网关侧虽有域分离（HMAC 派生），但它的 _load_secret() 是直接读原
+    # 文件再派生的 ⇒ 攻陷网关就拿到面板签名密钥。域分离挡得住逻辑混用，
+    # 挡不住攻陷后横向。
+    _orig_secret_file = panel.AUTH_SESSION_SECRET_FILE
+    _secret_probe = f"{_tmpdir}/session-secret-probe"
+    panel.AUTH_SESSION_SECRET_FILE = _secret_probe
     try:
         _, _seen2 = _with_fake_nftweb_group(lambda: panel._init_app_secret())
         _m2 = (os.stat(_secret_probe).st_mode & 0o777
                if os.path.exists(_secret_probe) else None)
-        check("_init_app_secret 写出 640",
-              _m2 == 0o640,
+        check("_init_app_secret 写出 600（网关读不到）",
+              _m2 == 0o600,
               f"实际={'文件没生成' if _m2 is None else format(_m2, 'o')}")
-        check("_init_app_secret 确实 chgrp nftweb",
-              any(g == 4242 for _, _, g in _seen2), f"chown 调用={_seen2}")
+        check("_init_app_secret **不**把属组 chgrp 成 nftweb",
+              not any(g == 4242 for _, _, g in _seen2), f"chown 调用={_seen2}")
     finally:
-        panel.AUTH_SECRET_FILE = _orig_secret_file
+        panel.AUTH_SESSION_SECRET_FILE = _orig_secret_file
 
     # 3) 没有 nftweb 组时必须退回保守的 600（不能放得更开）
     try:
@@ -672,6 +714,28 @@ try:
           _expect_mode is not None and _m1 == _expect_mode,
           f"面板={_m1:o}，init 期望={_expect_mode}")
     print(f"      init 脚本期望: chgrp nftweb + {_expect_mode:o}；面板写出: {_m1:o}")
+
+    # 5b) 面板会话密钥：init 脚本必须把它设成 0600 root:root，
+    #     而且**不能**落在 nftweb 组可读的那个循环里。
+    #
+    # 这一条是密钥分离（Shannon finding）的**端到端**断言：面板写 600，
+    # init 脚本也必须 600 + root:root。两边任何一边松了，网关就能读到
+    # 面板的会话签名密钥 ⇒ 攻陷网关 = 拿到面板管理员会话。
+    _mre2 = re.search(r'chmod\s+(\d+)\s+"\$_sesssecret"', _init_src)
+    _expect_sess_mode = int(_mre2.group(1), 8) if _mre2 else None
+    check("init 脚本把面板会话密钥设为 0600",
+          _expect_sess_mode == 0o600,
+          f"解析到的权限={_expect_sess_mode}（解析不到就是测试需要更新）")
+    check("init 脚本把面板会话密钥属主设成 root:root",
+          re.search(r'chown\s+0:0\s+"\$_sesssecret"', _init_src) is not None,
+          "解析不到 chown 0:0 语句")
+    check("面板会话密钥**不**在 nftweb 组可读的循环里",
+          re.search(r'for\s+f\s+in[^;]*nftables-web-session-secret', _init_src) is None,
+          "session-secret 绝不能和网关共享的文件走同一个 chgrp nftweb 循环")
+    check("网关令牌密钥走单独的 640 + chgrp nftweb（网关要读它）",
+          re.search(r'chmod\s+640\s+"\$_toksecret"', _init_src) is not None
+          and re.search(r'chgrp\s+"\$NFTWEB_USER"\s+"\$_toksecret"', _init_src) is not None,
+          "nftables-web-secret 必须是 root:nftweb 640")
 
     panel.CONFIG_PATH = _orig_cfg_path
     panel.AUTH_PASSWORD_FILE = _orig_pwd
@@ -877,8 +941,17 @@ os.rmdir(REVOKED)
 #     放行，走到续期分支才 revoke_jti 失败。这才是续期加固要防的场景。
 # 这里必须保证「可读」：把表换成目录会让 MISC-02 先拒掉，测的就不是续期了。
 #
-# 写失败的注入点选在 os.open 上：既不依赖 uid（root 照样写不进只读表，
-# 用 chmod 造的话 root 下会意外放行、被静默跳过），又只掐写、不掐读。
+# ⚠️ 续期路径在 Shannon 渗透测试修复里搬过家：
+#
+# 原来续期在 `_verify_or_deny()` 里 —— 那是 nginx `auth_request` 的**子请求**
+# 目标，而 auth_request 默认**丢弃子请求的响应头**（设备 nginx 只配了
+# auth_request_set $auth_user / $auth_device，没有捕获 Set-Cookie）。
+# 于是新令牌永远到不了客户端，而旧 jti 已经被吊销 ⇒ **用户 15 分钟后被踢回
+# 登录页**（.233 实测：token_refreshed → verify_denied/reason=revoked）。
+#
+# 现在续期在 **`/auth/status`** —— 那里在 nginx 里是普通 proxy_pass
+# （location = /auth/status，没有 auth_request），响应头原样到达浏览器。
+# 所以下面这段打的是 /auth/status，不是 /auth/verify。
 reset_revoked()
 ag.revoke_jti("jti-seed", int(time.time()) + 600)
 check("前置：吊销表可读且种子条目已写入",
@@ -897,10 +970,15 @@ def _open_ro(path, flags, mode=0o777, **k):
     return _open_real2(path, flags, mode, **k)
 
 
+# /auth/status 读的是 **cookie**（不是 Bearer），而且必须用**非 LAN** 来源
+# —— is_lan_source 会先短路成 {"authenticated": true, "user": "lan"}，
+# 那样就测不到续期分支了。test_client 的 remote_addr 是 127.0.0.1（回环），
+# 所以 client_ip() 会采信我们给的 X-Real-IP。
+set_cookie(_tokF)
 os.open = _open_ro
 _aud.clear()
 try:
-    _rF = verify(_tokF)
+    _rF = _c.get("/auth/status", headers={"Host": HOST, "X-Real-IP": "8.8.8.8"})
 finally:
     os.open = _open_real2
 check("吊销表只读时续期仍然放行（不能 401 踢人）",
@@ -909,10 +987,83 @@ _newF = ""
 for _p in (_rF.headers.get("Set-Cookie", "") or "").split(";"):
     if _p.strip().startswith("gw_token="):
         _newF = _p.strip().split("=", 1)[1]
-check("续期确实签发了新令牌", bool(_newF) and _newF != _tokF)
+check("续期确实签发了新令牌（/auth/status 下发 Set-Cookie）",
+      bool(_newF) and _newF != _tokF)
 check("续期这件事留下审计", "token_refreshed" in _aud, f"实际={_aud}")
 check("续期时旧令牌没吊销掉也留下审计（否则线上无从判断）",
       "refresh_old_token_not_revoked" in _aud, f"实际={_aud}")
+
+# ── F2. auth_request 路径必须是**纯校验**，不再续期 ─────────────────
+#
+# 这是修「用户每 15 分钟被踢下线」的关键：_verify_or_deny 是子请求，
+# 响应头到不了客户端，在那里续期 = 签了新令牌、吊销了旧 jti，而客户端
+# 什么都没收到 ⇒ 令牌被凭空作废。
+#
+# 现在那条路径不改任何令牌状态：不发 Set-Cookie、不吊销 jti。
+# 令牌真过期时返回 401 → 跳登录页，**一次性**，而不是每 15 分钟循环被踢。
+reset_revoked()
+_tokF2 = ag.issue_token("kirito", "devPure", 60)   # 剩余 60s → 接近过期
+_jti_before = jti_of(_tokF2)
+_aud.clear()
+_rF2 = verify(_tokF2)
+check("auth_request 路径校验通过（HTTP 200）",
+      _rF2.status_code == 200, f"HTTP {_rF2.status_code}")
+check("auth_request 路径**不再下发** Set-Cookie（子请求头到不了客户端）",
+      not (tok_of(_rF2) or "").strip(),
+      f"Set-Cookie={_rF2.headers.get('Set-Cookie', '')!r}")
+check("auth_request 路径**不再签发**新令牌（纯校验，无副作用）",
+      "token_refreshed" not in _aud, f"实际={_aud}")
+check("auth_request 路径**不吊销**旧令牌（不凭空作废用户会话）",
+      jti_of(_tokF2) == _jti_before
+      and _jti_before not in (ag.load_revoked() or {}),
+      f"jti={_jti_before}，吊销表={list((ag.load_revoked() or {}).keys())}")
+
+# ── F3. /auth/status 续期前**必须**校验世代号 ────────────────────
+#
+# 这是把续期从 `_verify_or_deny` 搬到 `/auth/status` 时最容易漏掉的一环。
+#
+# 续期原来在 _verify_or_deny 里，那条路径**先查世代号**再决定续不续，
+# 所以「改密码 → epoch 递增 → 旧令牌作废」这条保证是成立的。
+#
+# 搬到 /auth/status 之后，如果不补校验就出现了一条完整的绕过链：
+#   ① 用户改密码 → epoch 0→1 → 旧令牌（ep=0）本该立刻作废
+#   ② 攻击者拿着旧令牌打 GET /auth/status
+#   ③ 本端点不查 epoch → 只要令牌进了续期窗口就给它签新令牌
+#   ④ 新令牌的 ep 是**当前**世代（issue_token → _token_epoch()）= 1
+#      ⇒ 旧令牌被「洗」成一张完全有效的新令牌
+#
+# 也就是说：改完密码，泄露出去的旧令牌照样能换到新会话 ——
+# 「改密码作废全部会话」这条保证被彻底绕开。
+reset_revoked()
+write_cfg(auth_token_epoch=0)
+reload_cfg()
+_tokF3 = ag.issue_token("kirito", "devEpoch", 60)   # ep=0，剩余 60s → 必进续期窗口
+check("前置：令牌带 ep=0（改密码前的世代）",
+      ag.parse_token(_tokF3).get("ep") == 0,
+      f"实际 ep={ag.parse_token(_tokF3).get('ep')}")
+write_cfg(auth_token_epoch=1)      # 模拟「用户改了密码」
+reload_cfg()
+set_cookie(_tokF3)
+_aud.clear()
+_rF3 = _c.get("/auth/status", headers={"Host": HOST, "X-Real-IP": "8.8.8.8"})
+_bodyF3 = _rF3.get_json() or {}
+check("世代号失效后 /auth/status 报未认证",
+      _bodyF3.get("authenticated") is False,
+      f'实际={_bodyF3}')
+check("世代号失效后 /auth/status **不签发**新令牌（不能把旧令牌洗成新世代）",
+      not (tok_of(_rF3) or "").strip(),
+      f'Set-Cookie={_rF3.headers.get("Set-Cookie", "")!r}')
+check("世代号失效时不发生续期", "token_refreshed" not in _aud, f"实际={_aud}")
+check("世代号失效后旧令牌确实作废（auth_request 路径 401）",
+      verify(_tokF3).status_code == 401,
+      f"HTTP {verify(_tokF3).status_code}")
+# 把世代号改回去后，同一张令牌**仍然**可用（证明刚才只是被 epoch 挡住，
+# 不是令牌本身坏了）
+write_cfg(auth_token_epoch=0)
+reload_cfg()
+check("世代号改回去后同一张令牌恢复可用（验证机制本身没坏）",
+      verify(_tokF3).status_code == 200,
+      f"HTTP {verify(_tokF3).status_code}")
 
 # ── G. 同时带 cookie 和 Bearer 时，Bearer 必须胜出 ────────────────
 #

@@ -67,9 +67,23 @@
   /* ── next 参数防开放重定向 ──────────────────────────────
    * 只接受站内相对路径 `/foo`。
    * 拒绝 `//evil.com`（协议相对）、拒绝带 scheme 的、拒绝反斜杠
-   * （部分浏览器会把 `/\evil.com` 归一成 `//evil.com`）。 */
+   * （部分浏览器会把 `/\evil.com` 归一成 `//evil.com`）。
+   *
+   * ⚠️ 控制字符必须**第一条**就挡掉（Shannon 渗透测试 finding）：
+   * WHATWG URL 解析器会把 tab(0x09) / LF(0x0a) / CR(0x0d) 从
+   * URL 里**剥掉**再解析 —— 于是 "/\t/evil.com" 解析完就是
+   * "//evil.com"（协议相对外链），而原来那四条守卫一个都不看
+   * 控制字符，三种载荷（%09 / %0a / %0d）全都跳得出去。
+   * 实测（Playwright 真机端到端）：三种载荷全部跳到
+   * https://evil.invalid/ ，而对照组 "//evil.invalid" 与
+   * "/safe/path" 正确留在站内。
+   *
+   * 用**拒绝**而不是剥除：剥掉 tab 后 "/\t/evil.com" 会变成
+   * "//evil.com"，仍然要靠后面的守卫兜，而拒绝最省事也最安全
+   * —— 正常用户的 next 参数里不会有控制字符。 */
   function safeNext() {
     var raw = new URLSearchParams(location.search).get('next') || '/';
+    if (/[\u0000-\u001f\u007f]/.test(raw)) return '/';
     if (raw.charAt(0) !== '/') return '/';
     if (raw.charAt(1) === '/') return '/';
     if (raw.indexOf('\\') !== -1) return '/';

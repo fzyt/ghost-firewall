@@ -168,10 +168,20 @@ MUTATIONS = [
      '    _apply_shared_secret_perms(AUTH_PASSWORD_FILE)',
      '    os.chmod(AUTH_PASSWORD_FILE, 0o600)'),
 
-    ("权限：_init_app_secret 退回 chmod 600",
+    # ⚠️ 语义在 Shannon 渗透测试修复里变过：面板的会话签名密钥现在写
+    # **独立的** AUTH_SESSION_SECRET_FILE，权限 0600 root:root（网关读不到）。
+    #
+    # 变异改成「退回共享权限」（chgrp nftweb + 640）—— 这正是真实的风险
+    # 形态：面板签名密钥落到网关可读的文件里。测试必须抓到它。
+    ("权限：_init_app_secret 退回共享权限（chgrp nftweb + 640）→ 网关能读面板会话密钥",
      APP,
-     '        _apply_shared_secret_perms(AUTH_SECRET_FILE)',
-     '        os.chmod(AUTH_SECRET_FILE, 0o600)'),
+     '        _apply_session_secret_perms(AUTH_SESSION_SECRET_FILE)',
+     '        _apply_shared_secret_perms(AUTH_SESSION_SECRET_FILE)'),
+
+    ("权限：_init_app_secret 完全不设权限（落到 umask 默认 0644）",
+     APP,
+     '        _apply_session_secret_perms(AUTH_SESSION_SECRET_FILE)',
+     '        pass'),
 
     ("权限：有 nftweb 组时也不再 chgrp（组名写错等于没修）",
      APP,
@@ -264,13 +274,57 @@ MUTATIONS = [
      '                  exp=int(_old.get("exp", 0)))',
      '        revoke_jti(_old.get("jti", ""), int(_old.get("exp", 0)))'),
 
+    # ⚠️ 这条锚点跟着续期代码搬过家：续期原来在 `_verify_or_deny()`
+    # （auth_request 子请求），现在在 `/auth/status`（普通 proxy_pass，
+    # Set-Cookie 能到浏览器）。锚点必须跟着搬，否则会变成
+    # 「锚点未命中」——那种静默失效比没有变异锚点更危险。
     ("续期：吊销表只读时直接拒绝放行（每次续期都 401，把网关对外全关）",
      AG,
-     '            if not revoke_jti(payload.get("jti", ""), int(payload.get("exp", 0))):\n'
+     '        if not revoke_jti(payload.get("jti", ""), exp):\n'
+     '            audit("refresh_old_token_not_revoked",\n'
+     '                  exp=exp, device=payload.get("dev"))',
+     '        if not revoke_jti(payload.get("jti", ""), exp):\n'
+     '            return jsonify({"authenticated": False})'),
+
+    # ── 续期搬家的直接后果：世代号校验必须补在续期之前 ─────────────
+    #
+    # 续期原来在 _verify_or_deny 里，那条路径**先查世代号**，所以
+    # 「改密码 → epoch 递增 → 旧令牌作废」是成立的。搬到 /auth/status
+    # 之后如果不补校验，就出现了一条完整的绕过链：
+    #   改密码（epoch 0→1）→ 攻击者拿旧令牌打 /auth/status →
+    #   本端点不查 epoch → 令牌进续期窗口就给它签**新世代**的新令牌
+    # ⇒ 「改密码作废全部会话」这条保证被彻底绕开。
+    ("续期：搬到家之后不再校验世代号（旧令牌能洗成新世代的令牌）",
+     AG,
+     '    if not _payload_epoch_ok(payload, cfg):\n'
+     '        return jsonify({"authenticated": False})',
+     '    if False:\n'
+     '        return jsonify({"authenticated": False})'),
+
+    # 续期搬家的另一个后果：auth_request 路径必须**纯校验**、无副作用。
+    # 在那里续期 = 签了新令牌 + 吊销了旧 jti，而子请求的响应头到不了
+    # 客户端 ⇒ 用户每 15 分钟被踢回登录页。
+    #
+    # 这条变异把续期**塞回** `_verify_or_deny`（= 修复前的原样）。
+    # 变异必须还原出一段**能跑**的代码：exp/ttl 在搬家时被删掉了，
+    # 直接引用会 NameError → 走 except → 401 —— 那会让 F2 断言以
+    # 「另一个理由」变红，等于测了个寂寞。所以这里把定义一并补回去。
+    ("续期：又被塞回 auth_request 路径（子请求头到不了客户端，用户被循环踢下线）",
+     AG,
+     '        # 循环被踢。\n        return resp',
+     '        # 循环被踢。\n'
+     '        exp = int(payload["exp"])\n'
+     '        ttl = _session_ttl(cfg)\n'
+     '        if exp - now < ttl * TOKEN_REFRESH_RATIO:\n'
+     '            if not revoke_jti(payload.get("jti", ""), exp):\n'
      '                audit("refresh_old_token_not_revoked",\n'
-     '                      exp=int(payload.get("exp", 0)), device=payload.get("dev"))',
-     '            if not revoke_jti(payload.get("jti", ""), int(payload.get("exp", 0))):\n'
-     '                return _deny("revocation_failed")'),
+     '                      exp=exp, device=payload.get("dev"))\n'
+     '            new_tok = issue_token(str(payload.get("sub", "kirito")),\n'
+     '                                  str(payload.get("dev", "")), ttl,\n'
+     '                                  int(payload.get("iat", now)) + abs_to if abs_to else 0)\n'
+     '            _set_cookies(resp, new_tok, str(payload.get("dev", "")), raw=False)\n'
+     '            audit("token_refreshed", device=payload.get("dev"), fp=fingerprint())\n'
+     '        return resp'),
 
     # ── 凭据优先级：Bearer 必须压过 cookie（4g 节）────────────────────
     #

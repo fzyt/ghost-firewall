@@ -81,6 +81,18 @@ TOKEN_ABS_TTL_DEFAULT = 43200
 TOKEN_REFRESH_RATIO = 0.5       # 剩余不足一半时才重新签发，避免每个资源都回 Set-Cookie
 DEVICE_COOKIE_TTL = 31536000    # 设备标识 cookie 一年
 PBKDF2_ITERATIONS_MIN = 100000  # 拒绝迭代数过低的存量哈希（等于没加固）
+# dummy 路径用的**基准**迭代数。
+#
+# 必须 ≥ 面板侧的真实默认（app.py 的 PBKDF2_ITERATIONS = 200000）：
+# dummy 路径原来固定用 PBKDF2_ITERATIONS_MIN(100000)，而真实路径用存储
+# 哈希里的 200000 —— 两条路径耗时差一个数量级。设备实测：
+# **94.9ms vs 48.6ms（差 46.3ms，1.95x）**。攻击者用一个错密码就能靠
+# 响应时间区分「哈希损坏/未配置」和「配置正常」，是个可用的状态枚举
+# oracle（Shannon 渗透测试 finding，实测坐实）。
+#
+# 取 max(存储哈希里的真实 iters, MIN, 这个基准) —— 保证 dummy 路径
+# **永远不慢于**真实路径，真实路径反而是「更慢的那个」，就再也区分不出来。
+PBKDF2_ITERATIONS_DUMMY = 200000
 
 # PBKDF2 并发闸门：限制「同时在跑的 PBKDF2 个数」，防止 GIL 争用把
 # 并发做成负优化。
@@ -321,11 +333,14 @@ def _verify_password(password: str, stored: str) -> bool:
     又给了一个绕开限流的廉价入口。
     """
     with PBKDF2_GATE:
+        # 记住真实哈希里的迭代数，dummy 路径要用它（见下面 except 块）。
+        # 解析失败时它是 0，except 里会退到基准值。
+        iters = 0
         try:
-            algo, iters, salt, hash_hex = stored.split("$", 3)
+            algo, iters_raw, salt, hash_hex = stored.split("$", 3)
+            iters = int(iters_raw)
             if algo != "pbkdf2_sha256":
                 raise ValueError("algo")
-            iters = int(iters)
             if iters < PBKDF2_ITERATIONS_MIN:
                 # 迭代数过低 = 哈希强度形同虚设，直接拒绝而不是"降级接受"
                 raise ValueError("iters")
@@ -334,10 +349,14 @@ def _verify_password(password: str, stored: str) -> bool:
             # return False，耗时不到 1ms；正常路径要跑几万到几十万轮迭代。
             # 攻击者只发一个 {"password":"x"} 就能靠响应耗时区分
             # 「部署没配密码」和「配了密码」——等于一个免认证的状态枚举口。
-            # 迭代数取下限：既去掉那个数量级差异，又不让畸形配置触发
-            # 天文数字的迭代把请求线程拖死。
+            #
+            # ⚠️ 迭代数**不能**用 PBKDF2_ITERATIONS_MIN（Shannon finding，
+            # 实测坐实）：那是 100000，而真实路径是 200000，两条路径差
+            # 46.3ms（1.95x）——照样能区分。这里取三者的最大值，保证
+            # dummy 路径**永远不慢于**真实路径。
+            dummy_iters = max(iters, PBKDF2_ITERATIONS_MIN, PBKDF2_ITERATIONS_DUMMY)
             hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
-                                b"nftables-web-dummy", PBKDF2_ITERATIONS_MIN)
+                                b"nftables-web-dummy", dummy_iters)
             return False
         digest = hashlib.pbkdf2_hmac(
             "sha256", password.encode("utf-8"), salt.encode("utf-8"), iters)
@@ -617,13 +636,20 @@ def _ratelimit_fallback_mutate(ip: str, on_fail: bool):
     if on_fail:
         fails.append(now)
         if len(fails) >= RATE_LIMIT_MAX_FAILS:
-            rec = {"locked_until": now + RATE_LIMIT_LOCKOUT, "fails": []}
+            # ⚠️ 原来这里是 rec = {"locked_until": ..., "fails": []}
+            # —— 清空 fails 后返回的 count 是 0，auth_login 算出
+            # remaining = MAX - 0 = 5，「触发锁定的那一次」反而报
+            # 「还剩 5 次」而且返 401。保留 fails → remaining = 0。
+            rec = {"locked_until": now + RATE_LIMIT_LOCKOUT, "fails": fails}
         else:
             rec = {"locked_until": 0, "fails": fails}
     else:
         rec = {}                       # 成功登录：清空该 IP 的失败记录
     _RATE_FALLBACK[ip] = rec
-    return False, len(rec.get("fails", []))
+    # 返回真实的锁定状态（与落盘版语义一致）：触发锁定的那一次也报 True。
+    _lu = rec.get("locked_until", 0)
+    _locked = isinstance(_lu, (int, float)) and _lu > now
+    return _locked, len(rec.get("fails", []))
 
 
 def _mutate_ratelimit(ip: str, on_fail: bool):
@@ -664,7 +690,16 @@ def _mutate_ratelimit(ip: str, on_fail: bool):
                     rec["fails"] = fails
                     if len(fails) >= RATE_LIMIT_MAX_FAILS:
                         rec["locked_until"] = now + RATE_LIMIT_LOCKOUT
-                        rec["fails"] = []
+                        # ⚠️ 原来这里有一行 `rec["fails"] = []`。
+                        #
+                        # 清空之后本函数返回的 fail_count 是 0，auth_login
+                        # 算出 remaining = MAX - 0 = 5 —— **触发锁定的那一次
+                        # 反而报「还剩 5 次」**，而且那次返回的是 401 而不是
+                        # 429。.233 实测序列：4→3→2→1→5→429。
+                        #
+                        # 改成**保留** fails（长度 = MAX）→ remaining = 0。
+                        # 「锁定期间不再累加失败次数」由上面那句
+                        # `if locked_until > now: return True, ...` 负责。
                     data[ip] = rec
                 elif ip in data:
                     # 成功登录：清空该 IP 的失败记录
@@ -684,7 +719,11 @@ def _mutate_ratelimit(ip: str, on_fail: bool):
                 os.fsync(f.fileno())
 
                 rec = data.get(ip, {})
-                return False, len(rec.get("fails", []))
+                # 返回**真实的**锁定状态：触发锁定的那一次也要报 True，
+                # 否则 auth_login 会把它当普通失败（401）而不是 429。
+                _lu = rec.get("locked_until", 0)
+                _locked = isinstance(_lu, (int, float)) and _lu > now
+                return _locked, len(rec.get("fails", []))
             finally:
                 fcntl.flock(f, fcntl.LOCK_UN)
     except Exception as e:  # noqa: BLE001
@@ -1048,12 +1087,85 @@ def auth_status():
     payload = parse_token(request.cookies.get(COOKIE_TOKEN, ""))
     if not payload or is_revoked(payload.get("jti", "")):
         return jsonify({"authenticated": False})
-    return jsonify({
+
+    # ⚠️ 世代号必须**在续期之前**校验（Shannon P0-1 修复引入的坑，已修）。
+    #
+    # 滑动续期原本在 `_verify_or_deny()` 里，那条路径**会**先查世代号，
+    # 于是「改密码 → epoch 递增 → 旧令牌作废」这条保证是成立的。
+    #
+    # 续期搬到 /auth/status 之后，如果这里不补上校验，就出现了一条绕过：
+    #   ① 用户改密码 → epoch 0→1 → 所有旧令牌（ep=0）本该立刻作废
+    #   ② 攻击者拿着旧令牌打 GET /auth/status
+    #   ③ 本端点不查 epoch → 只要令牌进入续期窗口（剩余不足一半 TTL），
+    #      就给它签一张**新令牌**
+    #   ④ 新令牌上的 ep 是**当前**世代（issue_token → _token_epoch()）= 1
+    #      ⇒ 旧令牌借续期「洗」成了一张完全有效的新令牌
+    #
+    # 结果就是「改密码作废全部会话」这条保证被彻底绕开：改完密码，
+    # 泄露出去的旧令牌照样能换到新会话。
+    #
+    # 判据与 `_verify_or_deny` 共用 `_payload_epoch_ok` —— 两条路径
+    # 必须同一套判据。
+    if not _payload_epoch_ok(payload, cfg):
+        return jsonify({"authenticated": False})
+
+    now = int(time.time())
+    exp = int(payload["exp"])
+    ttl = _session_ttl(cfg)
+    abs_to = _absolute_ttl(cfg)
+    resp = jsonify({
         "authenticated": True,
         "user": payload.get("sub"), "device_id": payload.get("dev"),
         "fp": fingerprint(),
-        "expires_in": max(0, int(payload["exp"]) - int(time.time())),
+        "expires_in": max(0, exp - now),
     })
+
+    # ── 滑动续期放在这里（Shannon 渗透测试 finding，实测坐实）────────────
+    #
+    # 为什么必须放这里：`_verify_or_deny()` 是 nginx `auth_request` 的
+    # **子请求**目标，auth_request 默认**丢弃子请求的响应头**。设备 nginx
+    # 只配了 auth_request_set $auth_user / $auth_device 两条，没有捕获
+    # Set-Cookie —— 在那里续期 = 签了新令牌、吊销了旧 jti，但新令牌**永远
+    # 到不了客户端**。
+    # .233 实测（修复前）：审计日志
+    #   10:28:09 token_refreshed
+    #   10:28:54 verify_denied / reason=revoked
+    # 客户端全程没有 Set-Cookie ⇒ **每个用户 15 分钟后被踢回登录页**。
+    #
+    # /auth/status 在 nginx 里是普通 proxy_pass（location = /auth/status，
+    # **没有** auth_request），响应头原样到达浏览器 ⇒ Set-Cookie 真的生效。
+    # portal.js 每次打开门户都会调它（portal.js:263）。
+    #
+    # 安全前提：**必须持有有效令牌**才能走到这里 —— 令牌无效/被吊销时上面
+    # 已经 return 了。攻击者拿不到别人的令牌，就无法靠反复调这个端点把
+    # 对方的会话顶掉（续期只签发给他自己）。
+    #
+    # 绝对 TTL 不能被续期绕过：issue_token 的第四个参数是**原始 iat + 绝对
+    # 上限**，续期不重置它。
+    if exp - now < ttl * TOKEN_REFRESH_RATIO:
+        # 必须先吊销旧 jti 再签新的。否则攻击者截获的旧 token 在受害者
+        # 反复续期期间一直是有效的 —— 更要命的是**登出也救不回来**：
+        # 登出只吊销「当时手上那张」，受害者手里那张是续期后的新 token，
+        # 攻击者那张是更早的、jti 从未被吊销的旧 token。
+        # 结果是「登出」这个本该能一键切断的急停开关对已泄露凭据无效。
+        #
+        # 吊销失败不拦续期。注意这只针对「表**可读但不可写**」这一种故障
+        # （目录变只读、属主被改）。「表不可读」时 is_revoked 的 fail-closed
+        # 早就把请求拒了，压根走不到这里 —— 那是 MISC-02 刻意选的取舍。
+        # 这里抛异常同样糟：会被 except Exception 接住变成 500，
+        # 于是每一次需要续期的请求都失败，比「旧 token 多活一会儿」严重得多。
+        if not revoke_jti(payload.get("jti", ""), exp):
+            audit("refresh_old_token_not_revoked",
+                  exp=exp, device=payload.get("dev"))
+        new_tok = issue_token(
+            str(payload.get("sub", "kirito")),
+            str(payload.get("dev", "")),
+            ttl,
+            int(payload.get("iat", now)) + abs_to if abs_to else 0,
+        )
+        _set_cookies(resp, new_tok, str(payload.get("dev", "")), raw=False)
+        audit("token_refreshed", device=payload.get("dev"), fp=fingerprint())
+    return resp
 
 
 @app.route("/auth/login", methods=["POST"])
@@ -1137,10 +1249,26 @@ def auth_login():
     ok = bool(password) and bool(stored) and _ok
 
     if not ok:
-        _, fails = _mutate_ratelimit(ip, on_fail=True)
+        locked, fails = _mutate_ratelimit(ip, on_fail=True)
         audit("login_fail", device=device_id_from_request(), fp=fingerprint())
         # 响应体与耗时对「密码错」和「未设密码」保持一致，避免状态枚举
         remaining = max(0, RATE_LIMIT_MAX_FAILS - fails)
+        if locked:
+            # ⚠️ 这次请求**触发了锁定**（或本来就在锁定期内）——
+            # 必须返 429，不能返 401。
+            #
+            # 原来这里一律返 401，于是「第 5 次（触发锁定的那次）」返回的是
+            # 「密码错误，还剩 5 次」—— 两处都错：既不是 429，remaining 也
+            # 算错了。.233 实测序列：4→3→2→1→5→429。
+            #
+            # 审计仍记 login_fail ——「密码确实错了」是事实；429 只是
+            # 「现在别再试了」这个限流状态，两者不冲突。
+            remaining = 0
+            audit("login_rate_limited", device=device_id_from_request(),
+                  fp=fingerprint())
+            return jsonify({"success": False, "code": "RATE_LIMITED",
+                            "message": "尝试次数过多，已临时锁定，请稍后再试",
+                            "remaining": 0}), 429
         return jsonify({"success": False, "code": "AUTH_FAILED",
                         "message": "密码错误", "remaining": remaining}), 401
 
@@ -1261,8 +1389,6 @@ def _verify_or_deny():
             return _deny("revoked")
 
         now = int(time.time())
-        exp = int(payload["exp"])
-        ttl = _session_ttl(cfg)
         abs_to = _absolute_ttl(cfg)
 
         # 绝对上限：签发时间起算，超时强制重登
@@ -1276,31 +1402,27 @@ def _verify_or_deny():
         }
         resp = Response(status=200, headers=headers)
 
-        # 滑动续期：剩余不足一半才重签，避免每个静态资源都回一个 Set-Cookie
-        if exp - now < ttl * TOKEN_REFRESH_RATIO:
-            # 必须先吊销旧 jti 再签新的。否则攻击者截获的旧 token 在受害者
-            # 反复续期期间一直是有效的 —— 更要命的是**登出也救不回来**：
-            # 登出只吊销「当时手上那张」，受害者手里那张是续期后的新 token，
-            # 攻击者那张是更早的、jti 从未被吊销的旧 token。
-            # 结果是「登出」这个本该能一键切断的急停开关对已泄露凭据无效。
-            # （Shannon 渗透测试 finding，实测确认调用链里确实缺这一句。）
-            #
-            # 吊销失败不拦续期。注意这只针对「表**可读但不可写**」这一种故障
-            # （目录变只读、属主被改）。「表不可读」时 is_revoked 的 fail-closed
-            # 早就把请求拒了，压根走不到这里 —— 那是 MISC-02 刻意选的取舍。
-            # 这里抛异常同样糟：会被下面的 except Exception 接住变成 _deny()，
-            # 于是每一次需要续期的请求都 401，比「旧 token 多活一会儿」严重得多。
-            if not revoke_jti(payload.get("jti", ""), int(payload.get("exp", 0))):
-                audit("refresh_old_token_not_revoked",
-                      exp=int(payload.get("exp", 0)), device=payload.get("dev"))
-            new_tok = issue_token(
-                str(payload.get("sub", "kirito")),
-                str(payload.get("dev", "")),
-                ttl,
-                int(payload.get("iat", now)) + abs_to if abs_to else 0,
-            )
-            _set_cookies(resp, new_tok, str(payload.get("dev", "")), raw=False)
-            audit("token_refreshed", device=payload.get("dev"), fp=fingerprint())
+        # ⚠️ 这里**不做**滑动续期（Shannon 渗透测试 finding，实测坐实）。
+        #
+        # 本函数是 nginx `auth_request` 的**子请求**目标，而 auth_request
+        # 默认**丢弃子请求的响应头** —— 设备 nginx 只配了
+        #   auth_request_set $auth_user ...
+        #   auth_request_set $auth_device ...
+        # 两条，**没有捕获 Set-Cookie**。
+        #
+        # 所以原来在这里续期 = 签了新令牌 + 吊销了旧 jti，但新令牌**永远
+        # 到不了客户端**。.233 实测：审计日志
+        #   10:28:09 token_refreshed
+        #   10:28:54 verify_denied / reason=revoked
+        # 客户端全程没收到任何 Set-Cookie ⇒ **每个登录用户 15 分钟后被踢回
+        # 登录页**，自 bfde5ec 起存在，所有部署都中招。
+        #
+        # 续期已搬到 `/auth/status`（那里在 nginx 里是普通 proxy_pass，
+        # 响应头原样到达浏览器，Set-Cookie 才真的生效）。
+        #
+        # 这里退回**纯校验**、无副作用：既不改令牌状态，也不吊销 jti。
+        # 令牌自然过期时返回 401 → 跳登录页，**一次性**，而不是每 15 分钟
+        # 循环被踢。
         return resp
 
     except Exception as e:   # noqa: BLE001 —— 这里必须兜住一切
@@ -1433,14 +1555,29 @@ def _is_locked(ip: str) -> bool:
     """
     try:
         with open(RATELIMIT_FILE, "r") as f:
-            data = json.load(f)
+            # ⚠️ 读端必须拿共享锁（Shannon 渗透测试 finding）。
+            #
+            # 写端是「truncate + 就地写」，持 LOCK_EX。读端不拿锁的话，
+            # 可能正好读到 truncate 之后、json.dump 之前的**半截 JSON**
+            # → json.load 抛 JSONDecodeError → 被 except 吞掉 →
+            # **当作「没锁定」放行** ⇒ 暴力破解防护被绕过。
+            #
+            # 拿 LOCK_SH 之后，读到的要么是完整的旧内容，要么是完整的新内容。
+            # （写端本来就在同一个文件上用 LOCK_EX，两边配对。）
+            fcntl.flock(f, fcntl.LOCK_SH)
+            try:
+                data = json.load(f)
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
         if isinstance(data, dict):
             rec = data.get(ip)
             if isinstance(rec, dict):
                 lu = rec.get("locked_until", 0)
                 if isinstance(lu, (int, float)) and lu > time.time():
                     return True
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
+        # ValueError 覆盖 json.JSONDecodeError（它是 ValueError 的子类）
+        # 以及其它解析异常 —— 读不到就当没锁定，交给下面的内存兜底判断。
         pass
     return _ratelimit_fallback_is_locked(ip)
 

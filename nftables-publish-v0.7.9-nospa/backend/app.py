@@ -8,6 +8,31 @@ AUTH_PASSWORD_FILE = os.environ.get(
     "AUTH_PASSWORD_FILE", "/etc/nftables/nftables-web-password")
 AUTH_SECRET_FILE = os.environ.get(
     "AUTH_SECRET_FILE", "/etc/nftables/nftables-web-secret")
+# 面板会话签名密钥 —— **只归面板自己**，网关读不到。
+#
+# ⚠️ 为什么必须与 AUTH_SECRET_FILE 分开（Shannon 渗透测试 finding）：
+#
+# 以前面板的 Flask SECRET_KEY 和网关的令牌密钥读的是**同一个文件**
+# nftables-web-secret，而那个文件是 0640 root:nftweb —— **降权后的网关
+# （公网可达的那个进程）能读它**。
+#
+# 网关侧确实做了域分离（_token_key = HMAC(secret, "nftables-web/auth-token/v1")），
+# 所以日常**不会**拿它去签面板 session，域分离挡住了「逻辑混用」。
+# 但域分离挡不住「攻陷后横向」：网关的 _load_secret() 是**直接读文件拿原始
+# secret** 再派生的 —— 也就是说**网关进程内存里就握着面板的 session 签名
+# 密钥本身**。一旦网关进程被攻破，攻击者读到的就是这个文件 ⇒ 拿到原始
+# secret ⇒ 立刻能签出面板认可的 session ⇒ 伪造管理员会话。
+#
+# 降权做到一半反而给攻击者递了把万能钥匙 —— 这就是这条 finding 的实质。
+#
+# 拆开之后：
+#   nftables-web-session-secret  0600 root:root    ← 只有面板(root)能读
+#   nftables-web-secret         0640 root:nftweb  ← 只有网关能读（令牌密钥）
+#
+# 迁移代价：面板已签发的 session 会全部失效（换密钥了）→ 重新登录一次。
+# **网关令牌密钥不变** → 用户不需要重新登录网关。
+AUTH_SESSION_SECRET_FILE = os.environ.get(
+    "AUTH_SESSION_SECRET_FILE", "/etc/nftables/nftables-web-session-secret")
 AUTH_COOKIE_NAME = 'nftables_web_session'
 AUTH_SESSION_LIFETIME = 12 * 3600   # 12 小时（最长生命周期）
 AUTH_IDLE_TIMEOUT = 3600            # 1 小时无操作自动登出
@@ -22,6 +47,22 @@ CONFIG_PATH = os.environ.get(
     "AUTH_CONFIG_PATH", "/etc/nftables/nftables-web-config.json")
 RULES_PATH = os.environ.get(
     "NFTABLES_WEB_RULES_PATH", "/etc/nftables.d/99-custom-rules.nft")
+
+# 共享配置与备份的目标权限位。
+#
+# 为什么是 0640 而不是 0600：这份配置里有 reverse_proxy.dns_credentials
+# （DNS/ACME 服务商 API token）和阿里云 DDNS 的 access_key_secret ——
+# **任何本地账号都不能读**（Shannon 渗透测试 finding，设备实测原文件是
+# `-rw-r--r-- root:nftweb` = world-readable）。
+#
+# 为什么不是 0600：认证网关（降权到 nftweb）是**独立进程**，它读同一个
+# 配置文件（auth_gateway.load_gateway_config → CONFIG_PATH）。目录
+# /etc/nftables 是 setgid + 属组 nftweb，所以属组随目录继承；0640 让
+# 网关（组内）读得到，其它本地用户读不到。
+#
+# 同一个项目里的限流表 writer（app.py 的 _ratelimit_write）和阿里云
+# writer 都已经 chmod 0o600 —— 共享配置是唯一漏掉的一个。
+_CONFIG_FILE_MODE = 0o640
 
 # 面板 HTTPS 端口（仅 LAN 可达，防火墙侧由 lan_allowed_ports 放行）。
 # 定义在文件顶部：validate_config() 要用它做「网关端口不能占用面板端口」的交叉校验。
@@ -57,11 +98,38 @@ def _apply_shared_secret_perms(path):
         pass
 
 
-def _init_app_secret():
-    """读取或生成 Flask SECRET_KEY（持久化到 /etc/nftables/nftables-web-secret）"""
+def _apply_session_secret_perms(path):
+    """面板会话密钥必须是 0600 root:root —— **不能**给 nftweb 组读权限。
+
+    这是密钥分离的关键一步：这个文件的内容就是 Flask 的 SECRET_KEY，
+    网关进程（uid = nftweb）一旦能读它，就能签出面板认可的管理员 session。
+    跟 `_apply_shared_secret_perms`（640 root:nftweb，给网关读密码文件）
+    是**相反**的要求 —— 两个文件走两套权限，不要弄混。
+    """
     try:
-        if os.path.exists(AUTH_SECRET_FILE):
-            with open(AUTH_SECRET_FILE, 'r') as f:
+        import grp
+        os.chown(path, 0, grp.getgrnam('root').gr_gid)
+    except (KeyError, OSError, ImportError):
+        pass
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _init_app_secret():
+    """读取或生成 Flask SECRET_KEY。
+
+    持久化到 **AUTH_SESSION_SECRET_FILE**（与网关的令牌密钥文件分开），
+    权限 0600 root:root —— 网关读不到。
+
+    为什么不再写 AUTH_SECRET_FILE：那个文件现在是**网关的令牌密钥**，
+    面板写它就等于把面板的签名能力递到网关手里（见常量处的说明）。
+    网关令牌密钥由 init 脚本播种（它以 root 跑，且必须在降权前准备好）。
+    """
+    try:
+        if os.path.exists(AUTH_SESSION_SECRET_FILE):
+            with open(AUTH_SESSION_SECRET_FILE, 'r') as f:
                 key = f.read().strip()
                 if key:
                     return key
@@ -69,12 +137,15 @@ def _init_app_secret():
         pass
     secret = secrets.token_hex(32)
     try:
-        os.makedirs(os.path.dirname(AUTH_SECRET_FILE), exist_ok=True)
-        with open(AUTH_SECRET_FILE, 'w') as f:
+        os.makedirs(os.path.dirname(AUTH_SESSION_SECRET_FILE), exist_ok=True)
+        with open(AUTH_SESSION_SECRET_FILE, 'w') as f:
             f.write(secret)
-        _apply_shared_secret_perms(AUTH_SECRET_FILE)
+        _apply_session_secret_perms(AUTH_SESSION_SECRET_FILE)
     except Exception:
-        pass
+        # 写不了就退回内存随机值 —— 面板进程内自洽（session 仍然有效），
+        # 但重启后会话失效。打印出来，别让人以为配置正常。
+        print(f"[WARNING] 面板会话密钥无法持久化到 {AUTH_SESSION_SECRET_FILE}"
+              "（重启后会话失效）", flush=True)
     return secret
 
 
@@ -958,6 +1029,13 @@ def save_config(config, _force=False):
     # 自动备份当前配置
     if os.path.exists(CONFIG_PATH):
         shutil.copy(CONFIG_PATH, CONFIG_PATH + '.backup')
+        # shutil.copy 不复制权限位，新建出来的 .backup 会落到 umask 默认值
+        # （通常 0644 = world-readable）。备份里同样有第三方 DNS 凭据，
+        # 收紧到与主文件一致。
+        try:
+            os.chmod(CONFIG_PATH + '.backup', _CONFIG_FILE_MODE)
+        except OSError:
+            pass
     os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
     # 原子写 + 文件锁：先写临时文件再 rename，避免并发写入导致损坏
     tmp_path = CONFIG_PATH + '.tmp'
@@ -970,6 +1048,7 @@ def save_config(config, _force=False):
                 json.dump(config, f, indent=2, ensure_ascii=False)
                 f.flush()
                 os.fsync(f.fileno())
+            os.chmod(tmp_path, _CONFIG_FILE_MODE)
             os.replace(tmp_path, CONFIG_PATH)
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -982,6 +1061,7 @@ def save_config(config, _force=False):
                 json.dump(config, f, indent=2, ensure_ascii=False)
                 f.flush()
                 os.fsync(f.fileno())
+            os.chmod(tmp_path, _CONFIG_FILE_MODE)
             if os.path.exists(tmp_path):
                 os.replace(tmp_path, CONFIG_PATH)
         except Exception as e2:
@@ -3382,7 +3462,24 @@ def _upsert_cron_for(script_path, cron_entry):
     """
     try:
         result = subprocess.run(['crontab', '-l'], capture_output=True, text=True, timeout=10)
-        lines = result.stdout.splitlines() if result.returncode == 0 else []
+        # ⚠️ fail-closed：读不到 crontab 就**不要写**。
+        #
+        # 原来这里是 `lines = result.stdout.splitlines() if result.returncode == 0 else []`
+        # —— 查了 returncode，但失败时仍然拿**空列表继续**，于是
+        # `crontab -` 用「只有我这一条」的内容覆盖整个 root crontab。
+        #
+        # 实测（.233，Shannon 渗透测试 finding 复核时坐实）：移走
+        # /var/spool/cron/crontabs/root 让 `crontab -l` 返回 1 之后调
+        # /api/network/install-ipv6-cron，crontab 从 3 条变成 1 条 ——
+        # `/etc/init.d/acme renew` 与 `/opt/nftables-web/renew-certs.sh`
+        # 双双被抹，而接口照样返回 200「脚本已安装」。
+        #
+        # crontab 读不出来是个**运维故障**（spool 被删/损坏、磁盘异常、
+        # 二进制被 shadow），不需要攻击者参与，也不会有任何人察觉。
+        if result.returncode != 0:
+            return False, (f"读取 crontab 失败，已中止（未做任何修改）: "
+                           f"{(result.stderr or result.stdout).strip()}")
+        lines = result.stdout.splitlines()
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as e:
         return False, f"读取 crontab 失败: {e}"
     lines = [ln for ln in lines if script_path not in ln]
@@ -3748,6 +3845,17 @@ def install_china_ips():
         # 添加 crontab：每周一凌晨3点执行
         cron_entry = '0 3 * * 1 /opt/nftables-web-v2/update-china-ips.sh'
         result = subprocess.run(['crontab', '-l'], capture_output=True, text=True, timeout=10)
+        # ⚠️ fail-closed：读不到 crontab 就**不要写**。
+        #
+        # 原来这里**连 returncode 都不查**，失败时 existing=[] → 用只有
+        # 一条 china-ips 条目的内容覆盖整个 root crontab。
+        # 实测（.233）：移走 spool 文件让 `crontab -l` 返回 1 之后调本
+        # 端点，crontab 从 3 条变成 1 条，`/etc/init.d/acme renew` 和
+        # renew-certs.sh 双双被抹，而接口照样返回 200。
+        if result.returncode != 0:
+            return jsonify({"success": False,
+                            "message": f"crontab 读取失败，已中止（未做任何修改）: "
+                                       f"{(result.stderr or result.stdout).strip()}"}), 500
         existing = result.stdout.splitlines()
         if cron_entry not in existing:
             existing.append(cron_entry)
@@ -3970,6 +4078,32 @@ def get_ddns_config():
         return jsonify({"success": False, "message": f"读取 DDNS 配置失败: {str(e)}"}), 500
 
 
+def _validate_ddns_services(services):
+    """校验 DDNS service 列表。返回 (ok, message)。
+
+    必须在「删除所有现有 service 块」**之前**调用 —— 校验放在重建循环里
+    的话，撞到非法值直接 return 400 会留下**半成品**配置（旧 service 已删、
+    新 service 只写了一半）。
+
+    校验点只有 ipv6_source：它会被拼进 ip_script，而 ip_script 是被
+    ddns-scripts 以 **root** eval 执行的命令字符串。
+
+    合法取值只有两种："router"（本机 IPv6）和 "rule_<数字>"（第 N 条转发
+    规则）。详见 save_ddns_config 拼装处的说明。
+    """
+    import re as _re
+    if not isinstance(services, list):
+        return False, "services 必须是数组"
+    for _i, _svc in enumerate(services):
+        if not isinstance(_svc, dict):
+            return False, f"第 {_i + 1} 条 DDNS 记录格式错误（不是对象）"
+        _src = str(_svc.get('ipv6_source', '') or '')
+        if _src and _src != 'router' and not _re.fullmatch(r'rule_\d+', _src):
+            return False, (f"第 {_i + 1} 条 DDNS 记录的 ipv6_source 无效: {_src!r}"
+                           "（只允许 router 或 rule_<数字>）")
+    return True, ""
+
+
 @app.route('/api/ddns/save', methods=['POST'])
 def save_ddns_config():
     """保存 DDNS 配置（先清除所有 service，再重建）"""
@@ -3979,6 +4113,10 @@ def save_ddns_config():
 
     services = data['services']
     try:
+        # ── 预校验：必须在「删除所有现有 service 块」之前做完 ──────────
+        ok, msg = _validate_ddns_services(services)
+        if not ok:
+            return jsonify({"success": False, "message": msg}), 400
         # 1. 先获取现有的 service 名称和密码缓存
         existing = _parse_ddns_config()
         # 缓存原始密码（掩码值跳过写入时使用）
@@ -4050,11 +4188,43 @@ def save_ddns_config():
             _uci_set(f'ddns.{uci_name}.interface', svc.get('interface', 'wan'))
             ipv6_source = svc.get('ipv6_source', '')
             if svc.get('use_ipv6') and ipv6_source:
-                # 映射 ipv6_source 到 ip_script
-                _uci_set(f'ddns.{uci_name}.ip_source', 'script')
-                idx = '0' if ipv6_source == 'router' else ipv6_source.replace('rule_', '')
-                _uci_set(f'ddns.{uci_name}.ip_script', f'/bin/cat /tmp/ddns-ipv6-{idx}')
-                _uci_set(f'ddns.{uci_name}.ipv6_source', ipv6_source)
+                # ⚠️ 白名单：ipv6_source **只能**是 "router" 或 "rule_<数字>"。
+                #
+                # 原来这里没有任何校验，idx 直接由用户输入拼成：
+                #   idx = ipv6_source.replace('rule_', '')
+                #   ip_script = f'/bin/cat /tmp/ddns-ipv6-{idx}'
+                # 而 ip_script 是被 ddns-scripts 以 **root** eval 执行的。
+                #
+                # 实测（.233，Shannon 渗透测试复核时坐实）：
+                #   ipv6_source="../../etc/hostname" → ip_script =
+                #     /bin/cat /tmp/ddns-ipv6-../../etc/hostname   ← 路径穿越
+                #   ipv6_source="x;id" → ip_script =
+                #     /bin/cat /tmp/ddns-ipv6-x;id                 ← 分号命令注入
+                # （换行注入已被 _uci_set 挡住 —— 它把 \n/\r 换成空格；
+                #   但 ; / .. 这些原样保留。）
+                #
+                # 上面的预校验已经挡掉非法值，这里是第二道防线（防御纵深）。
+                _src = str(ipv6_source)
+                if _src == 'router':
+                    idx = '0'
+                else:
+                    _m = _re.fullmatch(r'rule_(\d+)', _src)
+                    if not _m:
+                        # 理论上到不了这里（预校验已拦）；真到了也不能把
+                        # 非法值拼进 ip_script —— 直接跳过这条的 IPv6 配置。
+                        print(f'[WARN] ddns service {uci_name} 的 ipv6_source 非法'
+                              f'（{_src!r}），已跳过 IPv6 来源设置', flush=True)
+                        idx = None
+                    else:
+                        idx = _m.group(1)
+                if idx is None:
+                    _uci_set(f'ddns.{uci_name}.ip_source', svc.get('ip_source', 'network'))
+                    _uci_set(f'ddns.{uci_name}.ipv6_source', '')
+                else:
+                    # 映射 ipv6_source 到 ip_script
+                    _uci_set(f'ddns.{uci_name}.ip_source', 'script')
+                    _uci_set(f'ddns.{uci_name}.ip_script', f'/bin/cat /tmp/ddns-ipv6-{idx}')
+                    _uci_set(f'ddns.{uci_name}.ipv6_source', ipv6_source)
             else:
                 _uci_set(f'ddns.{uci_name}.ip_source', svc.get('ip_source', 'network'))
                 _uci_set(f'ddns.{uci_name}.ipv6_source', '')
@@ -6575,6 +6745,25 @@ READONLY_CONFIG_KEYS = frozenset({
     'gateway_actual',
     # 版本号不是配置字段，只是「这份快照是什么时候拿的」的凭据
     'config_rev',
+    # ⚠️ auth_token_epoch 是**安全状态**，不是普通设置。
+    #
+    # 它的语义是「改密码后作废全部会话」的世代号：改密码时 +1，
+    # 所有签发时带旧世代号的令牌一律作废。它**只能**由改密码路径写。
+    #
+    # 之前它不在任何名单里，于是通用 POST /api/config 能改它 —— 实测
+    # （.233）：`POST /api/config {"auth_token_epoch": 999}` 返回 200
+    # 「配置已保存」，落盘真的变成 999，而且三个剔除名单
+    # (ignored_gateway_fields / ignored_readonly_fields /
+    # ignored_rp_fields) 全是空的。
+    #
+    # 危害是双向的：
+    #   ① 调**大** → 立刻作废所有人的会话（DoS）
+    #   ② 调**小 / 调回旧值** → 撤销「改密码作废全部会话」的保证，
+    #      被作废的令牌可以复活
+    #
+    # 它确实会被 GET /api/config 返回（前端要显示「当前世代」），
+    # 所以完全符合 READONLY 的语义：可读、不可经通用路径落盘。
+    'auth_token_epoch',
 })
 
 
@@ -8656,6 +8845,10 @@ def rp_delete_rule(rule_id):
 
 @app.route('/api/reverse-proxy/rules/<rule_id>/test', methods=['POST'])
 def rp_test_rule(rule_id):
+    # 反代连通性测试的**最小耗时**（毫秒）。不可达时也要等满这么久，
+    # 消除「连接被拒绝（立刻返回）」与「超时（等 5 秒）」的时间差 ——
+    # 否则响应耗时本身就是端口扫描的 oracle。详见函数内的说明。
+    _RP_TEST_MIN_WAIT_MS = 1500
     config, rp = _get_rp_config()
     rule = _find_rp_rule(rp, rule_id)
     if not rule:
@@ -8674,25 +8867,60 @@ def rp_test_rule(rule_id):
         port = port or 443
 
     # TCP 连通性测试
+    #
+    # ⚠️ 这里天然是一个**内网端口扫描 oracle**（Shannon 渗透测试 finding，
+    # 实测坐实）：把规则的 target_address 改成任意 host:port 再打这个端点，
+    # 就能问「这个端口开还是不开」。agent 实测扫出了
+    #   127.0.0.1:8444 ✅  127.0.0.1:22 ✅  192.168.100.233:22 ✅
+    #   127.0.0.1:5443 ❌ refused  127.0.0.1:9 ❌ refused
+    #
+    # 它**不是权限提升**（要管理员会话，而管理员本来就能配任意反代目标），
+    # 但管理员口令一旦泄露，攻击者不必再找别的 SSRF 点 —— 直接拿它扫
+    # 整个内网。
+    #
+    # 这个端点没法在「保留功能」的前提下彻底消灭（管理员确实需要测自己
+    # 的反代目标通不通），所以做纵深防御，把 oracle 的精度和可追溯性收紧：
+    #   ① 错误信息归一化 —— 不回显原始异常（Connection refused /
+    #      timed out / DNS 失败原本三者可区分）
+    #   ② 不可达时也等满同样的时间 —— 消除「refused 立即返回 vs 超时等
+    #      5 秒」这个**时间侧信道**
+    #   ③ 记审计 —— 谁在什么时候探测了哪个 host:port
     import socket
     reachable = False
-    response_ms = -1
+    t0 = time.time()
     try:
-        t0 = time.time()
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(5)
         sock.connect((host, port))
-        response_ms = int((time.time() - t0) * 1000)
         sock.close()
         reachable = True
-    except Exception as e:
-        return jsonify({"success": True, "data": {"target_reachable": False, "response_time_ms": -1, "ssl_valid": False, "message": f"连接失败: {str(e)}"}})
+    except Exception:
+        # 原始异常文本**不回显**（见上）。它会被写进下面的审计行，
+        # 但审计是本机 root 才看得着的日志，不是 HTTP 响应。
+        pass
+    elapsed_ms = int((time.time() - t0) * 1000)
+
+    if reachable:
+        response_ms = elapsed_ms
+        message = f"目标服务可达 ({response_ms}ms)"
+    else:
+        # ② 不可达时也等满 _RP_TEST_MIN_WAIT_MS —— 让「拒绝连接」和
+        # 「超时」在耗时上没有差别，否则时间本身就是 oracle。
+        _wait = _RP_TEST_MIN_WAIT_MS - elapsed_ms
+        if _wait > 0:
+            time.sleep(_wait / 1000.0)
+        response_ms = -1
+        message = "连接失败：目标不可达"
+
+    # ③ 审计：让「口令泄露后扫内网」留下痕迹。
+    print(f'[AUDIT] rp_test_rule rule={rule_id} target={host}:{port} '
+          f'reachable={reachable} from={request.remote_addr or "-"}', flush=True)
 
     return jsonify({"success": True, "data": {
-        "target_reachable": True,
+        "target_reachable": reachable,
         "response_time_ms": response_ms,
-        "ssl_valid": True,
-        "message": f"目标服务可达 ({response_ms}ms)"
+        "ssl_valid": reachable,
+        "message": message
     }})
 
 
