@@ -334,6 +334,19 @@ check('面板会话密钥与网关令牌密钥是两个不同的文件',
       and re.search(r'_sesssecret="[^"]*nftables-web-session-secret"', _init) is not None
       and re.search(r'_toksecret="[^"]*nftables-web-secret"', _init) is not None,
       '两个密钥必须落在两个不同的文件上')
+# 谁来生成这个文件？
+#
+# init 脚本以 root 在**降权前**生成它，理由不是「面板也能生成」：
+#  · 面板运行期如果配置目录变成不可写（只读挂载、事后收紧权限），
+#    它就写不出这个文件，只能退回进程内随机值 ⇒ 重启即会话全失。
+#  · init 脚本生成的那份在网关（uid 1000）起来之前就位，
+#    网关从一开始就**读不到**它（0600 root:root）。
+# 面板自己的兜底路径（_init_app_secret → _apply_session_secret_perms）
+# 同样保证 0600 root:root，两条路殊途同归 —— 但只有 init 这一条
+# 在「目录不可写」时仍然成立，所以它必须被钉住。
+check('面板会话密钥由 init 脚本在降权前生成（面板运行期目录不可写时没有兜底）',
+      re.search(r'if\s+\[\s*!\s*-s\s+"\$_sesssecret"\s*\]', _init) is not None,
+      'init 脚本必须负责生成 nftables-web-session-secret')
 
 # 启动后复核：这是最后一道闸，防止将来 _drop_privileges 被改坏
 #

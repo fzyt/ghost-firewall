@@ -256,28 +256,56 @@ check("跨站 Referer → 403", r.status_code == 403, f"实际 {r.status_code}")
 r = login_with()   # curl/脚本：什么都不带
 check("无 Origin 无 Referer → 非 403（脚本仍可用）", r.status_code != 403, f"实际 {r.status_code}")
 
-# 11.3 滑动续期要吊销旧 token（旧代码只签新的，旧的永远有效）
-print("\n--- 11.3 续期吊销旧 token（旧代码让登出对已泄露 token 失效）---")
+# 11.3 滑动续期：续期点搬到了 /auth/status（Shannon P0-1 修复）
+print("\n--- 11.3 续期只在 /auth/status 发生，auth_request 路径无副作用 ---")
 # 触发续期的条件是「剩余时间 < 会话 TTL 的一半」= 1800/2 = 900 秒，
 # 所以这里签一张剩余 100 秒的：既仍然有效，又必然落入续期区间。
 old = ag.issue_token("kirito", "dev-rot", 100)
 old_jti = ag.parse_token(old)["jti"]
 check("旧 token 初始有效且未被吊销",
       ag.parse_token(old) is not None and not ag.is_revoked(old_jti))
+
+# ① auth_request 路径（/auth/verify）必须**纯校验、一个副作用都不留**。
+#
+# 修复前续期就在这里发生：签了新令牌 + 吊销旧 jti。但 /auth/verify 是 nginx
+# auth_request 的**子请求**目标，auth_request 默认丢弃子请求的响应头 ——
+# 新令牌永远到不了客户端，旧 jti 却已经被吊销 ⇒ 用户 15 分钟后被踢下线。
+# 续期搬走之后，这条路径既不能吊销，也不能下发 cookie。
 cc = ag.app.test_client()
 cc.set_cookie("gw_token", old, domain=HOST)
 r = cc.get("/auth/verify", headers={"X-Real-IP": "8.8.8.8", "Host": HOST})
-check("带旧 token 请求被接受并触发续期", r.status_code == 200, f"实际 {r.status_code}")
+check("带旧 token 请求被接受", r.status_code == 200, f"实际 {r.status_code}")
+check("auth_request 路径不吊销旧 jti（续期不在这里发生）",
+      not ag.is_revoked(old_jti),
+      "旧 jti 被吊销 = 客户端拿不到新令牌却被踢下线")
+check("auth_request 路径不下发新 cookie",
+      "Set-Cookie" not in r.headers,
+      f"实际={r.headers.get('Set-Cookie')!r}")
 
+# ② 续期点：/auth/status 是普通 proxy_pass，Set-Cookie 原样到达浏览器。
+# 它必须**吊销旧 jti**（否则攻击者截获的旧 token 一直有效，而且「登出」
+# 这个本该一键切断的急停开关对它无效），同时下发一张新令牌。
+cc2 = ag.app.test_client()
+cc2.set_cookie("gw_token", old, domain=HOST)
+r2 = cc2.get("/auth/status", headers={"X-Real-IP": "8.8.8.8", "Host": HOST})
+check("/auth/status 返回已认证",
+      (r2.get_json() or {}).get("authenticated") is True,
+      f"实际={r2.get_json()}")
+check("续期后旧 jti 已进吊销表", ag.is_revoked(old_jti),
+      "旧 jti 未被吊销 = 攻击者截获的凭据不会因受害者续期而失效")
+check("/auth/status 下发了新令牌 cookie",
+      "gw_token=" in (r2.headers.get("Set-Cookie") or ""),
+      f"实际={r2.headers.get('Set-Cookie')!r}")
+
+# ③ 续期之后旧 token 必须真的失效 —— 这才是「受害者续期 ⇒ 攻击者的副本作废」
+#
 # 注意：parse_token 只验签名与 exp，**不查吊销表**（吊销在 _verify_or_deny 里
 # 单独用 is_revoked 判）。所以不能断言 parse_token(old) is None —— 那测的是
 # 另一件事。要断言的是「旧 token 真的进了吊销表，且真的被拒绝」。
-check("续期后旧 jti 已进吊销表", ag.is_revoked(old_jti),
-      "旧 jti 未被吊销 = 攻击者截获的凭据不会因受害者续期而失效")
-cc2 = ag.app.test_client()
-cc2.set_cookie("gw_token", old, domain=HOST)
-r2 = cc2.get("/auth/verify", headers={"X-Real-IP": "8.8.8.8", "Host": HOST})
-check("续期后旧 token 被 /auth/verify 拒绝", r2.status_code == 401, f"实际 {r2.status_code}")
+cc3 = ag.app.test_client()
+cc3.set_cookie("gw_token", old, domain=HOST)
+r3 = cc3.get("/auth/verify", headers={"X-Real-IP": "8.8.8.8", "Host": HOST})
+check("续期后旧 token 被 /auth/verify 拒绝", r3.status_code == 401, f"实际 {r3.status_code}")
 
 # 11.4 非回环来源不得采信代理头（Shannon 攻击链的第二环）
 print("\n--- 11.4 client_ip 只在回环来源时采信 X-Real-IP ---")

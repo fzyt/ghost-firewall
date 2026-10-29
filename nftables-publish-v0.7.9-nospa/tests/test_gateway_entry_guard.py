@@ -172,6 +172,8 @@ try:
         'luci_actual': True,
         'luci_ports_listening': ['80'],
         'gateway_actual': {'enabled': True},
+        # 以及「安全状态」类只读键（Shannon P0-4）：通用路径必须写不进去
+        'auth_token_epoch': 999,
     })
     check('接口仍然返回 200（不能因为剔字段就失败）', r.status_code == 200,
           f'HTTP {r.status_code} {r.get_data(as_text=True)[:160]}')
@@ -183,7 +185,8 @@ try:
           f'实际={data.get("ignored_gateway_fields")}')
     check('回报剔掉了哪些只读字段',
           set(data.get('ignored_readonly_fields') or []) ==
-          {'success', 'luci_actual', 'luci_ports_listening', 'gateway_actual'},
+          {'success', 'luci_actual', 'luci_ports_listening', 'gateway_actual',
+           'auth_token_epoch'},
           f'实际={data.get("ignored_readonly_fields")}')
 
     disk = json.load(open(CFG3))
@@ -200,8 +203,30 @@ try:
     check('磁盘上 auth_lan_bypass 没被改',
           disk.get('auth_lan_bypass') is False,
           f'实际={disk.get("auth_lan_bypass")!r}')
-    for k in mod.READONLY_CONFIG_KEYS:
-        check(f'只读键 {k} 没有落盘', k not in disk, f'磁盘里有={k!r}')
+    # READONLY_CONFIG_KEYS 里有两类东西，不能一把尺子量：
+    #
+    #   ① **视图类**（success / luci_actual / luci_ports_listening /
+    #      gateway_actual / config_rev）—— GET 为了让前端显示「实际状态」
+    #      多给的，前端把整个 config 原样回传。落盘就是污染配置 ⇒ 必须不落盘。
+    #
+    #   ② **状态类**（auth_token_epoch）—— 面板自己的安全状态（改密码时
+    #      递增的世代号），**必须**由面板自己落盘，只是**不允许**经通用
+    #      /api/config 路径写入。所以对它的断言是「写不进去」，不是
+    #      「不在磁盘上」—— 一刀切断言「只读键一律不落盘」会把这条判错。
+    #
+    # Shannon P0-4 实测：POST /api/config {"auth_token_epoch": 999} 曾经
+    # 返回 200 且真的落盘 999，三个剔除名单一个都没拦它。
+    VIEW_ONLY_KEYS = {'success', 'luci_actual', 'luci_ports_listening',
+                      'gateway_actual', 'config_rev'}
+    check('只读名单 = 视图类 + auth_token_epoch（新增的键必须归到其中一类）',
+          set(mod.READONLY_CONFIG_KEYS) == VIEW_ONLY_KEYS | {'auth_token_epoch'},
+          f'实际={sorted(mod.READONLY_CONFIG_KEYS)}')
+    for k in sorted(set(mod.READONLY_CONFIG_KEYS) & VIEW_ONLY_KEYS):
+        check(f'视图类只读键 {k} 没有落盘', k not in disk, f'磁盘里有={k!r}')
+    check('状态类只读键 auth_token_epoch 没被通用路径改掉',
+          int(disk.get('auth_token_epoch', 0) or 0) == 0,
+          f'磁盘里={disk.get("auth_token_epoch")!r} —— '
+          f'通用路径能改它 = 「改密码作废全部会话」的保证被撤销')
     check('非网关字段照常保存（不能连累正常功能）',
           disk.get('trusted_ip4') == '192.168.100.224',
           f'实际={disk.get("trusted_ip4")!r}')

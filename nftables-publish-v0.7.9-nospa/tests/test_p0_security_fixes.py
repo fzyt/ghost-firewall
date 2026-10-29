@@ -18,6 +18,7 @@ test_gateway_ui_safety.py、test_privilege_drop.py 里。
 沙箱运行：只 import 模块并打补丁，不碰真实路径、不执行 nft/nginx/uci/crontab。
 """
 import importlib
+import io
 import json
 import os
 import re
@@ -25,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import builtins
 
 BACKEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'backend')
 sys.path.insert(0, os.path.abspath(BACKEND))
@@ -156,6 +158,49 @@ _cp_body = func_body(_SRC_APP, 'auth_change_password')
 check('改密码路径仍然写 auth_token_epoch（没被误伤）',
       'auth_token_epoch' in _cp_body,
       '改密码必须能递增世代号')
+
+# ── 端到端：拿管理员会话真打一次 POST /api/config ──────────────────
+#
+# 为什么必须补这一段：
+#   上面那条「落盘没被改成 999」用的是**未认证**请求 —— 它在鉴权那一步
+#   就被拒了（401），**压根没走到剔除逻辑**。所以它证明的是「鉴权没被
+#   绕过」，证明不了「剔除逻辑真的生效」。
+#   而源码级断言（post_config 里有没有 `for k in READONLY_CONFIG_KEYS`）
+#   是**文本**层面的：谁把那个循环换成 pass，文本断言会红；但谁把剔除
+#   挪到别处、只改了一半、或换了个键名，文本断言看不出来。
+#
+# Shannon P0-4 的原始实测就是这样打穿的：管理员会话
+# POST /api/config {"auth_token_epoch": 999} → 200「配置已保存」，
+# 落盘真的变成 999，三个剔除名单一个都没拦它。
+app2 = fresh_app()
+_cfg3 = json.loads(json.dumps(app2.DEFAULT_CONFIG))
+_cfg3['auth_token_epoch'] = 0
+app2.save_config(_cfg3)
+_hooks2 = list(app2.app.before_request_funcs[None])
+app2.app.before_request_funcs[None] = []      # 去掉全局拦截器（含 CSRF），改用会话认证
+try:
+    _pc2 = app2.app.test_client()
+    with _pc2.session_transaction() as sess:
+        sess['authenticated'] = True
+    _post2 = _pc2.post('/api/config', json={'auth_token_epoch': 999,
+                                           'trusted_ip4': '192.168.100.224'})
+    check('管理员会话 POST /api/config 仍然 200（剔除字段不能把接口搞失败）',
+          _post2.status_code == 200,
+          f'HTTP {_post2.status_code} {_post2.get_data(as_text=True)[:160]}')
+    _d2 = (_post2.get_json() or {}).get('data') or {}
+    check('管理员会话 POST 时 auth_token_epoch 被列入 ignored_readonly_fields',
+          'auth_token_epoch' in (_d2.get('ignored_readonly_fields') or []),
+          f'实际={_d2.get("ignored_readonly_fields")}')
+    _saved2 = json.load(open(app2.CONFIG_PATH, encoding='utf-8'))
+    check('**管理员会话也改不掉 auth_token_epoch**（通用路径彻底写不进去）',
+          int(_saved2.get('auth_token_epoch', 0) or 0) == 0,
+          f'落盘={_saved2.get("auth_token_epoch")} —— 世代号能被通用路径改 = '
+          f'「改密码作废全部会话」的保证被撤销')
+    check('同一请求里的正常字段照常保存（剔除不能连累正常功能）',
+          _saved2.get('trusted_ip4') == '192.168.100.224',
+          f'实际={_saved2.get("trusted_ip4")!r}')
+finally:
+    app2.app.before_request_funcs[None] = _hooks2
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -387,12 +432,81 @@ check('crontab -l 失败时**没有**执行 `crontab -`（不会覆盖 crontab�
       f'调用={_calls}')
 
 # ② install_china_ips 同样必须 fail-closed
+#
+# 这里原来只有一条**源码文本**断言（'returncode != 0' 出现在函数体里），
+# 但 install_china_ips 里有**两处** returncode 检查：一处是读 crontab -l
+# （这才是要 fail-closed 的那处），另一处是写 crontab -。
+# 「函数体里出现过 returncode != 0」这种粗断言，把**读**的那一处变异掉
+# 照样能通过 —— 变异脚本第一轮就抓到了这个洞（漏网 1 条）。
+#
+# 所以拆成两件事：
+#   ① **精确**断言：crontab -l 读取点与 existing= 之间必须有 returncode 闸门
+#   ② **行为**断言：真的打一次端点，看它有没有执行 `crontab -`
 _iic_body = func_body(_SRC_APP, 'install_china_ips')
-check('install_china_ips 也检查 crontab -l 的 returncode',
-      'returncode != 0' in _iic_body,
-      '原来连 returncode 都不查 → existing=[] → 覆盖整个 root crontab')
+_i_l = _iic_body.find("'crontab', '-l'")
+_i_e = _iic_body.find('existing =', _i_l) if _i_l >= 0 else -1
+_iic_gate = _iic_body[_i_l:_i_e] if (_i_l >= 0 and _i_e > _i_l) else ''
+check('install_china_ips 在 crontab -l 读取点后有 returncode 闸门（fail-closed）',
+      'returncode != 0' in _iic_gate,
+      f'读取点与 existing= 之间={_iic_gate[:200]!r}')
 check('install_china_ips 读取失败时返回错误且不做任何修改',
-      re.search(r'returncode\s*!=\s*0.*?return jsonify', _iic_body, re.S) is not None)
+      re.search(r'returncode\s*!=\s*0.*?return jsonify', _iic_gate, re.S) is not None,
+      f'闸门段={_iic_gate[:200]!r}')
+
+# 行为级：crontab -l 失败时端点必须中止，且**绝不**执行 `crontab -`
+#
+# 端点会往 /opt/nftables-web-v2/update-china-ips.sh 写脚本（本机没权限），
+# 所以把「建目录 / 写脚本 / chmod」都 mock 掉，只留被测的那段判断逻辑。
+_iic_calls = []
+_real_open2 = builtins.open
+_real_makedirs = os.makedirs
+_real_chmod = os.chmod
+
+
+def _iic_fake_run(cmd, *a, **kw):
+    _iic_calls.append(cmd)
+    if isinstance(cmd, (list, tuple)) and 'crontab' in cmd:
+        if '-l' in cmd:
+            class _R2:
+                returncode = 1
+                stdout = ''
+                stderr = "crontab: can't open 'root': No such file or directory"
+            return _R2()
+        # 写入类调用：绝不放行到真实 crontab（这正是 P0-10 描述的故障）
+        raise AssertionError(f'测试不允许真正写 crontab：{cmd!r}')
+    return _real_run(cmd, *a, **kw)
+
+
+def _iic_fake_open(path, mode='r', *a, **kw):
+    if str(path).endswith('update-china-ips.sh'):
+        return io.StringIO()
+    return _real_open2(path, mode, *a, **kw)
+
+
+subprocess.run = _iic_fake_run
+os.makedirs = lambda *a, **k: None
+os.chmod = lambda *a, **k: None
+builtins.open = _iic_fake_open
+try:
+    _cfg_ici = json.loads(json.dumps(app.DEFAULT_CONFIG))
+    _cfg_ici['china_ip_block'] = True
+    app.save_config(_cfg_ici)
+    with app.app.test_request_context('/api/firewall/install-china-ips', method='POST'):
+        _resp_ici = app.install_china_ips()
+    try:
+        _ici_ok = bool(_resp_ici[0].get_json().get('success'))
+    except Exception:
+        _ici_ok = False
+finally:
+    subprocess.run = _real_run
+    os.makedirs = _real_makedirs
+    os.chmod = _real_chmod
+    builtins.open = _real_open2
+check('crontab -l 失败时 install_china_ips 返回失败', not _ici_ok,
+      f'实际={_resp_ici!r}')
+check('crontab -l 失败时**没有**执行 `crontab -`（不会覆盖整个 root crontab）',
+      ['crontab', '-'] not in _iic_calls,
+      f'调用={_iic_calls}')
 
 
 # ═════════════════════════════════════════════════════════════════════

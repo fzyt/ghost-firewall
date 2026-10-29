@@ -474,6 +474,28 @@ try:
         check("限流生效前一直是 401（密码错，不是 200）",
               all(c == 401 for c in _codes[:ag.RATE_LIMIT_MAX_FAILS - 1]),
               f"序列={_codes}")
+
+        # ── 锁定期内，**密码正确**也必须被拒 ──────────────────────────
+        #
+        # auth_login 里 `_is_locked(ip)` 是**校验密码之前**的只读闸门。
+        # 降级状态下锁定信息只存在内存里，这道闸门必须能读到它。
+        #
+        # 为什么上面那两条断言抓不住这一层：密码**错**的时候，
+        # 「早期闸门 → 429」和「走到 _mutate_ratelimit → locked → 429」
+        # 两条路径给的状态码**完全一样**。只有把密码换成正确的，
+        # 差别才显出来：
+        #   闸门在  → 429（锁定生效）
+        #   闸门拆  → 200（降级期间已锁定的 IP 拿正确密码就能登录成功）
+        # 后者等于锁定形同虚设 —— 而且没有任何断言能发现。
+        _vp2 = ag._verify_password
+        ag._verify_password = lambda p, s: True
+        try:
+            _r_locked = _call("/auth/login", "POST", {"password": "right"})
+        finally:
+            ag._verify_password = _vp2
+        check("**降级状态下锁定期内的 IP 即使密码正确也必须被拒（429）**",
+              _r_locked.status_code == 429,
+              f"HTTP {_r_locked.status_code} —— 锁定只拦错密码、正确密码放行 = 锁定形同虚设")
     finally:
         ag.RATELIMIT_FILE = _rl_dir_saved
 

@@ -117,34 +117,26 @@ MUTATIONS = [
      "    try:\n"
      "        with os.fdopen(fd, \"r+\") as f:"),
 
+    # 下面三条锚点指向 `_ratelimit_fallback_mutate` / `_is_locked`。
+    # 2026-10-29：这两处被 Shannon P0-5 修复改写过（锁定时不再清空 fails、
+    # 降级路径返回真实 locked 标志、读端补 flock(LOCK_SH)），旧锚点
+    # 匹配不上 → 「锚点未命中（跳过）」。跳过 = 这三条变异**根本没跑过**，
+    # 等于静默失去覆盖。锚点必须跟着源码一起更新。
+    #
+    # 锚点刻意避开注释块：注释里引用了修复前的代码原文，
+    # 拿它当锚点会在下次改注释时再次失效。
+
     ("限流表：降级后放行但不计数（暴力破解防护被悄悄关掉）",
      AG,
-     "    if on_fail:\n"
      "        fails.append(now)\n"
-     "        if len(fails) >= RATE_LIMIT_MAX_FAILS:\n"
-     "            rec = {\"locked_until\": now + RATE_LIMIT_LOCKOUT, \"fails\": []}\n"
-     "        else:\n"
-     "            rec = {\"locked_until\": 0, \"fails\": fails}\n"
-     "    else:\n"
-     "        rec = {}                       # 成功登录：清空该 IP 的失败记录",
-     "    if on_fail:\n"
-     "        fails.append(now)\n"
-     "        rec = {\"locked_until\": 0, \"fails\": []}\n"
-     "    else:\n"
-     "        rec = {}"),
+     "        if len(fails) >= RATE_LIMIT_MAX_FAILS:\n",
+     "        # 变异：降级后放行但不计数\n"
+     "        if len(fails) >= RATE_LIMIT_MAX_FAILS:\n"),
 
     ("限流表：降级后永不上锁",
      AG,
-     "        fails.append(now)\n"
-     "        if len(fails) >= RATE_LIMIT_MAX_FAILS:\n"
-     "            rec = {\"locked_until\": now + RATE_LIMIT_LOCKOUT, \"fails\": []}\n"
-     "        else:\n"
-     "            rec = {\"locked_until\": 0, \"fails\": fails}",
-     "        fails.append(now)\n"
-     "        if False:\n"
-     "            rec = {\"locked_until\": now + RATE_LIMIT_LOCKOUT, \"fails\": []}\n"
-     "        else:\n"
-     "            rec = {\"locked_until\": 0, \"fails\": fails}"),
+     "            rec = {\"locked_until\": now + RATE_LIMIT_LOCKOUT, \"fails\": fails}\n",
+     "            rec = {\"locked_until\": 0, \"fails\": fails}\n"),
 
     ("限流表：降级时不置告警标志（线上无从判断限流已失效）",
      AG,
@@ -155,14 +147,10 @@ MUTATIONS = [
 
     ("限流表：上锁判定退回只读文件（降级期间暴力破解防护被悄悄关掉）",
      AG,
-     "    except (OSError, json.JSONDecodeError):\n"
-     "        pass\n"
      "    return _ratelimit_fallback_is_locked(ip)\n"
      "\n"
      "\n"
      "def _origin_host_mismatch",
-     "    except (OSError, json.JSONDecodeError):\n"
-     "        pass\n"
      "    return False\n"
      "\n"
      "\n"
