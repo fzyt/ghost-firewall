@@ -30,16 +30,11 @@ PY = 'py'
 
 APP_MUTANTS = [
     ('默认值退回「0 = 不限」（公网入口请求体上限完全敞开）',
-     'cmbs = (_sanitize_client_max_body_size(rule.get("client_max_body_size", ""))\n'
-     '                    or DEFAULT_CLIENT_MAX_BODY)',
-     'cmbs = (_sanitize_client_max_body_size(rule.get("client_max_body_size", ""))\n'
-     '                    or "0")'),
+     'cmbs = (_sanitize_client_max_body_size(rule.get("client_max_body_size", ""))\n                or DEFAULT_CLIENT_MAX_BODY)',
+     'cmbs = (_sanitize_client_max_body_size(rule.get("client_max_body_size", ""))\n                or "0")'),
     ('非法值分支退回「0 = 不限」',
-     "            print(f'[WARN] 服务 {name} 的 client_max_body_size 非法，'\n"
-     "                  f'已按默认 {DEFAULT_CLIENT_MAX_BODY} 处理', flush=True)\n"
-     "            cmbs = DEFAULT_CLIENT_MAX_BODY",
-     "            print(f'[WARN] 服务 {name} 的 client_max_body_size 非法', flush=True)\n"
-     '            cmbs = "0"'),
+     "        print(f'[WARN] 服务 {name} 的 client_max_body_size 非法，'\n              f'已按默认 {DEFAULT_CLIENT_MAX_BODY} 处理', flush=True)\n        cmbs = DEFAULT_CLIENT_MAX_BODY",
+     '        print(f\'[WARN] 服务 {name} 的 client_max_body_size 非法\', flush=True)\n        cmbs = "0"'),
     ('默认值常量被改成 8K（跟认证端点混了）',
      'DEFAULT_CLIENT_MAX_BODY = "1M"',
      'DEFAULT_CLIENT_MAX_BODY = "8K"'),

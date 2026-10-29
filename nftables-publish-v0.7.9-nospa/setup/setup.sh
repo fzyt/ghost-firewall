@@ -683,31 +683,92 @@ install_blinker_via_pip() {
 # ============================================================
 # 3. 安装 acme.sh（优先 opkg，fallback pipe）
 # ============================================================
+# acme.sh 的 DNS 插件清单，与产品面板支持的 DNS 提供商一一对应。
+# 少任何一个，那个提供商在面板上就会报「申请失败」。
+ACME_DNSAPI_PLUGINS="dns_ali dns_tencent dns_cf dns_huaweicloud dns_porkbun dns_gd"
+
+# 准备 acme.sh 主脚本 + DNS 插件到 ~/.acme.sh/ 下。
+#
+# 为什么不能直接用 OpenWrt 的 opkg acme-acmesh：
+#   那个包装的是**裁剪版** acme.sh —— 只有主脚本，一个 dnsapi/dns_*.sh
+#   都没有（实测 25.12.5：整个文件系统里找不到 dns_*.sh）。
+#   `--dns dns_ali` 直接失败，面板点「申请证书」必然报错。
+#
+# 为什么不能直接用官方安装器：
+#   官方安装器要下 https://github.com/.../archive/master.tar.gz
+#   （codeload.github.com），国内网络经常 curl 56 失败（2026-10-28
+#   在 .233 实测失败）；而主脚本本体走 raw.githubusercontent 是通的
+#   （200 / 0.85s）。
+#
+# 所以拆成两半分别拿：主脚本用 OpenWrt 裁剪版（上游已把它改成
+# #!/usr/bin/env sh，没有 bash 也能跑），插件按需从 raw.githubusercontent
+# 单独取（该域名国内可达，插件本身也是 sh 兼容的）。
 install_acme() {
     info "========== 安装 acme.sh =========="
 
-    if [ -f ~/.acme.sh/acme.sh ] || command -v acme.sh >/dev/null 2>&1; then
-        ok "acme.sh 已安装，跳过"
-        return
+    local acme_home="${HOME}/.acme.sh"
+    local acme_main="${acme_home}/acme.sh"
+    local c
+
+    # ---- 主脚本 ----
+    if [ ! -f "$acme_main" ]; then
+        for c in /usr/lib/acme/client/acme.sh /usr/share/acme/acme.sh /usr/bin/acme.sh; do
+            if [ -f "$c" ]; then
+                mkdir -p "$acme_home"
+                cp "$c" "$acme_main" && chmod +x "$acme_main" \
+                    && ok "已就位 acme.sh 主脚本: $c → $acme_main" && break
+            fi
+        done
     fi
 
-    info "尝试通过 ${PKG_MANAGER} 安装 acme-acmesh..."
-    if pkg_install acme-acmesh 2>/dev/null; then
-        ok "✅ acme-acmesh 安装成功"
-        return
+    if [ ! -f "$acme_main" ]; then
+        info "尝试通过 ${PKG_MANAGER} 安装 acme-acmesh..."
+        if pkg_install acme-acmesh 2>/dev/null; then
+            for c in /usr/lib/acme/client/acme.sh /usr/share/acme/acme.sh /usr/bin/acme.sh; do
+                if [ -f "$c" ]; then
+                    mkdir -p "$acme_home"
+                    cp "$c" "$acme_main" && chmod +x "$acme_main" && break
+                fi
+            done
+        fi
     fi
 
-    warn "${PKG_MANAGER} 安装 acme-acmesh 失败，尝试通过 curl pipe 安装..."
-    warn "⚠️  安全提示：pipe 安装会从 get.acme.sh 下载并直接执行脚本"
-    warn "    如果担心安全风险，请手动下载 acme.sh 源码后安装"
+    if [ ! -f "$acme_main" ]; then
+        warn "${PKG_MANAGER} 安装 acme-acmesh 失败，尝试官方安装器..."
+        warn "⚠️  安全提示：pipe 安装会从 get.acme.sh 下载并直接执行脚本"
+        warn "    如果担心安全风险，请手动下载 acme.sh 源码后安装"
+        curl -fsSL --connect-timeout 30 --retry 2 --max-time 120 https://get.acme.sh \
+            | sh -s email="${ACME_EMAIL}" --home "$acme_home" --nocron \
+            || warn "官方安装器也失败，HTTPS 证书自动申请将不可用"
+        if [ -f "$acme_main" ]; then
+            ok "✅ acme.sh 安装完成"
+        else
+            error "❌ acme.sh 安装失败，HTTPS 证书功能将不可用"
+            return
+        fi
+    fi
 
-    curl -fsSL --connect-timeout 30 --retry 2 --max-time 120 https://get.acme.sh | sh -s email="${ACME_EMAIL}" \
-        || { error "❌ acme.sh 安装失败，HTTPS 证书功能将不可用"; return; }
+    # ---- DNS 插件（面板的 DNS-01 验证全靠它们）----
+    local dnsapi_dir="${acme_home}/dnsapi"
+    mkdir -p "$dnsapi_dir"
+    local base="https://raw.githubusercontent.com/acmesh-official/acme.sh/master/dnsapi"
+    local p
+    for p in ${ACME_DNSAPI_PLUGINS}; do
+        if [ -f "${dnsapi_dir}/${p}.sh" ]; then
+            continue
+        fi
+        info "下载 acme.sh DNS 插件 ${p}.sh ..."
+        if curl -fsSL --connect-timeout 15 --retry 2 --max-time 60 \
+             -o "${dnsapi_dir}/${p}.sh.part" "${base}/${p}.sh" 2>/dev/null; then
+            mv "${dnsapi_dir}/${p}.sh.part" "${dnsapi_dir}/${p}.sh"
+            chmod +x "${dnsapi_dir}/${p}.sh"
+        else
+            warn "插件 ${p}.sh 下载失败（该 DNS 提供商将不可用）"
+            mv -f "${dnsapi_dir}/${p}.sh.part" "${dnsapi_dir}/${p}.sh.part.failed" 2>/dev/null || true
+        fi
+    done
 
-    # 确保 PATH 包含 acme.sh
-    export PATH="$HOME/.acme.sh:$PATH"
-
-    ok "✅ acme.sh 安装完成"
+    ok "✅ acme.sh 就绪: $acme_main（插件目录 $dnsapi_dir）"
 }
 
 # ============================================================

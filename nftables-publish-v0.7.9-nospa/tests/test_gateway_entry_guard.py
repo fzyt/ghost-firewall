@@ -400,8 +400,11 @@ _orig_actual = mod._gateway_actual_state
 mod.NGINX_CONF_DIR = CONF_DIR_4B
 mod._nginx_test = lambda: (True, 'ok')
 mod._nginx_reload = lambda: (True, 'ok')
+# 元组元数必须跟 _gateway_services 一致：(rule, prefix, protocol, host, port, rp_host)
+# 2026-10-28 host 分发改造后多了一个 rp_host —— mock 少给一个就直接 ValueError，
+# 表现是「测试崩在半路」，而不是一条干净的断言失败。
 mod._gateway_services = lambda cfg: [({'name': 'NAS', 'public_access': True},
-                                     '/nas', 'http', '10.0.0.2', 5000)]
+                                     '/nas', 'http', '10.0.0.2', 5000, '')]
 alive = {'v': True, 'conf': True}
 
 
@@ -463,8 +466,11 @@ os.makedirs(CONF_DIR_4C)
 mod.NGINX_CONF_DIR = CONF_DIR_4C
 mod._nginx_test = lambda: (True, 'ok')
 mod._nginx_reload = lambda: (True, 'ok')
+# 元组元数必须跟 _gateway_services 一致：(rule, prefix, protocol, host, port, rp_host)
+# 2026-10-28 host 分发改造后多了一个 rp_host —— mock 少给一个就直接 ValueError，
+# 表现是「测试崩在半路」，而不是一条干净的断言失败。
 mod._gateway_services = lambda cfg: [({'name': 'NAS', 'public_access': True},
-                                     '/nas', 'http', '10.0.0.2', 5000)]
+                                     '/nas', 'http', '10.0.0.2', 5000, '')]
 mod.time.sleep = lambda s: None        # 不真的等，测试要快
 try:
     # 端口在第 3 次探测才通（模拟 master 建 socket 的延迟）

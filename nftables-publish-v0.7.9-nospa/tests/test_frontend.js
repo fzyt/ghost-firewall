@@ -14,22 +14,42 @@ const ok = (n, c, x) => { if (c) { P++; console.log('  ✅ ' + n); } else { F++;
 
 // ── 极简 DOM 桩 ────────────────────────────────────────────
 function mkEl(tag) {
-  return {
+  const el = {
     tagName: (tag || 'div').toUpperCase(),
     children: [], attrs: {}, _text: '', className: '', hidden: false,
     disabled: false, value: '',
+    _cls: new Set(),
+    /* 门脸页移植后 login.js 改用 classList 驱动状态
+       （校验中 / 出错 / 抖动 / 电平刻度），所以桩里必须有它。 */
+    classList: {
+      add(...c) { c.forEach(x => el._cls.add(x)); el.className = [...el._cls].join(' '); },
+      remove(...c) { c.forEach(x => el._cls.delete(x)); el.className = [...el._cls].join(' '); },
+      toggle(c, on) {
+        const want = on === undefined ? !el._cls.has(c) : !!on;
+        if (want) el._cls.add(c); else el._cls.delete(c);
+        el.className = [...el._cls].join(' ');
+        return want;
+      },
+      contains(c) { return el._cls.has(c); },
+    },
     get textContent() { return this._text; },
     set textContent(v) { this._text = String(v); this.children.length = 0; },
     appendChild(c) { this.children.push(c); return c; },
     setAttribute(k, v) { this.attrs[k] = v; },
     addEventListener(ev, fn) { (this._h = this._h || {})[ev] = fn; },
+    focus() { this.focused = true; },
+    blur() { this.focused = false; },
     getContext() { return null; },   // canvas 不可用 → 走 fallback 分支
     get href() { return this._href || ''; }, set href(v) { this._href = v; },
   };
+  return el;
 }
 const byId = {};
-['form', 'pw', 'msg', 'submit', 'device', 'who', 'timer', 'left', 'logout', 'main', 'empty']
+['form', 'pw', 'msg', 'submit', 'device', 'who', 'timer', 'left', 'logout', 'main', 'empty',
+ 'pwField', 'levels', 'port']
   .forEach(id => { byId[id] = mkEl(); });
+/* 电平刻度：登录页画了 8 格，login.js 按输入位数点亮前 N 格 */
+for (let i = 0; i < 8; i++) byId['levels'].appendChild(mkEl('i'));
 
 const sandbox = {
   console,
@@ -121,8 +141,74 @@ sandbox.DevFingerprint.get().then(fp => {
   ok('login.js 中确实实现了这套判定',
      /charAt\(1\) === '\/'/.test(fs.readFileSync(path.join(DIR, 'login.js'), 'utf8')) &&
      /indexOf\('\\\\'\)/.test(fs.readFileSync(path.join(DIR, 'login.js'), 'utf8')));
+  return runDoorfaceTests();
+}).then(() => {
   finish();
 });
+
+/* 门脸页移植后的登录页：呈现层状态 + 提交载荷。
+ *
+ * 这几条盯的是**换皮不能换掉的东西**：
+ *   · 刻度是 class 驱动的（不是内联样式）
+ *   · 提交仍然打 /auth/login，载荷仍然是 {"password": ...}
+ * 换句话说：门脸页可以随便改，但端点和载荷不许跟着改。 */
+async function runDoorfaceTests() {
+  console.log('\n=== 3b. 门脸页移植：电平刻度与提交载荷 ===');
+  const pw = byId['pw'];
+  const levels = byId['levels'];
+
+  ok('登录页有电平刻度容器', !!levels);
+  ok('电平刻度是 8 格', levels.children.length === 8, `实际 ${levels.children.length}`);
+
+  const inputH = pw._h && pw._h['input'];
+  ok('login.js 给密码框挂了 input 监听', typeof inputH === 'function');
+  if (typeof inputH === 'function') {
+    pw.value = 'abc';
+    inputH();
+    let on = levels.children.filter(c => c.classList.contains('on')).length;
+    ok('输入 3 位 → 点亮 3 格', on === 3, `实际 ${on}`);
+    pw.value = '123456789';
+    inputH();
+    on = levels.children.filter(c => c.classList.contains('on')).length;
+    ok('超过 8 位也不会点亮第 9 格', on === 8, `实际 ${on}`);
+    pw.value = '';
+    inputH();
+    ok('清空 → 全部熄灭',
+       levels.children.every(c => !c.classList.contains('on')));
+  }
+
+  // 抓住 fetch，确认端点和载荷没被动过
+  const calls = [];
+  sandbox.fetch = (url, opts) => {
+    calls.push({ url, opts });
+    return Promise.resolve({
+      ok: false, status: 401,
+      json: () => Promise.resolve({ code: 'AUTH_FAILED', remaining: 3 }),
+    });
+  };
+  pw.value = 'secret';
+  const submitH = byId['form']._h && byId['form']._h['submit'];
+  ok('login.js 给表单挂了 submit 监听', typeof submitH === 'function');
+  if (typeof submitH === 'function') {
+    submitH({ preventDefault() {} });
+    await new Promise(r => setTimeout(r, 40));
+    const post = calls.find(c => c.url === '/auth/login');
+    ok('提交打的是 /auth/login', !!post, JSON.stringify(calls.map(c => c.url)));
+    ok('载荷是 {"password":...}',
+       !!post && post.opts.body === JSON.stringify({ password: 'secret' }),
+       post && post.opts.body);
+    ok('POST + application/json',
+       !!post && post.opts.method === 'POST'
+       && post.opts.headers['Content-Type'] === 'application/json');
+    ok('失败后清空密码框', pw.value === '', `实际 ${JSON.stringify(pw.value)}`);
+    ok('失败后框上带 is-bad',
+       byId['pwField'].classList.contains('is-bad'),
+       byId['pwField'].className);
+    ok('失败提示落在消息行',
+       (byId['msg'].textContent || '').includes('密码错误'),
+       byId['msg'].textContent);
+  }
+}
 
 function finish() {
   console.log('\n=== 4. 页面 HTML 无内联脚本（CSP 可收紧）===');

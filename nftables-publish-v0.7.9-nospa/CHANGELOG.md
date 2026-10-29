@@ -2,6 +2,87 @@
 
 所有重要更改均记录在此文件中。
 
+## [v0.8.6] - 2026-10-28
+
+泛域名体系落地：**泛域名证书**（签发 / SAN / 定时续期）+ **host 分发**
+（服务按自己的对外域名分发到根路径，认证一步不丢）。
+
+### 泛域名证书
+
+| 能力 | 说明 |
+|---|---|
+| 签发 | 面板直接申请 `base` + `*.base`（DNS-01），acme.sh 走多路径探测，OpenWrt 裁剪版缺 dnsapi 插件时给**人话报错**而不是 acme.sh 原始报错 |
+| 覆盖范围 | 证书列表返回真实 **SAN**（从证书里读，不信用户填的标签），卡片显示「覆盖：SAN（含泛域名）」 |
+| 自动续期 | `auto_renew` + `renew_days` → 落盘 `/opt/nftables-web/renew-certs.sh` + crontab `*/30`；`python3 app.py --renew-certs` 可手动触发 |
+| setup.sh | 补装 6 个 DNS 插件（`dns_ali` / `dns_tencent` / `dns_cf` / `dns_huaweicloud` / `dns_porkbun` / `dns_gd`）到 `~/.acme.sh/dnsapi/` |
+
+### host 分发（本次主线）
+
+反代规则新增 **`host`** 字段（对外域名，如 `siyuan.fzyto.top`）。
+填了就会**额外**开一个 `server_name` 入口，服务挂到该域名的**根路径**：
+
+```
+server {
+    server_name siyuan.fzyto.top;
+    location / { proxy_pass http://192.168.100.218:6807/; auth_request /_auth; ... }
+}
+```
+
+**为什么必须做**：路径前缀分发（`/siy/`）下，上游写死的根绝对路径
+（`/api/xxx`）会逃出 location → 接口全 404；而 WebSocket 因上游在运行时
+按 `location.host` 拼 URL，**静态 `sub_filter` 根本匹配不到** ——
+子路径反代的天花板不是补丁能补的。挂在域名根路径上，这两个问题天然不存在。
+
+**认证一步不丢**：host 入口同样走 `auth_request /_auth` + 401 跳登录，
+和路径入口完全一致。
+
+**跨子域共用一次登录**：浏览器按 host 存 cookie，门户在 `fzyto.top` 登录
+拿到的令牌送到 `siyuan.fzyto.top` 时不会被带上 —— 表现是「每换一个域名
+就要重登一次」。解法是把 cookie 的 `Domain` 抬到父域（`.fzyto.top`）：
+
+- `base_domain` 由面板**从默认证书的 SAN 自动推导**（`*.fzyto.top` → `fzyto.top`），
+  用户不必手填（手填十有八九填错，浏览器就是满屏证书告警）；
+- `cookie_domain` 默认 `.` + `base_domain`，可单独覆盖；
+- ⚠️ **IP 主机名必须退回 host-only**：浏览器对「IP + Domain 属性」的 cookie 是
+  **整条拒收**（RFC 6265 §5.3），硬带 Domain 会让「密码正确却登不进去」，
+  比不带 Domain 更难查。所以 `Domain` 按**当前请求主机**动态决定。
+
+**「键存在 = 已做过决定」**：`base_domain` / `cookie_domain` 的语义与其它开关
+不同 —— 键不存在 = 还没问过用户（可以从证书自动推导）；键存在但值为空 =
+用户**明确清空**了（绝不能再自动改回来）。若把它们放进 `RP_DEFAULT_SETTINGS`
+当普通开关处理，「自动推导」就永远不触发，「用户清空」也会被悄悄覆盖。
+
+**派生值必须落盘，不能只活在面板内存里**（真机踩出来的）：认证服务
+（`auth_gateway.py`）是**另一个进程**，只读同一份 JSON，不会去解析证书。
+如果这两个值只在面板的接口层现算，接口返回看着一切正常，但认证服务读到
+的是空的 → 下发的 cookie **没有 Domain 属性** → 浏览器按 host 各自存 →
+**跨子域每换一个域名就要重登一次**，而且面板上完全看不出来。
+现在 `_save_rp_config()` 在写盘前先把派生值物化。
+
+**两侧语义必须一致**：面板 `app.py._rp_cookie_domain()` 与认证服务
+`auth_gateway._cookie_domain()` 用同一套判据（键存在就用、键不存在就推导）。
+两边不一致 = 「面板说共享、认证服务不共享」。
+
+### 顺带修掉的既有缺陷
+
+- `getRpCertDaysClass` 前端**根本没实现**，但证书卡片两处在调 →
+  「剩余天数」「状态」两行颜色一直绑不上（补实现：灰/红/黄/绿四档）
+- `loadReverseProxy()` 判断顺序错：「只有一个证书就自动设默认」写在
+  `settings` 赋值**之前** → 每次新开面板进反代页都误触发 `set-default` →
+  `_deploy_all_rules` 重生成整份 nginx 配置 → **冲掉手工补丁**
+  （实测把 33 条 `sub_filter` 冲成 7 条）。已把该块移到赋值之后
+
+### 回归
+
+`tests/run_all.sh` 全量通过（断言 ✅1991 · ❌0，源码指纹一致）；
+新增 `tests/test_host_dispatch.py`。重构把网关 nginx 生成拆成三个函数后，
+**5 个变异脚本共 22 条锚点因缩进变化失效**（锚点未命中 = 那条变异根本没跑，
+是「悄悄少验」），已逐条对齐并复核命中数。
+
+真机（OpenWrt `.233`）验证：门户登录一次 → 点服务卡片 → 直接进
+`https://siyuan.fzyto.top:8443/`，不再重复登录；思源完整加载，
+WebSocket 连通，42 个请求 **0 个 4xx/5xx**。
+
 ## [v0.8.5] - 2026-10-21
 
 一次「保存配置」把整棵反代配置清空 —— 2026-10-21 `.1` 主路由真机事故的定案与修复。

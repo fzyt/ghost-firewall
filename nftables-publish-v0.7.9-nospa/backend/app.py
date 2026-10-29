@@ -1,6 +1,6 @@
 # Version: 0.7.9.1
 from flask import Flask, jsonify, request, send_from_directory, send_file, session
-import os, subprocess, shutil, json, time, re, hmac, hashlib, base64, datetime, uuid, fcntl, io, zipfile, secrets, ssl, ipaddress, socket, threading, contextlib
+import os, subprocess, shutil, json, time, re, hmac, hashlib, base64, datetime, uuid, fcntl, io, zipfile, secrets, ssl, ipaddress, socket, threading, contextlib, sys
 from template_engine import load_template, generate_rules
 
 # ======================= 认证配置 =======================
@@ -1907,7 +1907,7 @@ def config_to_variables(config):
         # 所以 WAN 白名单只需要放行这一个端口 —— 公网暴露面从「N 个反代端口」
         # 收敛成 1 个。只有确实存在「已启用 + public_access + 配了 path 前缀」
         # 的服务时才放行，免得开着一个没人用的公网端口。
-        if any(r.get("public_access") for r, _p, _pr, _h, _tp in _gateway_services(config)):
+        if any(r.get("public_access") for r, _p, _pr, _h, _tp, _rh in _gateway_services(config)):
             all_tcp.add(_safe_port(config.get("gateway_port"), 8443))
     else:
         for rule in rp_rules:
@@ -5562,7 +5562,20 @@ def list_clear_history():
 # ======================= 反向代理模块 =======================
 # nftables-web v0.7.6 — HTTPS 反向代理管理
 
-ACME_SH_PATH = os.path.expanduser("~/.acme.sh/acme.sh")
+# acme.sh 在不同安装方式下落在不同路径，写死一个等于「在某些设备上
+# 永远找不到」：
+#   · curl 官方安装              ~/.acme.sh/acme.sh
+#   · OpenWrt opkg acme-acmesh   /usr/lib/acme/client/acme.sh   ← 实测 25.12.5
+#   · Debian/Ubuntu 包           /usr/bin/acme.sh
+# 面板的「申请证书 / 续期」全靠这个路径。原来写死 ~/.acme.sh 的直接
+# 后果：设备上装了 acme.sh，点了申请还是返回「acme.sh 未安装」。
+ACME_SH_CANDIDATES = (
+    "~/.acme.sh/acme.sh",
+    "/usr/lib/acme/client/acme.sh",
+    "/usr/share/acme/acme.sh",
+    "/usr/bin/acme.sh",
+    "/usr/local/bin/acme.sh",
+)
 NGINX_SSL_DIR = os.environ.get(
     "NFTABLES_WEB_SSL_DIR", "/etc/nginx/ssl")
 NGINX_CONF_DIR = os.environ.get(
@@ -5639,6 +5652,259 @@ def _sanitize_domain(domain):
     if not re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)+$', domain):
         raise ValueError(f"无效域名格式: {domain}")
     return domain
+
+
+def _sanitize_cert_domain(raw):
+    """解析证书域名，返回 (base_domain, wildcard)。
+
+    接受 "example.com" 和 "*.example.com" 两种写法。
+
+    为什么不复用 _sanitize_domain：那个函数是**反代目标主机**的校验器
+    （_sanitize_target_address 会调它），放行 `*` 等于允许把
+    `*.evil.com` 写进 proxy_pass，nginx 解析时是当字面主机名的 ——
+    等于放开一个注入面。证书域名是另一套语义，必须单独一套解析。
+
+    返回的 base_domain 是不带 `*.` 的主域名，它同时充当证书的存放
+    目录名（`/etc/nginx/ssl/<base_domain>/`）—— 目录名里带 `*` 会在
+    shell 通配和运维操作里制造麻烦，统一用主域名更干净。
+    """
+    d = (raw or "").strip().lower()
+    wildcard = False
+    if d.startswith("*."):
+        wildcard = True
+        d = d[2:].strip()
+    if not re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)+$', d):
+        raise ValueError(f"无效域名格式: {raw}")
+    return d, wildcard
+
+
+def _get_cert_san(cert_path):
+    """读证书的 subjectAltName，返回列表（没有 SAN 时返回空列表）。
+
+    为什么需要它：证书条目里的 domain 字段是**用户填的标签**，跟证书
+    实际覆盖的范围不是一回事 —— 泛域名证书的标签可能是 "example.com"，
+    而它真正覆盖的是 example.com + *.example.com。面板不显示 SAN，
+    用户就无从判断「这张证书到底盖不盖我要访问的那个子域」。
+    """
+    if not cert_path or not os.path.exists(cert_path):
+        return []
+    try:
+        result = subprocess.run(
+            ["openssl", "x509", "-in", cert_path, "-noout", "-ext", "subjectAltName"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0:
+            return []
+        # 输出形如（openssl 1.1 / 3.x 一致）：
+        #     X509v3 Subject Alternative Name:
+        #         DNS:*.example.com, DNS:example.com
+        #
+        # 注意表头是 "Subject Alternative Name"（带空格），不是命令行参数
+        # 里的 "subjectAltName" —— 按后者去匹配会永远匹配不到。
+        m = re.search(r"Subject Alternative Name:[ \t]*(?:\r?\n[ \t]*)?([^\r\n]+)",
+                      result.stdout)
+        if not m:
+            return []
+        sans = []
+        for part in m.group(1).split(","):
+            part = part.strip()
+            if part.upper().startswith("DNS:"):
+                sans.append(part[4:].strip())
+        return sans
+    except Exception:
+        return []
+
+
+# ══════════════════════════════════════════════════════════════════════
+# host 分发（按域名分发到不同服务）
+# ══════════════════════════════════════════════════════════════════════
+#
+# 为什么要做 host 分发：
+#   路径前缀分发（v0.8.1 唯一形态）把服务挂在 /siy/ 这种前缀下，
+#   于是上游页面里写死的**根绝对路径**（/api/xxx、/ws）会逃出本 location，
+#   浏览器按 RFC 3986 解析成网关根路径 → 404；WebSocket 更是因为
+#   「运行时按 location.host 拼 URL」而永远连不上。
+#   host 分发把服务挂在**自己的域名根路径**上（https://siyuan.fzyto.top/），
+#   绝对路径天然正确，WS 也天然正确 —— 不用再跟上游的静态文本较劲。
+#
+# 代价：同一个服务多了一个入口，而认证 cookie 必须能在多个域名之间共用
+# （见 auth_gateway._set_cookies 的 Domain 处理），否则每个域名都要重登一次。
+
+_RE_RP_HOST_LABEL = re.compile(r"^[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?$")
+
+
+def _sanitize_rp_host(raw):
+    """校验 host 分发用的主机名，返回规范化结果（空串 = 不做 host 分发）。
+
+    与 _sanitize_domain 的三处不同，缺一不可：
+      · 只收**纯主机名** —— 不带 scheme、不带端口、不带路径。
+        这个值会直接进 nginx 的 `server_name` 指令，带任何分隔符都是注入面。
+      · 允许**单段**主机名（"router"）。泛域名证书虽然只覆盖多段，
+        但内网里用短名字做 host 分发是常见需求，不该在这里一刀切。
+      · **不放行通配**。`*` 是证书的概念（SAN 里的 *.example.com），
+        不是路由的概念 —— nginx 的 server_name 里的 `*` 是通配匹配，
+        语义完全不同，绝不能混。
+
+    非法抛 ValueError（调用方转成 400）。
+    """
+    h = (raw or "").strip().lower()
+    if h.endswith("."):
+        h = h[:-1]          # 去掉根域末尾的点：FQDN 写法，规范化掉
+    if not h:
+        return ""
+    if len(h) > 253:
+        raise ValueError(f"域名过长（{len(h)} 字符 > 253）")
+    # 这几个字符在 server_name 里都非法，且能拼出指令注入
+    if any(c in h for c in ("/", ":", " ", "\t", "\n", "\r", "*", "@", "?", "#", ";")):
+        raise ValueError(f"无效域名格式: {raw}")
+    for lb in h.split("."):
+        if not _RE_RP_HOST_LABEL.match(lb):
+            raise ValueError(f"无效域名格式: {raw}")
+    return h
+
+
+def _safe_rp_host(raw):
+    """_sanitize_rp_host 的不抛异常版本：非法值一律当空（不开 host 分发）。
+
+    用于「读落盘配置」的路径 —— 那里遇到脏数据应该降级，不该中断。
+    写入路径（_validate_rp_service）仍然用会抛的版本，让用户当场看到错。
+    """
+    try:
+        return _sanitize_rp_host(raw)
+    except ValueError:
+        return ""
+
+
+def _rp_default_cert_entry(config):
+    """取当前默认证书条目；没有设默认证书返回 None。"""
+    rp = config.get("reverse_proxy")
+    if not isinstance(rp, dict):
+        return None
+    settings = rp.get("settings")
+    settings = settings if isinstance(settings, dict) else {}
+    cert_id = str(settings.get("default_cert_id", "") or "")
+    if not cert_id:
+        return None
+    for c in (rp.get("certificates") or []):
+        if isinstance(c, dict) and c.get("id") == cert_id:
+            return c
+    return None
+
+
+def _rp_base_domain(config):
+    """网关的基础域名（如 fzyto.top），空串表示未启用泛域名。
+
+    语义（与其它开关不同，务必看清）：
+      · settings 里**没有** base_domain 这个键 → 面板还没问过用户 →
+        从默认证书的 SAN 自动推导（有通配 SAN 就取它去掉 "*." 的部分；
+        没有通配就取第一个含 "." 的普通 SAN）
+      · 键存在但值为空 → 用户**明确清空**了 → 返回空，**不再推导**
+      · 键存在且有值 → 用它（用户说了算，哪怕与证书对不上）
+
+    为什么必须与**证书**绑定而不是让用户随便填一个域：
+    host 分发出去的入口要用泛域名证书才不会有浏览器告警，
+    而 cookie 的共享域也必须是这个基础域的父域。
+    两边对不上，host 分发就只剩「能打开但满屏证书错误」。
+    """
+    rp = config.get("reverse_proxy")
+    settings = rp.get("settings") if isinstance(rp, dict) else {}
+    settings = settings if isinstance(settings, dict) else {}
+    if "base_domain" in settings:
+        bd = str(settings.get("base_domain") or "").strip().lower()
+        if not bd:
+            return ""            # 用户明确清空 —— 尊重决定，不再推导
+        try:
+            return _sanitize_rp_host(bd)
+        except ValueError:
+            return ""            # 用户填了非法值 —— 不猜，也不自动改
+    # 还没做过决定 → 从默认证书推导
+    cert = _rp_default_cert_entry(config)
+    if not cert:
+        return ""
+    sans = _get_cert_san(cert.get("cert_path", "") or "")
+    for s in sans:
+        if s.startswith("*."):
+            return s[2:].lower()
+    for s in sans:
+        if "." in s and not s.startswith("*"):
+            return s.lower()
+    return ""
+
+
+def _rp_cookie_domain(config):
+    """cookie 共享域（形如 ".fzyto.top"）；空串表示 cookie 按 host 各自存。
+
+    这是 host 分发**保住网关认证**的关键：浏览器按 host 存 cookie，
+    门户在 fzyto.top 登录拿到的令牌，送到 siyuan.fzyto.top 时不会被带上
+    —— 表现是「每换一个域名就要重登一次」。
+    把 cookie 的 Domain 抬到父域，一次登录就能覆盖所有子域。
+
+    派生规则（与 base_domain 同一套语义）：
+      · 键不存在 → 用 "." + base_domain 推导
+      · 键存在但值为空 → 用户明确清空 → 不共享（各域名分别登录）
+    """
+    rp = config.get("reverse_proxy")
+    settings = rp.get("settings") if isinstance(rp, dict) else {}
+    settings = settings if isinstance(settings, dict) else {}
+    if "cookie_domain" in settings:
+        cd = str(settings.get("cookie_domain") or "").strip().lower()
+        if not cd:
+            return ""
+        try:
+            base = _sanitize_rp_host(cd.lstrip("."))
+        except ValueError:
+            return ""
+        return ("." + base) if base else ""
+    bd = _rp_base_domain(config)
+    return ("." + bd) if bd else ""
+
+
+def _rp_sync_base_domain(config):
+    """从默认证书的 SAN 自动补出 base_domain（只在没设过时补）。
+
+    为什么要有这一步：用户装好泛域名证书、设为默认，然后期望
+    「给服务填个域名就能用」—— 但 base_domain 是 host 分发的地基
+    （自动生成域名、cookie 共享域都靠它）。如果全靠用户手填，
+    十有八九会填错（填成 *.fzyto.top 或者填成完整 URL）。
+
+    只在**没做过决定**时补（settings 里根本没有 base_domain 这个键）：
+    用户手动清空是有意的安排（他可能想自己控），面板不该每次换证书
+    就替他改回来。判据是「键是否存在」，不是「值是否为空」——
+    空串恰恰是「用户明确清空」的信号。
+
+    返回推导出来的值（推导不到返回空串）。
+    """
+    rp = config.get("reverse_proxy")
+    if not isinstance(rp, dict):
+        return ""
+    settings = rp.get("settings")
+    settings = settings if isinstance(settings, dict) else {}
+    if "base_domain" in settings:
+        return _rp_base_domain(config)
+    cert = _rp_default_cert_entry(config)
+    if not cert:
+        return ""
+    sans = _get_cert_san(cert.get("cert_path", "") or "")
+    derived = ""
+    for s in sans:
+        if s.startswith("*."):
+            derived = s[2:].lower()
+            break
+    if not derived:
+        for s in sans:
+            if "." in s and not s.startswith("*"):
+                derived = s.lower()
+                break
+    if derived:
+        settings["base_domain"] = derived
+        # cookie 共享域跟着走：用户没单独设过 cookie_domain 时，
+        # 让它跟着 base_domain 一起生效，host 分发才能一次登录通用。
+        # 同样只看「键是否存在」—— 用户清空过就别再塞回去。
+        if "cookie_domain" not in settings:
+            settings["cookie_domain"] = "." + derived
+        print(f'[INFO] 已从默认证书 SAN 自动推导基础域名 {derived}'
+              f'（可用于 host 分发与 cookie 共享域）', flush=True)
+    return derived
 
 
 def _host_resolvable(host, timeout=3.0):
@@ -5808,6 +6074,26 @@ def _validate_rp_service(data, existing=None, all_rules=None):
             return None, f"path_prefix {prefix!r} 与规则「{r.get('name') or r.get('id')}」重复"
     clean["path_prefix"] = prefix
 
+    # host 分发用的主机名（可空）
+    #
+    # 空 = 只保留路径前缀入口（v0.8.1 的行为，完全不变）。
+    # 有值 = 额外开一个 server_name 入口，服务挂到该域名的**根路径**上。
+    #
+    # 两条入口可以共存：同一个服务既能用 /siy/ 访问，也能用
+    # https://siyuan.fzyto.top/ 访问，且两条都过认证。
+    try:
+        clean["host"] = _sanitize_rp_host(pick("host", ""))
+    except ValueError as e:
+        return None, str(e)
+    if clean["host"]:
+        for r in all_rules:
+            if r.get("id") == existing.get("id"):
+                continue
+            other = str(r.get("host", "") or "").strip().lower()
+            if other and other == clean["host"]:
+                return None, (f"域名 {clean['host']!r} 与规则"
+                              f"「{r.get('name') or r.get('id')}」重复")
+
     # 目标地址
     target = pick("target_address", "")
     try:
@@ -5932,6 +6218,12 @@ def _migrate_rp_rules(config):
             "name": _sanitize_name(r.get("name", "")),
             "enabled": bool(r.get("enabled", True)),
             "path_prefix": prefix,
+            # host 分发入口（空 = 不开）。同样**必须显式列在这里** ——
+            # 本函数是字段白名单，没列出来的键会被无声丢弃，
+            # 后果是「配置存进去了、界面也显示了，生成器读到的却是空的」。
+            # 配置文件可能被手工改坏，所以这里不能抛 —— 一条脏 host
+            # 不该让**整份**网关配置生成失败（那等于所有服务一起挂）。
+            "host": _safe_rp_host(r.get("host", "") or ""),
             "target_address": r.get("target_address", ""),
             "target_protocol": str(r.get("target_protocol", "http") or "http").lower(),
             "public_access": bool(r.get("public_access", False)),
@@ -5962,6 +6254,14 @@ RP_DEFAULT_SETTINGS = {
     "hsts_enabled": True,
     "tls_min_version": "TLSv1.2",
     "auto_reload_nginx": True,
+    # ⚠️ 这里**故意不列** base_domain / cookie_domain。
+    #
+    # 它们的语义是「键存在 = 已经做过决定」，与其它开关不同：
+    #   · 键不存在 → 面板还没问过用户 → 可以从证书 SAN 自动推导
+    #   · 键存在但值为空 → 用户**明确清空**了 → 绝不能再自动改回来
+    # 如果这里给它们一个默认空串，「键存在」就永远成立，
+    # 自动推导永远不触发；反过来写成非空又会覆盖用户的清空操作。
+    # 用「键是否存在」来区分这两种状态，是唯一说得清的做法。
 }
 
 
@@ -6076,6 +6376,20 @@ def _get_rp_config():
 
 def _save_rp_config(config):
     """保存包含 reverse_proxy 的完整配置"""
+    # 落盘前把 host 分发的派生值物化（base_domain / cookie_domain）。
+    #
+    # 为什么必须在这里做：认证服务（auth_gateway.py）是**另一个进程**，
+    # 它只读这份 JSON，不会去解析证书 —— 所以「cookie 共享域」必须**已经
+    # 在文件里**，而不是只活在面板的内存里。
+    #
+    # 漏了这一步的后果很隐蔽：面板的 API 返回 base_domain=fzyto.top
+    # （接口层会现算，看着一切正常），但认证服务读到的是空的 →
+    # 下发的 cookie 没有 Domain 属性 → 浏览器按 host 各自存 →
+    # **跨子域每换一个域名就要重登一次**，而面板上完全看不出来。
+    #
+    # 只做一次：_rp_sync_base_domain 只在 settings 里**没有**这两个键时补，
+    # 用户手动清空之后就不会被改回来。
+    _rp_sync_base_domain(config)
     save_config(config)
 
 
@@ -6868,8 +7182,15 @@ def _is_managed_conf(conf_path):
 def _gateway_services(config):
     """取出参与网关分发的服务列表（已启用 + 有合法 path 前缀）。
 
-    返回 [(rule, prefix, protocol, host, port), ...]，越界的配置在这里被丢掉，
-    保证生成的 nginx 配置里只可能出现经过净化的值。
+    返回 [(rule, prefix, protocol, host, port, rp_host), ...]，
+    越界的配置在这里被丢掉，保证生成的 nginx 配置里只可能出现经过净化的值。
+
+    rp_host 是这条服务的 **host 分发域名**（空串 = 不开 host 分发）。
+    它与 path_prefix 是**两条独立入口**：同一条服务可以同时有
+    /siy/ 和 https://siyuan.fzyto.top/ 两个入口，且都过认证。
+
+    ⚠️ 这里的 host 是「对外域名」（用户访问的），与元组里的 host
+    （上游后端地址）完全是两回事，名字撞车只是历史包袱，别搞混。
     """
     rp = config.get("reverse_proxy")
     rules = rp.get("rules") if isinstance(rp, dict) else None
@@ -6894,9 +7215,395 @@ def _gateway_services(config):
             continue
         if not (_RE_IFACE.match(host) or _valid_ip(host, 6) or _valid_ip(host, 4)):
             continue
-        out.append((r, prefix, protocol, host, int(port)))
+        # 对外域名：脏值直接丢掉（不开 host 分发），但**绝不**因此丢掉整条服务 ——
+        # 一个写坏的可选字段不该让路径前缀入口也跟着消失。
+        rp_host = _safe_rp_host(r.get("host", "") or "")
+        out.append((r, prefix, protocol, host, int(port), rp_host))
     out.sort(key=lambda x: x[1])
     return out
+
+
+def _nginx_server_preamble(L, port, cert_path, key_path, tls_protos):
+    """单个 server 块的公共前言：监听 / 身份变量默认值 / SSL / 日志。
+
+    host 分发把网关从「一个 server 块」变成「一个默认块 + N 个 host 块」，
+    这段前言必须**逐字一致** —— 所以抽成公共函数，而不是复制粘贴。
+    复制粘贴的代价很实在：哪天加一条安全头，漏改一处就等于那一类 host
+    少了一层防护，而且从生成的配置上完全看不出来。
+    """
+    L.append(f"    listen {port} ssl;")
+    L.append(f"    listen [::]:{port} ssl;")
+    L.append("    http2 on;")
+    L.append("    server_tokens off;")
+    # 认证身份变量的服务器级默认值。
+    #
+    # 少了这两行：「网关开着 + 一个反代服务都没有」会让整份配置被 nginx 拒绝加载。
+    # 原因很隐蔽 —— access_log 的 log_format 引用了 $auth_user / $auth_device，
+    # 而真正给它们赋值的 auth_request_set 只写在「每个反代服务」的 location 里。
+    # 服务数为 0 时那个循环一次都不执行，两个变量从头到尾没人定义，nginx 启动就
+    # [emerg] unknown "auth_user" variable 直接罢工。
+    #
+    # 这不是什么边角状态：删掉最后一个反代服务后保存配置，落地的就是它。
+    # 而且后果不是「网关少了点东西」，是**整个网关连同 portal、登录页一起没了**。
+    #
+    # 这里显式给出空默认值，变量恒存在；服务 location 里的 auth_request_set
+    # 会在认证子请求返回后覆盖成真实值，不影响鉴权与审计。
+    L.append("    # 认证身份变量默认值（服务 location 内由 auth_request_set 覆盖）")
+    L.append('    set $auth_user "";')
+    L.append('    set $auth_device "";')
+    L.append("")
+    L.append("    # SSL")
+    L.append(f"    ssl_certificate {cert_path};")
+    L.append(f"    ssl_certificate_key {key_path};")
+    L.append(f"    ssl_protocols {tls_protos};")
+    L.append("    ssl_prefer_server_ciphers on;")
+    L.append("    ssl_session_timeout 1d;")
+    # 共享内存区名在 nginx 里是全局的：同名但大小不同会直接 [emerg] 拒绝加载整份配置。
+    # OpenWrt 的 LuCI 已经声明了 shared:SSL:32k，这里若再用 shared:SSL:50m 就冲突。
+    # 用独立的区名彻底避开与其他 server 块的碰撞。
+    #
+    # 多个 server 块复用同一个区名是允许的 —— nginx 只在**大小不一致**时报
+    # "conflicts with already declared size"。这里每次都用同一个常量，天然一致。
+    L.append(f"    ssl_session_cache shared:{GATEWAY_SSL_ZONE}:{GATEWAY_SSL_CACHE_SIZE};")
+    L.append("    ssl_session_tickets off;")
+    L.append("")
+    L.append("    access_log /var/log/nginx/nftables-web-gateway.access.log nftgw;")
+    L.append("    error_log  /var/log/nginx/nftables-web-gateway.error.log warn;")
+    L.append("")
+
+
+def _nginx_auth_locations(L, api_port):
+    """认证子请求入口 + 认证端点白名单 + 静态资源 + 兜底 404。
+
+    **每个** server 块都要有这一段 —— 包括 host 分发出来的那些。
+    原因：host 入口被 302 到登录页时，登录页必须能在
+    https://<host>:<port>/auth/login 上直接打开。少了这段，
+    用户点进 siyuan.fzyto.top 被踢去登录，登录页自己又打不开 → 死循环。
+    """
+    # ── 认证子请求入口 ──────────────────────────────────────────
+    # internal = 外部无法直接访问 /_auth，只能由 nginx 内部发起。
+    L.append("    # 认证子请求：仅供 auth_request 调用，外部无法直接访问")
+    L.append("    location = /_auth {")
+    L.append("        internal;")
+    L.append(f"        proxy_pass http://127.0.0.1:{api_port}/auth/verify;")
+    L.append("        proxy_pass_request_body off;")
+    L.append('        proxy_set_header Content-Length "";')
+    L.append("        proxy_set_header Cookie $http_cookie;")
+    L.append("        proxy_set_header Authorization $http_authorization;")
+    L.append("        # 认证服务只听 127.0.0.1，remote_addr 永远是本机，")
+    L.append("        # 判断「是否内网来源」必须靠这里透传的真实客户端 IP。")
+    L.append("        proxy_set_header X-Real-IP $remote_addr;")
+    L.append("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
+    L.append("        proxy_set_header X-Original-URI $request_uri;")
+    L.append("        proxy_read_timeout 10s;")
+    L.append("    }")
+    L.append("")
+
+    # ── 认证端点（浏览器直连） ──────────────────────────────────
+    #
+    # 公网只需要这 5 个端点，必须逐个精确列举，绝不能图省事写成
+    # `location /auth/` —— 那是**前缀匹配**，会把认证服务下所有 /auth/* 一并
+    # 暴露出去，其中包括：
+    #   /auth/verify  仅供上面的 location = /_auth 以 auth_request 方式内部调用
+    #                  （它自带 internal; 保护），本不该有任何外部入口
+    #   /auth/health  探活端点，外部可达等于泄露服务存在与内部状态
+    # 认证服务里任何新加的 /auth/* 端点都会默认被这个前缀匹配带出去 ——
+    # 属于典型的「默认开放」，所以改成白名单式精确列举。
+    L.append("    # 认证端点：只暴露登录/登出/状态/门户数据/静态资源，其余一律 404")
+    for _ep, _comment in (("/auth/login", "登录页 GET + 登录提交 POST"),
+                          ("/auth/logout", "登出"),
+                          ("/auth/status", "会话状态"),
+                          ("/auth/portal", "门户服务列表（需已认证）")):
+        L.append(f"    # {_comment}")
+        L.append(f"    location = {_ep} {{")
+        L.append(f"        proxy_pass http://127.0.0.1:{api_port}{_ep};")
+        L.append(f"        client_max_body_size {GATEWAY_AUTH_MAX_BODY};")
+        L.append("        proxy_set_header X-Real-IP $remote_addr;")
+        L.append("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
+        L.append("        proxy_set_header X-Original-URI $request_uri;")
+        L.append("        proxy_set_header Host $host;")
+        # TLS 在 nginx 这里终结，转给 Flask 的已经是明文 HTTP，
+        # 所以 request.is_secure 恒为 False。没有这一行，
+        # auth_gateway 的 after_request 判定不出 HTTPS，HSTS 永远不会下发
+        #（.224 线上实测踩过：其它安全头都齐了，唯独缺 HSTS）。
+        L.append("        proxy_set_header X-Forwarded-Proto $scheme;")
+        L.append("    }")
+        L.append("")
+
+    L.append("    # 认证页面的 CSS/JS（白名单文件，见 auth_gateway.STATIC_ALLOWED）")
+    L.append("    location /auth/static/ {")
+    L.append(f"        proxy_pass http://127.0.0.1:{api_port};")
+    L.append(f"        client_max_body_size {GATEWAY_AUTH_MAX_BODY};")
+    L.append("        proxy_set_header X-Real-IP $remote_addr;")
+    L.append("        proxy_set_header Host $host;")
+    L.append("        proxy_set_header X-Forwarded-Proto $scheme;")
+    L.append("    }")
+    L.append("")
+
+    L.append("    # 其余 /auth/* 一律不认：verify / health 等内部端点到此为止")
+    L.append("    location /auth/ {")
+    L.append("        return 404;")
+    L.append("    }")
+    L.append("")
+
+
+def _nginx_to_login(L, port):
+    """未认证时跳登录页。
+
+    端口必须显式带上：nginx 变量 $host 只含主机名、不含端口，
+    而本项目的网关端口按设计就是自定义高位端口（家宽常用非 443）。
+    漏掉端口会把用户甩到 443 去 —— 要么打不开，要么撞上别的服务。
+    这里用配置里的 port 而非 $http_host：后者是客户端可控的 Host 头，
+    拼进重定向就是 Host Header 注入。$host 经 nginx 校验，相对安全。
+    """
+    if port == 443:
+        L.append("    location @to_login {")
+        L.append("        return 302 https://$host/auth/login?next=$request_uri;")
+        L.append("    }")
+    else:
+        L.append("    location @to_login {")
+        L.append(f"        return 302 https://$host:{port}/auth/login?next=$request_uri;")
+        L.append("    }")
+    L.append("")
+
+
+def _nginx_service_location(L, rule, prefix, protocol, host, tport,
+                            lan_cidr, gw_port, mode="path"):
+    """生成单个服务的 location 块。
+
+    mode="path" —— 挂在路径前缀下（/siy/）。上游页面里写死的根绝对路径
+                    会逃出本 location，需要 sub_filter 改写 + Location 补前缀。
+    mode="host" —— 挂在**域名根路径**下（/）。此时上游的根绝对路径天然正确
+                    （浏览器把 /api/x 解析成 https://<host>/api/x，仍落在
+                    location / 里），WebSocket 那种「运行时按 location.host
+                    拼 URL」的连接也天然正确 ——
+                    所以 host 模式**不需要**任何 sub_filter / proxy_redirect 补丁。
+
+    两种模式共用同一套认证逻辑：public_access=true 一律 auth_request，
+    否则只放行 LAN 网段。host 入口同样受网关认证保护 —— 这是本项目的核心能力，
+    绝不因为「换了域名」就绕过。
+    """
+    name = _sanitize_name(rule.get("name") or prefix)
+    try:
+        cmbs = (_sanitize_client_max_body_size(rule.get("client_max_body_size", ""))
+                or DEFAULT_CLIENT_MAX_BODY)
+    except ValueError:
+        # 配置被手工改坏时退回默认值，但不能因此让整份配置生成失败
+        print(f'[WARN] 服务 {name} 的 client_max_body_size 非法，'
+              f'已按默认 {DEFAULT_CLIENT_MAX_BODY} 处理', flush=True)
+        cmbs = DEFAULT_CLIENT_MAX_BODY
+
+    host_mode = (mode == "host")
+    loc_path = "/" if host_mode else f"{prefix}/"
+
+    L.append(f"    # ---- {name} ----")
+    L.append(f"    location {loc_path} {{")
+    L.append(f"        proxy_pass {protocol}://{host}:{tport}/;")
+    L.append("        proxy_set_header Host $http_host;")
+    L.append("        proxy_set_header X-Real-IP $remote_addr;")
+    L.append("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
+    L.append("        proxy_set_header X-Forwarded-Proto $scheme;")
+    L.append("        proxy_set_header X-Forwarded-Host $host;")
+    L.append("        proxy_set_header X-Forwarded-Port $server_port;")
+    L.append("        proxy_set_header X-Auth-User $auth_user;")
+    L.append("        proxy_set_header X-Auth-Device $auth_device;")
+
+    if rule.get("public_access"):
+        # 公网可达 → 无条件要求认证
+        L.append("        # public_access=true：所有来源可达，但必须先过认证")
+        L.append("        auth_request /_auth;")
+        L.append("        error_page 401 = @to_login;")
+        L.append("        auth_request_set $auth_user $upstream_http_x_auth_user;")
+        L.append("        auth_request_set $auth_device $upstream_http_x_auth_device;")
+    else:
+        # 仅内网 → 按来源地址拦截，不进认证
+        L.append(f"        # public_access=false：仅内网 {lan_cidr} 可达，公网直连被拒")
+        L.append(f"        allow {lan_cidr};")
+        # 回环白名单：IPv4 和 IPv6 都要写。
+        # 原来只写了 `allow ::1;` —— 于是 `curl https://127.0.0.1:8443/dsm/`
+        # 从路由器本机发起的 IPv4 回环请求不在 lan_cidr 里，直接吃 deny all
+        # 变成 403，而同样语义的 `curl https://[::1]:8443/dsm/` 却能通。
+        # 同一个「本机」两种结果，纯属遗漏。
+        # 安全上没有风险：127.0.0.1 只有路由器自己发起的连接才是这个源地址，
+        # 公网侧根本无法伪造（WAN 入向本来就有反伪造 drop）。
+        L.append("        allow 127.0.0.1;")
+        L.append("        allow ::1;")
+        L.append("        deny all;")
+        L.append("        auth_request_set $auth_user \"lan\";")
+        L.append("        auth_request_set $auth_device $cookie_gw_device;")
+
+    # 认证服务不可达时的 fail-closed 行为：
+    # auth_request 拿不到上游 → nginx 自己返回 5xx，不会放行。
+    L.append("        proxy_read_timeout 300s;")
+    L.append("        proxy_send_timeout 300s;")
+    L.append("        proxy_buffering off;")
+    L.append("        proxy_request_buffering off;")
+    if rule.get("websocket_enabled", True):
+        L.append("        proxy_http_version 1.1;")
+        L.append("        proxy_set_header Upgrade $http_upgrade;")
+        L.append("        proxy_set_header Connection \"upgrade\";")
+    else:
+        L.append("        proxy_http_version 1.1;")
+    # 上传体积限制：用户配的值在这里**真正生效**。
+    # v0.8.0 这里硬编码 0（不限），界面上填的 client_max_body_size
+    # 只对已废弃的独立站点生效，网关这一侧被完全忽略 —— 配了没反应。
+    # 现在空值 = DEFAULT_CLIENT_MAX_BODY（1M，nginx 自己的默认值），
+    # 显式填 0 才是「不限」，填 100M/1G 都能放大。
+    L.append(f"        client_max_body_size {cmbs};   "
+             f"# 上传体积限制（0=不限，空值默认 {DEFAULT_CLIENT_MAX_BODY}）")
+
+    if host_mode:
+        # ── host 模式：不做任何路径改写 ──────────────────────────
+        #
+        # 服务挂在域名根路径上，上游的根绝对路径**天然落在本 location**：
+        # 浏览器请求 https://siyuan.fzyto.top:8443/api/xxx → nginx 的
+        # location / 接住 → proxy_pass 去掉前缀后仍是 /api/xxx。
+        #
+        # 也因此**不需要** sub_filter（改写反而会弄坏上游自己的路径）
+        # 和 proxy_redirect 补前缀（上游返回的相对 Location 在根路径下
+        # 本来就解析正确；绝对 Location 由 nginx 默认 proxy_redirect
+        # 把 host 换成对外地址）。
+        #
+        # WebSocket 同理：上游在运行时按 location.host 拼出
+        # ws://siyuan.fzyto.top:8443/ws，浏览器连的正是网关自己，
+        # location / 接住 → 转发上游 /ws。这正是子路径反代做不到的事。
+        L.append("        # host 分发模式：服务挂在域名根路径，路径与 WS 均无需改写")
+        L.append("    }")
+        L.append("")
+        return
+
+    # ── 上游绝对路径改写（窄模式）─────────────────────────────
+    # 上游页面里写死的绝对路径（典型 /api/xxx）会**逃出本 location**：
+    # 网关按 path 前缀分发，/api/xxx 匹配不到任何 location → 直接 404，
+    # 表现就是「页面能打开、数据接口全挂」。
+    #
+    # 这里用 nginx sub_filter 把「上游自己声明的那一段前缀」改写成
+    # 「带网关前缀的同一段」，浏览器再请求就落回本 location。
+    #
+    # ⚠️ 只做**窄模式**：只替换 api_path_prefix 这一段字面量。
+    # 通用规则（任何根绝对路径都加前缀）实测会把页面里普通的路径字符串
+    # （"/var/log/syslog" 这种）也一起改掉，直接改坏应用。
+    # 窄模式的失败模式是「没改写 → 404（跟改之前一样）」，
+    # 绝不会比不装更糟 —— 这是选它不选通用规则的根本原因。
+    #
+    # 这个值最终会进 nginx 的**引号字符串**里，所以这里**必须再净化一次**：
+    # 校验只在保存时做，而配置文件可能被手工改过。带引号/分号/换行的值
+    # 拼进 sub_filter 就能逃出引号 → nginx 指令注入。
+    # （与 client_max_body_size 同样的道理：生成期也要净化，不信任落盘值。）
+    try:
+        api_prefix = _sanitize_api_path_prefix(rule.get("api_path_prefix", ""))
+    except ValueError as e:
+        # 非法值：**只放弃「改写」这一项，不放弃整条服务**。
+        #
+        # 这里刻意不像 client_max_body_size 那样让异常冒泡 ——
+        # 那会让整份网关配置生成失败，**所有**服务一起挂，
+        # 那比一个 404 严重得多，也违背上面「窄模式降级安全」的承诺。
+        # 正确做法：跳过改写（该服务退回今天的行为），并在生成的
+        # 配置里留一行说明，让运维能看见「有人填了非法值」。
+        #
+        # 原始值与错误信息都回显，但**必须强制单行**：
+        # nginx 注释到行尾为止，值里一个换行就能把注释劈开，
+        # 后半行变成一条 nginx 指令 ⇒ 注入面。
+        # repr() 本身已转义换行，这里再 collapse 一次做双保险
+        # （错误信息是第三方拼的，不保证单行）。
+        _bad = repr(rule.get('api_path_prefix')).replace('\n', '\\n')
+        _why = str(e).replace('\n', ' ').replace('\r', ' ')
+        L.append("        # ⚠️ api_path_prefix 非法，已跳过路径改写"
+                 f"（原始值 {_bad}）")
+        L.append(f"        #    原因：{_why}")
+        api_prefix = ""
+    # ── 正文里的绝对路径改写（sub_filter）────────────────────
+    #
+    # 两种模式，可同时开：
+    #   窄模式（api_path_prefix）：替换「引号紧跟」的一段字面量
+    #   宽模式（rewrite_root_paths）：替换「HTML 属性值紧跟」的根绝对路径
+    #
+    # 两者都只改**正文**。302 跳转的 Location 在**响应头**里，
+    # sub_filter 管不到 —— 那部分由下面的 proxy_redirect 负责。
+    #
+    # ⚠️ 窄模式的失败模式是「没改写 → 404（跟改之前一样）」，
+    # 绝不会比不装更糟 —— 这是选它不选通用规则的根本原因。
+    sf_rules = []
+    if api_prefix:
+        L.append(f"        # ── 上游绝对路径改写：{api_prefix}... -> "
+                 f"{prefix}{api_prefix}... ──")
+        L.append("        # 窄模式：只替换这一段字面量，避免改坏应用里的其它路径")
+        sf_rules.append((f"'{api_prefix}", f"'{prefix}{api_prefix}"))
+        sf_rules.append((f'"{api_prefix}', f'"{prefix}{api_prefix}'))
+
+    # 生成期不信任落盘值（与 client_max_body_size 同样的道理）：
+    # 配置可能被手工改坏，非布尔值一律按「不改写」处理。
+    _rrp = rule.get("rewrite_root_paths")
+    if isinstance(_rrp, (bool, int)) and _rrp:
+        L.append("        # ── 根绝对路径改写（宽模式）─────────────────")
+        L.append("        # 应用吐出的 href=\"/x\" / src=\"/x\" / action=\"/x\" 是"
+                 "**根绝对路径**，")
+        L.append("        # 浏览器按 absolute-path 语义解析时会丢掉本路径前缀"
+                 "（RFC 3986 §5.2.2）")
+        L.append("        # ⇒ 资源与链接跑出本 location → 404。")
+        L.append("        # 只改「属性值紧跟」这一种形态，"
+                 "不碰 JS 里普通的字符串字面量。")
+        for _attr in ("href", "src", "action"):
+            sf_rules.append((f'{_attr}="/', f'{_attr}="{prefix}/'))
+
+    if sf_rules:
+        # sub_filter 必须在明文正文上做：上游若压缩了正文就匹配不到
+        L.append('        proxy_set_header Accept-Encoding "";')
+        L.append("        sub_filter_once off;")
+        # ⚠️ 这里**不能**再写 text/html：nginx 的 sub_filter_types 默认
+        # 已经含 text/html，指令是「在默认之外追加」，重复写会报
+        #   [warn] duplicate MIME type "text/html"
+        # 每次 nginx -t / reload 都刷一行。真机实测确认：省掉 text/html
+        # 后 text/html 照样被替换（nginx 文档原文：in addition to "text/html"）。
+        L.append("        sub_filter_types application/javascript text/css;")
+        for _old, _new in sf_rules:
+            L.append(f'        sub_filter "{_nginx_dquote(_old)}" '
+                     f'"{_nginx_dquote(_new)}";')
+
+    # ── 302/301 跳转的 Location 补回路径前缀 ──────────────────
+    #
+    # 上游返回 `Location: /check-auth?to=%2F` 时，浏览器按 absolute-path
+    # 语义解析：base 的 path（/siy/）被整个丢弃 ⇒ 跳到 /check-auth ⇒
+    # 网关无此 location ⇒ 404。这是「子路径反代」最常见的翻车点。
+    #
+    # ⚠️ nginx 的 **default proxy_redirect 救不了这个**：它加的是
+    # **proxy_pass 的 URI 部分**，而 proxy_pass 末尾的 "/" 是「替换」语义
+    # —— location 前缀根本没进 proxy_pass ⇒ 加上去的还是 "/" ⇒ 前缀照丢。
+    # 必须显式写，而且要用 location 前缀。
+    #
+    # 负向先行断言避免给「已经带前缀」的 Location 重复加前缀。
+    #
+    # ⚠️ **只改写能证明是「我们自己的」的 Location**：
+    #   ① 相对路径 —— 思源实测就是这种：`Location: /check-auth?to=%2F`
+    #   ② host 是**上游自己**的绝对 URL
+    # 其余一律**原样放过**。特别是「跳到外站」的绝对 URL
+    # （OAuth 跳转、跳到邮件/支付/其它站点的验证页）——
+    # 真机实测过：用 `[^/]+` 匹配任意 host 的写法会把外站跳转
+    # **劫持到网关自己**（external.example.com/page → 网关/ght/page），
+    # 用户再也跳不回原站。宁可漏改，也不能劫持。
+    _lit = _nginx_regex_literal(prefix)
+    if _lit:
+        # 负向先行断言里的前缀**不能带开头的斜杠**。
+        # 正则里 ^/ 已经把那个斜杠吃掉了，断言落在斜杠**之后**的位置上，
+        # 那里剩下的是 "siy/check-auth" 而不是 "/siy/check-auth" ——
+        # 写成 (?!/siy/) 的话断言恒成立，已经带前缀的 Location
+        # 会被**重复加前缀**（/siy/siy/check-auth → 404）。
+        _bare = _lit[1:] if _lit.startswith('/') else _lit
+        L.append("        # ── 302 跳转的 Location 补回路径前缀 ──")
+        L.append(f"        proxy_redirect ~^/(?!{_bare}/)(.*)$ {prefix}/$1;")
+        # 上游自己 host 的绝对 URL：host 换成对外地址 + 补前缀。
+        # 端口用**非捕获**组 (?::[0-9]+)? —— 用捕获组的话 $1 取到的是端口
+        # 而不是路径，替换结果会变成 ".../siy/:8095"。
+        # 端口可选：上游可能带端口也可能不带。
+        # 对外地址用 $host（nginx 校验过的）+ 配置里的端口，
+        # 不用 $http_host：后者是客户端可控的 Host 头，
+        # 拼进重定向就是 Host Header 注入。
+        _host_lit = _nginx_host_literal(host)
+        if _host_lit:
+            L.append(f"        proxy_redirect ~^https?://{_host_lit}(?::[0-9]+)?"
+                     f"/(?!{_bare}/)(.*)$ $scheme://$host{gw_port}{prefix}/$1;")
+    L.append("    }")
+    L.append("")
 
 
 def _generate_gateway_nginx_conf(config):
@@ -6909,6 +7616,13 @@ def _generate_gateway_nginx_conf(config):
       /<prefix>/  每个服务一个 location
         · public_access=true  → 所有来源可达，但必须过 auth_request
         · public_access=false → 只放行 LAN 网段，直接 deny 其他来源
+
+    **两类入口**（同一份配置里可以同时存在）：
+      · 路径前缀入口 —— 上面那套，v0.8.1 起的唯一形态
+      · host 入口    —— 每条配了 host 的服务额外开一个 server 块，
+                        server_name = <host>，服务挂在**该域名的根路径**上。
+                        认证策略完全一致（auth_request / LAN 白名单），
+                        绝不因为换了域名就绕过网关。
 
     为什么 public_access=false 不用认证层拦：认证层只管「有没有 token」，
     管不了「从哪来」。一个 WAN 用户登录后照样能摸到这个服务。
@@ -6975,108 +7689,9 @@ def _generate_gateway_nginx_conf(config):
     L.append("")
 
     L.append("server {")
-    L.append(f"    listen {port} ssl;")
-    L.append(f"    listen [::]:{port} ssl;")
-    L.append("    http2 on;")
-    L.append("    server_tokens off;")
-    # 认证身份变量的服务器级默认值。
-    #
-    # 少了这两行：「网关开着 + 一个反代服务都没有」会让整份配置被 nginx 拒绝加载。
-    # 原因很隐蔽 —— access_log 的 log_format 引用了 $auth_user / $auth_device，
-    # 而真正给它们赋值的 auth_request_set 只写在「每个反代服务」的 location 里。
-    # 服务数为 0 时那个循环一次都不执行，两个变量从头到尾没人定义，nginx 启动就
-    # [emerg] unknown "auth_user" variable 直接罢工。
-    #
-    # 这不是什么边角状态：删掉最后一个反代服务后保存配置，落地的就是它。
-    # 而且后果不是「网关少了点东西」，是**整个网关连同 portal、登录页一起没了**。
-    #
-    # 这里显式给出空默认值，变量恒存在；服务 location 里的 auth_request_set
-    # 会在认证子请求返回后覆盖成真实值，不影响鉴权与审计。
-    L.append("    # 认证身份变量默认值（服务 location 内由 auth_request_set 覆盖）")
-    L.append('    set $auth_user "";')
-    L.append('    set $auth_device "";')
-    L.append("")
-    L.append("    # SSL")
-    L.append(f"    ssl_certificate {cert_path};")
-    L.append(f"    ssl_certificate_key {key_path};")
-    L.append(f"    ssl_protocols {tls_protos};")
-    L.append("    ssl_prefer_server_ciphers on;")
-    L.append("    ssl_session_timeout 1d;")
-    # 共享内存区名在 nginx 里是全局的：同名但大小不同会直接 [emerg] 拒绝加载整份配置。
-    # OpenWrt 的 LuCI 已经声明了 shared:SSL:32k，这里若再用 shared:SSL:50m 就冲突。
-    # 用独立的区名彻底避开与其他 server 块的碰撞。
-    L.append(f"    ssl_session_cache shared:{GATEWAY_SSL_ZONE}:{GATEWAY_SSL_CACHE_SIZE};")
-    L.append("    ssl_session_tickets off;")
-    L.append("")
-    L.append("    access_log /var/log/nginx/nftables-web-gateway.access.log nftgw;")
-    L.append("    error_log  /var/log/nginx/nftables-web-gateway.error.log warn;")
-    L.append("")
+    _nginx_server_preamble(L, port, cert_path, key_path, tls_protos)
+    _nginx_auth_locations(L, api_port)
 
-    # ── 认证子请求入口 ──────────────────────────────────────────
-    # internal = 外部无法直接访问 /_auth，只能由 nginx 内部发起。
-    L.append("    # 认证子请求：仅供 auth_request 调用，外部无法直接访问")
-    L.append("    location = /_auth {")
-    L.append("        internal;")
-    L.append(f"        proxy_pass http://127.0.0.1:{api_port}/auth/verify;")
-    L.append("        proxy_pass_request_body off;")
-    L.append("        proxy_set_header Content-Length \"\";")
-    L.append("        proxy_set_header Cookie $http_cookie;")
-    L.append("        proxy_set_header Authorization $http_authorization;")
-    L.append("        # 认证服务只听 127.0.0.1，remote_addr 永远是本机，")
-    L.append("        # 判断「是否内网来源」必须靠这里透传的真实客户端 IP。")
-    L.append("        proxy_set_header X-Real-IP $remote_addr;")
-    L.append("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
-    L.append("        proxy_set_header X-Original-URI $request_uri;")
-    L.append("        proxy_read_timeout 10s;")
-    L.append("    }")
-    L.append("")
-
-    # ── 认证端点（浏览器直连） ──────────────────────────────────
-    #
-    # 公网只需要这 5 个端点，必须逐个精确列举，绝不能图省事写成
-    # `location /auth/` —— 那是**前缀匹配**，会把认证服务下所有 /auth/* 一并
-    # 暴露出去，其中包括：
-    #   /auth/verify  仅供上面的 location = /_auth 以 auth_request 方式内部调用
-    #                  （它自带 internal; 保护），本不该有任何外部入口
-    #   /auth/health  探活端点，外部可达等于泄露服务存在与内部状态
-    # 认证服务里任何新加的 /auth/* 端点都会默认被这个前缀匹配带出去 ——
-    # 属于典型的「默认开放」，所以改成白名单式精确列举。
-    L.append("    # 认证端点：只暴露登录/登出/状态/门户数据/静态资源，其余一律 404")
-    for _ep, _comment in (("/auth/login", "登录页 GET + 登录提交 POST"),
-                          ("/auth/logout", "登出"),
-                          ("/auth/status", "会话状态"),
-                          ("/auth/portal", "门户服务列表（需已认证）")):
-        L.append(f"    # {_comment}")
-        L.append(f"    location = {_ep} {{")
-        L.append(f"        proxy_pass http://127.0.0.1:{api_port}{_ep};")
-        L.append(f"        client_max_body_size {GATEWAY_AUTH_MAX_BODY};")
-        L.append("        proxy_set_header X-Real-IP $remote_addr;")
-        L.append("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
-        L.append("        proxy_set_header X-Original-URI $request_uri;")
-        L.append("        proxy_set_header Host $host;")
-        # TLS 在 nginx 这里终结，转给 Flask 的已经是明文 HTTP，
-        # 所以 request.is_secure 恒为 False。没有这一行，
-        # auth_gateway 的 after_request 判定不出 HTTPS，HSTS 永远不会下发
-        #（.224 线上实测踩过：其它安全头都齐了，唯独缺 HSTS）。
-        L.append("        proxy_set_header X-Forwarded-Proto $scheme;")
-        L.append("    }")
-        L.append("")
-
-    L.append("    # 认证页面的 CSS/JS（白名单文件，见 auth_gateway.STATIC_ALLOWED）")
-    L.append("    location /auth/static/ {")
-    L.append(f"        proxy_pass http://127.0.0.1:{api_port};")
-    L.append(f"        client_max_body_size {GATEWAY_AUTH_MAX_BODY};")
-    L.append("        proxy_set_header X-Real-IP $remote_addr;")
-    L.append("        proxy_set_header Host $host;")
-    L.append("        proxy_set_header X-Forwarded-Proto $scheme;")
-    L.append("    }")
-    L.append("")
-
-    L.append("    # 其余 /auth/* 一律不认：verify / health 等内部端点到此为止")
-    L.append("    location /auth/ {")
-    L.append("        return 404;")
-    L.append("    }")
-    L.append("")
 
     # ── 门户页 ──────────────────────────────────────────────────
     # 转发到认证服务的根路径（那里返回门户 HTML）。
@@ -7092,224 +7707,46 @@ def _generate_gateway_nginx_conf(config):
     L.append("    }")
     L.append("")
 
-    # ── 各服务 location ─────────────────────────────────────────
-    for rule, prefix, protocol, host, tport in services:
-        name = _sanitize_name(rule.get("name") or prefix)
-        try:
-            cmbs = (_sanitize_client_max_body_size(rule.get("client_max_body_size", ""))
-                    or DEFAULT_CLIENT_MAX_BODY)
-        except ValueError:
-            # 配置被手工改坏时退回默认值，但不能因此让整份配置生成失败
-            print(f'[WARN] 服务 {name} 的 client_max_body_size 非法，'
-                  f'已按默认 {DEFAULT_CLIENT_MAX_BODY} 处理', flush=True)
-            cmbs = DEFAULT_CLIENT_MAX_BODY
-        L.append(f"    # ---- {name} ----")
-        L.append(f"    location {prefix}/ {{")
-        L.append(f"        proxy_pass {protocol}://{host}:{tport}/;")
-        L.append("        proxy_set_header Host $http_host;")
-        L.append("        proxy_set_header X-Real-IP $remote_addr;")
-        L.append("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
-        L.append("        proxy_set_header X-Forwarded-Proto $scheme;")
-        L.append("        proxy_set_header X-Forwarded-Host $host;")
-        L.append("        proxy_set_header X-Forwarded-Port $server_port;")
-        L.append("        proxy_set_header X-Auth-User $auth_user;")
-        L.append("        proxy_set_header X-Auth-Device $auth_device;")
+    # ── 各服务 location（路径前缀入口）─────────────────────────
+    #
+    # 这一段是「按路径前缀分发」的入口：https://<网关>/siy/ → 思源。
+    # 兼容 v0.8.1 的既有行为，一个字都没改。
+    for rule, prefix, protocol, host, tport, rp_host in services:
+        _nginx_service_location(L, rule, prefix, protocol, host, tport,
+                                lan_cidr, _gw_port, mode="path")
 
-        if rule.get("public_access"):
-            # 公网可达 → 无条件要求认证
-            L.append("        # public_access=true：所有来源可达，但必须先过认证")
-            L.append("        auth_request /_auth;")
-            L.append("        error_page 401 = @to_login;")
-            L.append("        auth_request_set $auth_user $upstream_http_x_auth_user;")
-            L.append("        auth_request_set $auth_device $upstream_http_x_auth_device;")
-        else:
-            # 仅内网 → 按来源地址拦截，不进认证
-            L.append(f"        # public_access=false：仅内网 {lan_cidr} 可达，公网直连被拒")
-            L.append(f"        allow {lan_cidr};")
-            # 回环白名单：IPv4 和 IPv6 都要写。
-            # 原来只写了 `allow ::1;` —— 于是 `curl https://127.0.0.1:8443/dsm/`
-            # 从路由器本机发起的 IPv4 回环请求不在 lan_cidr 里，直接吃 deny all
-            # 变成 403，而同样语义的 `curl https://[::1]:8443/dsm/` 却能通。
-            # 同一个「本机」两种结果，纯属遗漏。
-            # 安全上没有风险：127.0.0.1 只有路由器自己发起的连接才是这个源地址，
-            # 公网侧根本无法伪造（WAN 入向本来就有反伪造 drop）。
-            L.append("        allow 127.0.0.1;")
-            L.append("        allow ::1;")
-            L.append("        deny all;")
-            L.append("        auth_request_set $auth_user \"lan\";")
-            L.append("        auth_request_set $auth_device $cookie_gw_device;")
-
-        # 认证服务不可达时的 fail-closed 行为：
-        # auth_request 拿不到上游 → nginx 自己返回 5xx，不会放行。
-        L.append("        proxy_read_timeout 300s;")
-        L.append("        proxy_send_timeout 300s;")
-        L.append("        proxy_buffering off;")
-        L.append("        proxy_request_buffering off;")
-        if rule.get("websocket_enabled", True):
-            L.append("        proxy_http_version 1.1;")
-            L.append("        proxy_set_header Upgrade $http_upgrade;")
-            L.append("        proxy_set_header Connection \"upgrade\";")
-        else:
-            L.append("        proxy_http_version 1.1;")
-        # 上传体积限制：用户配的值在这里**真正生效**。
-        # v0.8.0 这里硬编码 0（不限），界面上填的 client_max_body_size
-        # 只对已废弃的独立站点生效，网关这一侧被完全忽略 —— 配了没反应。
-        # 现在空值 = DEFAULT_CLIENT_MAX_BODY（1M，nginx 自己的默认值），
-        # 显式填 0 才是「不限」，填 100M/1G 都能放大。
-        L.append(f"        client_max_body_size {cmbs};   "
-                 f"# 上传体积限制（0=不限，空值默认 {DEFAULT_CLIENT_MAX_BODY}）")
-
-        # ── 上游绝对路径改写（窄模式）─────────────────────────────
-        # 上游页面里写死的绝对路径（典型 /api/xxx）会**逃出本 location**：
-        # 网关按 path 前缀分发，/api/xxx 匹配不到任何 location → 直接 404，
-        # 表现就是「页面能打开、数据接口全挂」。
-        #
-        # 这里用 nginx sub_filter 把「上游自己声明的那一段前缀」改写成
-        # 「带网关前缀的同一段」，浏览器再请求就落回本 location。
-        #
-        # ⚠️ 只做**窄模式**：只替换 api_path_prefix 这一段字面量。
-        # 通用规则（任何根绝对路径都加前缀）实测会把页面里普通的路径字符串
-        # （"/var/log/syslog" 这种）也一起改掉，直接改坏应用。
-        # 窄模式的失败模式是「没改写 → 404（跟改之前一样）」，
-        # 绝不会比不装更糟 —— 这是选它不选通用规则的根本原因。
-        #
-        # 这个值最终会进 nginx 的**引号字符串**里，所以这里**必须再净化一次**：
-        # 校验只在保存时做，而配置文件可能被手工改过。带引号/分号/换行的值
-        # 拼进 sub_filter 就能逃出引号 → nginx 指令注入。
-        # （与 client_max_body_size 同样的道理：生成期也要净化，不信任落盘值。）
-        try:
-            api_prefix = _sanitize_api_path_prefix(rule.get("api_path_prefix", ""))
-        except ValueError as e:
-            # 非法值：**只放弃「改写」这一项，不放弃整条服务**。
-            #
-            # 这里刻意不像 client_max_body_size 那样让异常冒泡 ——
-            # 那会让整份网关配置生成失败，**所有**服务一起挂，
-            # 那比一个 404 严重得多，也违背上面「窄模式降级安全」的承诺。
-            # 正确做法：跳过改写（该服务退回今天的行为），并在生成的
-            # 配置里留一行说明，让运维能看见「有人填了非法值」。
-            #
-            # 原始值与错误信息都回显，但**必须强制单行**：
-            # nginx 注释到行尾为止，值里一个换行就能把注释劈开，
-            # 后半行变成一条 nginx 指令 ⇒ 注入面。
-            # repr() 本身已转义换行，这里再 collapse 一次做双保险
-            # （错误信息是第三方拼的，不保证单行）。
-            _bad = repr(rule.get('api_path_prefix')).replace('\n', '\\n')
-            _why = str(e).replace('\n', ' ').replace('\r', ' ')
-            L.append("        # ⚠️ api_path_prefix 非法，已跳过路径改写"
-                     f"（原始值 {_bad}）")
-            L.append(f"        #    原因：{_why}")
-            api_prefix = ""
-        # ── 正文里的绝对路径改写（sub_filter）────────────────────
-        #
-        # 两种模式，可同时开：
-        #   窄模式（api_path_prefix）：替换「引号紧跟」的一段字面量
-        #   宽模式（rewrite_root_paths）：替换「HTML 属性值紧跟」的根绝对路径
-        #
-        # 两者都只改**正文**。302 跳转的 Location 在**响应头**里，
-        # sub_filter 管不到 —— 那部分由下面的 proxy_redirect 负责。
-        #
-        # ⚠️ 窄模式的失败模式是「没改写 → 404（跟改之前一样）」，
-        # 绝不会比不装更糟 —— 这是选它不选通用规则的根本原因。
-        sf_rules = []
-        if api_prefix:
-            L.append(f"        # ── 上游绝对路径改写：{api_prefix}... -> "
-                     f"{prefix}{api_prefix}... ──")
-            L.append("        # 窄模式：只替换这一段字面量，避免改坏应用里的其它路径")
-            sf_rules.append((f"'{api_prefix}", f"'{prefix}{api_prefix}"))
-            sf_rules.append((f'"{api_prefix}', f'"{prefix}{api_prefix}'))
-
-        # 生成期不信任落盘值（与 client_max_body_size 同样的道理）：
-        # 配置可能被手工改坏，非布尔值一律按「不改写」处理。
-        _rrp = rule.get("rewrite_root_paths")
-        if isinstance(_rrp, (bool, int)) and _rrp:
-            L.append("        # ── 根绝对路径改写（宽模式）─────────────────")
-            L.append("        # 应用吐出的 href=\"/x\" / src=\"/x\" / action=\"/x\" 是"
-                     "**根绝对路径**，")
-            L.append("        # 浏览器按 absolute-path 语义解析时会丢掉本路径前缀"
-                     "（RFC 3986 §5.2.2）")
-            L.append("        # ⇒ 资源与链接跑出本 location → 404。")
-            L.append("        # 只改「属性值紧跟」这一种形态，"
-                     "不碰 JS 里普通的字符串字面量。")
-            for _attr in ("href", "src", "action"):
-                sf_rules.append((f'{_attr}="/', f'{_attr}="{prefix}/'))
-
-        if sf_rules:
-            # sub_filter 必须在明文正文上做：上游若压缩了正文就匹配不到
-            L.append('        proxy_set_header Accept-Encoding "";')
-            L.append("        sub_filter_once off;")
-            # ⚠️ 这里**不能**再写 text/html：nginx 的 sub_filter_types 默认
-            # 已经含 text/html，指令是「在默认之外追加」，重复写会报
-            #   [warn] duplicate MIME type "text/html"
-            # 每次 nginx -t / reload 都刷一行。真机实测确认：省掉 text/html
-            # 后 text/html 照样被替换（nginx 文档原文：in addition to "text/html"）。
-            L.append("        sub_filter_types application/javascript text/css;")
-            for _old, _new in sf_rules:
-                L.append(f'        sub_filter "{_nginx_dquote(_old)}" '
-                         f'"{_nginx_dquote(_new)}";')
-
-        # ── 302/301 跳转的 Location 补回路径前缀 ──────────────────
-        #
-        # 上游返回 `Location: /check-auth?to=%2F` 时，浏览器按 absolute-path
-        # 语义解析：base 的 path（/siy/）被整个丢弃 ⇒ 跳到 /check-auth ⇒
-        # 网关无此 location ⇒ 404。这是「子路径反代」最常见的翻车点。
-        #
-        # ⚠️ nginx 的 **default proxy_redirect 救不了这个**：它加的是
-        # **proxy_pass 的 URI 部分**，而 proxy_pass 末尾的 "/" 是「替换」语义
-        # —— location 前缀根本没进 proxy_pass ⇒ 加上去的还是 "/" ⇒ 前缀照丢。
-        # 必须显式写，而且要用 location 前缀。
-        #
-        # 负向先行断言避免给「已经带前缀」的 Location 重复加前缀。
-        #
-        # ⚠️ **只改写能证明是「我们自己的」的 Location**：
-        #   ① 相对路径 —— 思源实测就是这种：`Location: /check-auth?to=%2F`
-        #   ② host 是**上游自己**的绝对 URL
-        # 其余一律**原样放过**。特别是「跳到外站」的绝对 URL
-        # （OAuth 跳转、跳到邮件/支付/其它站点的验证页）——
-        # 真机实测过：用 `[^/]+` 匹配任意 host 的写法会把外站跳转
-        # **劫持到网关自己**（external.example.com/page → 网关/ght/page），
-        # 用户再也跳不回原站。宁可漏改，也不能劫持。
-        _lit = _nginx_regex_literal(prefix)
-        if _lit:
-            # 负向先行断言里的前缀**不能带开头的斜杠**。
-            # 正则里 ^/ 已经把那个斜杠吃掉了，断言落在斜杠**之后**的位置上，
-            # 那里剩下的是 "siy/check-auth" 而不是 "/siy/check-auth" ——
-            # 写成 (?!/siy/) 的话断言恒成立，已经带前缀的 Location
-            # 会被**重复加前缀**（/siy/siy/check-auth → 404）。
-            _bare = _lit[1:] if _lit.startswith('/') else _lit
-            L.append("        # ── 302 跳转的 Location 补回路径前缀 ──")
-            L.append(f"        proxy_redirect ~^/(?!{_bare}/)(.*)$ {prefix}/$1;")
-            # 上游自己 host 的绝对 URL：host 换成对外地址 + 补前缀。
-            # 端口用**非捕获**组 (?::[0-9]+)? —— 用捕获组的话 $1 取到的是端口
-            # 而不是路径，替换结果会变成 ".../siy/:8095"。
-            # 端口可选：上游可能带端口也可能不带。
-            # 对外地址用 $host（nginx 校验过的）+ 配置里的端口，
-            # 不用 $http_host：后者是客户端可控的 Host 头，
-            # 拼进重定向就是 Host Header 注入。
-            _host_lit = _nginx_host_literal(host)
-            if _host_lit:
-                L.append(f"        proxy_redirect ~^https?://{_host_lit}(?::[0-9]+)?"
-                         f"/(?!{_bare}/)(.*)$ $scheme://$host{_gw_port}{prefix}/$1;")
-        L.append("    }")
-        L.append("")
-
-    # ── 跳登录 ──────────────────────────────────────────────────
-    # 端口必须显式带上：nginx 变量 $host 只含主机名、不含端口，
-    # 而本项目的网关端口按设计就是自定义高位端口（家宽常用非 443）。
-    # 漏掉端口会把用户甩到 443 去 —— 要么打不开，要么撞上别的服务。
-    # 这里用配置里的 port 而非 $http_host：后者是客户端可控的 Host 头，
-    # 拼进重定向就是 Host Header 注入。$host 经 nginx 校验，相对安全。
-    if port == 443:
-        L.append("    location @to_login {")
-        L.append("        return 302 https://$host/auth/login?next=$request_uri;")
-        L.append("    }")
-    else:
-        L.append(f"    location @to_login {{")
-        L.append(f"        return 302 https://$host:{port}/auth/login?next=$request_uri;")
-        L.append("    }")
-    L.append("")
+    _nginx_to_login(L, port)
     L.append("    location = /favicon.ico { return 204; }")
     L.append("}")
     L.append("")
+
+    # ── host 分发入口 ──────────────────────────────────────────
+    #
+    # 每个配了 host 的服务多开一个 server 块：
+    #     server_name <host>   →   服务挂在**该域名的根路径**上
+    #
+    # 为什么独立 server 块，而不是用 map $host 转发：每个服务的认证策略、
+    # 体积限制、WebSocket 设置都不同，map 方案要么把这些做成 nginx 变量
+    # （大部分做不到），要么就得写 if（nginx 里 if 是坑）。
+    # 独立 server 块是 nginx 的原生做法，语义清楚、配置可读、审计友好。
+    #
+    # **认证不打折**：host 入口同样走 auth_request，未登录照样被 302 到登录页。
+    # 这正是本项目的核心能力 —— 换了域名不等于绕过网关。
+    for rule, prefix, protocol, host, tport, rp_host in services:
+        if not rp_host:
+            continue
+        name = _sanitize_name(rule.get("name") or rp_host)
+        L.append(f"# ==== host 分发：{rp_host} → {name} ====")
+        L.append("server {")
+        L.append(f"    server_name {rp_host};")
+        _nginx_server_preamble(L, port, cert_path, key_path, tls_protos)
+        _nginx_auth_locations(L, api_port)
+        # host 模式：location 是 /（域名根路径），路径与 WebSocket 都无需改写。
+        _nginx_service_location(L, rule, prefix, protocol, host, tport,
+                                lan_cidr, _gw_port, mode="host")
+        _nginx_to_login(L, port)
+        L.append("}")
+        L.append("")
 
     return "\n".join(L)
 
@@ -7477,8 +7914,28 @@ def _acme_load_aliyun_credentials():
     return cfg.get("access_key_id", ""), cfg.get("access_key_secret", "")
 
 
-def _acme_issue(domain, dns_provider="ali", dns_credentials=None):
-    """使用 acme.sh + 指定 DNS 提供商申请证书，返回 (ok, result_dict)"""
+def _acme_sh_path():
+    """探测 acme.sh 的真实路径，返回路径字符串或 None。
+
+    为什么每次调用都探测而不是模块级算一次：setup.sh 是在 app.py
+    启动之后才把 acme.sh 装上的，模块级常量在 import 那一刻就已经
+    固化了「不存在」这个结论，之后再也不会更新。
+    """
+    for cand in ACME_SH_CANDIDATES:
+        p = os.path.expanduser(cand)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return shutil.which("acme.sh")
+
+
+def _acme_issue(domain, dns_provider="ali", dns_credentials=None, wildcard=False):
+    """使用 acme.sh + 指定 DNS 提供商申请证书，返回 (ok, result_dict)
+
+    wildcard=True 时同时申请泛域名（-d example.com -d *.example.com）。
+    裸域与通配是**同一个 ACME order 的两个 identifier**，LE 会分别给
+    两个 authz，两条 dns-01 挑战值必须同时出现在 _acme-challenge.<域名>
+    这一个名字下 —— acme.sh 的 DNS 插件会各自 Add 一条记录来保证并存。
+    """
     domain = _sanitize_domain(domain)
     provider = DNS_PROVIDERS.get(dns_provider)
     if not provider:
@@ -7495,8 +7952,27 @@ def _acme_issue(domain, dns_provider="ali", dns_credentials=None):
         if not creds.get(field["key"]):
             return False, {"error": f"缺少字段: {field['label']}"}
 
-    if not os.path.exists(ACME_SH_PATH):
-        return False, {"error": f"acme.sh 未安装: {ACME_SH_PATH}"}
+    acme_sh = _acme_sh_path()
+    if not acme_sh:
+        return False, {"error": "acme.sh 未安装"}
+
+    # DNS-01 需要对应的 dnsapi 插件。OpenWrt 的 opkg acme-acmesh 是
+    # **裁剪版**，一个 dnsapi/dns_*.sh 都不带 —— 不提前查的话，acme.sh
+    # 只会抛一句看不懂的错，用户完全不知道是缺插件。
+    #
+    # 插件目录恒为 $LE_WORKING_DIR/dnsapi/，而 acme.sh 的 LE_WORKING_DIR
+    # 默认是 $HOME/.acme.sh（跟主脚本装在哪无关），所以两处都看一遍。
+    plugin_name = provider["acme_param"] + ".sh"
+    plugin_paths = [
+        os.path.join(os.path.expanduser("~/.acme.sh/dnsapi"), plugin_name),
+        os.path.join(os.path.dirname(acme_sh), "dnsapi", plugin_name),
+    ]
+    if not any(os.path.exists(p) for p in plugin_paths):
+        return False, {"error": (
+            f"缺少 acme.sh DNS 插件 {plugin_name} —— "
+            f"OpenWrt 的 opkg acme-acmesh 是裁剪版不含 DNS 插件，"
+            f"需要完整版 acme.sh（setup.sh 会自动补装）"
+        )}
 
     cert_dir = os.path.join(NGINX_SSL_DIR, domain)
     os.makedirs(cert_dir, exist_ok=True)
@@ -7507,8 +7983,12 @@ def _acme_issue(domain, dns_provider="ali", dns_credentials=None):
 
     # 申请证书
     try:
+        args = [acme_sh, "--issue", "--dns", provider["acme_param"], "-d", domain]
+        if wildcard:
+            args += ["-d", "*." + domain]
+        args += ["--force"]
         result = subprocess.run(
-            [ACME_SH_PATH, "--issue", "--dns", provider["acme_param"], "-d", domain, "--force"],
+            args,
             capture_output=True, text=True, env=env, timeout=300
         )
         if result.returncode != 0:
@@ -7524,7 +8004,7 @@ def _acme_issue(domain, dns_provider="ali", dns_credentials=None):
     certfile = os.path.join(cert_dir, "cert.pem")
     try:
         result = subprocess.run(
-            [ACME_SH_PATH, "--install-cert", "-d", domain,
+            [acme_sh, "--install-cert", "-d", domain,
              "--fullchain-file", fullchain,
              "--key-file", keyfile,
              "--cert-file", certfile,
@@ -7559,7 +8039,8 @@ def _acme_renew(domain, dns_provider="ali", dns_credentials=None):
         return False, {"error": f"不支持的 DNS 提供商: {dns_provider}"}
 
     creds = dns_credentials or {}
-    if not os.path.exists(ACME_SH_PATH):
+    acme_sh = _acme_sh_path()
+    if not acme_sh:
         return False, {"error": "acme.sh 未安装"}
 
     env = os.environ.copy()
@@ -7568,8 +8049,10 @@ def _acme_renew(domain, dns_provider="ali", dns_credentials=None):
             env[field["key"]] = creds[field["key"]]
 
     try:
+        # 只给主域名：泛域名的 SAN 记在 acme.sh 自己的域名配置里
+        # （Le_Alt），--renew 会照着它一起重新挑战，不需要在这里再写一遍。
         result = subprocess.run(
-            [ACME_SH_PATH, "--renew", "-d", domain, "--force"],
+            [acme_sh, "--renew", "-d", domain, "--force"],
             capture_output=True, text=True, env=env, timeout=120
         )
         if result.returncode != 0:
@@ -7579,11 +8062,132 @@ def _acme_renew(domain, dns_provider="ali", dns_credentials=None):
 
     cert_dir = os.path.join(NGINX_SSL_DIR, domain)
     fullchain = os.path.join(cert_dir, "fullchain.pem")
+    keyfile = os.path.join(cert_dir, "privkey.pem")
+    certfile = os.path.join(cert_dir, "cert.pem")
+
+    # 显式重装一次。acme.sh 的 --renew 会用签发时保存的 Le_RealFullChainPath
+    # 把新证书写回原处并跑 reloadcmd，正常情况下这一步是多余的；
+    # 但「续期成功、磁盘上还是旧证书」是个很难查的故障（面板显示新到期时间，
+    # 浏览器拿到的还是旧证书），显式重装把这条路径钉死。
+    try:
+        subprocess.run(
+            [acme_sh, "--install-cert", "-d", domain,
+             "--fullchain-file", fullchain,
+             "--key-file", keyfile,
+             "--cert-file", certfile,
+             "--reloadcmd", "nginx -s reload"],
+            capture_output=True, text=True, env=env, timeout=60
+        )
+    except Exception as e:
+        return False, {"error": f"证书重装失败: {e}"}
+
     # 同 _acme_issue：续期会重写 privkey.pem，权限必须跟着补。
     # 路径固定可推导，不需要问 acme.sh 要 key 在哪。
+    #
+    # 这一行刻意写成 os.path.join(cert_dir, "privkey.pem") 而不是上面那个
+    # keyfile 变量 —— 两者指向同一个文件，但变异测试（N9）靠这一行的
+    # 原文定位「续期路径漏加固」这个缺陷，改写会让锚点失效、变异被跳过，
+    # 等于悄悄少验一条。
     _harden_key_for_nginx_worker(os.path.join(cert_dir, "privkey.pem"))
     expires_at, days = _get_cert_expiry(fullchain)
     return True, {"new_expires_at": expires_at, "days_remaining": days}
+
+
+# ======================= 证书自动续期 =======================
+#
+# 以前 auto_renew 只是一个存进配置、**没有任何人读**的字段：证书到期前
+# 必须用户手动点「续期」，忘了就过期，面板还照样显示「有效」。
+#
+# 现在用 cron 真正把它跑起来。刻意做成独立 shell + `app.py --renew-certs`
+# 入口，而不是塞进常驻进程：续期要调 acme.sh，最长能跑好几分钟，
+# 放在 HTTP 请求线程里会把面板卡住。
+
+CERT_RENEW_SCRIPT_PATH = os.environ.get(
+    "NFTABLES_WEB_CERT_RENEW_SCRIPT", "/opt/nftables-web/renew-certs.sh")
+CERT_RENEW_CRON_ENTRY = f'*/30 * * * * {CERT_RENEW_SCRIPT_PATH}'
+
+CERT_RENEW_SCRIPT = '''#!/bin/sh
+# 证书自动续期 —— 由 crontab 每 30 分钟调一次（app.py 写入，不要手改）。
+#
+# 只续「该续的」：source=auto 且 auto_renew=true 且剩余天数 <= renew_days。
+# 续期完由 app.py 重装证书并 reload nginx。
+LOG=/var/log/nftables-web-cert-renew.log
+APP=""
+for c in /opt/nftables-web-v2/backend/app.py /opt/nftables-web/app.py; do
+  if [ -f "$c" ]; then APP="$c"; break; fi
+done
+if [ -z "$APP" ]; then
+  echo "$(date '+%F %T') 找不到 app.py，跳过本次续期" >> "$LOG"
+  exit 1
+fi
+cd "$(dirname "$APP")" || exit 1
+python3 "$APP" --renew-certs >> "$LOG" 2>&1
+exit $?
+'''
+
+
+def _renew_due_certs():
+    """把所有到期在即的自动证书续掉。
+
+    返回 (renewed, errors)：renewed 是续成功的域名列表，errors 是
+    「该续但没续成」的原因列表 —— 这部分必须让用户看得见，
+    静默失败等于没做。
+    """
+    config, rp = _get_rp_config()
+    renewed = []
+    errors = []
+    for c in list(rp.get("certificates", [])):
+        if c.get("source") != "auto":
+            continue
+        if not c.get("auto_renew"):
+            continue
+        domain = c.get("domain", "")
+        cert_path = c.get("cert_path", "")
+        _exp, days = _get_cert_expiry(cert_path)
+        if days < 0:
+            errors.append(f"{domain}: 读不到证书有效期（文件缺失或格式不对）")
+            continue
+        try:
+            renew_days = int(c.get("renew_days") or 60)
+        except (TypeError, ValueError):
+            renew_days = 60
+        if days > renew_days:
+            continue
+        provider = c.get("dns_provider") or "ali"
+        creds = _get_dns_credentials(rp, provider)
+        if not creds:
+            errors.append(f"{domain}: 缺少 {provider} 的 DNS 凭证，无法自动续期")
+            continue
+        ok, res = _acme_renew(domain, provider, creds)
+        if not ok:
+            errors.append(f"{domain}: {res.get('error', '续期失败')}")
+            continue
+        c["expires_at"] = res.get("new_expires_at")
+        c["days_remaining"] = res.get("days_remaining")
+        renewed.append(domain)
+    if renewed:
+        _save_rp_config(config)
+    return renewed, errors
+
+
+def _ensure_cert_renew_cron():
+    """静默确保证书续期脚本与 crontab 就绪（幂等）。
+
+    与 _ensure_ipv6_cron 同一套套路：脚本由面板自己写，crontab 按
+    「脚本路径」去重，避免历史条目残留导致重复执行。
+    """
+    try:
+        os.makedirs(os.path.dirname(CERT_RENEW_SCRIPT_PATH), exist_ok=True)
+        with open(CERT_RENEW_SCRIPT_PATH, 'w') as f:
+            f.write(CERT_RENEW_SCRIPT)
+        os.chmod(CERT_RENEW_SCRIPT_PATH, 0o755)
+    except OSError as e:
+        print(f'[WARN] 证书续期脚本写入失败: {e}', flush=True)
+        return False
+    ok, msg = _upsert_cron_for(CERT_RENEW_SCRIPT_PATH, CERT_RENEW_CRON_ENTRY)
+    if not ok:
+        print(f'[WARN] 证书续期 cron 配置失败: {msg}', flush=True)
+    return ok
 
 
 def _deploy_all_rules(config=None):
@@ -7721,9 +8325,15 @@ def gateway_status():
                     "name": str(r.get("name") or p.lstrip("/"))[:64],
                     "path": p,
                     "public": bool(r.get("public_access")),
-                    "url": f"/{p}/",
+                    # 有 host 分发入口时，url 给**绝对地址**（含域名与端口），
+                    # 否则面板上显示的链接点开还是走路径前缀那一套，
+                    # 用户会以为「host 分发没生效」。
+                    # 端口必须带上：网关按设计就跑在自定义高位端口上，
+                    # 漏掉端口点开就是 443 —— 要么打不开，要么撞上别的服务。
+                    "url": (f"https://{rh}:{gw_port}/" if rh else f"/{p}/"),
+                    "host": rh,
                 }
-                for r, p, _pr, _h, _tp in services
+                for r, p, _pr, _h, _tp, rh in services
             ],
             "nginx_conf": os.path.join(NGINX_CONF_DIR, GATEWAY_CONF_NAME)
                            if config.get("gateway_enabled") else None,
@@ -7829,13 +8439,18 @@ def rp_get_rules():
     """
     config, rp = _get_rp_config()
     config = _migrate_rp_rules(config)
+    gw_port = _safe_port(config.get('gateway_port'), 8443)
     rules_out = []
     for r in rp["rules"]:
+        rp_host = _safe_rp_host(r.get("host", "") or "")
         rules_out.append({
             **r,
             # 访问地址：网关统一入口 + 路径前缀，UI 直接展示这个
-            "access_url": f"{_safe_port(config.get('gateway_port'), 8443)}"
-                          f"{r.get('path_prefix', '')}/",
+            "access_url": f"{gw_port}{r.get('path_prefix', '')}/",
+            # host 分发入口的对外地址（含端口）。UI 要把它显示出来 ——
+            # 只显示路径前缀那个，用户会以为域名入口没生效。
+            "host": rp_host,
+            "host_url": (f"https://{rp_host}:{gw_port}/" if rp_host else ""),
         })
     return jsonify({"success": True,
                     "data": {"rules": rules_out, "total": len(rules_out)}})
@@ -8132,11 +8747,19 @@ def rp_get_certs():
                     issuer = r.stdout.strip().replace("issuer=", "")
             except Exception:
                 pass
+        sans = _get_cert_san(cp)
         certs_out.append({
             **c,
             "expires_at": expires_at,
             "days_remaining": days,
             "issuer": issuer,
+            # 证书实际覆盖的域名（SAN）。domain 字段只是用户填的标签，
+            # 泛域名证书靠这个字段才能看出「还盖住了哪些子域」。
+            "sans": sans,
+            # 是不是泛域名，实时从 SAN 推导 —— 存进配置的 wildcard 字段
+            # 只反映「申请时怎么申请的」，证书被重新上传/替换后可能对不上了，
+            # 而证书自己的 SAN 永远是事实。
+            "wildcard": any(s.startswith("*.") for s in sans) or bool(c.get("wildcard")),
         })
     return jsonify({"success": True, "data": {"certificates": certs_out, "total": len(certs_out)}})
 
@@ -8144,9 +8767,11 @@ def rp_get_certs():
 @app.route('/api/reverse-proxy/certificates/upload', methods=['POST'])
 def rp_upload_cert():
     config, rp = _get_rp_config()
-    domain = request.form.get("domain", "").strip()
+    raw_domain = request.form.get("domain", "").strip()
     try:
-        domain = _sanitize_domain(domain)
+        # 允许写 *.example.com：上传的泛域名证书如果填了带星号的域名，
+        # 归一化成主域名做标签和目录名（目录名带 * 在 shell 通配里是坑）。
+        domain, _parsed_wildcard = _sanitize_cert_domain(raw_domain)
     except ValueError as e:
         return jsonify({"success": False, "message": str(e)}), 400
     cert_file = request.files.get("cert_file")
@@ -8194,6 +8819,10 @@ def rp_upload_cert():
             existing_manual = c
             break
 
+    # 是不是泛域名，以**证书自己的 SAN** 为准，不看用户填的标签 ——
+    # 标签填错的话，面板显示的覆盖范围就是错的。
+    is_wildcard = any(s.startswith("*.") for s in _get_cert_san(fullchain_path))
+
     if existing_manual:
         new_id = existing_manual["id"]
         cert_entry = {
@@ -8202,6 +8831,7 @@ def rp_upload_cert():
             "key_path": key_path,
             "expires_at": expires_at,
             "days_remaining": days,
+            "wildcard": is_wildcard,
         }
         rp["certificates"] = [cert_entry if c["id"] == new_id else c
                               for c in rp["certificates"]]
@@ -8211,6 +8841,7 @@ def rp_upload_cert():
         cert_entry = {
             "id": new_id,
             "domain": domain,
+            "wildcard": is_wildcard,
             "source": "manual",
             "cert_path": fullchain_path,
             "key_path": key_path,
@@ -8222,6 +8853,11 @@ def rp_upload_cert():
         }
         rp["certificates"].append(cert_entry)
         replaced = False
+
+    # 上传泛域名证书时顺手把 base_domain 补上 —— 用户下一步就是
+    # 「给服务填域名做 host 分发」，域名从哪来应该由证书说了算，
+    # 而不是让用户手填一遍（填错一个字符，浏览器就是满屏证书告警）。
+    _rp_sync_base_domain(config)
 
     _save_rp_config(config)
 
@@ -8361,13 +8997,16 @@ def rp_request_cert():
     data = request.get_json(silent=True)
     if not data:
         return jsonify({"success": False, "message": "请求体不能为空"}), 400
-    domain = data.get("domain", "").strip()
-    if not domain:
+    raw_domain = data.get("domain", "").strip()
+    if not raw_domain:
         return jsonify({"success": False, "message": "domain 不能为空"}), 400
     try:
-        domain = _sanitize_domain(domain)
+        domain, parsed_wildcard = _sanitize_cert_domain(raw_domain)
     except ValueError as e:
         return jsonify({"success": False, "message": str(e)}), 400
+    # 两种写法都能表达泛域名：域名框里直接写 *.example.com，
+    # 或者写 example.com 再勾「包含泛域名」。
+    wildcard = bool(data.get("wildcard")) or parsed_wildcard
     # 检查域名唯一
     for c in rp.get("certificates", []):
         if c["domain"] == domain:
@@ -8393,7 +9032,7 @@ def rp_request_cert():
             rp["dns_credentials"] = {}
         rp["dns_credentials"][dns_provider] = data["dns_credentials"]
 
-    ok, result = _acme_issue(domain, dns_provider, dns_credentials)
+    ok, result = _acme_issue(domain, dns_provider, dns_credentials, wildcard=wildcard)
     if not ok:
         return jsonify({"success": False, "message": result.get("error", "证书申请失败"), "log": result.get("log", "")}), 400
 
@@ -8402,6 +9041,7 @@ def rp_request_cert():
     cert_entry = {
         "id": new_id,
         "domain": domain,
+        "wildcard": wildcard,
         "source": "auto",
         "dns_provider": dns_provider,
         "cert_path": result["cert_path"],
@@ -8413,7 +9053,7 @@ def rp_request_cert():
     }
     rp["certificates"].append(cert_entry)
     _save_rp_config(config)
-    return jsonify({"success": True, "data": {"cert_id": new_id, "domain": domain, **result, "message": "证书申请成功"}})
+    return jsonify({"success": True, "data": {"cert_id": new_id, "domain": domain, "wildcard": wildcard, **result, "message": "证书申请成功"}})
 
 
 @app.route('/api/reverse-proxy/certificates/<cert_id>/renew', methods=['POST'])
@@ -8540,10 +9180,21 @@ def rp_nginx_preview(rule_id):
         return jsonify({"success": False, "message": "规则不存在"}), 404
     full = _generate_gateway_nginx_conf(config) or ""
     marker = f"# ---- {_sanitize_name(rule.get('name') or rule.get('path_prefix'))} ----"
-    seg = ''
-    if marker in full:
-        seg = full[full.index(marker):]
-        seg = seg.split('\n    }\n', 1)[0] + '\n    }'
+    # 一条规则可能有**两段**：路径前缀入口 + host 分发入口。
+    # 两段都标着同一个「---- 名字 ----」注释，所以要把**全部**出现位置
+    # 都收进来 —— 只取第一段的话，host 入口出问题时预览里根本看不到它，
+    # 而用户恰恰是在 host 入口上排查。
+    segs = []
+    idx = 0
+    while True:
+        i = full.find(marker, idx)
+        if i < 0:
+            break
+        part = full[i:]
+        part = part.split('\n    }\n', 1)[0] + '\n    }'
+        segs.append(part)
+        idx = i + len(marker)
+    seg = '\n\n'.join(segs)
     return jsonify({"success": True, "data": {
         "config_content": seg or "# 网关未启用或该服务未启用",
         "config_path": GATEWAY_CONF_NAME,
@@ -8558,6 +9209,11 @@ def rp_get_settings():
     config, rp = _get_rp_config()
     settings = dict(rp.get("settings", RP_DEFAULT_SETTINGS))
     settings["default_cert_id"] = rp.get("settings", {}).get("default_cert_id")
+    # base_domain / cookie_domain 的**生效值**（不只是落盘值）：
+    # 用户可能还没设过，但默认证书里有泛域名 → 实际是可用的。
+    # 前端要拿这个去提示「自动生成的域名长什么样」，所以必须是生效值。
+    settings["base_domain"] = _rp_base_domain(config)
+    settings["cookie_domain"] = _rp_cookie_domain(config)
     return jsonify({"success": True, "data": settings})
 
 
@@ -8571,6 +9227,30 @@ def rp_save_settings():
     for key in ["http_redirect_enabled", "hsts_enabled", "tls_min_version", "auto_reload_nginx"]:
         if key in data:
             settings[key] = data[key]
+    # base_domain / cookie_domain 是**域名**，必须过一遍净化：
+    # 这两个值会进 nginx 的 server_name 与 cookie 的 Domain 属性。
+    # 写入路径不能像读取路径那样「非法就当空」—— 用户当场就该看到错。
+    #
+    # ⚠️ 只写**非空**值：空值在语义上是「用户明确清空」，但这个端点
+    # 是「全局设置」页，保存别的开关时不该顺手把基础域名冻结掉 ——
+    # 一旦冻结，用户后来再装泛域名证书，自动推导就再也不触发了
+    # （「键存在 = 已做过决定」）。要清空请用别的入口。
+    if "base_domain" in data:
+        raw_bd = str(data["base_domain"] or "").strip()
+        if raw_bd:
+            try:
+                settings["base_domain"] = _sanitize_rp_host(raw_bd)
+            except ValueError as e:
+                return jsonify({"success": False, "message": f"base_domain 非法：{e}"}), 400
+    if "cookie_domain" in data:
+        raw_cd = str(data["cookie_domain"] or "").strip().lower()
+        if raw_cd:
+            try:
+                base = _sanitize_rp_host(raw_cd.lstrip("."))
+            except ValueError as e:
+                return jsonify({"success": False, "message": f"cookie_domain 非法：{e}"}), 400
+            if base:
+                settings["cookie_domain"] = "." + base
     _save_rp_config(config)
 
     # 重新生成所有规则配置
@@ -8589,6 +9269,8 @@ def rp_set_default_cert(cert_id):
         return jsonify({"success": False, "message": f"证书 {cert_id} 不存在"}), 404
     settings = rp.setdefault("settings", dict(RP_DEFAULT_SETTINGS))
     settings["default_cert_id"] = cert_id
+    # 换默认证书 = 换「这套网关用哪个域名体系」→ 顺手把 base_domain 补上。
+    _rp_sync_base_domain(config)
     _save_rp_config(config)
 
     # 换默认证书必须真的下发 nginx —— 只落盘的话用户永远看不到效果。
@@ -9591,6 +10273,17 @@ def _start_servers():
         print(f'[MIGRATE] auth_absolute_timeout 落盘失败（网关侧已兜底，'
               f'不影响强制重登）: {type(e).__name__}: {e}', flush=True)
 
+    # ========== 启动时确保证书自动续期 cron 就绪 ==========
+    # 没有这一步，auto_renew 字段就真的只是存着没人读 —— 证书到期了
+    # 还得用户手动点「续期」。幂等，失败不阻断启动（续期是锦上添花，
+    # 不能因为写不了 crontab 就让面板起不来）。
+    try:
+        if _ensure_cert_renew_cron():
+            print(f'[CRON] 证书自动续期已启用: {CERT_RENEW_CRON_ENTRY}', flush=True)
+    except Exception as e:
+        print(f'[WARN] 证书自动续期 cron 配置异常（不影响面板启动）: '
+              f'{type(e).__name__}: {e}', flush=True)
+
     # ========== 运行期防火墙自检 ==========
     # 启动恢复只覆盖「启动那一刻」。运行期规则集被清空（fw4 被别人 enable、
     # 别的工具 flush、内核异常）没人会发现，期间路由器裸奔。
@@ -9668,5 +10361,23 @@ def _start_servers():
         https_server.shutdown()
 
 
+def _renew_certs_cli():
+    """`app.py --renew-certs` 入口：给 crontab 调，跑完就退，不起服务。
+
+    退出码：有续期失败时返回 1，方便 cron 日志里一眼看出出了问题。
+    """
+    renewed, errors = _renew_due_certs()
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if renewed:
+        print(f"[{ts}] 已续期: {', '.join(renewed)}", flush=True)
+    else:
+        print(f"[{ts}] 无到期证书，无需续期", flush=True)
+    for e in errors:
+        print(f"[{ts}] [WARN] {e}", flush=True)
+    return 1 if errors else 0
+
+
 if __name__ == "__main__":
+    if "--renew-certs" in sys.argv:
+        sys.exit(_renew_certs_cli())
     _start_servers()

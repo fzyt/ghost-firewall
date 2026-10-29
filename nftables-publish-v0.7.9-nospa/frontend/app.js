@@ -185,7 +185,13 @@ function app() {
     rp: {
       rules: [],
       certificates: [],
-      settings: { http_redirect_enabled: true, hsts_enabled: true, tls_min_version: 'TLSv1.2', default_cert_id: '' },
+      settings: {
+        http_redirect_enabled: true, hsts_enabled: true,
+        tls_min_version: 'TLSv1.2', default_cert_id: ''
+      },
+      // host 分发的地基：基础域名（从默认证书 SAN 推导）与 cookie 共享域。
+      // 单独放，不进 rp.settings —— 理由见 loadReverseProxy 里的注释。
+      hostBaseDomain: '', hostCookieDomain: '',
       loading: false,
       dnsProviders: [],
       selectedDnsProvider: '',
@@ -219,6 +225,9 @@ function app() {
     rpUploading: false,
     rpUploadDomain: '',
     rpRequestDomain: '',
+    rpRequestWildcard: false,
+    rpRequestRenewDays: 60,
+    rpRequestAutoRenew: true,
     rpDetectingPrefix: false,
     rpApiPrefixHint: '',
     rpDetectingProtoRel: false,
@@ -1590,10 +1599,6 @@ function app() {
         ]);
         this.rp.rules = (rules.data || rules).rules || [];
         this.rp.certificates = (certs.data || certs).certificates || [];
-        // 只有一个证书时自动设为默认
-        if (this.rp.certificates.length === 1 && !this.rp.settings.default_cert_id) {
-          await this.setDefaultCert(this.rp.certificates[0].id);
-        }
         if (settings) {
           const s = settings.data || settings;
           this.rp.settings = {
@@ -1602,6 +1607,25 @@ function app() {
             tls_min_version: s.tls_min_version || 'TLSv1.2',
             default_cert_id: s.default_cert_id || ''
           };
+          // 基础域名与 cookie 共享域**不放进 rp.settings** ——
+          // rp.settings 是「全局设置」表单的数据源，保存时会整包 POST 回去。
+          // 这两个字段的语义是「键存在 = 已做过决定」，一旦被原样写回，
+          // 就等于把「以后自动从证书 SAN 推导」这条路永久关掉了
+          // （用户后来才装泛域名证书时，域名就再也不会自动补上了）。
+          // 所以它们单独放，只读不随表单提交。
+          this.rp.hostBaseDomain = s.base_domain || '';
+          this.rp.hostCookieDomain = s.cookie_domain || '';
+        }
+        // 只有一个证书时自动设为默认。
+        //
+        // 这个判断必须在 settings 赋值**之后**。放前面的话，读到的是
+        // 初始值（default_cert_id 为空串），于是每次新开面板进反代页
+        // 都会误判「还没设默认证书」→ 自动调 set-default → 后端
+        // _deploy_all_rules 重新生成整份 nginx 配置 → 覆盖掉任何手工
+        // 改过的 conf。2026-10-28 在 .233 实测就是这么把 33 条
+        // sub_filter 补丁冲成 7 条的：一次「打开面板看看」就够了。
+        if (this.rp.certificates.length === 1 && !this.rp.settings.default_cert_id) {
+          await this.setDefaultCert(this.rp.certificates[0].id);
         }
         await this.loadDnsProviders();
         // 网关状态一并拉取：开关联入页就能看到，不用再点一次刷新
@@ -1751,12 +1775,61 @@ function app() {
 
     /* ── 反代服务（v0.8.1：只走认证网关） ──────────────────────
        规则不再持有 domain / listen_port / ssl_cert_id：
-       证书是网关的统一证书，入口是 gateway_port + path 前缀。 */
+       证书是网关的统一证书，入口是 gateway_port + path 前缀。
+       v0.8.2 起额外支持 **host 分发入口**：一条规则可以再加一个对外域名，
+       服务挂到那个域名的根路径上（两条入口都过认证）。 */
 
     // 网关根地址，用于表单里提示用户最终访问哪个地址
     gatewayPreviewUrl() {
       const p = this.gw.gateway_port || 8443;
       return `https://<你的公网地址>:${p}`;
+    },
+
+    // host 分发域名的前置提示。返回空字符串表示没问题。
+    //
+    // 与后端 _sanitize_rp_host 同一套判据 —— 前端只是提前说人话，
+    // 真正拦住非法值的是后端（前端校验永远只是体验，不是防线）。
+    rpHostConflict(rule) {
+      if (!rule) return '';
+      const h = String(rule.host || '').trim().toLowerCase();
+      if (!h) return '';           // 空 = 不开 host 分发，合法
+      if (h.includes('://')) return '只填域名，不要带 http://';
+      if (h.includes('/')) return '不要带路径，只填域名';
+      if (h.includes(':')) return '不要带端口，端口由网关统一决定';
+      if (h.includes('*')) return '不要带 * —— 通配是证书的概念，不是路由的';
+      if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(h)) {
+        return '域名格式不对，例如 siyuan.fzyto.top';
+      }
+      const clash = this.rp.rules.find(
+        r => r.id !== rule.id && String(r.host || '').trim().toLowerCase() === h);
+      if (clash) return `与「${clash.name || clash.path_prefix}」的域名重复`;
+      return '';
+    },
+
+    // 按「路径前缀 + 基础域名」自动生成 host 分发域名。
+    //
+    // 基础域名来自默认证书的 SAN（*.fzyto.top → fzyto.top），
+    // 所以生成出来的域名**一定**在泛域名证书的覆盖范围内 ——
+    // 手填反而容易填出一个证书盖不到的域名，浏览器就是满屏告警。
+    rpAutoHost() {
+      const r = this.rpEditingRule;
+      if (!r) return;
+      const bd = String((this.rp && this.rp.hostBaseDomain) || '').trim();
+      if (!bd) {
+        this.showToast('还没有基础域名：先在证书页把泛域名证书设为默认证书', 'error');
+        return;
+      }
+      const pfx = String(r.path_prefix || '').trim().replace(/^\/+|\/+$/g, '');
+      let label = (pfx.split('/')[0] || '').trim();
+      if (!label) label = String(r.name || '').trim();
+      label = label.toLowerCase()
+        .replace(/[^a-z0-9-]+/g, '-')
+        .replace(/^-+|-+$/g, '');
+      if (!label) {
+        this.showToast('没法从路径前缀推出域名，请手工填写', 'error');
+        return;
+      }
+      r.host = `${label}.${bd}`;
     },
 
     // 前缀冲突/非法的前置提示。返回空字符串表示没问题。
@@ -1780,6 +1853,7 @@ function app() {
       if (!r) return false;
       if (!String(r.name || '').trim()) return false;
       if (this.rpPrefixConflict(r)) return false;
+      if (this.rpHostConflict(r)) return false;
       if (!String(r.target_address || '').trim()) return false;
       return true;
     },
@@ -1788,6 +1862,10 @@ function app() {
       const rule = { ...this.rpEditingRule };
       // 路径前缀归一：去掉结尾斜杠，输入 /nas/ 和 /nas 等价
       rule.path_prefix = String(rule.path_prefix || '').trim().replace(/\/+$/, '');
+      // 域名归一：去空白 + 转小写。DNS 大小写不敏感，
+      // 但 nginx 的 server_name 与浏览器的 Cookie 域都按小写比较，
+      // 统一小写省掉一类「看着填对了却不生效」的坑。
+      rule.host = String(rule.host || '').trim().toLowerCase();
       // 先取下标再删标记：反序会让编辑永远走 push 分支，编辑一条等于追加一条
       const idx = rule._editIndex;
       delete rule._editIndex;
@@ -1899,6 +1977,8 @@ function app() {
         // 需要传大文件时在表单里改大（填 0 = 不限）。
         client_max_body_size: '1M',
         api_path_prefix: '',
+        // host 分发入口（对外域名）：空 = 不开，只有路径前缀一个入口。
+        host: '',
         // 根绝对路径改写：默认关。用相对路径的应用不需要它。
         rewrite_root_paths: false,
         icon: '',
@@ -1916,6 +1996,7 @@ function app() {
       // undefined / "false" 这类杂值传过去会被当成关（安全侧降级）。
       r.rewrite_root_paths = r.rewrite_root_paths === true;
       r.path_prefix = r.path_prefix || '';
+      r.host = r.host || '';
       r.name = r.name || '';
       r.target_address = r.target_address || '';
       r.target_protocol = r.target_protocol || 'http';
@@ -2050,6 +2131,9 @@ function app() {
         const body = {
           domain: this.rpRequestDomain,
           dns_provider: this.rp.selectedDnsProvider,
+          wildcard: this.rpRequestWildcard,
+          auto_renew: this.rpRequestAutoRenew,
+          renew_days: parseInt(this.rpRequestRenewDays, 10) || 60,
         };
         if (this.rp.selectedDnsProvider !== 'ali') {
           body.dns_credentials = this.rp.dnsCredentials;
@@ -2057,6 +2141,7 @@ function app() {
         const data = await api.post('/api/reverse-proxy/certificates/request', body);
         this.showToast(unwrap(data).message || '证书申请成功', 'success');
         this.rpRequestDomain = '';
+        this.rpRequestWildcard = false;
         await this.loadReverseProxy();
       } catch (e) {
         this.showToast('申请失败: ' + e.message, 'error');
@@ -2237,10 +2322,25 @@ function app() {
       this.rpEditingRule = null;
     },
 
+    // 这个函数以前**根本不存在** —— index.html 里两处 `:class="getRpCertDaysClass(...)"`
+    // 一直在求值时抛 "getRpCertDaysClass is not defined"，结果是证书卡片的
+    // 「剩余天数」和「状态」两行颜色一直不生效（Alpine 表达式一抛错，
+    // 那个元素的 class 就整个绑不上）。
+    // 和上面那个 cancelRpEdit 是同一类问题：HTML 引用了，JS 里没实现。
+    getRpCertDaysClass(days) {
+      if (days === undefined || days === null || days < 0) return 'text-gray-500';
+      if (days <= 0) return 'text-red-600 font-semibold';
+      if (days <= 15) return 'text-red-600';
+      if (days <= 30) return 'text-yellow-600';
+      return 'text-green-600';
+    },
+
     getRpCertStatusText(days) {
-      if (days === undefined || days === null) return '-';
+      if (days === undefined || days === null || days < 0) return '-';
       if (days <= 0) return '🔴 已过期';
-      return '● 有效';
+      if (days <= 15) return '🟠 即将过期';
+      if (days <= 30) return '🟡 需尽快续期';
+      return '🟢 有效';
     },
 
     async saveRpSettings() {

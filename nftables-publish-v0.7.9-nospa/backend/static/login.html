@@ -1,38 +1,111 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<!-- 光之门开关：data-gate="off" = 不演「正在进入」的转场动画，验证通过直接跳。
+     想去掉这个属性就开回来（动画体和时序在 gate.css / login.js 里没删）。
+
+     2026-10-25：这一页换成了**门脸页**的骨架 —— 品牌条 + 几何饰件 + 密码闸。
+     视觉规格来自 ghost-landing/hero-grid.tsx，做的是**零构建手写移植**：
+       · 不用 React / Tailwind / Babel —— 页面里没有一行内联样式或内联脚本
+       · 不引外部字体 / CDN —— 网关可能被部署在隔离网络里
+       · 配色跟随像素场的月白（moonstone）调色板
+     鉴权逻辑一个字没动：safeNext() 的开放重定向防护、?next= 回跳、
+     /auth/status 预探测、错误码分支、限流处理全部原样（都在 login.js）。 -->
+<html lang="zh-CN" data-gate="off">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="robots" content="noindex, nofollow">
 <title>登录 · Ghost Firewall</title>
 <link rel="stylesheet" href="/auth/static/base.css">
+<link rel="stylesheet" href="/auth/static/gate.css">
 </head>
-<body class="centered">
+<body class="doorface">
 
-<div class="card">
-  <div class="brand">
-    <div class="logo" aria-hidden="true"></div>
-    <h1>Ghost Firewall</h1>
-    <p class="sub">统一认证门户</p>
+<!-- 像素场背景：和门脸页、门户页同一个引擎（pixelfield.js）。纯装饰。 -->
+<canvas class="pixfield" id="pix" aria-hidden="true"></canvas>
+<!-- 中心暗晕：像素场是背景，文字必须压得住它。 -->
+<div class="df-vignette" aria-hidden="true"></div>
+<!-- 上下压边，把画面收到中间。 -->
+<div class="df-press df-press--top" aria-hidden="true"></div>
+<div class="df-press df-press--bottom" aria-hidden="true"></div>
+<!-- CRT 扫描线。 -->
+<div class="df-scanlines" aria-hidden="true"></div>
+
+<!-- 品牌条 -->
+<header class="df-brand layer">
+  <div class="df-brand__id">
+    <span class="logo logo-xs" aria-hidden="true"></span>
+    <span class="df-brand__name">GHOST FIREWALL</span>
+  </div>
+  <span class="df-brand__port" id="port">:8443</span>
+</header>
+
+<main class="df-main layer">
+  <!-- 几何饰件：两条线 + 一枚缓转的菱。没有文字。 -->
+  <div class="df-ornament" aria-hidden="true">
+    <span class="df-ornament__line df-ornament__line--l"></span>
+    <span class="df-ornament__gem"></span>
+    <span class="df-ornament__line df-ornament__line--r"></span>
   </div>
 
-  <form id="form" autocomplete="on" novalidate>
-    <label class="field">
-      <span>访问密码</span>
-      <input id="pw" type="password" name="password" autocomplete="current-password"
-             inputmode="text" autocapitalize="off" autocorrect="off" spellcheck="false"
-             required autofocus>
-    </label>
+  <!-- 密码闸：门脸页上的门。 -->
+  <form class="pw-form" id="form" autocomplete="on" novalidate>
+    <div class="pw-labelrow">
+      <label class="pw-label" for="pw">访问密码</label>
+      <!-- 电平刻度：一位亮一格，最多 8 位。亮灭由 login.js 挂 class 控制。 -->
+      <span class="pw-levels" id="levels" aria-hidden="true">
+        <i class="pw-lv"></i><i class="pw-lv"></i><i class="pw-lv"></i><i class="pw-lv"></i>
+        <i class="pw-lv"></i><i class="pw-lv"></i><i class="pw-lv"></i><i class="pw-lv"></i>
+      </span>
+    </div>
 
-    <div id="msg" class="msg" hidden></div>
+    <div class="pw-field" id="pwField">
+      <!-- 四角定位角标：贴着边框外缘，聚焦时浮起 -->
+      <span class="pw-corner pw-corner--tl" aria-hidden="true"></span>
+      <span class="pw-corner pw-corner--tr" aria-hidden="true"></span>
+      <span class="pw-corner pw-corner--bl" aria-hidden="true"></span>
+      <span class="pw-corner pw-corner--br" aria-hidden="true"></span>
 
-    <button id="submit" type="submit" class="primary">进入</button>
+      <div class="pw-frame">
+        <!-- 上沿流光：聚焦时循环扫过 -->
+        <span class="pw-sweep" aria-hidden="true"></span>
+        <!-- 底沿能量条：常驻呼吸 -->
+        <span class="pw-energy" aria-hidden="true"></span>
+
+        <div class="pw-field__row">
+          <div class="pw-field__input">
+            <!-- 校验中扫描光：只覆盖输入框，不扫按钮 -->
+            <span class="pw-scan" aria-hidden="true"></span>
+            <input id="pw" type="password" name="password" autocomplete="current-password"
+                   inputmode="text" autocapitalize="off" autocorrect="off" spellcheck="false"
+                   placeholder="••••••••" required autofocus>
+          </div>
+          <button id="submit" type="submit" class="pw-btn">
+            <span class="ripple" aria-hidden="true"></span>
+            <span id="btnLabel">进入</span>
+            <span class="pw-btn__arrow" aria-hidden="true">→</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <p class="pw-msg" id="msg" role="status" aria-live="polite"></p>
+    <!-- 设备标识：门脸页不显示读数，指纹仍随请求头发出。
+         元素留着（login.js 会填），需要显示时去掉 hidden 并改 base.css 里
+         .pw-device 的 display —— 但门脸页的定位是「门」，不是仪表盘。 -->
+    <p class="pw-device" id="device" hidden></p>
   </form>
+</main>
 
-  <p class="foot"><span id="device" class="device">正在识别设备…</span></p>
+<!-- 门转场层：登录成功后盖住屏幕再跳转。纯装饰，不参与鉴权。 -->
+<div class="gate" id="gate" aria-hidden="true">
+  <div class="gate__plane"></div>
+  <div class="gate__wash"></div>
+  <div class="gate__flash"></div>
+  <div class="gate__label" id="gateLabel"></div>
 </div>
 
 <script src="/auth/static/fingerprint.js"></script>
+<script src="/auth/static/pixelfield.js"></script>
 <script src="/auth/static/login.js"></script>
 </body>
 </html>

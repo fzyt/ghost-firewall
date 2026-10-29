@@ -36,54 +36,48 @@ JS_KEY = 'js'
 APP_MUTANTS = [
     # ── 宽模式开关被忽略 ────────────────────────────────────────
     ('宽模式开关被忽略（永远不生成 sub_filter）',
-     "        if isinstance(_rrp, (bool, int)) and _rrp:",
-     "        if False:"),
+     '    if isinstance(_rrp, (bool, int)) and _rrp:',
+     '    if False:'),
 
     # ── 形态漏掉一种 ────────────────────────────────────────────
     ('宽模式漏掉 action 形态（表单提交会跑到别的服务去）',
-     '            for _attr in ("href", "src", "action"):',
-     '            for _attr in ("href", "src"):'),
+     '        for _attr in ("href", "src", "action"):',
+     '        for _attr in ("href", "src"):'),
 
     ('宽模式把 href 形态写成 src（链接全改不对）',
-     """            for _attr in ("href", "src", "action"):
-                sf_rules.append((f'{_attr}="/', f'{_attr}="{prefix}/'))""",
-     """            for _attr in ("src", "action"):
-                sf_rules.append((f'{_attr}="/', f'{_attr}="{prefix}/'))"""),
+     '        for _attr in ("href", "src", "action"):\n            sf_rules.append((f\'{_attr}="/\', f\'{_attr}="{prefix}/\'))',
+     '        for _attr in ("src", "action"):\n            sf_rules.append((f\'{_attr}="/\', f\'{_attr}="{prefix}/\'))'),
 
     # ── 前缀拼接错 ──────────────────────────────────────────────
     ('宽模式前缀后面少一个斜杠（改写出来的路径少一层）',
-     """                sf_rules.append((f'{_attr}="/', f'{_attr}="{prefix}/'))""",
-     """                sf_rules.append((f'{_attr}="/', f'{_attr}="{prefix}'))"""),
+     '            sf_rules.append((f\'{_attr}="/\', f\'{_attr}="{prefix}/\'))',
+     '            sf_rules.append((f\'{_attr}="/\', f\'{_attr}="{prefix}\'))'),
 
     # ── proxy_redirect 被拿掉（302 跳转又丢前缀）─────────────────
     ('proxy_redirect 不生成（302 跳转会丢路径前缀）',
-     """        _lit = _nginx_regex_literal(prefix)
-        if _lit:""",
-     """        _lit = _nginx_regex_literal(prefix)
-        if False:"""),
+     '    _lit = _nginx_regex_literal(prefix)\n    if _lit:',
+     '    _lit = _nginx_regex_literal(prefix)\n    if False:'),
 
     ('proxy_redirect 少了负向先行断言（会给已带前缀的 Location 重复加前缀）',
-     """            L.append(f"        proxy_redirect ~^/(?!{_bare}/)(.*)$ {prefix}/$1;")""",
-     """            L.append(f"        proxy_redirect ~^/(.*)$ {prefix}/$1;")"""),
+     '        L.append(f"        proxy_redirect ~^/(?!{_bare}/)(.*)$ {prefix}/$1;")',
+     '        L.append(f"        proxy_redirect ~^/(.*)$ {prefix}/$1;")'),
 
     ('proxy_redirect 的前缀写错（跳到别的服务去）',
-     """            L.append(f"        proxy_redirect ~^/(?!{_bare}/)(.*)$ {prefix}/$1;")""",
-     """            L.append(f"        proxy_redirect ~^/(?!{_bare}/)(.*)$ /wrong/$1;")"""),
+     '        L.append(f"        proxy_redirect ~^/(?!{_bare}/)(.*)$ {prefix}/$1;")',
+     '        L.append(f"        proxy_redirect ~^/(?!{_bare}/)(.*)$ /wrong/$1;")'),
 
     # ── proxy_redirect 的两个真机坑（2026-10-20 .166 实测）────────
     ('负向先行断言里带上开头的斜杠（断言恒成立，已带前缀的 Location 被重复加前缀）',
-     """            _bare = _lit[1:] if _lit.startswith('/') else _lit""",
-     """            _bare = _lit"""),
+     "        _bare = _lit[1:] if _lit.startswith('/') else _lit",
+     '        _bare = _lit'),
 
     ('绝对 URL 规则里端口用捕获组（$1 取到端口，路径整个丢掉）',
      '''f"        proxy_redirect ~^https?://{_host_lit}(?::[0-9]+)?"''',
      '''f"        proxy_redirect ~^https?://{_host_lit}(:[0-9]+)?"'''),
 
     ('宽泛的「匹配任意 host」规则又回来了（外站跳转被劫持到网关自己）',
-     '''            L.append(f"        proxy_redirect ~^/(?!{_bare}/)(.*)$ {prefix}/$1;")''',
-     '''            L.append(f"        proxy_redirect ~^/(?!{_bare}/)(.*)$ {prefix}/$1;")\n'''
-     '''            L.append(f"        proxy_redirect ~^https?://[^/]+/(?!{_bare}/)(.*)$ "\n'''
-     '''                     f"$scheme://$http_host{prefix}/$1;")'''),
+     '        L.append(f"        proxy_redirect ~^/(?!{_bare}/)(.*)$ {prefix}/$1;")',
+     '        L.append(f"        proxy_redirect ~^/(?!{_bare}/)(.*)$ {prefix}/$1;")\n        L.append(f"        proxy_redirect ~^https?://[^/]+/(?!{_bare}/)(.*)$ "\n                 f"$scheme://$http_host{prefix}/$1;")'),
 
     ('上游 host 的点没转义（192.168.100.218 会匹配到 192x168x100x218）',
      """    return host.replace('.', '\\\\.')""",

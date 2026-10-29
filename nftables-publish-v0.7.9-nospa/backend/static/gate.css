@@ -1,0 +1,154 @@
+/* ══════════════════════════════════════════════════════════════
+   光之门（light gate）—— 门脸页与产品页共用的转场动画
+   ══════════════════════════════════════════════════════════════
+
+   **这一版换掉了原来的「黑幕合拢」。**
+
+   上一版：一条细线从中心长出，黑幕顺着那条缝从上下边缘向中心合拢，
+   盖满屏幕后跳转。观感是「幕布从远处压过来」—— 用户明确指出这条不对：
+   「出现的线条有点从远到近执行的」。
+
+   这一版反过来 —— **光迎面冲过来，占满整个屏幕**，
+   像穿过一道光之门（light gate）：
+
+     .gate__plane  门缝：一道贯穿全高的窄光，动画里向两侧炸开
+     .gate__wash   光潮：光缝张开后，光从中间漫出来把整屏淹没
+     .gate__flash  闪白：穿过去的那一瞬间
+     .gate__label  跳转前的提示文字（纯装饰，由 JS 用 textContent 填）
+
+   **时序**（全部由下面的 CSS 变量驱动，JS 只读变量、不再写死数字）：
+
+     --gate-open        560ms  门缝炸开到整屏（缓动是**加速**的，所以像朝你扑过来）
+     --gate-wash        360ms  光潮淡入
+     --gate-wash-delay  160ms  光潮比门缝晚一点起
+     --gate-label-delay 300ms  提示字开始显现
+     --gate-label-fade  260ms  提示字淡入
+     --gate-hold       1080ms  闪白时机（提示字此时已全亮并停留了 520ms，够读完）
+     --gate-total      1220ms  跳转时机
+
+   为什么缓动要用**加速**（cubic-bezier 尾段陡）而不是缓出：
+   缓出 = 东西离你远去；加速 = 东西朝你冲过来。差一个方向，感受完全不同。
+
+   **时序为什么必须放在 CSS 里**：
+   早先是 CSS 写一份、login.js / portal.js / 门脸页各写一份 430/100，
+   改一处忘另一处就脱节 —— 表现是「门缝还没张开就闪白了」，
+   光之门根本冲不过来，只剩啪一下。
+   现在 CSS 是唯一真源，JS 用 getComputedStyle 读 --gate-hold / --gate-total。
+
+   **配色**：跟随像素场的**月白 Moonstone**（银白单色）。
+   早先是暖橙红紫（rgba(255,188,126) / rgba(150,60,110)）——
+   那是像素场还是琥珀时代配的，换成银白门脸后一开门就是一屏橙红，跟画面打架。
+
+   CSP 说明：这里全部是外部样式表里的规则，页面里没有一行内联样式。
+   ══════════════════════════════════════════════════════════════ */
+
+.gate {
+  /* ── 时序：CSS 是唯一真源，JS 读 --gate-hold / --gate-total ── */
+  --gate-open: 560ms;
+  --gate-wash: 360ms;
+  --gate-wash-delay: 160ms;
+  --gate-label-delay: 300ms;
+  --gate-label-fade: 260ms;
+  --gate-hold: 1080ms;
+  --gate-total: 1220ms;
+
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  pointer-events: none;
+  visibility: hidden;
+  overflow: hidden;
+}
+
+/* 只有加了 .on 才接管点击（此时正在跳转，不能再点表单） */
+.gate.on { visibility: visible; pointer-events: all; }
+
+/* ── 开关：<html data-gate="off"> → 光之门整个不演 ─────────────
+   2026-10-25 用户提出「正在进入 / 正在退出这两个特效不要了，直接跳转」。
+   做法是**加开关而不是删代码**：
+     · CSS：这里把 .gate 彻底藏掉
+     · JS：三个入口（playGate / gateClose / gateOpen）都读同一个属性，
+       不演动画、也不等那 1.2 秒，直接跳。
+   想开回来：把三个 HTML 的 <html> 上的 data-gate="off" 去掉即可，
+   动画体和时序一行都不用改。 */
+html[data-gate="off"] .gate { display: none !important; }
+
+/* ── 门缝：一道贯穿全高的窄光，向两侧炸开 ─────────────────── */
+.gate__plane {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 100%;
+  margin-left: -50%;
+  background: linear-gradient(180deg,
+    rgba(255, 255, 255, 0) 0%,
+    rgba(255, 255, 255, .40) 13%,
+    rgba(255, 255, 255, .96) 50%,
+    rgba(255, 255, 255, .40) 87%,
+    rgba(255, 255, 255, 0) 100%);
+  box-shadow: 0 0 90px 26px rgba(214, 222, 236, .55);
+  transform: scaleX(.012);
+  transform-origin: 50% 50%;
+  transition: transform var(--gate-open) cubic-bezier(.58, .02, .85, .18);
+  will-change: transform;
+}
+.gate.on .gate__plane { transform: scaleX(1); }
+
+/* ── 光潮：光从中间漫出来，把整屏淹没 ─────────────────────── */
+.gate__wash {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(112% 82% at 50% 50%,
+    #fff 0%,
+    rgba(243, 246, 250, .97) 22%,
+    rgba(198, 204, 214, .88) 48%,
+    rgba(120, 130, 150, .55) 74%,
+    rgba(18, 20, 26, 0) 100%);
+  opacity: 0;
+  transition: opacity var(--gate-wash) linear var(--gate-wash-delay);
+}
+.gate.on .gate__wash { opacity: 1; }
+
+/* ── 闪白：穿过去的那一瞬间 ───────────────────────────────── */
+.gate__flash {
+  position: absolute;
+  inset: 0;
+  background: #fff;
+  opacity: 0;
+  transition: opacity .12s linear;
+}
+.gate.settled .gate__flash { opacity: 1; }
+
+/* ── 门上的标题：跳转前一闪而过 ─────────────────────────────
+   纯装饰，用 textContent 由 JS 填。颜色是深色 —— 这时候背景
+   已经被光潮染白了，深字才读得出来。 */
+.gate__label {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  transform: translate3d(0, -50%, 0);
+  text-align: center;
+  font-family: var(--mono, ui-monospace, "SF Mono", Menlo, Consolas, monospace);
+  font-size: 13px;
+  letter-spacing: .34em;
+  color: rgba(20, 23, 30, .82);
+  text-shadow: 0 0 14px rgba(255, 255, 255, .75);
+  opacity: 0;
+  transition: opacity var(--gate-label-fade) linear var(--gate-label-delay);
+}
+.gate.on .gate__label { opacity: 1; }
+
+/* ── 反向开门：页面一加载就是「门关着」的状态 ───────────────
+   撤掉 .preclosed 时，光潮退散、让出页面 —— 像从光门里走出来。
+   .preclosed 用来跳过展开动画（否则会先「开」一下再「关」，闪一帧）。 */
+.gate.preclosed .gate__plane { opacity: 0; transition: none; }
+.gate.preclosed .gate__wash { opacity: 1; transition: none; }
+.gate.preclosed .gate__flash { opacity: 0; transition: none; }
+.gate.preclosed .gate__label { opacity: 0; transition: none; }
+
+/* ── 降级：开了「减弱动态效果」就完全不播 ─────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  .gate { display: none !important; }
+}

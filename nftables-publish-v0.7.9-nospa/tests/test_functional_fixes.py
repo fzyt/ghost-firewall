@@ -327,7 +327,14 @@ check('看门狗有自己的损坏检查（守卫下沉不会误伤自愈）',
 # 旧代码在这里产出 [emerg] unknown "auth_user" variable（.224 真机实测），
 # 后果不是少个功能，是整份配置拒绝加载 → 整个网关连 portal/登录页一起没了。
 sec('FIX-10 网关 0 服务时 nginx 配置仍可加载（$auth_user 必须有定义）')
-_gen = fn_src(APP_SRC, '_generate_gateway_nginx_conf')
+# 2026-10-28 host 分发改造把网关配置的生成拆成了三个函数：
+#   _generate_gateway_nginx_conf（组装）/ _nginx_server_preamble（server 前言）/
+#   _nginx_service_location（单个服务的 location）
+# $auth_user 的默认值在前言里、回环白名单在 service location 里 —— 只看主函数
+# 会把它们当成「消失了」。这里是**搬走**，不是删除，所以断言要覆盖整条链路。
+_gen = (fn_src(APP_SRC, '_nginx_server_preamble')
+        + fn_src(APP_SRC, '_nginx_service_location')
+        + fn_src(APP_SRC, '_generate_gateway_nginx_conf'))
 
 # 只看剥掉注释后的代码 —— 解释这个 bug 的注释里就写着 auth_request_set，
 # 做位置判断时会被当成真的赋值语句（同一个坑已经踩过三次）。
@@ -344,7 +351,9 @@ _NGINX_BUILTIN_VARS = {
     'http_user_agent', 'http_referer',
 }
 _i_set_user = _gen_code.find('set $auth_user')
-_i_loop = _gen_code.find('for rule, prefix, protocol, host, tport in services')
+# 循环元组 2026-10-28 起是 6 元（多了 rp_host），这里只匹配前缀，
+# 免得每加一个字段就要改一次锚点。
+_i_loop = _gen_code.find('for rule, prefix, protocol, host, tport')
 check('$auth_user 在服务端级别有 set 默认值（不依赖服务循环）',
       _i_set_user != -1 and (_i_loop == -1 or _i_set_user < _i_loop),
       f'set@{_i_set_user} / 循环@{_i_loop}')
@@ -599,7 +608,9 @@ check('阿里云结果行用的是 x-if 而不是 x-show',
 
 # ── FIX-14  网关 allow 127.0.0.1 ──────────────────────────────────
 sec('FIX-14 仅内网服务同时放行 IPv4 与 IPv6 回环')
-_gen2b = fn_src(APP_SRC, '_generate_gateway_nginx_conf')
+# 回环白名单搬进了 _nginx_service_location —— 同上，看整条链路。
+_gen2b = (fn_src(APP_SRC, '_nginx_service_location')
+          + fn_src(APP_SRC, '_generate_gateway_nginx_conf'))
 _gen2b_c = strip_comments(_gen2b)
 check('生成物里有 allow 127.0.0.1', 'allow 127.0.0.1;' in _gen2b_c)
 check('生成物里仍保留 allow ::1（IPv6 回环没被这个改动挤掉）',

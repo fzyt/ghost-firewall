@@ -1,19 +1,75 @@
 /* 认证门户共用样式 —— 自包含，不引外部字体/CDN
  * 理由：网关可能被部署在隔离网络里，外链资源既拖慢首屏又引入
- * 「第三方被劫持就能改登录页」的攻击面。 */
+ * 「第三方被劫持就能改登录页」的攻击面。
+ *
+ * CSP 是 `default-src 'none'; script-src 'self'; style-src 'self'`，
+ * 所以**不能用内联 <style>、不能用 style="" 属性、不能用内联 <script>**。
+ * 本文件是唯一的样式来源。
+ *
+ * 2026-10-22 视觉重做（第二轮）：
+ *   · 背景换成**像素场**（pixelfield.js 画的方块流），和门脸页同一个引擎
+ *   · 按钮重做成一套语言：辉光 / 高光扫过 / 底部呼吸条 / 按压冲击波
+ *   · 服务卡片改高对比度：暗底实面、锐角、顶部高光、悬停辉光
+ *   · 圆角从 22px 收到 3–6px（方块和像素场是一套语言）
+ *   · 所有动效都有 @media (prefers-reduced-motion: reduce) 降级
+ *   · 动效纯装饰，不参与任何鉴权流程；JS 挂了表单照样能提交
+ */
+
+/* ══════════════════════════════════════════════════════════════
+   设计令牌
+   ══════════════════════════════════════════════════════════════ */
 
 :root {
-  --bg: #0b0d10;
-  --card: #15181d;
-  --card-2: #1c2027;
-  --line: #2a2f37;
-  --fg: #e8eaed;
-  --fg-dim: #9aa0a8;
-  --accent: #3b82f6;
-  --ok: #22c55e;
-  --warn: #f59e0b;
-  --err: #ef4444;
-  --radius: 12px;
+  /* 底色：和像素场引擎 moonstone 调色板的 bg（rgb(10,10,11)）严格对齐。
+     两者只要差一点点，canvas 的底就会从页面底上「浮」出来一条边。 */
+  --bg:          #0a0a0b;
+  --bg-2:        #101013;
+
+  /* 表面：暗底实面 + 背景模糊。不用浅色玻璃 —— 像素场在背后，
+     浅色玻璃会把方块洗成一片脏灰。 */
+  --surface:     rgba(10, 10, 11, .72);
+  --surface-2:   rgba(16, 16, 19, .82);
+  --surface-3:   rgba(23, 23, 27, .90);
+
+  /* 描边：默认几乎看不见，悬停时才亮。月白银不带彩，
+     所以这里用「亮度差」而不是「色相差」来表达层级。 */
+  --stroke:      rgba(206, 210, 222, .12);
+  --stroke-2:    rgba(206, 210, 222, .26);
+  --stroke-hot:  rgba(214, 220, 232, .50);
+
+  /* 文字 */
+  --fg:          #eceef2;
+  --fg-dim:      #9a9ea8;
+  --fg-mute:     #6b6f79;
+
+  /* 信号银：整站唯一的强调色（月白银，不带彩）。
+     底 #babec8 / 亮 #e8eaef / 墨 #0a0a0b（压在亮色上的文字/图形） */
+  --signal:      #babec8;
+  --signal-hi:   #e8eaef;
+  --signal-ink:  #0a0a0b;
+
+  --ok:          #34d399;
+  --warn:        #fbbf24;
+  --err:         #f87171;
+
+  /* 圆角：像素场是方的，界面也得方 */
+  --r-xl: 8px;
+  --r-lg: 6px;
+  --r-md: 4px;
+  --r-sm: 3px;
+
+  /* 统一缓动：出场用 ease-out，位移用 spring-ish */
+  --ease:        cubic-bezier(.16, 1, .3, 1);
+  --ease-in:     cubic-bezier(.7, 0, .84, 0);
+  --spring:      cubic-bezier(.34, 1.56, .64, 1);
+
+  --t-fast:  .16s;
+  --t-mid:   .28s;
+  --t-slow:  .46s;
+
+  /* 等宽字体栈：编号、路径、状态都走它 */
+  --mono: ui-monospace, SFMono-Regular, Menlo, "Cascadia Mono",
+          "Liberation Mono", "Noto Sans Mono CJK SC", monospace;
 }
 
 * { box-sizing: border-box; }
@@ -21,202 +77,1247 @@
 html, body {
   margin: 0;
   padding: 0;
-  background: var(--bg);
+  min-height: 100%;
   color: var(--fg);
-  font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+  font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
         "Hiragino Sans GB", "Microsoft YaHei", Roboto, sans-serif;
   -webkit-font-smoothing: antialiased;
   -webkit-text-size-adjust: 100%;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   像素场背景层
+   ══════════════════════════════════════════════════════════════ */
+
+/* 画布本体。fixed 全屏，吃不到指针事件。
+   注意：canvas 是替换元素，inset:0 不会把它拉伸（会退回 300×150 的
+   固有尺寸），必须显式给 width/height:100% —— 否则只有左上角一块。 */
+.pixfield {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 0;
+  pointer-events: none;
+  display: block;
+}
+
+/* 压暗层：像素场是背景，内容必须压得住它。
+   内容是顶部对齐的，所以左上角压得最狠，底部保留更多场。 */
+.pix-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(58% 48% at 34% 20%,
+      rgba(10, 10, 11, .94) 0%, rgba(10, 10, 11, .74) 48%, rgba(10, 10, 11, .22) 100%),
+    linear-gradient(180deg,
+      rgba(10, 10, 11, .90) 0%, rgba(10, 10, 11, .34) 30%,
+      rgba(10, 10, 11, .50) 70%, rgba(10, 10, 11, .88) 100%);
+}
+
+/* 内容层：永远在像素场之上 */
+.layer {
+  position: relative;
+  z-index: 1;
+}
+
+body {
+  background: var(--bg);
+  position: relative;
+  isolation: isolate;
+  overflow-x: hidden;
 }
 
 body.centered {
   min-height: 100vh;
   min-height: 100dvh;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 20px;
+  display: grid;
+  place-items: center;
+  padding: 24px 20px;
 }
 
-/* ── 登录卡片 ─────────────────────────────────────────── */
+/* 通用文本 */
+h1, h2, h3 { font-weight: 600; letter-spacing: -.01em; }
+a { color: inherit; }
+
+/* ══════════════════════════════════════════════════════════════
+   登录卡片
+   ══════════════════════════════════════════════════════════════ */
 
 .card {
+  position: relative;
+  z-index: 1;                 /* 压在像素场之上 */
   width: 100%;
-  max-width: 380px;
-  background: var(--card);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: 28px 24px 20px;
+  max-width: 396px;
+  padding: 34px 30px 24px;
+  border-radius: var(--r-xl);
+  border: 1px solid var(--stroke);
+  background:
+    linear-gradient(180deg, rgba(190, 196, 210, .05), rgba(190, 196, 210, 0) 42%),
+    var(--surface-2);
+  backdrop-filter: blur(20px) saturate(130%);
+  -webkit-backdrop-filter: blur(20px) saturate(130%);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, .07) inset,
+    0 30px 70px -18px rgba(0, 0, 0, .92),
+    0 0 0 1px rgba(0, 0, 0, .5),
+    0 0 90px -44px rgba(190, 196, 210, .50);
+  animation: card-in .62s var(--ease) both;
+  overflow: hidden;
+}
+/* 顶部一道高光描边，模拟玻璃边缘反光 */
+.card::before {
+  content: "";
+  position: absolute;
+  top: 0; left: 12%; right: 12%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(190, 196, 210, .52), transparent);
+  opacity: .8;
+}
+@keyframes card-in {
+  from { opacity: 0; transform: translate3d(0, 18px, 0) scale(.985); }
+  to   { opacity: 1; transform: none; }
 }
 
-.brand { text-align: center; margin-bottom: 22px; }
+.brand { text-align: center; margin-bottom: 26px; }
 
 .logo {
-  width: 44px; height: 44px;
-  margin: 0 auto 12px;
-  border-radius: 11px;
-  background: linear-gradient(135deg, var(--accent), #1d4ed8);
   position: relative;
+  width: 52px; height: 52px;
+  margin: 0 auto 14px;
+  border-radius: 12px;
+  background: linear-gradient(140deg, #dfe2e9, #7f838d);
+  box-shadow:
+    0 8px 22px -8px rgba(190, 196, 210, .38),
+    0 0 0 1px rgba(255, 255, 255, .10) inset;
+  animation: logo-breathe 4.2s ease-in-out infinite;
 }
 .logo::after {
   content: "";
-  position: absolute; inset: 13px;
-  border: 2px solid rgba(255,255,255,.92);
+  position: absolute; inset: 15px;
+  border: 2px solid rgba(10, 10, 11, .92);
   border-radius: 3px;
   border-bottom-color: transparent;
   border-right-color: transparent;
   transform: rotate(-45deg);
 }
+/* Logo 上缓慢扫过的一道高光 */
+.logo::before {
+  content: "";
+  position: absolute; inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(115deg, transparent 30%, rgba(255, 255, 255, .45) 48%, transparent 62%);
+  background-size: 260% 100%;
+  animation: logo-sweep 4.2s ease-in-out infinite;
+  mix-blend-mode: overlay;
+}
+@keyframes logo-breathe {
+  0%, 100% { transform: translateY(0) scale(1); }
+  50%      { transform: translateY(-2px) scale(1.035); }
+}
+@keyframes logo-sweep {
+  0%   { background-position: 160% 0; }
+  55%, 100% { background-position: -60% 0; }
+}
 
-.brand h1 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: .2px; }
-.brand .sub { margin: 4px 0 0; font-size: 13px; color: var(--fg-dim); }
+.brand h1 { margin: 0; font-size: 19px; font-weight: 650; }
+.brand .sub { margin: 5px 0 0; font-size: 13px; color: var(--fg-dim); }
 
-/* ── 表单 ─────────────────────────────────────────────── */
+/* ══════════════════════════════════════════════════════════════
+   表单
+   ══════════════════════════════════════════════════════════════ */
 
-.field { display: block; margin-bottom: 14px; }
+.field { display: block; margin-bottom: 16px; }
 .field span {
   display: block;
-  font-size: 13px;
+  font-size: 12.5px;
   color: var(--fg-dim);
-  margin-bottom: 6px;
+  margin-bottom: 7px;
+  letter-spacing: .02em;
 }
 
 input[type="password"], input[type="text"] {
   width: 100%;
-  padding: 11px 12px;
-  background: var(--card-2);
-  border: 1px solid var(--line);
-  border-radius: 9px;
+  padding: 12px 13px;
+  background: rgba(0, 0, 0, .42);
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-md);
   color: var(--fg);
   font-size: 16px;              /* iOS 上小于 16px 会触发聚焦缩放 */
   outline: none;
-  transition: border-color .15s, box-shadow .15s;
+  transition: border-color var(--t-fast), box-shadow var(--t-fast), background var(--t-fast);
 }
+input::placeholder { color: var(--fg-mute); }
+input:hover { border-color: var(--stroke-2); }
 input:focus {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(59,130,246,.18);
+  border-color: var(--stroke-hot);
+  background: rgba(0, 0, 0, .58);
+  box-shadow: 0 0 0 3px rgba(190, 196, 210, .14), 0 0 26px -6px rgba(190, 196, 210, .36);
 }
 
+/* ══════════════════════════════════════════════════════════════
+   按钮系统
+   —— 辉光 / 高光扫过 / 底部呼吸条 / 按压冲击波
+   ══════════════════════════════════════════════════════════════ */
+
+.btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 12px 18px;
+  border-radius: var(--r-md);
+  border: 1px solid rgba(190, 196, 210, .38);
+  background: rgba(190, 196, 210, .07);
+  color: var(--signal-hi);
+  font-family: var(--mono);
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: .06em;
+  cursor: pointer;
+  overflow: hidden;
+  isolation: isolate;
+  text-decoration: none;
+  box-shadow:
+    0 0 0 1px rgba(190, 196, 210, .06),
+    0 0 50px -20px rgba(190, 196, 210, .46);
+  transition:
+    transform var(--t-fast) var(--spring),
+    box-shadow var(--t-mid) var(--ease),
+    border-color var(--t-mid) var(--ease),
+    background-color var(--t-mid) var(--ease),
+    color var(--t-mid) var(--ease);
+}
+
+/* 高光：斜切光条从左扫到右 */
+.btn::before {
+  content: "";
+  position: absolute;
+  top: -60%; bottom: -60%;
+  left: -60%;
+  width: 40%;
+  z-index: -1;
+  background: linear-gradient(100deg, transparent, rgba(240, 242, 246, .34), transparent);
+  transform: translate3d(-160%, 0, 0) rotate(14deg);
+  transition: transform .7s var(--ease);
+}
+/* 呼吸：底部一道细辉光条 */
+.btn::after {
+  content: "";
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(190, 196, 210, .76), transparent);
+  opacity: .55;
+  transition: opacity var(--t-mid) var(--ease);
+}
+.btn:hover:not([disabled]) {
+  border-color: rgba(244, 245, 248, .55);
+  background: rgba(190, 196, 210, .16);
+  color: #ffffff;
+  /* 辉光分两层：贴边亮环（几乎白的）+ 宽域柔晕（中银）。
+     早先只有一层 70px/-14px 的中灰 —— 在近黑底上颜色太暗、
+     spread 收得太紧，看着像没发光。 */
+  box-shadow:
+    0 0 0 1px rgba(232, 234, 240, .40),
+    0 0 26px -6px rgba(244, 245, 248, .62),
+    0 0 72px -12px rgba(186, 190, 200, .80);
+}
+.btn:hover:not([disabled])::before { transform: translate3d(420%, 0, 0) rotate(14deg); }
+.btn:hover:not([disabled])::after { opacity: 1; }
+.btn:active:not([disabled]) { transform: scale(.975); }
+.btn[disabled] { opacity: .5; cursor: default; }
+
+/* 冲击波：按下时炸开的一圈。位置由 JS 通过 --rx / --ry 传进来，
+   传不进来就退化成从中心炸开（纯 CSS 也能用）。 */
+.btn .ripple,
+.ghost .ripple,
+.pw-btn .ripple {
+  position: absolute;
+  left: var(--rx, 50%);
+  top: var(--ry, 50%);
+  width: 12px; height: 12px;
+  margin: -6px 0 0 -6px;
+  border-radius: 50%;
+  background: radial-gradient(circle,
+    rgba(240, 242, 246, .50) 0%, rgba(190, 196, 210, 0) 70%);
+  opacity: 0;
+  pointer-events: none;
+  transform: scale(.2);
+}
+.btn.rippling .ripple,
+.ghost.rippling .ripple,
+.pw-btn.rippling .ripple { animation: ripple .7s var(--ease) forwards; }
+@keyframes ripple {
+  from { opacity: .9; transform: scale(.2); }
+  to   { opacity: 0; transform: scale(22); }
+}
+
+/* 主按钮：登录页的「进入」。占满宽度。 */
 button.primary {
   width: 100%;
-  padding: 11px 12px;
-  background: var(--accent);
-  color: #fff;
-  border: 0;
-  border-radius: 9px;
+  padding: 13px 16px;
   font-size: 15px;
   font-weight: 600;
-  cursor: pointer;
-  transition: background .15s, opacity .15s;
 }
-button.primary:hover:not(:disabled) { background: #2f6fe0; }
-button.primary:disabled { opacity: .6; cursor: default; }
+/* 次级按钮（门户页的「退出」）的样式统一放在下面的 .ghost 里 ——
+   早先这里有一份 button.ghost，选择器比 .ghost 更具体，
+   改 .ghost 根本改不动它，两份样式会慢慢漂移。现在只留一份。 */
 
-/* ── 提示条 ───────────────────────────────────────────── */
+/* 验证中：按钮里转的弧 */
+button.primary .spinner {
+  display: none;
+  width: 14px; height: 14px;
+  margin-right: 2px;
+  vertical-align: -2px;
+  border: 2px solid rgba(240, 242, 246, .26);
+  border-top-color: rgba(240, 242, 246, .95);
+  border-radius: 50%;
+  animation: spin .68s linear infinite;
+}
+button.primary.busy .spinner { display: inline-block; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ══════════════════════════════════════════════════════════════
+   提示条
+   ══════════════════════════════════════════════════════════════ */
 
 .msg {
-  margin: 0 0 12px;
-  padding: 9px 11px;
-  border-radius: 8px;
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border-radius: var(--r-sm);
   font-size: 13.5px;
-  background: var(--card-2);
-  border: 1px solid var(--line);
+  background: rgba(16, 16, 19, .8);
+  border: 1px solid var(--stroke);
   color: var(--fg-dim);
+  animation: msg-in .3s var(--ease) both;
 }
-.msg.err  { color: #fca5a5; border-color: #7f1d1d; background: #2a1414; }
-.msg.warn { color: #fcd34d; border-color: #78350f; background: #2a1f10; }
-.msg.ok   { color: #86efac; border-color: #14532d; background: #12251a; }
+@keyframes msg-in {
+  from { opacity: 0; transform: translate3d(0, -6px, 0); }
+  to   { opacity: 1; transform: none; }
+}
+.msg.err  { color: #fca5a5; border-color: rgba(248, 113, 113, .38); background: rgba(248, 113, 113, .10); }
+.msg.warn { color: #fcd34d; border-color: rgba(251, 191, 36, .34);  background: rgba(251, 191, 36, .09); }
+.msg.ok   { color: #86efac; border-color: rgba(52, 211, 153, .34);  background: rgba(52, 211, 153, .09); }
 
-.foot { margin: 16px 0 0; text-align: center; font-size: 12px; color: var(--fg-dim); }
-.device { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }
+/* 密码错误：卡片横向抖一下（不位移布局，只做视觉反馈） */
+.card.shake { animation: shake .42s cubic-bezier(.36, .07, .19, .97) both; }
+@keyframes shake {
+  10%, 90% { transform: translate3d(-2px, 0, 0); }
+  20%, 80% { transform: translate3d(4px, 0, 0); }
+  30%, 50%, 70% { transform: translate3d(-7px, 0, 0); }
+  40%, 60% { transform: translate3d(7px, 0, 0); }
+}
 
-/* ── 门户页 ───────────────────────────────────────────── */
+.foot { margin: 18px 0 0; text-align: center; font-size: 12px; color: var(--fg-mute); }
+.device { font-family: var(--mono); font-size: 11.5px; }
 
-.portal { max-width: 880px; margin: 0 auto; padding: 24px 18px 48px; }
+/* ══════════════════════════════════════════════════════════════
+   门转场 —— 已移出
+
+   光之门的动画现在单独放在 gate.css：
+   门脸页（demo）和产品门户页 / 登录页要演**同一道门**，
+   拆成独立文件才能真正共用一份，而不是各写一份然后慢慢漂移。
+   ══════════════════════════════════════════════════════════════ */
+
+/* ══════════════════════════════════════════════════════════════
+   门户页
+   ══════════════════════════════════════════════════════════════ */
+
+.portal {
+  max-width: 940px;
+  margin: 0 auto;
+  padding: 30px 20px 56px;
+}
 
 .p-head {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 14px;
+  gap: 16px;
   flex-wrap: wrap;
-  padding-bottom: 16px;
-  margin-bottom: 20px;
-  border-bottom: 1px solid var(--line);
+  padding: 16px 18px;
+  margin-bottom: 24px;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--stroke);
+  background: var(--surface);
+  backdrop-filter: blur(16px) saturate(130%);
+  -webkit-backdrop-filter: blur(16px) saturate(130%);
+  box-shadow: 0 18px 44px -26px rgba(0, 0, 0, .95);
+  animation: card-in .55s var(--ease) both;
 }
-.p-title h1 { margin: 0; font-size: 20px; font-weight: 600; }
-.p-title p { margin: 4px 0 0; font-size: 13px; color: var(--fg-dim); }
-.p-actions { display: flex; align-items: center; gap: 8px; }
+.p-title h1 { margin: 0; font-size: 21px; font-weight: 650; }
+.p-title p { margin: 5px 0 0; font-size: 13px; color: var(--fg-dim); }
+.p-actions { display: flex; align-items: center; gap: 9px; }
+/* 竖分隔线：把「倒计时」和「退出」分成两件不同的事。
+   倒计时被隐藏时（内网免认证）分隔线跟着消失，不留一根孤线。 */
+.vsep {
+  width: 1px;
+  height: 20px;
+  flex: none;
+  background: var(--stroke);
+}
+.pill[hidden] + .vsep { display: none; }
+
+/* 头部左侧的品牌标识 */
+.p-brand { display: flex; align-items: center; gap: 13px; }
+.logo-sm {
+  width: 38px; height: 38px;
+  flex: none;
+  margin: 0;
+  border-radius: 10px;
+}
+.logo-sm::after { inset: 11px; }
+.logo-sm::before { display: none; }
 
 .pill {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 5px 10px;
+  padding: 5px 11px;
   border-radius: 999px;
-  border: 1px solid var(--line);
-  background: var(--card);
+  border: 1px solid var(--stroke);
+  background: var(--surface);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  font-family: var(--mono);
   font-size: 12.5px;
   color: var(--fg-dim);
   white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 .pill b { color: var(--fg); font-weight: 600; }
+.pill.low  { border-color: rgba(251, 191, 36, .34); color: #fcd34d; }
 .pill.low b { color: var(--warn); }
+.pill.crit { border-color: rgba(248, 113, 113, .40); color: #fca5a5; animation: pulse 1.5s ease-in-out infinite; }
 .pill.crit b { color: var(--err); }
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(248, 113, 113, .0); }
+  50%      { box-shadow: 0 0 0 4px rgba(248, 113, 113, .12); }
+}
 
+/* 退出：中性描边，不跟内容抢视觉。
+   hover 泛一点淡红 —— 全站只有这一个按钮带「破坏性」语义，
+   不用信号银（那是正向强调），也不用大红（太吵，像报警）。
+   它是**独立**的一套按钮样式，不挂 .btn —— .btn 的扫光、呼吸条、
+   银辉光都是给正向动作用的，套在「退出」上像在推销。 */
 .ghost {
-  padding: 6px 12px;
-  border-radius: 8px;
-  border: 1px solid var(--line);
-  background: var(--card);
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 7px 13px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--stroke);
+  background: var(--surface);
   color: var(--fg-dim);
+  font-family: var(--mono);
   font-size: 13px;
   cursor: pointer;
+  overflow: hidden;
+  isolation: isolate;
+  text-decoration: none;
+  transition:
+    color var(--t-fast) var(--ease),
+    border-color var(--t-fast) var(--ease),
+    background-color var(--t-fast) var(--ease),
+    box-shadow var(--t-fast) var(--ease),
+    transform var(--t-fast) var(--ease);
 }
-.ghost:hover { color: var(--fg); border-color: #3a4149; }
+.ghost:hover {
+  color: #f0b4b4;
+  border-color: rgba(248, 113, 113, .40);
+  background: rgba(248, 113, 113, .07);
+  box-shadow: 0 0 26px -14px rgba(248, 113, 113, .85);
+}
+.ghost:active { transform: scale(.97); }
+.ghost[disabled] { opacity: .5; cursor: default; }
 
 .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(198px, 1fr));
+  gap: 13px;
 }
 
+/* ── 服务卡片 ──────────────────────────────────────────────
+   瘦成两行：
+     行 1  [首字母] 服务名 ·············· 路径（同一行右端）
+     行 2  [首字母] ● 公网 · 需认证                ↗
+   服务名在左、路径在右「同一行两端」—— 扫一眼就能对上名字和路径，
+   不用在两行之间来回找。
+   图标只留路径首字母：服务名随时会改，路径首字母不会跟着变。
+   徽章去掉边框和底色，只留一个小圆点 —— 颜色本身就是信息，
+   再套个框等于把同一句话说两遍。
+   入场是「涌现」：从下方 + 缩小 + 透明，长出来。 */
 .tile {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 16px;
-  border-radius: var(--radius);
-  border: 1px solid var(--line);
-  background: var(--card);
+  position: relative;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas:
+    "ico nm pt"
+    "ico tag tag";
+  align-items: center;
+  column-gap: 10px;
+  row-gap: 5px;
+  padding: 13px 14px 12px;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--stroke);
+  background: var(--surface);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
   text-decoration: none;
   color: inherit;
-  transition: border-color .15s, transform .1s, background .15s;
+  overflow: hidden;
+  animation: tile-in .52s var(--ease) backwards;
+  transition:
+    border-color var(--t-mid) var(--ease),
+    transform var(--t-mid) var(--ease),
+    box-shadow var(--t-mid) var(--ease),
+    background-color var(--t-mid) var(--ease);
+  box-shadow: 0 14px 34px -22px rgba(0, 0, 0, .95);
 }
-.tile:hover { border-color: #3f4750; background: var(--card-2); transform: translateY(-1px); }
-.tile:active { transform: none; }
+/* 卡片顶部那道随悬停点亮的描边 */
+.tile::before {
+  content: "";
+  position: absolute;
+  top: 0; left: 18%; right: 18%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--signal), transparent);
+  opacity: 0;
+  transition: opacity var(--t-mid);
+}
+/* 指向感：右下角一枚 ↗，悬停/聚焦时浮出来。
+   放在**第二行**右侧 —— 第一行右端已经给了路径。
+   用 \2197 转义而不是直接写字符：样式表的编码跟着引用它的文档走，
+   写死字符等于赌它一定是 UTF-8。 */
+.tile::after {
+  content: "\2197";
+  position: absolute;
+  right: 13px; bottom: 10px;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--fg-mute);
+  opacity: 0;
+  transform: translate3d(-2px, 2px, 0);
+  transition:
+    opacity var(--t-mid) var(--ease),
+    transform var(--t-mid) var(--ease),
+    color var(--t-mid) var(--ease);
+}
+.tile:hover {
+  border-color: var(--stroke-hot);
+  background: var(--surface-2);
+  transform: translate3d(0, -4px, 0) scale(1.01);
+  box-shadow:
+    0 22px 46px -22px rgba(0, 0, 0, .95),
+    0 0 40px -14px rgba(190, 196, 210, .46);
+}
+.tile:hover::before { opacity: .95; }
+.tile:hover::after,
+.tile:focus-visible::after {
+  opacity: .9;
+  transform: none;
+  color: var(--signal-hi);
+}
+.tile:active { transform: translate3d(0, -1px, 0) scale(.995); }
 
-.tile .ico { font-size: 20px; line-height: 1; }
-.tile .nm { font-size: 15px; font-weight: 600; }
-.tile .pt { font-size: 12px; color: var(--fg-dim); font-family: ui-monospace, Menlo, monospace; }
+/* 点击即时反馈：按下瞬间卡片亮一下。
+   早先只有 :active 的位移，而位移又被入场动画的 fill 吃掉了
+   （动画在填充阶段优先级高于普通声明）—— 点下去「没被接住」。
+   这里给一个 90ms 的高亮，点了立刻有回应。 */
+.tile.is-hit {
+  background-color: rgba(240, 242, 246, .10);
+  border-color: rgba(214, 220, 232, .46);
+  transition:
+    border-color 90ms var(--ease),
+    transform 90ms var(--ease),
+    box-shadow 90ms var(--ease),
+    background-color 90ms linear;
+}
 
+/* 入场动效用 backwards 而不是 forwards：
+   forwards 会让动画结束后继续「占着」transform / opacity，
+   于是 .tile:hover 的位移永远不生效（动画填充的优先级高于普通声明）。
+   改成 backwards 之后静止态由 .tile 自己声明，悬停才能接管。 */
+@keyframes tile-in {
+  from { opacity: 0; transform: translate3d(0, 18px, 0) scale(.96); }
+}
+
+/* 卡片逐个入场。用 nth-child 而不是 JS 设 style ——
+ * CSP 的 style-src 'self' 会拦 HTML 里的 style="..." 属性，
+ * 纯 CSS 的方案不受任何限制。 */
+.tile:nth-child(1)  { animation-delay: .02s; }
+.tile:nth-child(2)  { animation-delay: .07s; }
+.tile:nth-child(3)  { animation-delay: .12s; }
+.tile:nth-child(4)  { animation-delay: .17s; }
+.tile:nth-child(5)  { animation-delay: .22s; }
+.tile:nth-child(6)  { animation-delay: .27s; }
+.tile:nth-child(7)  { animation-delay: .32s; }
+.tile:nth-child(8)  { animation-delay: .37s; }
+.tile:nth-child(9)  { animation-delay: .42s; }
+.tile:nth-child(10) { animation-delay: .47s; }
+.tile:nth-child(11) { animation-delay: .52s; }
+.tile:nth-child(12) { animation-delay: .57s; }
+
+/* 图标：只留路径首字母，一个 26px 的小方块 */
+.tile .ico {
+  grid-area: ico;
+  align-self: center;
+  width: 26px; height: 26px;
+  display: grid;
+  place-items: center;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1;
+  text-transform: uppercase;
+  border-radius: var(--r-sm);
+  background: rgba(190, 196, 210, .08);
+  border: 1px solid rgba(190, 196, 210, .20);
+  color: var(--signal-hi);
+  transition:
+    transform var(--t-mid) var(--spring),
+    background var(--t-mid) var(--ease),
+    box-shadow var(--t-mid) var(--ease),
+    border-color var(--t-mid) var(--ease);
+}
+.tile:hover .ico {
+  transform: translateY(-1px) scale(1.06);
+  background: rgba(190, 196, 210, .18);
+  border-color: rgba(190, 196, 210, .42);
+  box-shadow: 0 0 22px -8px rgba(190, 196, 210, .70);
+}
+.tile .nm {
+  grid-area: nm;
+  font-size: 14.5px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tile .pt {
+  grid-area: pt;
+  justify-self: end;
+  /* 上限用 px 不用百分比：百分比是按**轨道**宽度算的，
+     而 auto 轨道此刻的宽度就是内容宽度，46% 会把路径砍成 "/…" */
+  max-width: 84px;
+  font-size: 11.5px;
+  color: var(--fg-mute);
+  font-family: var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 徽章：去框，只留一个小圆点 + 文字。
+   公网 / 内网 的颜色差别本身就是信息，再套个边框和底色
+   只会让卡片多两行框线，显得啰嗦。 */
 .tag {
-  align-self: flex-start;
-  margin-top: 2px;
-  padding: 2px 7px;
-  border-radius: 5px;
+  grid-area: tag;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   font-size: 11px;
-  border: 1px solid var(--line);
-  color: var(--fg-dim);
+  font-family: var(--mono);
+  color: var(--fg-mute);
+  white-space: nowrap;
 }
-.tag.pub { color: #93c5fd; border-color: #1e3a5f; background: #12203a; }
-.tag.lan { color: #a7f3d0; border-color: #14532d; background: #10231a; }
+.tag::before {
+  content: "";
+  width: 5px; height: 5px;
+  flex: none;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 8px -1px currentColor;
+}
+.tag.pub { color: #8fb4e8; }
+.tag.lan { color: #86c9a8; }
 
 .empty {
-  padding: 40px 20px;
+  padding: 46px 22px;
   text-align: center;
   color: var(--fg-dim);
   font-size: 14px;
-  border: 1px dashed var(--line);
-  border-radius: var(--radius);
+  line-height: 1.9;
+  border: 1px dashed var(--stroke);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  animation: card-in .5s var(--ease) both;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   无障碍 / 降级
+   ══════════════════════════════════════════════════════════════ */
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+    scroll-behavior: auto !important;
+  }
+  .card, .tile, .p-head, .empty { opacity: 1 !important; transform: none !important; }
+  /* 动效关了就把「门」直接藏掉，跳转照常发生 */
+  .gate { display: none !important; }
+}
+
+/* 键盘焦点可见性：不能为了好看把焦点环去掉。
+   轮廓画在元素**外侧**（outline-offset），不改变卡片尺寸，
+   也不会被 .tile 自己的 overflow:hidden 裁掉。
+   这里刻意不写 border-radius —— 那会覆盖按钮/卡片各自的圆角。 */
+:focus-visible {
+  outline: 2px solid rgba(200, 206, 218, .82);
+  outline-offset: 2px;
+}
+.btn:focus-visible,
+.ghost:focus-visible { outline-offset: 3px; }
+/* 卡片本身已经有边框和阴影，焦点用发光边框表达，不画双层轮廓 */
+.tile:focus-visible {
+  outline: none;
+  border-color: var(--stroke-hot);
+  box-shadow:
+    0 0 0 2px rgba(200, 206, 218, .55),
+    0 18px 40px -22px rgba(0, 0, 0, .95);
+}
+
+@media (max-width: 420px) {
+  .card { padding: 28px 22px 20px; }
+  .portal { padding: 24px 15px 44px; }
+  .grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
+  .p-head { padding: 14px 14px; }
+}
+
+/* ══════════════════════════════════════════════════════════════
+   门脸页登录（2026-10-25）
+   ══════════════════════════════════════════════════════════════
+
+   这一段是**门脸页（demo）手写移植**到产品登录页的样式。
+   原始规格在 ghost-landing/hero-grid.tsx（React + Tailwind + framer-motion），
+   这里是零构建重写：没有 React、没有 Tailwind、没有 Babel，
+   全部落在本文件里 —— CSP 是 `style-src 'self'`，本来也不允许内联样式。
+
+   命名前缀：
+     df-*  页面骨架（品牌条 / 暗晕 / 压边 / 扫描线 / 几何饰件）
+     pw-*  密码闸（标签 / 电平刻度 / 输入框 / 角标 / 流光 / 能量条 / 按钮）
+
+   为什么不用 .card / .field / .btn 这些现成的：
+     门户页的 .card / .tile / .btn 是给**信息面板**定的那一套，
+     门脸页的密码闸是另一种语言（框体 + 角标 + 刻度），
+     硬套上去会让两边看起来像两个产品。所以另起一套前缀。
+
+   动效全是装饰，不参与鉴权；prefers-reduced-motion 下全部降级
+   （本文件末尾那个全局降级块会把时长压到 .001ms，
+   而下面每个动效的**静态基准态**都按「关掉动效后仍然成立」设计）。
+   ══════════════════════════════════════════════════════════════ */
+
+/* ── 页面骨架 ────────────────────────────────────────────────
+   整屏一屏铺满：品牌条贴顶、密码闸居中。
+   不用 body.centered —— 那套是给「一张卡片」准备的。 */
+body.doorface {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  overflow-x: hidden;
+}
+
+/* ── 覆盖层：暗晕 / 压边 / 扫描线 ───────────────────────────── */
+
+/* 中心暗晕：像素场是背景，文字必须压得住它。
+   窄屏要罩得更宽 —— 同样的百分比在手机上盖不住整段文字。 */
+.df-vignette {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background: radial-gradient(72% 34% at 50% 45%,
+    rgba(10, 10, 11, .96) 0%,
+    rgba(10, 10, 11, .90) 50%,
+    rgba(10, 10, 11, .48) 78%,
+    rgba(10, 10, 11, 0) 100%);
+}
+@media (min-width: 640px) {
+  .df-vignette {
+    background: radial-gradient(36% 33% at 50% 45%,
+      rgba(10, 10, 11, .97) 0%,
+      rgba(10, 10, 11, .90) 44%,
+      rgba(10, 10, 11, .52) 72%,
+      rgba(10, 10, 11, 0) 100%);
+  }
+}
+
+/* 上下压边，把画面收到中间 */
+.df-press {
+  position: fixed;
+  left: 0; right: 0;
+  height: 176px;
+  z-index: 0;
+  pointer-events: none;
+}
+.df-press--top {
+  top: 0;
+  background: linear-gradient(180deg, rgba(10, 10, 11, .95) 0%, rgba(10, 10, 11, 0) 100%);
+}
+.df-press--bottom {
+  bottom: 0;
+  background: linear-gradient(0deg, rgba(10, 10, 11, .95) 0%, rgba(10, 10, 11, 0) 100%);
+}
+
+/* CRT 扫描线 */
+.df-scanlines {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  opacity: .5;
+  background: repeating-linear-gradient(180deg,
+    rgba(200, 205, 215, .03) 0 1px,
+    transparent 1px 3px);
+}
+
+/* ── 品牌条 ─────────────────────────────────────────────────── */
+
+.df-brand {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex: none;
+  padding: 16px 20px;
+}
+@media (min-width: 640px) {
+  .df-brand { padding: 20px 32px; }
+}
+.df-brand__id {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.df-brand__name {
+  font-family: var(--mono);
+  font-size: 13px;
+  letter-spacing: .16em;
+  color: #dcdfe4;
+  white-space: nowrap;
+}
+.df-brand__port {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: .16em;
+  color: #6e727a;
+  flex: none;
+}
+
+/* 28px 的小 logo：复用门户页那套 CSS 画的月白银标，
+   不引二进制素材（少一个静态文件要登记进 STATIC_ALLOWED）。 */
+.logo-xs {
+  width: 28px;
+  height: 28px;
+  margin: 0;
+  flex: none;
+  border-radius: 6px;
+  animation: none;          /* 大 logo 的呼吸在这个尺寸上只是抖 */
+}
+.logo-xs::before { display: none; }   /* 高光扫过同理 */
+.logo-xs::after {
+  inset: 8px;
+  border-width: 1.5px;
+  border-radius: 2px;
+}
+
+/* ── 几何饰件 ───────────────────────────────────────────────── */
+
+.df-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 24px;
+}
+.df-ornament {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  margin-bottom: 36px;
+}
+.df-ornament__line {
+  width: 56px;
+  height: 1px;
+}
+.df-ornament__line--l {
+  background: linear-gradient(90deg, rgba(186, 190, 200, 0) 0%, rgba(186, 190, 200, .45) 100%);
+}
+.df-ornament__line--r {
+  background: linear-gradient(90deg, rgba(186, 190, 200, .45) 0%, rgba(186, 190, 200, 0) 100%);
+}
+/* 缓转的菱。静态基准态就是转 45° 的菱 —— 关掉动效后它依然成立。 */
+.df-ornament__gem {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border: 1px solid rgba(186, 190, 200, .70);
+  background: var(--bg);
+  opacity: .60;
+  transform: rotate(45deg);
+  animation: gem-spin 7.5s linear infinite;
+}
+@keyframes gem-spin {
+  0%   { transform: rotate(45deg);  opacity: .40; }
+  50%  { transform: rotate(225deg); opacity: .95; }
+  100% { transform: rotate(405deg); opacity: .40; }
+}
+
+/* ── 密码闸 ─────────────────────────────────────────────────── */
+
+.pw-form {
+  width: 100%;
+  /* 门脸页是 max-w-[26rem] = 416px（Tailwind 的 rem 按根字号 16px 算）。
+     这里必须写死 px 而不是 rem：本文件的 html/body 用了 font: 15px，
+     根字号被改成 15px ⇒ 26rem 只有 390px，比门脸页窄 26px。 */
+  max-width: 416px;
+  margin: 0 auto;
+}
+
+/* 标签行：「访问密码」+ 一排电平刻度 */
+.pw-labelrow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.pw-label {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: .22em;
+  color: #8b8f98;
+}
+
+/* 电平刻度：一位亮一格，最多 8 位。
+   亮灭由 login.js 给 .pw-lv 加/去 .on，CSS 只管形态。 */
+.pw-levels {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 3px;
+  padding-bottom: 1px;
+}
+.pw-lv {
+  display: block;
+  width: 2px;
+  height: 6px;
+  border-radius: 1px;
+  background: var(--signal);
+  opacity: .16;
+  transform: scaleY(.45);
+  transition: opacity .18s var(--ease), transform .18s var(--ease), height .18s var(--ease);
+}
+.pw-lv.on {
+  height: 9px;
+  opacity: .90;
+  transform: scaleY(1);
+}
+
+/* 输入框外壳：整页唯一一块「有厚度」的界面元素。
+   分两层（结构照门脸页）：
+     .pw-field  外壳 —— 状态载体（is-busy / is-bad / is-shake）+ 四角角标
+     .pw-frame  真正的边框盒子 —— 负责**裁切**
+   两层不能合：角标要能探到边框**外面**，而框里的上沿流光必须被
+   **关在框内**（早先漏了 overflow:hidden，流光直接扫到框外去了）。
+   框体抖起来的时候角标要跟着一起抖，所以抖动加在外壳上。 */
+.pw-field {
+  position: relative;
+}
+.pw-frame {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid rgba(186, 190, 200, .22);
+  border-radius: var(--r-sm);
+  background: rgba(12, 12, 14, .70);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+  transition: border-color .2s var(--ease), box-shadow .2s var(--ease);
+}
+.pw-field:focus-within .pw-frame {
+  border-color: rgba(186, 190, 200, .55);
+  box-shadow:
+    0 0 0 1px rgba(186, 190, 200, .16),
+    0 0 36px -14px rgba(186, 190, 200, .72);
+}
+/* 密码错误：描红 */
+.pw-field.is-bad .pw-frame {
+  border-color: rgba(255, 138, 155, .60);
+  box-shadow:
+    0 0 0 1px rgba(255, 138, 155, .18),
+    0 0 32px -14px rgba(255, 138, 155, .65);
+}
+
+/* 错误时整框横向抖一下。class 由 login.js 加/去，
+   连续失败时先摘掉再强制重排，保证动画能重放。 */
+.pw-field.is-shake {
+  animation: pw-shake .36s cubic-bezier(.36, .07, .19, .97) both;
+}
+@keyframes pw-shake {
+  0%   { transform: translateX(0); }
+  20%  { transform: translateX(-7px); }
+  40%  { transform: translateX(6px); }
+  60%  { transform: translateX(-4px); }
+  80%  { transform: translateX(3px); }
+  100% { transform: translateX(0); }
+}
+
+/* 四角定位角标：贴着边框外缘，聚焦时浮起。
+   逐个延迟 0.04s，于是是「依次亮起」而不是「一起亮起」。 */
+.pw-corner {
+  position: absolute;
+  width: 9px;
+  height: 9px;
+  pointer-events: none;
+  border-color: var(--signal);
+  border-style: solid;
+  border-width: 0;
+  opacity: 0;
+  transform: scale(.75);
+  transition: opacity .24s var(--ease), transform .24s var(--ease);
+}
+/* 角标的 9×9 L 形**骑在**边框上：外沿探出 1px，内沿压在边框上。
+   （实测门脸页：聚焦态角标左边正好落在边框盒外沿 -1px 处。
+   写成 0 就跟边框完全重叠，等于看不见这个角标。） */
+.pw-corner--tl { left: -1px; top: -1px; border-left-width: 1px; border-top-width: 1px; }
+.pw-corner--tr { right: -1px; top: -1px; border-right-width: 1px; border-top-width: 1px; }
+.pw-corner--bl { left: -1px; bottom: -1px; border-left-width: 1px; border-bottom-width: 1px; }
+.pw-corner--br { right: -1px; bottom: -1px; border-right-width: 1px; border-bottom-width: 1px; }
+.pw-field:focus-within .pw-corner {
+  opacity: .85;
+  transform: scale(1);
+}
+.pw-field:focus-within .pw-corner--tr { transition-delay: .04s; }
+.pw-field:focus-within .pw-corner--bl { transition-delay: .08s; }
+.pw-field:focus-within .pw-corner--br { transition-delay: .12s; }
+/* 出错时角标收起 —— 它是「可以输入」的暗示，报错了就别再暗示 */
+.pw-field.is-bad .pw-corner {
+  opacity: 0;
+  transform: scale(.75);
+  transition-delay: 0s;
+}
+
+/* 上沿流光：聚焦时循环扫过 */
+.pw-sweep {
+  position: absolute;
+  top: 0; left: 0;
+  width: 34%;
+  height: 2px;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent 0%, rgba(255, 255, 255, .95) 50%, transparent 100%);
+  box-shadow: 0 0 12px 2px rgba(244, 245, 248, .45);
+}
+.pw-field:focus-within .pw-sweep {
+  opacity: 1;
+  animation: pw-sweep 1.9s linear infinite;
+}
+@keyframes pw-sweep {
+  from { transform: translateX(-100%); }
+  to   { transform: translateX(300%); }
+}
+
+/* 底沿能量条：常驻呼吸。静态基准态是一道收着的暗条。 */
+.pw-energy {
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  height: 2px;
+  pointer-events: none;
+  transform-origin: left center;
+  transform: scaleX(.10);
+  opacity: .25;
+  background: linear-gradient(90deg,
+    rgba(186, 190, 200, 0) 0%,
+    rgba(214, 217, 224, .95) 50%,
+    rgba(186, 190, 200, 0) 100%);
+  box-shadow: 0 0 10px 1px rgba(186, 190, 200, .40);
+  animation: pw-energy 3.4s ease-in-out infinite;
+}
+@keyframes pw-energy {
+  0%   { transform: scaleX(.10); opacity: .25; }
+  50%  { transform: scaleX(1);   opacity: .85; }
+  100% { transform: scaleX(.10); opacity: .25; }
+}
+
+/* 框内一行：输入区 + 按钮 */
+.pw-field__row {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  padding: 8px 8px 8px 12px;
+}
+.pw-field__input {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+/* 覆盖 base.css 里给 input[type=password] 的通用样式 ——
+   这里要的是「无边框、透明底、纯文字」的输入区，
+   边框在外面的 .pw-field 上（不然会框两层）。
+   box-shadow 必须显式清掉：base.css 的 input:focus 带着一圈
+   3px 光环，那是给独立输入框设计的，套到「框里的输入区」上
+   会在框内再画一个发光小框（实测过，很难看）。 */
+.pw-field__input input[type="password"] {
+  width: 100%;
+  padding: 6px 0;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  color: #f4f5f8;
+  font-family: var(--mono);
+  font-size: 15px;
+  letter-spacing: .16em;
+  outline: none;
+  transition: none;
+}
+.pw-field__input input[type="password"]::placeholder { color: #4a4d55; }
+.pw-field__input input[type="password"]:disabled { opacity: .5; }
+
+/* 校验中扫描光：只覆盖输入框，不扫按钮 */
+.pw-scan {
+  position: absolute;
+  top: 0; bottom: 0; left: 0;
+  width: 28%;
+  pointer-events: none;
+  opacity: 0;
+  background: linear-gradient(90deg, transparent 0%, rgba(186, 190, 200, .16) 50%, transparent 100%);
+}
+.pw-field.is-busy .pw-scan {
+  opacity: 1;
+  animation: pw-scan 1.15s linear infinite;
+}
+@keyframes pw-scan {
+  from { transform: translateX(-130%); }
+  to   { transform: translateX(420%); }
+}
+
+/* 校验中时上沿流光停 —— 两道光一起扫会吵 */
+.pw-field.is-busy .pw-sweep {
+  opacity: 0;
+  animation: none;
+}
+
+/* 消息行：空着也占位，报错时页面不跳 */
+.pw-msg {
+  margin: 10px 0 0;
+  min-height: 18px;           /* 门脸页是 1.1rem ≈ 17.6px */
+  font-family: var(--mono);
+  font-size: 11.5px;
+  letter-spacing: .08em;
+  color: rgba(186, 190, 200, .80);
+}
+.pw-msg.err  { color: #ff8a9b; }
+.pw-msg.warn { color: #f0c987; }
+.pw-msg.ok   { color: #a9c4b4; }
+
+/* 设备标识：默认不显示（门脸页不摆读数）。
+   显式写 display:none —— 光靠 hidden 属性，将来谁给 .pw-device
+   加一条 display:flex 就会把它顶出来。 */
+.pw-device { display: none; }
+
+/* ── 门脸页的「进入」按钮 ──────────────────────────────────────
+   和门户页的 .btn 是同一套按钮语言（扫光 / 呼吸条 / 冲击波 / 两层辉光），
+   但尺寸和排版按门脸页来：它跟输入框并排在同一个框里。 */
+.pw-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  flex: none;
+  padding: 14px 32px;
+  border: 1px solid rgba(186, 190, 200, .40);
+  border-radius: var(--r-sm);
+  background: rgba(186, 190, 200, .07);
+  color: #f4f5f8;
+  font-family: var(--mono);
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: .08em;
+  white-space: nowrap;
+  cursor: pointer;
+  overflow: hidden;
+  isolation: isolate;
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+  box-shadow:
+    0 0 0 1px rgba(186, 190, 200, .07),
+    0 0 50px -20px rgba(186, 190, 200, .90);
+  transition:
+    transform .2s var(--ease),
+    box-shadow .2s var(--ease),
+    border-color .2s var(--ease),
+    background-color .2s var(--ease),
+    color .2s var(--ease);
+}
+/* 高光：斜切光条从左扫到右 */
+.pw-btn::before {
+  content: "";
+  position: absolute;
+  top: 0; bottom: 0;
+  left: -100%;
+  width: 50%;
+  z-index: -1;
+  background: linear-gradient(90deg, transparent 0%, rgba(244, 245, 248, .34) 50%, transparent 100%);
+  transform: skewX(-18deg);
+  transition: left .9s var(--ease);
+}
+/* 呼吸：底部一道细辉光条 */
+.pw-btn::after {
+  content: "";
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent 0%, rgba(186, 190, 200, .95) 50%, transparent 100%);
+  opacity: .55;
+  transition: opacity .3s var(--ease);
+}
+.pw-btn:hover:not([disabled]) {
+  border-color: rgba(244, 245, 248, .80);
+  background: rgba(186, 190, 200, .16);
+  color: #ffffff;
+  /* 辉光分两层：贴边亮环（几乎白的）+ 宽域柔晕（中银）。
+     跟门户页 .btn 用的是同一组参数 —— 两页的按钮得是同一套语言。 */
+  box-shadow:
+    0 0 0 1px rgba(232, 234, 240, .42),
+    0 0 26px -6px rgba(244, 245, 248, .75),
+    0 0 72px -12px rgba(186, 190, 200, .85);
+}
+.pw-btn:hover:not([disabled])::before { left: 100%; }
+.pw-btn:hover:not([disabled])::after { opacity: 1; }
+.pw-btn:active:not([disabled]) { transform: scale(.975); }
+.pw-btn[disabled] { opacity: .45; cursor: default; pointer-events: none; }
+
+/* 箭头：悬停时前移 */
+.pw-btn__arrow {
+  position: relative;
+  color: var(--signal);
+  transition: transform .2s var(--ease), color .2s var(--ease);
+}
+.pw-btn:hover:not([disabled]) .pw-btn__arrow {
+  transform: translateX(4px);
+  color: #f4f5f8;
+}
+
+/* ── 窄屏 ───────────────────────────────────────────────────── */
+
+@media (max-width: 480px) {
+  .df-main { padding: 36px 18px; }
+  .pw-field__row { padding: 7px 7px 7px 11px; }
+  .pw-btn { padding: 12px 20px; gap: 8px; }
 }

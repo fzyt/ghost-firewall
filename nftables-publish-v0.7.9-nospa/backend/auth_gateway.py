@@ -155,7 +155,7 @@ HEADER_ORIG_SVC = "X-Original-URI"
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 STATIC_ALLOWED = frozenset({
     "base.css", "fingerprint.js", "login.html", "login.js",
-    "portal.html", "portal.js",
+    "portal.html", "portal.js", "pixelfield.js", "gate.css",
 })
 
 # 两个 HTML 页面的 CSP。两者只差 form-action：登录页有表单要提交到
@@ -1326,17 +1326,30 @@ def auth_portal():
     services = []
     rp = cfg.get("reverse_proxy")
     rules = rp.get("rules") if isinstance(rp, dict) else None
+    # host 分发入口的对外地址需要带网关端口：网关按设计就跑在自定义高位端口上，
+    # 漏掉端口点开就是 443 —— 要么打不开，要么撞上别的服务。
+    try:
+        gw_port = int(cfg.get("gateway_port", 8443) or 8443)
+    except (TypeError, ValueError):
+        gw_port = 8443
+    port_part = "" if gw_port == 443 else f":{gw_port}"
     for r in (rules or []):
         if not isinstance(r, dict) or not r.get("enabled"):
             continue
         pfx = str(r.get("path_prefix", "") or "").strip().rstrip("/")
         if not pfx or pfx in RESERVED_PREFIXES:
             continue
+        # host 分发入口（空 = 只有路径前缀入口）
+        host = str(r.get("host", "") or "").strip().lower()
         services.append({
             "name": str(r.get("name") or pfx.lstrip("/"))[:64],
             "path": pfx,
             "public": bool(r.get("public_access")),
             "icon": str(r.get("icon") or "")[:16],
+            # host 与 url：host 分发时门户要跳到**另一个域名**，
+            # 光有 path 前缀拼不出那个地址。前端优先用 url。
+            "host": host,
+            "url": (f"https://{host}{port_part}/" if host else f"{pfx}/"),
         })
     services.sort(key=lambda s: s["path"])
     return jsonify({"success": True, "services": services,
@@ -1461,25 +1474,117 @@ def _origin_host_mismatch(url: str) -> bool:
         return True
 
 
+def _cookie_domain(cfg=None):
+    """cookie 共享域（形如 ".fzyto.top"）；空串 = 按 host 各自存。
+
+    这是 **host 分发保住网关认证** 的关键：浏览器按 host 存 cookie，
+    门户在 fzyto.top 登录拿到的令牌，送到 siyuan.fzyto.top 时不会被带上
+    —— 表现是「每换一个域名就要重登一次」，host 分发等于白做。
+    把 cookie 的 Domain 抬到父域，一次登录覆盖所有子域。
+
+    值由面板写进共享配置（reverse_proxy.settings.cookie_domain），
+    认证服务只读不猜 —— 猜父域要 publicsuffix 列表，猜错就是
+    「cookie 莫名其妙不生效」。
+    """
+    if cfg is None:
+        cfg = load_gateway_config()
+    rp = cfg.get("reverse_proxy")
+    settings = rp.get("settings") if isinstance(rp, dict) else None
+    settings = settings if isinstance(settings, dict) else {}
+    # 语义与面板（app.py 的 _rp_cookie_domain）**必须一致**：
+    #   · cookie_domain 这个键存在 → 用它（哪怕是空串 = 用户明确清空）
+    #   · 键不存在 → 用 "." + base_domain 推导
+    # 两边语义不一致的后果是「面板说共享、认证服务不共享」——
+    # 而且面板上完全看不出来（接口返回的是现算的生效值）。
+    if "cookie_domain" in settings:
+        cd = str(settings.get("cookie_domain") or "").strip().lower()
+        if not cd:
+            return ""
+        base = _safe_cookie_base(cd.lstrip("."))
+        return ("." + base) if base else ""
+    bd = _safe_cookie_base(str(settings.get("base_domain") or "").strip().lower())
+    return ("." + bd) if bd else ""
+
+
+def _safe_cookie_base(value):
+    """把 cookie 域的 base 部分净化成合法主机名；非法返回空串。
+
+    值来自面板（那边已经净化过），这里再过一道是**防御性**的：
+    配置文件可能被手工改坏，而这个值会直接进 Set-Cookie 的 Domain 属性 ——
+    带分隔符的话浏览器会整条拒收 cookie，登录直接失效。
+    """
+    v = (value or "").strip().lower()
+    if not v or len(v) > 253:
+        return ""
+    if any(c in v for c in (" ", "/", ":", "\t", "\n", "\r", ";", ",", "*", "@", "?")):
+        return ""
+    for lb in v.split("."):
+        if not lb or len(lb) > 63:
+            return ""
+        if not all(c.isalnum() or c == "-" for c in lb):
+            return ""
+        if lb.startswith("-") or lb.endswith("-"):
+            return ""
+    return v
+
+
+def _effective_cookie_domain(cfg=None):
+    """本次响应实际该用的 cookie Domain（可能为空 = host-only）。
+
+    ⚠️ **只有当请求主机本身在父域之下时才带 Domain 属性**。
+
+    浏览器对「IP 地址 + Domain 属性」的 cookie 是**整条拒收**的
+    （RFC 6265 §5.3 第 5 步：域名不匹配就丢弃整条 cookie，而不是只丢属性）。
+    于是用 IP 访问网关时（https://192.168.100.233:8443/）如果硬带
+    Domain=.fzyto.top，登录会**静默失败** —— 表现为「密码输对了又弹回登录页」，
+    比不带 Domain 更难查。
+
+    所以这里按请求主机判断：IP 字面量、以及不在父域之下的主机，一律退回
+    host-only cookie（各域名各自登录，功能正常，只是不能共享）。
+    """
+    d = _cookie_domain(cfg)
+    if not d:
+        return ""
+    base = d.lstrip(".")
+    host = (request.host or "").split(":")[0].strip().lower()
+    if not host:
+        return ""
+    try:
+        ipaddress.ip_address(host)
+        return ""          # IP 主机名：浏览器会整条拒收带 Domain 的 cookie
+    except ValueError:
+        pass
+    if host == base or host.endswith("." + base):
+        return d
+    return ""
+
+
 def _set_cookies(resp, token: str, device: str, clear: bool = False, raw: bool = True):
     """统一下发 cookie。
 
     token cookie 短寿（随 token exp），device cookie 长寿（一年）。
     HttpOnly 防 JS 读取，Secure 只走 HTTPS，SameSite=Lax 挡跨站携带。
+
+    domain 只在「请求主机确实在共享域之下」时才带（见 _effective_cookie_domain）：
+    抬到父域是为了让 host 分发出来的多个子域共用一次登录；
+    但给 IP 主机名硬塞 Domain 属性会让浏览器整条拒收 cookie，登录直接失效。
     """
+    cdom = _effective_cookie_domain(load_gateway_config())
     if clear:
         resp.set_cookie(COOKIE_TOKEN, "", max_age=0, httponly=True,
-                        secure=True, samesite="Lax", path="/")
+                        secure=True, samesite="Lax", path="/", domain=cdom or None)
         resp.set_cookie(COOKIE_DEVICE, "", max_age=0, httponly=True,
-                        secure=True, samesite="Lax", path="/")
+                        secure=True, samesite="Lax", path="/", domain=cdom or None)
         return
+    cfg = load_gateway_config()
     if token:
-        ttl = _session_ttl(load_gateway_config())
+        ttl = _session_ttl(cfg)
         resp.set_cookie(COOKIE_TOKEN, token, max_age=ttl, httponly=True,
-                        secure=True, samesite="Lax", path="/")
+                        secure=True, samesite="Lax", path="/", domain=cdom or None)
     if device:
         resp.set_cookie(COOKIE_DEVICE, device, max_age=DEVICE_COOKIE_TTL,
-                        httponly=True, secure=True, samesite="Lax", path="/")
+                        httponly=True, secure=True, samesite="Lax", path="/",
+                        domain=cdom or None)
 
 
 @app.errorhandler(Exception)

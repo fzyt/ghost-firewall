@@ -1,23 +1,34 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<!-- 光之门开关：data-gate="off" = 不演「正在退出 / 正在进入」的转场动画，直接跳。
+     想去掉这个属性就开回来（动画体和时序在 gate.css / portal.js 里没删）。 -->
+<html lang="zh-CN" data-gate="off">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="robots" content="noindex, nofollow">
 <title>服务门户 · Ghost Firewall</title>
 <link rel="stylesheet" href="/auth/static/base.css">
+<link rel="stylesheet" href="/auth/static/gate.css">
 </head>
 <body>
 
-<div class="portal">
+<!-- 像素场背景：和门脸页同一个引擎（pixelfield.js）。纯装饰，吃不到点击。 -->
+<canvas class="pixfield" id="pix" aria-hidden="true"></canvas>
+<div class="pix-scrim" aria-hidden="true"></div>
+
+<div class="portal layer">
   <header class="p-head">
-    <div class="p-title">
-      <h1>服务门户</h1>
-      <p id="who">正在校验登录状态…</p>
+    <div class="p-brand">
+      <div class="logo logo-sm" aria-hidden="true"></div>
+      <div class="p-title">
+        <h1>服务门户</h1>
+        <p id="who">正在校验登录状态…</p>
+      </div>
     </div>
     <div class="p-actions">
       <span id="timer" class="pill" hidden>剩余 <b id="left">--:--</b></span>
-      <button id="logout" class="ghost" type="button">退出</button>
+      <span class="vsep" aria-hidden="true"></span>
+      <button id="logout" class="ghost" type="button"><span class="ripple" aria-hidden="true"></span>退出</button>
     </div>
   </header>
 
@@ -25,7 +36,16 @@
   <p id="empty" class="empty" hidden>还没有配置任何服务。<br>去管理面板的「反向代理」里给规则填一个路径前缀，即可出现在这里。</p>
 </div>
 
+<!-- 门转场层：点击服务卡片 / 退出登录时盖住屏幕再跳转。纯装饰。 -->
+<div class="gate" id="gate" aria-hidden="true">
+  <div class="gate__plane"></div>
+  <div class="gate__wash"></div>
+  <div class="gate__flash"></div>
+  <div class="gate__label" id="gateLabel"></div>
+</div>
+
 <script src="/auth/static/fingerprint.js"></script>
+<script src="/auth/static/pixelfield.js"></script>
 <script src="/auth/static/portal.js"></script>
 </body>
 </html>

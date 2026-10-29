@@ -96,7 +96,22 @@ prepare_nftweb_files() {
 
     # 读写类：网关自己写、自己 flock、自己 chmod 600，属主必须是它
     for f in nftables-web-auth-ratelimit.json nftables-web-auth-ratelimit-revoked.json; do
-        [ -f "$_cfgdir/$f" ] || : > "$_cfgdir/$f" || return 1
+        # 必须播种成**合法 JSON**（{}），不能留 0 字节的空文件。
+        #
+        # 空文件不是合法 JSON —— 吊销表那边 load_revoked() 读不出来，
+        # 又拿不到 last-known-good（进程刚起），就返回 None；
+        # is_revoked() 于是对**所有** jti 判为「已吊销」（fail-closed）。
+        # 结果是：登录接口照样返 200 并下发 token，但那个 token 立刻作废，
+        # 门户永远把你弹回登录页 —— **全新安装必现**。
+        #
+        # 这里刻意不用「空文件也算合法」来绕过：
+        # 能把吊销表截断成 0 字节的人，也能借此让已登出的 token 复活
+        # （空表 = 没有吊销记录）。所以坏了就该 fail-closed，
+        # 根因修在「建文件时就播成 {}」。
+        #
+        # 限流表那边读不出来会退化成空表（fail-open，只多试几次），
+        # 不受这个影响；但两个文件都播 {} 更干净。
+        [ -s "$_cfgdir/$f" ] || printf '{}' > "$_cfgdir/$f" || return 1
         chown "${NFTWEB_UID}:${NFTWEB_GID}" "$_cfgdir/$f" || return 1
         chmod 600 "$_cfgdir/$f" || return 1
     done

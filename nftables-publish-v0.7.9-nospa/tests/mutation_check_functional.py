@@ -43,8 +43,11 @@ MUTATIONS = [
      '写入私钥的路径一共五条', '写入私钥的路径一共三条', 1),
 
     # ── FIX-2  前后端 source 取值不一致 ────────────────────────────
+    # 期望 4 处：续期按钮 / 来源行(2 处) / 自动续期行。
+    # 加过一行「自动续期」展示后从 3 变 4 —— 变异目标不变（把所有判 auto
+    # 的地方改成 acme），只是覆盖面变大了。
     ('FIX-2 前端改回判 acme（后端写的是 auto → 续期按钮永不显示）', 'fe',
-     "cert.source === 'auto'", "cert.source === 'acme'", 3),
+     "cert.source === 'auto'", "cert.source === 'acme'", 4),
 
     # ── FIX-3  /auth/static/ 的 HTML 缺 CSP ─────────────────────────
     ('FIX-3 static_files 不给 HTML 加 CSP', 'auth',
@@ -55,8 +58,8 @@ MUTATIONS = [
      '    return resp', 1),
 
     ('FIX-3 CSP 不区分登录页与门户页（form-action 放宽成任意来源）', 'auth',
-     '            CSP_PORTAL_HTML if filename == "portal.html" else CSP_LOGIN_HTML)',
-     '            CSP_PORTAL_HTML)', 1),
+     '        CSP_PORTAL_HTML if filename == "portal.html" else CSP_LOGIN_HTML)',
+     '        CSP_PORTAL_HTML)', 1),
 
     # ── FIX-4  网关配置先落盘后部署 ────────────────────────────────
     ('FIX-4 改回「先 save_config 后部署」（部署失败时磁盘已是新配置）', 'app',
@@ -354,23 +357,27 @@ MUTATIONS = [
      '        if (failed && failed.length) {', 1),
 
     # ── FIX-14  回环白名单 ────────────────────────────────────────
+    # 2026-10-28：这三行的缩进从 12 变成 8 —— 代码从
+    # _generate_gateway_nginx_conf 的内联循环挪进了 _nginx_service_location
+    # 这个模块级函数（原来在 for 循环里、再嵌一层 if/else，所以是 12）。
+    # 锚点跟着挪 —— 锚点错位等于「这条变异验不到」，是悄悄少验。
     ('FIX-14 只放行 IPv6 回环（IPv4 本机访问被 deny all 挡成 403）', 'app',
-     '            L.append("        allow 127.0.0.1;")\n'
-     '            L.append("        allow ::1;")',
-     '            L.append("        allow ::1;")', 1),
+     '        L.append("        allow 127.0.0.1;")\n'
+     '        L.append("        allow ::1;")',
+     '        L.append("        allow ::1;")', 1),
 
     ('FIX-14 把 ::1 换成 127.0.0.1（等于把 IPv6 回环堵回去）', 'app',
-     '            L.append("        allow 127.0.0.1;")\n'
-     '            L.append("        allow ::1;")',
-     '            L.append("        allow 127.0.0.1;")', 1),
+     '        L.append("        allow 127.0.0.1;")\n'
+     '        L.append("        allow ::1;")',
+     '        L.append("        allow 127.0.0.1;")', 1),
 
     ('FIX-14 回环白名单排在 deny all 之后（写了也不生效）', 'app',
-     '            L.append("        allow 127.0.0.1;")\n'
-     '            L.append("        allow ::1;")\n'
-     '            L.append("        deny all;")',
-     '            L.append("        deny all;")\n'
-     '            L.append("        allow 127.0.0.1;")\n'
-     '            L.append("        allow ::1;")', 1),
+     '        L.append("        allow 127.0.0.1;")\n'
+     '        L.append("        allow ::1;")\n'
+     '        L.append("        deny all;")',
+     '        L.append("        deny all;")\n'
+     '        L.append("        allow 127.0.0.1;")\n'
+     '        L.append("        allow ::1;")', 1),
 
     # ── FIX-13  界面没接上（等于死接口还在） ───────────────────────
     ('FIX-13 侧边栏去掉改密码入口（功能又变成只有 curl 能用）', 'fe',

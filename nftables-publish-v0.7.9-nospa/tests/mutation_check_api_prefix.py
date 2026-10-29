@@ -81,33 +81,26 @@ APP_MUTANTS = [
 
     # ── 配置生成：功能本体 ──────────────────────────────────────────
     ('网关配置不再生成 sub_filter 块（功能完全没生效）',
-     '        if api_prefix:\n'
-     '            L.append(f"        # ── 上游绝对路径改写：{api_prefix}... -> "',
-     '        if False:\n'
-     '            L.append(f"        # ── 上游绝对路径改写：{api_prefix}... -> "'),
+     '    if api_prefix:\n        L.append(f"        # ── 上游绝对路径改写：{api_prefix}... -> "',
+     '    if False:\n        L.append(f"        # ── 上游绝对路径改写：{api_prefix}... -> "'),
 
     # 通用规则：实测会把页面里 /var/log/syslog 这类普通路径也改掉
     ('sub_filter 退化成通用规则（把页面里普通路径一起改坏）',
-     """            sf_rules.append((f"'{api_prefix}", f"'{prefix}{api_prefix}"))
-            sf_rules.append((f'"{api_prefix}', f'"{prefix}{api_prefix}'))""",
-     """            sf_rules.append((f"'/", f"'{prefix}/"))
-            sf_rules.append((f'"/', f'"{prefix}/'))"""),
+     '        sf_rules.append((f"\'{api_prefix}", f"\'{prefix}{api_prefix}"))\n        sf_rules.append((f\'"{api_prefix}\', f\'"{prefix}{api_prefix}\'))',
+     '        sf_rules.append((f"\'/", f"\'{prefix}/"))\n        sf_rules.append((f\'"/\', f\'"{prefix}/\'))'),
 
     # ── 生成期二次净化：落盘值不可信 ──────────────────────────────
     # 配置文件可能被手工改过；这个值要拼进 nginx 的引号字符串，
     # 不再净化一次 = nginx 指令注入。
     ('生成期不再二次净化（手工改过的配置能注入 nginx 指令）',
-     '            api_prefix = _sanitize_api_path_prefix(rule.get("api_path_prefix", ""))',
-     '            api_prefix = str(rule.get("api_path_prefix", "") or "").strip()'),
+     '        api_prefix = _sanitize_api_path_prefix(rule.get("api_path_prefix", ""))',
+     '        api_prefix = str(rule.get("api_path_prefix", "") or "").strip()'),
 
     # 非法值时让异常冒泡 → 整份网关配置生成失败 → **所有**服务一起挂
     # （比一个 404 严重得多，也违背「窄模式降级安全」的承诺）
     ('非法值时让异常冒泡（一份坏配置拖垮整个网关）',
-     '        except ValueError as e:\n'
-     '            # 非法值：**只放弃「改写」这一项，不放弃整条服务**。',
-     '        except ValueError as e:\n'
-     '            raise\n'
-     '            # 非法值：**只放弃「改写」这一项，不放弃整条服务**。'),
+     '    except ValueError as e:\n        # 非法值：**只放弃「改写」这一项，不放弃整条服务**。',
+     '    except ValueError as e:\n        raise\n        # 非法值：**只放弃「改写」这一项，不放弃整条服务**。'),
 
     # 回显进 nginx 注释时不做单行化 → 值里的换行把注释劈开
     # → 后半行变成一条 nginx 指令
@@ -117,34 +110,33 @@ APP_MUTANTS = [
     # 就已经把换行转义成 \n 了，删不删行为一样，断言抓不到。
     # 真正的漏洞是「用裸 f-string 插值原值」。
     ('回显原值时用裸插值（换行把 nginx 注释劈开 → 后半行变成指令）',
-     "            _bad = repr(rule.get('api_path_prefix')).replace('\\n', '\\\\n')",
-     "            _bad = f\"{rule.get('api_path_prefix')}\""),
+     "        _bad = repr(rule.get('api_path_prefix')).replace('\\n', '\\\\n')",
+     '        _bad = f"{rule.get(\'api_path_prefix\')}"'),
 
     ('sub_filter 只改单引号形式（双引号写的 API 路径漏改 → 照样 404）',
-     """            sf_rules.append((f"'{api_prefix}", f"'{prefix}{api_prefix}"))
-            sf_rules.append((f'"{api_prefix}', f'"{prefix}{api_prefix}'))""",
-     """            sf_rules.append((f"'{api_prefix}", f"'{prefix}{api_prefix}"))"""),
+     '        sf_rules.append((f"\'{api_prefix}", f"\'{prefix}{api_prefix}"))\n        sf_rules.append((f\'"{api_prefix}\', f\'"{prefix}{api_prefix}\'))',
+     '        sf_rules.append((f"\'{api_prefix}", f"\'{prefix}{api_prefix}"))'),
 
     # 默认 sub_filter_once on = 只改第一处，页面里第二处引用还是裸路径
     ('sub_filter_once off 被拿掉（页面里只有第一处被改）',
-     '            L.append("        sub_filter_once off;")',
-     '            # sub_filter_once removed'),
+     '        L.append("        sub_filter_once off;")',
+     '        # sub_filter_once removed'),
 
     # JSON 响应被改写 → 解析直接炸
     ('sub_filter_types 把 application/json 也算进去（改坏 JSON 响应）',
-     '            L.append("        sub_filter_types application/javascript text/css;")',
-     '            L.append("        sub_filter_types application/javascript text/css application/json;")'),
+     '        L.append("        sub_filter_types application/javascript text/css;")',
+     '        L.append("        sub_filter_types application/javascript text/css application/json;")'),
 
     # nginx 的 sub_filter_types 默认已含 text/html，重复写会报
     # [warn] duplicate MIME type "text/html" —— 每次 nginx -t / reload 刷一行
     ('sub_filter_types 重复写 text/html（nginx 每次 reload 都报 duplicate MIME type）',
-     '            L.append("        sub_filter_types application/javascript text/css;")',
-     '            L.append("        sub_filter_types text/html application/javascript text/css;")'),
+     '        L.append("        sub_filter_types application/javascript text/css;")',
+     '        L.append("        sub_filter_types text/html application/javascript text/css;")'),
 
     # 上游压缩了正文 → sub_filter 匹配不到 → 功能静默失效
     ('不再清掉上游压缩（sub_filter 在压缩正文上匹配不到）',
-     "            L.append('        proxy_set_header Accept-Encoding \"\";')",
-     '            # Accept-Encoding not cleared'),
+     '        L.append(\'        proxy_set_header Accept-Encoding "";\')',
+     '        # Accept-Encoding not cleared'),
 
     # ── 探测：读 openapi.json 的正确性 ──────────────────────────────
     ('探测把单段路径也算成 API 前缀（/health 会被当成前缀）',

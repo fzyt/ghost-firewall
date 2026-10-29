@@ -2091,6 +2091,36 @@
                    x-text="rpPrefixConflict(rpEditingRule)"></p>
               </div>
 
+              <div class="md:col-span-2">
+                <label class="block text-sm font-medium mb-1">访问域名（host 分发）
+                  <span class="text-gray-400 font-normal">留空 = 只用上面的路径前缀</span></label>
+                <div class="flex gap-2">
+                  <input type="text" x-model="rpEditingRule.host"
+                    placeholder="例如 siyuan.fzyto.top" maxlength="253"
+                    class="flex-1 nf-mono">
+                  <button type="button" @click="rpAutoHost()"
+                    class="px-3 py-1 border border-gray-300 rounded text-xs hover:bg-gray-50 transition-colors whitespace-nowrap">
+                    自动生成
+                  </button>
+                </div>
+                <p class="text-xs text-red-500 mt-1"
+                   x-show="rpHostConflict(rpEditingRule)" x-cloak
+                   x-text="rpHostConflict(rpEditingRule)"></p>
+                <p class="text-xs text-gray-400 mt-1 leading-relaxed">
+                  填了就会<strong>额外</strong>开一个域名入口，服务挂到该域名的<strong>根路径</strong>：
+                  <span class="nf-mono">https://siyuan.fzyto.top:8443/</span>。
+                  两个入口都过网关认证，门户也会跳到域名入口。
+                  <br>
+                  为什么值得多开一个：路径前缀分发下，上游写死的
+                  <span class="nf-mono">/api/xxx</span> 会跑出前缀 → 接口 404，
+                  WebSocket 更是因为运行时按 <span class="nf-mono">location.host</span>
+                  拼地址而永远连不上。挂在域名根路径上，这两个问题**天然不存在**。
+                  <br>
+                  域名必须在泛域名证书的覆盖范围内（当前基础域名：
+                  <span class="nf-mono" x-text="(rp.hostBaseDomain || '未设置 — 请先把泛域名证书设为默认')"></span>）。
+                </p>
+              </div>
+
               <div>
                 <label class="block text-sm font-medium mb-1">目标地址 <span class="text-red-500">*</span>
                   <span class="text-gray-400 font-normal">内网服务 IP:端口</span></label>
@@ -2246,6 +2276,13 @@
                     <!-- 访问路径是这条服务的真实入口，必须一眼可见 -->
                     <p class="text-sm mt-1 nf-mono text-gray-600 break-all"
                        x-text="gatewayPreviewUrl() + (rule.path_prefix || '/') + '/'"></p>
+                    <!-- host 分发入口：另开一个域名，服务挂到那个域名的根路径。
+                         两个入口并存时都要显示出来 —— 只显示一个，用户会以为
+                         另一个不存在。 -->
+                    <p class="text-sm mt-1 nf-mono text-indigo-700 break-all"
+                       x-show="rule.host" x-cloak>
+                      <span class="text-gray-400">域名入口：</span><span x-text="'https://' + rule.host + ':' + (gw.gateway_port || 8443) + '/'"></span>
+                    </p>
                   </div>
                   <div class="flex gap-2 shrink-0">
                     <button @click="editRpRule(index)"
@@ -2335,6 +2372,28 @@
               <label class="block text-sm font-medium mb-1">域名 *</label>
               <input type="text" x-model="rpRequestDomain" placeholder="app.example.com"
                 class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+              <label class="mt-2 flex items-start gap-2 text-sm text-gray-700 cursor-pointer">
+                <input type="checkbox" x-model="rpRequestWildcard" class="w-4 h-4 mt-0.5">
+                <span>同时签发泛域名 <code class="text-xs bg-gray-100 px-1 rounded">*.域名</code>
+                  <span class="block text-xs text-gray-500">一张证书覆盖所有子域。需要 DNS 服务商支持泛域名解析记录。</span>
+                </span>
+              </label>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label class="block text-sm font-medium mb-1">自动续期</label>
+                <label class="flex items-center gap-2 text-sm">
+                  <input type="checkbox" x-model="rpRequestAutoRenew" class="w-4 h-4">
+                  <span>到期前自动续期（面板每 30 分钟检查一次）</span>
+                </label>
+              </div>
+              <div x-show="rpRequestAutoRenew">
+                <label class="block text-sm font-medium mb-1">提前续期天数</label>
+                <input type="number" min="1" max="365" x-model="rpRequestRenewDays"
+                  class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:border-black">
+                <p class="text-xs text-gray-500 mt-1">剩余天数小于该值时触发续期，默认 60 天。</p>
+              </div>
             </div>
 
             <div>
@@ -2426,6 +2485,15 @@
                   <div class="text-sm space-y-1">
                     <p><span class="text-gray-500">来源：</span><span x-text="cert.source === 'auto' ? '自动申请' : '手动上传'"></span><span x-show="cert.source === 'auto' && cert.dns_provider" class="text-gray-400"> (<span x-text="cert.dns_provider"></span>)</span></p>
                     <p x-show="cert.issuer"><span class="text-gray-500">颁发者：</span><span x-text="cert.issuer"></span></p>
+                    <p x-show="cert.sans && cert.sans.length">
+                      <span class="text-gray-500">覆盖：</span><span x-text="cert.sans.join('、')"></span>
+                      <span x-show="cert.wildcard" class="text-gray-400">（含泛域名）</span>
+                    </p>
+                    <p x-show="cert.source === 'auto'">
+                      <span class="text-gray-500">自动续期：</span>
+                      <span x-show="cert.auto_renew" x-text="'开启（剩余 ' + (cert.renew_days || 60) + ' 天内触发）'"></span>
+                      <span x-show="!cert.auto_renew">关闭</span>
+                    </p>
                     <p><span class="text-gray-500">有效期：</span>
                       <span x-show="cert.not_before && cert.expires_at" x-text="(cert.not_before || '') + ' ~ ' + (cert.expires_at || '')"></span>
                       <span x-show="!cert.not_before" x-text="cert.expires_at || '-'"></span>
