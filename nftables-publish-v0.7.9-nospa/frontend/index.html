@@ -1150,11 +1150,26 @@
       </div>
 
       <!-- ========== 防火墙状态 ========== -->
-      <div class="nf-page" x-show="currentNav === 'firewall-status' && !loading"
+      <!--
+        x-show 里的 firewallStatusLoaded 是**默认页门控**（2026-10-30）。
+        这一页是打开面板后的第一屏，而它要显示的字段初值全是 false ——
+        在模板里 false 会被渲染成「未加载」「不存在」的红点。
+        数据没取回来之前就渲染这一屏，等于一上来就告诉用户「防火墙没加载」。
+        所以：数据没到齐 → 整页不渲染；查询失败 → 渲染，但显示错误而不是红点。
+      -->
+      <div class="nf-page" x-show="currentNav === 'firewall-status' && firewallStatusLoaded"
            x-transition:enter="nfx-enter"
            x-transition:enter-start="nfx-enter-start"
            x-transition:enter-end="nfx-enter-end">
         <h1 class="text-2xl font-bold mb-6">防火墙状态</h1>
+
+        <!-- 查询失败提示：宁可明说「没查到」，也不要显示一堆红点让人以为防火墙挂了 -->
+        <div x-show="firewallStatusError"
+             class="rounded border border-red-300 bg-red-50 px-4 py-3 mb-4">
+          <div class="text-sm text-red-800"
+               x-text="'查询防火墙状态失败：' + (firewallStatusError || '未知错误')"></div>
+          <div class="text-xs text-red-700 mt-1">面板与设备之间的连接可能已断开，请刷新页面重试。</div>
+        </div>
         <!-- ── 规则集健康 + 看门狗 ────────────────────────────────
      v0.8.x 加了一整套下发失败回滚 + 看门狗自愈，界面上却一个字都没有：
      规则没装上、或者被谁 flush 了又还没到重试时间，用户从面板上看不出来，
@@ -1241,7 +1256,7 @@
           </template>
         </div>
 
-        <div class="bg-gray-50 border rounded-lg p-5 space-y-5">
+        <div class="bg-gray-50 border rounded-lg p-5 space-y-5" x-show="!firewallStatusError">
           <!-- fw4 -->
           <div class="flex items-center gap-3">
             <span class="w-3 h-3 rounded-full inline-block" :class="!fw4Active ? 'bg-green-500' : 'bg-red-500'"></span>

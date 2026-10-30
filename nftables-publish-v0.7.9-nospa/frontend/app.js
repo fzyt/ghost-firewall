@@ -28,8 +28,43 @@ function app() {
       loginLoading: false,
       loginError: '',
     },
-    currentNav: 'network',
+    // 默认打开的页面。
+    //
+    // 2026-10-30 从「网络接口」改成「防火墙状态」：用户打开面板最想知道的是
+    // 「防火墙到底还活着吗、规则装上没」，那是**要看的**；
+    // 「网络接口」是**要改的**（PPPoE、网关 IP），属于低频操作。
+    // 打开面板第一眼看到「网络接口」，等于把最需要确认的状态藏起来了。
+    //
+    // ⚠️ 换默认页有个坑，必须和下面的 firewallStatusLoaded 门控一起看：
+    //
+    // 这一页要显示的字段（fw4Active / nftablesLoaded / initExists / initUpToDate …）
+    // 初值**全是 false**，而 false 在模板里被渲染成**红点 + 「未加载」/「不存在」**。
+    // 也就是说：数据还没取回来的那一瞬间，页面会显示
+    // 「nftables 规则：未加载」「init 脚本：不存在」——
+    // 这恰恰是这个面板**最不该给用户看的假状态**（真相是「还没查到」，不是「没加载」）。
+    // 用户第一眼看到红点，多半会以为防火墙挂了、面板坏了。
+    //
+    // 所以：模板里用 firewallStatusLoaded 门控，数据没到齐就**整页不渲染**；
+    // 查询失败也要渲染，但要显示「查询失败」而不是红点。
+    //
+    // 「网络接口」仍然留在 navItems 里 —— 配置还是要能改，只是不再是默认页。
+    currentNav: 'firewall-status',
     navItems: [
+      // 「防火墙状态」排第一（2026-10-30）。
+      //
+      // 为什么：它是**默认打开的页**，也是用户最常看的一页 ——
+      // 「防火墙到底还活着吗、规则装上没」。
+      // 默认页却排在导航第 11 位，两头不对付：
+      //   · 用户每次进来都要在左边找一遍才看见自己已经在那页；
+      //   · 更别扭的是，前十项是配置项（网络接口、敲门、转发、日志……），
+      //     默认页夹在配置项中间，视觉上像「某个配置的子页」。
+      //
+      // 排到第一位之后，导航第一项 = 默认页 = 最该先看的那页，三者一致。
+      //
+      // 「网络接口」等配置项的相对次序不变 —— 只把状态页提到最前，
+      // 不是把配置页全打乱（配置项之间的顺序是有含义的：
+      // 网络接口 → 端口转发 → 信任IP 是「先有网、再有转发、再定谁能进」的链路）。
+      { id: 'firewall-status', label: '防火墙状态', icon: '🛡️' },
       { id: 'network', label: '网络接口' },
       { id: 'knock', label: '端口敲门' },
       { id: 'ports', label: '端口转发' },
@@ -40,7 +75,6 @@ function app() {
       { id: 'dns-lan', label: 'DNS 局域网解析', icon: '🌐' },
       { id: 'ddns', label: 'DDNS' },
       { id: 'firewall', label: '防火墙规则' },
-      { id: 'firewall-status', label: '防火墙状态', icon: '🛡️' },
       { id: 'lists', label: '名单管理', icon: '📋' },
       { id: 'reverse-proxy', label: '反代管理' },
       { id: 'intro', label: '功能介绍', icon: '📖' },
@@ -100,6 +134,15 @@ function app() {
     initEnabled: false,
     initHasFw4Stop: false,
     initUpToDate: false,
+    // 防火墙状态页的数据是否已经取回（默认页门控，详见 currentNav 处的说明）。
+    //
+    // false 时这一页**整个不渲染** —— 因为上面那几个字段的初值都是 false，
+    // 在模板里会被渲染成「未加载」「不存在」的红点，那是**假状态**
+    // （真实情况是「还没查」，不是「没加载」）。
+    firewallStatusLoaded: false,
+    // 查询失败时的原因。非空时页面显示错误、并且**不画**那些红点 ——
+    // 「查不到」和「没加载」是两回事，混为一谈会让人以为防火墙挂了。
+    firewallStatusError: '',
     // init 脚本写的开机恢复状态（P1-34）：ok / degraded / failed / null(未知)
     recoveryStatus: null,
     repairing: false,
@@ -269,11 +312,16 @@ function app() {
       await this.checkAuth();
       if (!this.auth.authenticated) return;
 
+      // 防火墙状态是**默认页**（见 currentNav），它的数据排在最前面取。
+      //
+      // 为什么不能按老顺序排在最后：
+      // 默认页显示的就是用户进面板第一眼要看的东西，让它等后面四五个接口
+      // 轮完才出现，等于开门先甩一片空白。
+      await this.loadFirewallStatus();
       await this.loadConfig();
       await this.loadNetworkConfig();
       await this.loadInterfaces();
       await this.loadLogdConfig();
-      await this.loadFirewallStatus();
       await this.loadDdns();
     },
 
@@ -398,11 +446,12 @@ function app() {
 
     async loadAllData() {
       // 登录/初始化后批量加载所有数据
+      // 防火墙状态是默认页，先加载它（理由同 init() 里那处注释）
+      try { await this.loadFirewallStatus(); } catch (_) {}
       try { await this.loadConfig(); } catch (_) {}
       try { await this.loadNetworkConfig(); } catch (_) {}
       try { await this.loadInterfaces(); } catch (_) {}
       try { await this.loadLogdConfig(); } catch (_) {}
-      try { await this.loadFirewallStatus(); } catch (_) {}
       try { await this.loadDdns(); } catch (_) {}
       try { await this.loadReverseProxy(); } catch (_) {}
       // 规则预览走的是 x-init，而 x-init 在未登录时就被守卫挡掉了，
@@ -1478,7 +1527,18 @@ function app() {
         // 开机恢复状态（P1-34）：degraded/failed 时面板必须说清楚
         // 「现在跑的是过期策略」，不能只报「规则已加载」。
         this.recoveryStatus = data.recovery || null;
-      } catch(e) {}
+        this.firewallStatusError = '';
+      } catch (e) {
+        // 原来是 catch(e) {} —— 静默吞掉，页面上 fw4Active / nftablesLoaded
+        // 停在初值 false，模板就把它们渲染成「未加载」「不存在」的红点。
+        // 那是**假状态**：真相是「没查到」，不是「没加载」。
+        // 现在把原因记下来，模板据此显示错误、并且不画那些红点。
+        this.firewallStatusError = e.message || '查询失败';
+      } finally {
+        // 成功失败都要放开这一页 —— 失败时也得让用户看见「查询失败」，
+        // 永远空白比报错更难查。
+        this.firewallStatusLoaded = true;
+      }
       await this.loadRulesHealth();
     },
 
