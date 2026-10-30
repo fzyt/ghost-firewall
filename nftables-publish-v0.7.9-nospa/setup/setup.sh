@@ -11,13 +11,18 @@ set -e
 # ============================================================
 # 变量定义
 # ============================================================
-VERSION="0.7.9.1"
-# 上面这个是兜底值。真实版本从同级的 VERSION 文件读 ——
-# 写死的后果是「装的是 v0.8.7 的代码，屏幕上写的是 v0.7.9.1」。
+VERSION="unknown"
+# 真实版本从**同级的 VERSION 文件**读（setup/ 的上一级就是仓库根）。
+# 写死的后果是「装的是 v0.8.8 的代码，屏幕上写的是 v0.7.9.1」——
+# 比不显示版本更糟，因为它看起来是对的。
+# 兜底用 "unknown" 而不是某个具体版本号：宁可说"不知道"，
+# 也不要报一个**看起来对但其实过期**的版本。
 _VERSION_FILE="$(dirname "$0")/../VERSION"
 if [ -f "$_VERSION_FILE" ]; then
     _v="$(tr -d ' \t\n\r' < "$_VERSION_FILE" 2>/dev/null)"
     [ -n "$_v" ] && VERSION="$_v"
+else
+    echo "警告: 找不到 VERSION 文件（$_VERSION_FILE），版本号显示为 unknown" >&2
 fi
 PROJECT_NAME="nftables-web-v2"
 INSTALL_DIR="/opt/nftables-web-v2"
@@ -41,6 +46,63 @@ detect_pkg_manager() {
     fi
 }
 
+# 单包安装的最大尝试次数（弱网下 apk 单次失败很常见）
+PKG_RETRY=${PKG_RETRY:-3}
+
+# ------------------------------------------------------------
+# apk 单包安装（带重试 + 索引自愈）
+# ------------------------------------------------------------
+#
+# 为什么必须重试（2026-10-30 在 .232 全新机上实测）：
+#   弱网下 apk 把**索引文件**（packages.adb）拉到一半断线：
+#       WARNING: fetching .../packages.adb: unexpected end of file
+#   索引残缺时 apk 会认为包里根本没有这个包：
+#       ERROR: unable to select packages:
+#         python3-flask (no such package)
+#   注意它报的**不是** "network error"，而是 "no such package" ——
+#   一个纯网络问题被伪装成了"这个包不存在"，旧版这里只 warn 一次就跳过，
+#   于是这个包**永远**装不上，面板最后起不来，而报错指向完全不相干的地方。
+#
+#   修法：失败后先 `apk update` 把残缺的索引重下一遍，再重试。
+#   （只重试不加 update 是不够的 —— 坏的索引还在，照样 no such package。）
+pkg_install_apk() {
+    local pkg="$1" attempt=1
+    while [ "$attempt" -le "$PKG_RETRY" ]; do
+        # --no-cache：apk 的下载缓存在 /var/cache/apk，那是在 **overlay** 上
+        # （不是 tmpfs）。不清理的话下载的包会再存一份 —— OpenWrt 的
+        # overlay 常常只有 80~90MB，一份 50MB 的缓存直接把它撑满。
+        if apk add --no-cache "$pkg"; then
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        if [ "$attempt" -le "$PKG_RETRY" ]; then
+            warn "  安装 ${pkg} 失败（第 ${attempt} 次尝试），刷新索引后重试..."
+            # 重下索引：上一次的失败很可能把 .adb 拉残了
+            apk update >/dev/null 2>&1 || true
+            sleep $((attempt * 2))
+        fi
+    done
+    warn "安装失败: ${pkg}（已重试 $PKG_RETRY 次）"
+    return 1
+}
+
+pkg_install_opkg() {
+    local pkg="$1" attempt=1
+    while [ "$attempt" -le "$PKG_RETRY" ]; do
+        if opkg install "$pkg"; then
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        if [ "$attempt" -le "$PKG_RETRY" ]; then
+            warn "  安装 ${pkg} 失败（第 ${attempt} 次尝试），重试中..."
+            opkg update >/dev/null 2>&1 || true
+            sleep $((attempt * 2))
+        fi
+    done
+    warn "安装失败: ${pkg}（已重试 $PKG_RETRY 次）"
+    return 1
+}
+
 pkg_install() {
     for pkg in "$@"; do
         case "$PKG_MANAGER" in
@@ -49,17 +111,14 @@ pkg_install() {
                     info "已安装: ${pkg}"; continue
                 fi
                 info "安装: ${pkg}"
-                opkg install "$pkg" || warn "安装失败: ${pkg}"
+                pkg_install_opkg "$pkg" || true
                 ;;
             apk)
                 if apk info -e "$pkg" >/dev/null 2>&1; then
                     info "已安装: ${pkg}"; continue
                 fi
                 info "安装: ${pkg}"
-                # --no-cache：apk 的下载缓存在 /var/cache/apk，那是在 **overlay** 上
-                # （不是 tmpfs）。不清理的话下载的包会再存一份 —— OpenWrt 的
-                # overlay 常常只有 80~90MB，一份 50MB 的缓存直接把它撑满。
-                apk add --no-cache "$pkg" || warn "安装失败: ${pkg}"
+                pkg_install_apk "$pkg" || true
                 ;;
         esac
     done
@@ -660,7 +719,47 @@ install_deps() {
         ok "✅ blinker 就绪"
     fi
 
-    ok "✅ 依赖安装完成"
+    # ------------------------------------------------------------
+    # 关键依赖的**可用性**硬校验（不是"装上了"，是"能 import"）
+    # ------------------------------------------------------------
+    #
+    # 为什么不能只看"安装失败"的警告就放过（2026-10-30 在 .232 实测）：
+    #   单个包安装失败只 warn 不中断 ⇒ setup.sh 会一路走到
+    #   "✅ 依赖安装完成"，然后继续装 nginx、拷代码、注册服务，
+    #   最后面板起不来 —— 报错在几百行之外，而且指向 nginx 或端口，
+    #   跟真正缺的东西（flask）八竿子打不着。
+    #
+    #   这里在依赖阶段末尾当场验一次：缺什么就报什么，
+    #   让人一眼看出是哪个包没装上，而不是"面板起不来"这种糊涂账。
+    check_critical_deps
+}
+
+# 关键依赖可用性校验
+check_critical_deps() {
+    local missing=""
+
+    # python3 本身
+    if ! command -v python3 >/dev/null 2>&1; then
+        missing="${missing}\n  - python3（命令不存在）"
+    else
+        # flask / requests：面板与认证网关的硬依赖
+        python3 -c "import flask" 2>/dev/null || missing="${missing}\n  - python3-flask（import flask 失败）"
+        python3 -c "import requests" 2>/dev/null || missing="${missing}\n  - python3-requests（import requests 失败）"
+        python3 -c "import blinker" 2>/dev/null || missing="${missing}\n  - blinker（import blinker 失败）"
+    fi
+
+    # nginx：网关的承载体
+    command -v nginx >/dev/null 2>&1 || missing="${missing}\n  - nginx-full（nginx 命令不存在）"
+
+    if [ -n "$missing" ]; then
+        die "关键依赖不可用，停止安装：${missing}
+     这些是面板/网关的硬依赖，装不上后面必然起不来，先修好再重跑。
+     常见原因（弱网下最常见）：apk 的索引文件 packages.adb 被下载截断，
+     apk 会把这种情况误报成 'no such package'。
+     修法：apk update 刷新索引后重跑，或手动 apk add --no-cache <包名>。"
+    fi
+
+    ok "✅ 关键依赖可用性校验通过（flask / requests / blinker / nginx）"
 }
 
 # blinker 的 pip 兜底（随包安装失败时才走）

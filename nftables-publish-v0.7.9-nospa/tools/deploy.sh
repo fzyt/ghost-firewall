@@ -668,13 +668,27 @@ phase_verify() {
 
     # 全新安装的初始状态：还没设密码（第一次打开面板时设置）
     if [ "$MODE" = "fresh" ]; then
+        # ⚠️ password_set 在**面板**的 /api/auth/status 里（backend/app.py:9539），
+        #    网关的 /auth/status 只返回 {"authenticated": ...}，压根没这个字段。
+        #    第一版去问网关 ⇒ 永远问不到，还错用了 https（网关是纯 HTTP，
+        #    TLS 握手会打成 400，body 为空）—— 两个错叠在一起，
+        #    结果每次全新安装都报一条「网关读不到配置？」的假警报。
         local pset
-        pset="$(rssh "curl -sk --max-time 8 https://127.0.0.1:${AUTH_PORT}/auth/status 2>/dev/null | grep -o '\"password_set\":[a-z]*' | head -1" || true)"
-        [ -n "$pset" ] && ok "认证 API 报告面板口令状态: $pset" || warn "拿不到 password_set（网关读不到配置？）"
+        if [ -n "$REMOTE_LAN_ADDR" ]; then
+            pset="$(rssh "curl -sk --max-time 8 https://${REMOTE_LAN_ADDR}:${PANEL_PORT}/api/auth/status 2>/dev/null | grep -o '\"password_set\":[a-z]*' | head -1" || true)"
+            [ -n "$pset" ] && ok "面板报告口令状态: $pset" || warn "面板 /api/auth/status 没返回 password_set"
+        else
+            warn "取不到面板绑定地址，跳过口令状态检查"
+        fi
+        # 面板的 password_set 就是「口令文件存不存在」（app.py:_password_set），
+        # 所以磁盘上的文件必须和面板说的对得上 —— 两边不一致说明状态乱了。
         if [ -f "$CFG_DIR/nftables-web-password" ]; then
             warn "口令文件已存在 —— 全新装出来却有旧口令？检查一下是不是没真的重置"
+            [ "$pset" = '"password_set":true' ] || warn "  但面板报告 $pset —— 两边对不上"
         else
             ok "口令文件不存在（全新状态正确，首次打开面板时设置）"
+            [ "$pset" = '"password_set":false' ] || [ -z "$pset" ] || \
+                warn "  但面板报告 $pset —— 两边对不上"
         fi
     fi
 

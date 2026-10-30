@@ -90,6 +90,35 @@ sh /tmp/setup.sh --force
 ssh root@192.168.100.233 'sh /root/nftables-web-backups/<时间戳>/restore.sh'
 ```
 
+### 装依赖失败：报「no such package」多半不是包不存在
+
+弱网下 apk 把索引文件 `packages.adb` 拉到一半断线：
+
+```
+WARNING: fetching .../packages.adb: unexpected end of file
+ERROR: unable to select packages:
+  python3-flask (no such package):
+```
+
+注意它报的**不是网络错误，而是「这个包不存在」** —— 一个纯网络问题被伪装成了
+「仓库里没这个包」，而且这个误报会一直持续到索引被重下为止。
+`setup.sh` 现在会自动 `apk update` 刷新索引后重试（最多 3 次），
+但如果机器到官方源实在不通，可以把源换到国内镜像（OpenWrt 25.x 的源配置在
+`/etc/apk/repositories.d/distfeeds.list`）：
+
+```bash
+# 以南京大学镜像为例，把每条 downloads.openwrt.org 换成 mirror.nju.edu.cn
+sed -i 's#https://downloads.openwrt.org/releases#https://mirror.nju.edu.cn/openwrt/releases#' \
+    /etc/apk/repositories.d/distfeeds.list
+apk update
+```
+
+实测 8 条索引全部可达、单条下载都在 0.35 秒内（官方源 3.2 秒且经常断）。
+换了源之后**不需要**重装设备，重跑 `./tools/deploy.sh --host <ip> --yes` 即可续装。
+
+> 注意：`/etc/apk/repositories`（旧布局）是空的，OpenWrt 25.x 读的是
+> `/etc/apk/repositories.d/distfeeds.list`。
+
 ## 项目结构
 
 ```
@@ -156,6 +185,12 @@ frontend/
   `nginx-ssl` 不含该模块（装完不报错，一开网关整片 500）。已在
   `192.168.100.224`（OpenWrt 24.10.0）实测：`nginx-full 1.26.3` 具备
   `auth_request` / `realip`，`setup.sh` 装完会当场校验
+- **overlay 至少要留 80~90MB**：全新安装实测（`.232`，OpenWrt 25.12.5 x86_64，
+  overlay 共 86.4MB）—— 装完依赖 + 项目代码后**已用 56MB**、剩 27MB。
+  这是 `apk add --no-cache`（不落包缓存）与「不装 python3-pip」（52MB，
+  改用随包 blinker）这两条设计换来的。装的时候别顺手在同一个 overlay 上放别的东西，
+  否则会在装到一半时把盘撑满 —— 表现为「apk 装不动、log 写不进去、一堆莫名其妙的失败」。
+  想留备份的话，备份目录可以指到 tmpfs（`/tmp` 是 tmpfs，不占 overlay）
 
 ### 浏览器实测
 
