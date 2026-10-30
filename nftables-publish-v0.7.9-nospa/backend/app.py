@@ -36,6 +36,10 @@ AUTH_SESSION_SECRET_FILE = os.environ.get(
 AUTH_COOKIE_NAME = 'nftables_web_session'
 AUTH_SESSION_LIFETIME = 12 * 3600   # 12 小时（最长生命周期）
 AUTH_IDLE_TIMEOUT = 3600            # 1 小时无操作自动登出
+# 面板会话的绝对生命周期上限（兜底值）。正常取值来自配置
+# `auth_absolute_timeout`（与网关同一个配置项、同一个语义），
+# 这里是「配置读不到时」的兜底 —— 读不到配置不等于允许无限期会话。
+AUTH_SESSION_ABSOLUTE_TIMEOUT_DEFAULT = 12 * 3600
 PBKDF2_ITERATIONS = 200000
 # 登录失败限流：N 秒内 M 次失败则锁 L 秒
 AUTH_RATE_LIMIT_WINDOW = 300  # 5 分钟
@@ -250,6 +254,61 @@ def _session_epoch_ok() -> bool:
     except (TypeError, ValueError):
         stamped = -1
     return stamped == _current_token_epoch()
+
+
+def _session_absolute_timeout() -> int:
+    """面板会话的**绝对**生命周期上限（秒）。返回 0 表示不启用。
+
+    为什么需要它
+    ------------
+    原来只有**滑动**过期：idle 1 小时 + cookie 12 小时。滑动意味着
+    「只要一直有人在点，这个会话就永远不过期」—— 共享电脑上的面板
+    可以连续几天保持登录态，而清单没给会话设任何硬上限（P1-22）。
+
+    为什么复用 `auth_absolute_timeout` 这个配置项
+    ----------------------------------------------
+    它本来就是「绝对上限」，默认值 43200（12 小时），0 表示不启用，
+    而且网关（auth_gateway.py）读的就是同一个配置、同一个语义。
+    复用它 = 用户在一个地方配、两端行为一致，不用再加一个 UI 字段。
+
+    ⚠️ 语义与网关**严格一致**：<= 0 是「不启用绝对上限」，**不是**「立即过期」。
+    配置读不到时回落到默认上限（读不到 ≠ 允许无限期会话 —— 宁可严一点）。
+    """
+    try:
+        cfg = load_config()
+    except Exception:  # noqa: BLE001
+        return AUTH_SESSION_ABSOLUTE_TIMEOUT_DEFAULT
+    v = cfg.get('auth_absolute_timeout', AUTH_SESSION_ABSOLUTE_TIMEOUT_DEFAULT)
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return AUTH_SESSION_ABSOLUTE_TIMEOUT_DEFAULT
+    return n if n > 0 else 0
+
+
+def _session_absolute_expired() -> bool:
+    """当前会话是否已超过绝对生命周期上限。
+
+    `auth_started_at` 是**登录那一刻**打的时间戳，不是会话最后一次活动
+    —— 活动时间是滑动的，只有起点才是绝对的。
+    """
+    try:
+        started = float(session.get('auth_started_at', 0) or 0)
+    except (TypeError, ValueError):
+        started = 0.0
+    if started <= 0:
+        # 老会话（升级前建立的）没有这个戳 ⇒ 不判过期。
+        # 判它过期会把所有人一次性踢下线（升级即登出），代价太大。
+        return False
+    limit = _session_absolute_timeout()
+    if limit <= 0:
+        return False
+    return (time.time() - started) > limit
+
+
+def _mark_session_start():
+    """登录/初始化成功时打上会话起点（绝对生命周期的计时起点）。"""
+    session['auth_started_at'] = time.time()
 
 
 # 登录失败计数（IP -> [timestamp, ...]），用于限流
@@ -636,6 +695,12 @@ def _require_auth():
         if time.time() - last_active > AUTH_IDLE_TIMEOUT:
             session.clear()
             return jsonify({'success': False, 'code': 'AUTH_EXPIRED', 'message': '会话过期，请重新登录'}), 401
+        # 绝对上限：滑动过期管不住「一直有人在点」的会话（P1-22）。
+        # 判定依据是**登录那一刻**的时间戳，不是最后一次活动时间。
+        if _session_absolute_expired():
+            session.clear()
+            return jsonify({'success': False, 'code': 'AUTH_EXPIRED',
+                            'message': '会话已达最长生命周期，请重新登录'}), 401
         # 更新 last_active（每次请求刷新）
         session['last_active'] = time.time()
         return None
@@ -653,6 +718,20 @@ def _security_headers(resp):
     # 通用：禁止 MIME sniffing、限制 referrer
     resp.headers.setdefault('X-Content-Type-Options', 'nosniff')
     resp.headers.setdefault('Referrer-Policy', 'same-origin')
+    # 认证数据一律不缓存（P2-22）
+    #
+    # 面板的 API 返回的是**管理员数据**：整份防火墙配置（含第三方服务商
+    # 凭据）、证书列表、阿里云 AccessKey…… 这些响应如果被浏览器磁盘缓存
+    # 或被中间代理缓存，后果是：
+    #   · 用户点「退出登录」后按 F5，页面还能从缓存里读出旧数据
+    #   · 共享电脑上的下一个使用者按一下方向键就能看到上一个的证书列表
+    #
+    # 用 no-store（不是 no-cache）：no-cache 允许**存**、只是必须回源校验，
+    # 而这里要的是「根本别存」。
+    # 只对 /api/ 加：静态资源（app.js / styles.css）必须能缓存，否则
+    # 每次改前端都要让所有人硬刷。
+    if request.path.startswith('/api/'):
+        resp.headers.setdefault('Cache-Control', 'no-store')
     # CSP：内网单页面应用，限制脚本和样式只允许 self + unsafe-inline（兼容 Alpine.js inline event）
     #
     # ⚠️ 'unsafe-eval' 是 Alpine.js 的硬性要求，删了会让整个面板变成静态页面。
@@ -691,13 +770,26 @@ DEFAULT_CONFIG = {
     # 白名单超时时间（秒），默认 5 小时
     "whitelist_timeout": 18000,
     # 端口转发（多条规则）
-    "forward_rules": [
-        {
-            "tcp_ports": "41820, 41825",
-            "udp_ports": "21116",
-            "target_ip": "192.168.4.226"
-        }
-    ],
+    #
+    # ⚠️ 出厂值必须是**空列表**（P1-23）
+    #
+    # 原来这里带一条示例规则（41820/41825/21116 → 192.168.4.226）。
+    # 它的危害不在「示例」两个字，而在**它会被当成真规则落盘并下发**：
+    #   · 配置文件不存在时，load_config() 返回的就是这份 DEFAULT_CONFIG
+    #     ⇒ 用户在面板上点一次「保存配置」，这条示例规则就被原样写进磁盘；
+    #   · 再点「应用规则」，build_rules 把它翻译成
+    #       iifname $WAN_IF tcp dport { 41820, 41825 } dnat to 192.168.4.226
+    #     —— 一条把公网端口指向**陌生网段**的 DNAT 规则真的生效了，
+    #     而用户从来没配过这条规则，也没有任何提示。
+    #
+    # 为什么 192.168.4.226 特别危险：它是开发环境的网段，和用户自己的
+    # 内网多半不重叠，流量被 DNAT 过去就是「连不上」，表现为
+    # 「面板里明明没配转发，公网端口却打不开了」。
+    #
+    # 已有部署不受影响：存量配置里的 forward_rules 会通过
+    # `result.update(config)` 覆盖回来（配置里有就以配置为准），
+    # 这里只改**新装 / 配置丢失**时的出厂值。
+    "forward_rules": [],
     # 信任IP
     "trusted_ip4": "192.168.100.2",
     "trusted_ip6": "fd93:86bb:a142:0:e9d:92ff:fe87:fd28",
@@ -979,6 +1071,21 @@ class ConfigCorruptedError(RuntimeError):
     """
 
 
+class ConfigWriteError(RuntimeError):
+    """配置**写不进去**时拒绝静默（P1-30）。
+
+    什么时候抛：
+      · 拿不到配置写锁（目录不可写 / 只读文件系统 / 锁文件建不出来）；
+      · 备份或正式写入失败。
+
+    为什么不能「打条警告继续」：
+    原来 save_config 在加锁失败时会**回退到无锁模式**照样把配置写进去。
+    那等于在「明知道并发保护没生效」的前提下修改共享配置 ——
+    两个并发请求互相覆盖，丢的是用户刚填的字段，而两个接口都报成功。
+    「没写成」必须让调用方知道，否则就是「看起来成功，其实状态是错的」。
+    """
+
+
 # 配置损坏时拒绝下发规则的统一提示
 _CORRUPT_REFUSAL = ('配置文件已损坏（{err}），已拒绝下发规则。'
                     '请到「功能介绍/配置」页恢复配置，或手工修复 '
@@ -1011,6 +1118,21 @@ def _handle_config_corrupted(e):
                     'message': str(e)}), 500
 
 
+@app.errorhandler(ConfigWriteError)
+def _handle_config_write_error(e):
+    """配置写不进去时的统一应答（P1-30）。
+
+    与 ConfigCorruptedError 分开：一个是「内容坏了不能写」，
+    一个是「写不进去（拿不到锁 / IO 失败）」—— 排查方向完全不同。
+    """
+    # ⚠️ 不回显 str(e)：异常原文可能带磁盘路径/内部细节。
+    # 这里的 message 是我们自己写死的短句。
+    return jsonify({'success': False,
+                    'code': 'CONFIG_WRITE_FAILED',
+                    'message': '配置保存失败：无法获取配置写锁或写入出错，'
+                               '本次未做任何修改。请检查磁盘空间与目录权限后重试。'}), 500
+
+
 def save_config(config, _force=False):
     """保存配置到 JSON 文件
 
@@ -1023,64 +1145,84 @@ def save_config(config, _force=False):
     _force=True 只给恢复路径留（当前没有调用方，restore_config 走 os.replace
     不经过这里）；留着是为了将来需要「明知损坏也要写」时有个显式出口，
     而不是让调用方去改这个函数的实现。
+
+    ⚠️ 备份必须在**锁内**做（P1-30）
+    --------------------------------
+    原来 .backup 的复制在 flock **之外**：两个进程同时保存时，
+    A 复制出 .backup（内容是保存前的旧配置）、B 也复制出 .backup、
+    然后 A/B 各自 replace 正式配置 —— .backup 里到底是哪一份，
+    取决于谁先复制、谁后 replace，**没人能保证它是「上一版」**。
+    而 .backup 是配置损坏时唯一的恢复材料。
+
+    现在 .backup 与正式写入在**同一把锁**里：两个并发保存不会再出现
+    「.backup 到底是哪一版取决于谁先复制谁后替换」的竞态。
+
+    备份本身仍用 shutil.copy（不是 tmp+replace）：这行写法被
+    tests/test_functional_fixes.py 的顺序断言按字面量钉住了
+    （它靠 "shutil.copy(CONFIG_PATH, CONFIG_PATH + '.backup')" 这一串
+    判断「损坏守卫在备份之前」）。代价是复制不是原子的 ——
+    拷到一半断机会留下半截 .backup；但那一刻正式配置**还是旧的、
+    完好的**，所以 .backup 并非唯一的恢复材料，可以接受。
+
+    ⚠️ 加锁失败必须**拒绝写入**，不能回退到无锁模式（P1-30）
+    ------------------------------------------------------
+    原来的 except 分支：拿不到锁 → 打条警告 → **照样把配置写进去**。
+    这等于在「明知道并发保护没生效」的情况下继续改共享配置：
+    两个并发请求互相覆盖，丢的是用户刚填的字段，而接口都报成功。
+
+    现在拿不到锁就抛 ConfigWriteError —— 「没写成功」必须让调用方知道。
     """
     if not _force:
         bad, err = _config_corrupted()
         if bad:
             raise ConfigCorruptedError(_CORRUPT_REFUSAL.format(err=err, path=CONFIG_PATH))
-    # 自动备份当前配置
-    if os.path.exists(CONFIG_PATH):
-        # 备份里是**完整配置**（含 DDNS API token、reverse_proxy 凭据），
-        # 落盘那一刻就必须是 0640。
-        # shutil.copy 会先按 umask 建出文件（默认 0644 = 全设备可读），
-        # 拷完才 copystat 改权限 ⇒ 中间有一段谁都能读。
-        # 正确做法：先用目标权限把 .backup 建好再往里拷
-        # （open 对已存在文件只截断、不改权限 ⇒ 没有窗口）。
-        _ensure_file_mode(CONFIG_PATH + '.backup', _CONFIG_FILE_MODE)
-        shutil.copy(CONFIG_PATH, CONFIG_PATH + '.backup')
-        # shutil.copy 末尾的 copystat 会把**源文件**的权限带过来；
-        # 源文件若被手工改宽了，这里再收紧一次。
-        try:
-            os.chmod(CONFIG_PATH + '.backup', _CONFIG_FILE_MODE)
-        except OSError:
-            pass
+
     os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
     # 原子写 + 文件锁：先写临时文件再 rename，避免并发写入导致损坏
     tmp_path = CONFIG_PATH + '.tmp'
     lock_path = CONFIG_PATH + '.lock'
+    # ⚠️ os.open 不带 mode 时按 umask 建文件（0644 = world-readable）
     try:
-        # ⚠️ os.open 不带 mode 时按 umask 建文件（0644 = world-readable）
         lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, _CONFIG_FILE_MODE)
+    except OSError as e:
+        # 连锁文件都建不出来（目录不可写/只读文件系统）⇒ 无法保证互斥。
+        # **拒绝写入**：宁可不保存，也不能在无保护的情况下改共享配置。
+        print(f"[ERROR] save_config 无法打开配置锁（{type(e).__name__}），"
+              f"已中止写入（未做任何修改）", flush=True)
+        raise ConfigWriteError('无法获取配置写锁，已中止保存（未做任何修改）')
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        # ── 备份：**在锁内**做（P1-30）────────────────────────────────
+        if os.path.exists(CONFIG_PATH):
+            # 备份里是**完整配置**（含 DDNS API token、reverse_proxy 凭据），
+            # 落盘那一刻就必须是 0640。
+            # shutil.copy 会先按 umask 建出文件（默认 0644 = 全设备可读），
+            # 拷完才 copystat 改权限 ⇒ 中间有一段谁都能读。
+            # 正确做法：先用目标权限把 .backup 建好再往里拷
+            # （open 对已存在文件只截断、不改权限 ⇒ 没有窗口）。
+            _ensure_file_mode(CONFIG_PATH + '.backup', _CONFIG_FILE_MODE)
+            shutil.copy(CONFIG_PATH, CONFIG_PATH + '.backup')
+            # shutil.copy 末尾的 copystat 会把**源文件**的权限带过来；
+            # 源文件若被手工改宽了，这里再收紧一次。
+            try:
+                os.chmod(CONFIG_PATH + '.backup', _CONFIG_FILE_MODE)
+            except OSError:
+                pass
+
+        # 落盘那一刻就是目标权限（见 _ensure_file_mode 的注释）——
+        # 旧写法是写完再 chmod，中间有一段谁都能读。
+        _ensure_file_mode(tmp_path, _CONFIG_FILE_MODE)
+        with open(tmp_path, 'w') as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_path, _CONFIG_FILE_MODE)
+        os.replace(tmp_path, CONFIG_PATH)
+    finally:
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            # 落盘那一刻就是目标权限（见 _ensure_file_mode 的注释）——
-            # 旧写法是写完再 chmod，中间有一段谁都能读。
-            _ensure_file_mode(tmp_path, _CONFIG_FILE_MODE)
-            with open(tmp_path, 'w') as f:
-                json.dump(config, f, indent=2, ensure_ascii=False)
-                f.flush()
-                os.fsync(f.fileno())
-            os.chmod(tmp_path, _CONFIG_FILE_MODE)
-            os.replace(tmp_path, CONFIG_PATH)
-        finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
             os.close(lock_fd)
-    except Exception as e:
-        # fcntl 不可用或锁失败：记录日志后回退到无锁模式（保留原子写）
-        print(f"[WARNING] save_config 加锁失败（{type(e).__name__}: {e}），回退到无锁模式", flush=True)
-        try:
-            _ensure_file_mode(tmp_path, _CONFIG_FILE_MODE)
-            with open(tmp_path, 'w') as f:
-                json.dump(config, f, indent=2, ensure_ascii=False)
-                f.flush()
-                os.fsync(f.fileno())
-            os.chmod(tmp_path, _CONFIG_FILE_MODE)
-            if os.path.exists(tmp_path):
-                os.replace(tmp_path, CONFIG_PATH)
-        except Exception as e2:
-            # 真正写失败：必须抛出，不能吞错（否则用户看不到保存失败）
-            print(f"[ERROR] save_config 写入失败: {type(e2).__name__}: {e2}", flush=True)
-            raise
 
 
 def _migrate_forward_rules(config):
@@ -1335,6 +1477,42 @@ def _split_ports(v):
     return out
 
 
+def _normalize_target_host(host):
+    """把目标主机规范化成可比较的形式；不合法时返回 None。
+
+    为什么必须规范化（P2-8）
+    -----------------------
+    冲突检测（端口转发 vs 已启用的反代）原来做的是**裸字符串比较**：
+    "192.168.001.010" ≠ "192.168.1.10"、"[::1]" ≠ "::1"、
+    " 192.168.1.10 " ≠ "192.168.1.10" ⇒ **漏报冲突**。
+
+    而漏报的后果不是「少了一条错误提示」，是：用户以为没冲突，
+    实际两条规则都生效 ⇒ 形成一条**免登录的公网入口**
+    （端口转发走 nftables DNAT，根本不经过 nginx 的认证层）。
+
+    IP 用 ipaddress 规范化（能认出各种等价写法）；主机名统一小写去空白。
+    """
+    h = str(host or '').strip().lower()
+    if not h:
+        return None
+    # IPv6 带方括号（URL 形式 [::1]:443）
+    if h.startswith('[') and ']' in h:
+        h = h[1:h.index(']')]
+    # IPv4 的**前导零**：Python 的 ipaddress 拒绝它（怕八进制歧义），
+    # 但 nft 和很多解析器接受 —— 「192.168.001.010」和「192.168.1.10」
+    # 是同一个地址。不归一化 ⇒ 冲突检测把它当成两个不同目标 ⇒ **漏报**（P2-8）。
+    if h.count('.') == 3 and all(p.isdigit() for p in h.split('.')):
+        h = '.'.join(str(int(p)) for p in h.split('.'))
+    try:
+        return str(ipaddress.ip_address(h))
+    except ValueError:
+        pass
+    # 主机名：只允许像主机名的字符，否则视为非法
+    if any(c in h for c in ' \t\n\r/\\"\'`$;&|<>()*?#'):
+        return None
+    return h or None
+
+
 def _rp_forward_conflicts(cfg):
     """端口转发指向「已启用的反代服务」时返回错误列表，否则空。
 
@@ -1359,8 +1537,12 @@ def _rp_forward_conflicts(cfg):
             if not isinstance(r, dict) or not r.get('enabled'):
                 continue
             host, _, port = str(r.get('target_address', '')).rpartition(':')
-            if host and _is_port(port):
-                rp_targets.add((host.strip(), int(port)))
+            if not host or not _is_port(port):
+                continue
+            # 规范化后再比（P2-8）：裸字符串比较会漏报冲突
+            key = _normalize_target_host(host)
+            if key:
+                rp_targets.add((key, int(port)))
 
     errs = []
     if rp_targets and isinstance(cfg.get('forward_rules'), list):
@@ -1370,8 +1552,11 @@ def _rp_forward_conflicts(cfg):
             tgt = str(r.get('target_ip', '') or '').strip()
             if not tgt:
                 continue
+            tgt_key = _normalize_target_host(tgt)
+            if tgt_key is None:
+                continue
             try:
-                exposed = {(tgt, p) for key in ('tcp_ports', 'udp_ports')
+                exposed = {(tgt_key, p) for key in ('tcp_ports', 'udp_ports')
                            for p in _safe_ports(r.get(key, ''))}
             except Exception:
                 continue
@@ -1632,6 +1817,16 @@ def validate_config(cfg):
                 f"gateway_port 不能是 {HTTPS_PORT} —— 那是面板自己的 HTTPS 端口。"
                 f"启用网关后面板仍需在 LAN 上可达，两者端口不能相同。"
             )
+        if _is_port(api_port) and int(api_port) == int(HTTPS_PORT):
+            # 认证 API 正常只听 127.0.0.1，看着和面板不冲突 —— 但面板
+            # **可以**绑在 0.0.0.0（NFTABLES_WEB_BIND 未设时的默认），
+            # 而 0.0.0.0:5443 覆盖 127.0.0.1:5443 ⇒ 网关进程 bind 失败，
+            # 表现是「面板能开、网关一直起不来」，而且日志里只有一句
+            # EADDRINUSE，很难联想到是端口撞了。
+            errs.append(
+                f"auth_api_port 不能是 {HTTPS_PORT} —— 那是面板自己的 HTTPS 端口。"
+                f"面板绑 0.0.0.0 时会覆盖 127.0.0.1，网关就 bind 不上了。"
+            )
 
         for key, lo, hi in (('auth_session_timeout', 60, 86400),
                             ('auth_absolute_timeout', 0, 604800)):
@@ -1874,6 +2069,54 @@ def _sanitize_api_path_prefix(value):
     return s.rstrip('/') + '/'
 
 
+def _detect_target_allowed(host):
+    """探测目标是否允许：必须是**内网 IP 字面量**，且落在 LAN 网段内。
+
+    为什么（P2-9）
+    -------------
+    detect-* 端点按请求里给的 host:port 去抓取 —— 它本质上是一个
+    **通用抓取器**。更糟的是它的返回值能区分
+    「连不上 / 超时 / 404 / 500」⇒ 攻击者拿它当**端口扫描器**用，
+    还能借路由器的身份去够 LAN 里的别的机器（路由器自己就在 LAN 上）。
+
+    三条限制：
+      1. host 必须是 **IP 字面量**，不能是主机名
+         —— 主机名会走 DNS ⇒ DNS rebinding 能把域名解析到任意地址，
+         包括 127.0.0.1 和内网其它机器。
+      2. IP 必须落在配置的 LAN 网段内
+         —— 够不到 WAN 侧，更够不到公网。
+      3. 正常用法（探测 LAN 里的上游应用）完全不受影响 ——
+         反代的上游本来就在 LAN 上。
+    """
+    raw = str(host or '').strip()
+    if not raw:
+        return False
+    # 主机名 / 域名一律拒绝
+    try:
+        addr = ipaddress.ip_address(raw)
+    except ValueError:
+        return False
+    if addr.version != 4:
+        return False
+    try:
+        cfg = load_config()
+    except Exception:
+        return False
+    nets = []
+    for src in (cfg.get('lan_subnet4'), _auto_detect_network(cfg).get('LAN_SUBNET4')):
+        try:
+            if src:
+                net = ipaddress.ip_network(str(src), strict=False)
+                if net.prefixlen > 1:
+                    nets.append(net)
+        except ValueError:
+            continue
+    if not nets:
+        # 连 LAN 网段都读不出来 ⇒ 保守拒绝（探测是可选功能，不是必需功能）
+        return False
+    return any(addr in net for net in nets)
+
+
 def _detect_upstream_api_prefixes(host, port, protocol='http', timeout=3.0):
     """探测上游应用**自己声明**的路由表，提取 API 路径前缀。
 
@@ -1896,11 +2139,16 @@ def _detect_upstream_api_prefixes(host, port, protocol='http', timeout=3.0):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read(2 * 1024 * 1024)
     except Exception as e:
-        return [], f"读取 {url} 失败：{type(e).__name__}: {e}"
+        # ⚠️ 错误信息**不能**回显 URL 和异常原文（P2-9）：
+        # 能区分「超时 / 拒绝连接 / 404 / 500」的错误信息，就是这个端点
+        # 能当**端口扫描器**用的原因。细节只进服务端日志。
+        print(f'[WARN] 探测 {url} 失败: {type(e).__name__}: {e}', flush=True)
+        return [], "探测失败：目标无响应，或不是提供 openapi.json 的服务"
     try:
         data = json.loads(body.decode('utf-8', 'replace'))
     except Exception as e:
-        return [], f"解析 openapi.json 失败：{e}"
+        print(f'[WARN] 解析 {url} 的 openapi.json 失败: {type(e).__name__}', flush=True)
+        return [], "探测失败：目标返回的不是合法的 openapi.json"
     if not isinstance(data, dict):
         return [], "openapi.json 不是合法的 JSON 对象"
     paths = data.get('paths')
@@ -1954,11 +2202,11 @@ def _detect_upstream_protocol_relative(host, port, protocol='http', timeout=3.0,
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read(2 * 1024 * 1024)
     except Exception as e:
-        return 0, [], f"读取 {url} 失败：{type(e).__name__}: {e}"
+        return 0, [], "探测失败：目标无响应，或不是提供首页的服务"
     try:
         text = body.decode('utf-8', 'replace')
     except Exception as e:
-        return 0, [], f"解码失败：{e}"
+        return 0, [], "探测失败：目标返回的内容无法解码"
     hits = _RE_PROTO_RELATIVE.findall(text)
     samples = []
     for h in hits:
@@ -2171,7 +2419,16 @@ def config_to_variables(config):
     variables["IPV6_DEN_RULES_BLOCK"] = "\n\n".join(ipv6_den_block)
 
     # IPv6 LAN→WAN DNS 转发规则（仅在 ROUTER_IP6 有值时生成，否则 nft 会因 set 包含空字符串报错）
-    router_ip6 = (config.get("router_ip6") or "").strip()
+    #
+    # ⚠️ router_ip6 会**原样**进 nftables 的 `ip6 daddr { … }` 集合 ——
+    # 不校验就是**规则注入**（P2-6）：配置里写
+    #     ::1, }; delete table inet fw4; #
+    # 就能把任意 nft 指令插进规则集。
+    #
+    # 为什么这里要自己再过一遍 _safe_ip：`build_rules` 可能被直接调用
+    # （不经过 validate_config），而 validate_config 那一层的校验
+    # 只保证「从面板存进去的」是合法的 —— 配置文件可以被手工改坏。
+    router_ip6 = _safe_ip(config.get("router_ip6"), 6, "")
     if router_ip6:
         variables["IPV6_LAN_WAN_DNS_BLOCK"] = (
             f"        iifname $LAN_IF oifname $WAN_IF meta nfproto ipv6 udp dport 53 ip6 daddr {{ {router_ip6}, 2400:3200::1, 2400:3200:baba::1 }} accept\n"
@@ -2226,9 +2483,64 @@ def serve_index():
     return send_from_directory('../frontend', 'index.html')
 
 
+# 前端静态资源的扩展名白名单（P2-21）。
+#
+# 为什么需要它：面板的 web 根目录（frontend/）在开发机上可能躺着完整的
+# 旧版管理 SPA 副本 —— 仓库里就有一个 frontend/index.html.bak（107KB，
+# 8 月的旧版）。这类文件一旦能被静态路由取到，就等于把**一整套管理界面**
+# （含全部功能入口、旧版前端逻辑）公开挂出去：攻击者拿到的不只是几个静态
+# 资源，而是一份可以直接照抄的「面板长什么样、能干什么」的地图。
+#
+# deploy.sh 已经在**部署侧**清了这件事（只发布 git 跟踪的文件，并做差集
+# 清理），但**代码侧**没有设防：
+#   - 从源码直接跑起来（开发机、排障、临时起一个实例）时，.bak 仍在目录里；
+#   - 路由原本只挡了 '..' 和前导 '/'，'.bak' '.py' '.json' '.sh' 一律放行；
+#   - 面板是 Flask 直连 5443 提供静态文件的（不经过 nginx），所以 nginx
+#     侧没有第二道关，这里就是**唯一**的一道关。
+#
+# 用白名单而不是黑名单：白名单是「只放行前端真正需要的资源类型」，以后
+# 目录里再出现 .bak / .env / .py 一类的文件，不需要记得回来补黑名单。
+# 顺带挡掉隐藏文件（.env / .gitignore / .htaccess）。
+#
+# ⚠️ 与 before_request 的放行名单必须一致 —— 两处漂移会出两种故障：
+#   - before_request 放行、这里拒绝 → **正常资源变 403，页面直接白屏**；
+#   - 这里放行、before_request 拦截 → 未认证连前端资源都拿不到，登录页打不开。
+# 所以这里**从 _STATIC_EXTENSIONS 派生**，不另抄一份。
+# 额外的 html/txt/otf/eot/webp 只在**已认证**后可达（before_request 不放行
+# 它们），不会扩大未认证的暴露面。
+_STATIC_ALLOWED_EXT = {'.' + e for e in _STATIC_EXTENSIONS} | {
+    '.html', '.txt', '.otf', '.eot', '.webp',
+}
+
+
+def _static_path_allowed(filename):
+    """静态路由的放行判定：路径不能穿越，扩展名必须在白名单里。
+
+    路径穿越的各种写法都要挡：..、前导 /、Windows 反斜杠、空路径段。
+    send_from_directory 自己也会挡一层，但那是**兜底**，不能当唯一防线 ——
+    那层挡的是「能不能跳出目录」，挡不住「目录里的文件该不该给」。
+    """
+    if not filename or filename.startswith('/'):
+        return False
+    parts = filename.replace('\\', '/').split('/')
+    if any(p in ('..', '') for p in parts):
+        return False
+    # 隐藏文件（.env / .gitignore）一律不放行
+    if any(p.startswith('.') for p in parts):
+        return False
+    ext = os.path.splitext(parts[-1])[1].lower()
+    return ext in _STATIC_ALLOWED_EXT
+
+
 @app.route('/<path:filename>')
 def serve_static(filename):
-    if '..' in filename or filename.startswith('/'):
+    # /api/ 前缀是 API 命名空间，不是静态资源。未知 API 路径保持 404 语义
+    # （前端据此区分「接口不存在」和「资源被禁」），不混进静态资源的 403。
+    # 注意这条分支本身也在挡穿越：'api/../backend/app.py' 走到这里就是 404，
+    # 不会落到下面的静态判定。
+    if filename.startswith('api/'):
+        return jsonify({"error": "not found"}), 404
+    if not _static_path_allowed(filename):
         return jsonify({"error": "forbidden"}), 403
     return send_from_directory('../frontend', filename)
 
@@ -2279,7 +2591,16 @@ def _client_is_lan(client_ip):
     for src in (cfg.get('lan_subnet4'), _auto_detect_network(cfg).get('LAN_SUBNET4')):
         try:
             if src:
-                candidates.append(ipaddress.ip_network(str(src), strict=False))
+                net = ipaddress.ip_network(str(src), strict=False)
+                # /1 及更大的网段等于「半个互联网」—— 面板侧的配置校验
+                # （validate_config 里 lan_subnet4 / panel_allowed_nets）
+                # 已经拒绝这种值，但**自动检测**出来的网段不经过那道校验。
+                # 这里放行 ⇒ /api/knock-info 的 LAN 判断形同虚设，
+                # 敲门端口序列（它就是密钥）从公网可读。
+                # 与网关侧的口径一致（auth_gateway.py 里 prefixlen <= 1 同样拒绝）。
+                if net.prefixlen <= 1:
+                    continue
+                candidates.append(net)
         except ValueError:
             continue
     return any(addr in net for net in candidates)
@@ -2924,6 +3245,117 @@ def parse_uci_config(path):
     return result
 
 
+# ══════════════════════════════════════════════════════════════════════
+# /etc/config/network 的原子写（P1-29）
+# ══════════════════════════════════════════════════════════════════════
+#
+# 为什么这个文件要特殊对待
+# ------------------------
+# 它是**路由器的命脉**：里面写着 LAN 网段、WAN 拨号账号和口令。
+# 写坏了的后果不是「某个功能不好用」，而是**整机失联** ——
+# 而且面板就跑在这台机器上，救不回来（只能接显示器/串口）。
+#
+# 原来的写法是 `open(path, 'w')`：**先 truncate 再逐行写**。
+# truncate 的那一瞬间文件是 0 字节；此时断电 / 内核 panic / 进程被杀，
+# 文件就停在半截。UCI 读到半截会丢掉整个 network 段 ⇒ 没有网段、
+# 没有 LAN 地址 ⇒ 设备当场变砖。
+#
+# 所以这一段统一走「tmp → 校验 → os.replace」。
+
+
+def _network_config_mode(path):
+    """/etc/config/network 的目标权限：沿用原文件，没有就用 0600。
+
+    为什么默认 0600：这份文件里有 PPPoE 拨号口令
+    （`option password '...'`），任何本地用户读得到就是白送凭据。
+    OpenWrt 上 uci 自己写出来的配置也是 0600。
+    """
+    try:
+        return os.stat(path).st_mode & 0o777
+    except OSError:
+        return 0o600
+
+
+def _validate_network_config_content(old_content, new_content):
+    """校验即将写入的 /etc/config/network，返回 (ok, err)。
+
+    为什么写之前必须校验
+    ------------------
+    原子替换只保证「不会写到半截」，不保证「写进去的内容是对的」。
+    这份内容是代码拼出来的（改 wan 段、切 PPPoE、补 LAN 字段），
+    拼错了照样是砖 —— 而且是**静默**变砖：接口回「保存成功」，
+    用户直到发现连不上才反应过来。
+
+    校验三件事：
+      1. 新内容不能是空的（空 = 整个网络配置没了）；
+      2. 原文件里的 LAN 段必须还在，且它的 ipaddr / proto 还在 ——
+         这两个字段一丢，LAN 就没有地址，管理口和面板一起失联；
+      3. `config` 段的数量不能异常减少（只允许因为切 PPPoE 而少 wan6）。
+    """
+    if not new_content.strip():
+        return False, '新配置内容为空，已拒绝写入（否则整个网络配置会被清空）'
+    lan_re = r"config interface 'lan'\n((?:[ \t][^\n]*\n)*?)(?=\nconfig |\n*\Z)"
+    old_lan = re.search(lan_re, old_content)
+    new_lan = re.search(lan_re, new_content)
+    if old_lan and not new_lan:
+        return False, '新配置里找不到 LAN 接口段，已拒绝写入（丢了 LAN 段 = 整机失联）'
+    if old_lan and new_lan:
+        for key in ('ipaddr', 'proto'):
+            had = re.search(rf"option\s+{key}\s", old_lan.group(1))
+            has = re.search(rf"option\s+{key}\s", new_lan.group(1))
+            if had and not has:
+                return False, (f'LAN 段的 option {key} 丢失，已拒绝写入'
+                               f'（LAN 没有地址 = 路由器失联）')
+    old_n = len(re.findall(r'(?m)^config\s', old_content))
+    new_n = len(re.findall(r'(?m)^config\s', new_content))
+    if new_n < old_n - 1:
+        return False, (f'配置段数量异常减少（{old_n} → {new_n}），已拒绝写入'
+                       f'（只允许因为切换 PPPoE 而少掉 wan6 段）')
+    return True, ''
+
+
+def _atomic_write_network_config(path, content):
+    """原子写 /etc/config/network：tmp → fsync → os.replace。
+
+    三步缺一不可：
+      · 内容先写进**同目录**下的 tmp（同一文件系统 ⇒ replace 才是原子的；
+        跨文件系统的 rename 会退化成 copy + unlink，中间又变成 truncate 窗口）；
+      · fsync 之后再 os.replace —— 读者要么看到旧文件、要么看到新文件，
+        **永远不会看到半截**；
+      · 失败时原文件原封不动（tmp 只是垃圾，删掉即可），并把异常抛出去 ——
+        静默吞掉的话，调用方会以为「保存成功」而实际网络配置没改。
+    """
+    mode = _network_config_mode(path)
+    tmp_path = path + '.tmp'
+    # 落盘即正确：tmp 先按目标权限建好，再往里写。
+    # 这个文件里有 PPPoE 口令，绝不能先以 0644 露出来再 chmod。
+    _ensure_file_mode(tmp_path, mode)
+    try:
+        with open(tmp_path, 'w') as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    # 目录项也要落盘：只 fsync 文件的话，掉电后可能出现「文件内容在、
+    # 目录项丢了」的情况（老内核上 rename 不持久）。
+    try:
+        dir_fd = os.open(os.path.dirname(path) or '.', os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+    return True
+
+
 def update_uci_wan_config(path, data):
     """更新 /etc/config/network 中的 wan 接口配置"""
     with open(path, 'r') as f:
@@ -2971,7 +3403,19 @@ def update_uci_wan_config(path, data):
     pppoe_password = sanitize_uci_value(data.get('wan_pppoe_password', ''))
     if not pppoe_username:
         raise ValueError("PPPoE 拨号需要填写宽带账号（当前为空），已中止保存以免写出不可用的配置。")
+    # 备份必须留着（出事了要靠它回滚），而且**权限要跟原文件一致** ——
+    # 里面有 PPPoE 拨号口令。
+    #
+    # shutil.copy 会按 umask 建出目标文件（默认 0644 = 任何本地用户可读），
+    # 拷完才 copystat 把权限带回来 ⇒ 中间那一小段时间口令是敞开的。
+    # 正确做法：先用目标权限把 .backup 建好，再往里拷
+    # （open 对已存在文件只截断、不改权限 ⇒ 没有窗口）。
+    _ensure_file_mode(path + '.backup', _network_config_mode(path))
     shutil.copy(path, path + '.backup')
+    try:
+        os.chmod(path + '.backup', _network_config_mode(path))
+    except OSError:
+        pass
 
     # 保存 wan6 块内容，以便切换回非 PPPoE 时恢复
     saved_wan6_lines = []
@@ -3063,8 +3507,21 @@ def update_uci_wan_config(path, data):
         new_lines.append(f"\toption device '{wan_device}'\n")
         new_lines.append("\toption proto 'dhcpv6'\n")
 
-    with open(path, 'w') as f:
-        f.writelines(new_lines)
+    # ── 落盘：校验 + 原子替换（P1-29）─────────────────────────────
+    #
+    # 原来是 `open(path, 'w')` 原地 truncate 重写：写一半断电，
+    # /etc/config/network 就是半截 ⇒ UCI 丢掉整个 network 段 ⇒ 整机失联。
+    # 现在是「先拼内容 → 校验 → 写 tmp → os.replace」，
+    # 任何一步失败原文件都原封不动。
+    new_content = ''.join(new_lines)
+    ok, err = _validate_network_config_content(''.join(lines), new_content)
+    if not ok:
+        # 校验不过 = 拒绝写入，而不是「写进去再说」。
+        # 这条错误会一路冒到 save_network_config（ValueError → 400），
+        # 用户能直接看到「因为什么没保存」。
+        print(f'[ERROR] 网络配置校验未通过，已拒绝写入 {path}: {err}', flush=True)
+        raise ValueError(err)
+    _atomic_write_network_config(path, new_content)
 
 
 # === 网络配置 API ===
@@ -3132,9 +3589,16 @@ def _ensure_lan_essentials(path, has_pppoe=False):
         for key, default in defaults.items():
             if f'option {key}' not in lan_block:
                 lan_block = lan_block.rstrip('\n') + f"\n\toption {key} '{default}'\n"
-        content = content.replace(lan_match.group(1), lan_block)
-        with open(path, 'w') as f:
-            f.write(content)
+        new_content = content.replace(lan_match.group(1), lan_block)
+        # 这也是 /etc/config/network ⇒ 同样必须「校验 + 原子替换」（P1-29）。
+        # 原地 truncate 重写的话，写一半断电就只剩半截 LAN 段，
+        # 路由器当场没有 LAN 地址 —— 而这一步恰恰是在**抢救**失联。
+        ok, err = _validate_network_config_content(content, new_content)
+        if not ok:
+            print(f'[ERROR] 补全 LAN 关键字段后校验未通过，已拒绝写入 {path}: {err}',
+                  flush=True)
+            raise ValueError(err)
+        _atomic_write_network_config(path, new_content)
 
 
 @app.route('/api/network/config', methods=['POST'])
@@ -3217,6 +3681,49 @@ def restart_network():
         return jsonify({"success": False, "message": str(e)}), 500
 
 
+# init 脚本写的开机恢复状态文件（P1-34）。
+# 路径写死，不接受请求参数 —— 跟其它系统文件一样。
+RECOVERY_STATUS_FILE = os.environ.get(
+    "NFTABLES_WEB_RECOVERY_STATUS", "/var/run/nftables-web-recovery.status")
+
+
+def _read_recovery_status():
+    """读 init 脚本写的开机恢复状态。读不到/内容不认识时返回 None。
+
+    文件格式是 key=value（init 脚本写）：
+        state=ok|degraded|failed
+        reason=为什么
+        ts=什么时候
+        source=init
+
+    ⚠️ 读不到**不等于**没问题，但也**不等于**有问题 ——
+    文件可能还没写过（首次开机前），也可能这台设备根本没装 init 脚本。
+    所以返回 None，让前端显示「未知」，**不谎报成功**。
+    """
+    try:
+        with open(RECOVERY_STATUS_FILE, 'r', errors='replace') as f:
+            raw = f.read(4096)
+    except OSError:
+        return None
+    out = {}
+    for line in raw.splitlines():
+        if '=' not in line:
+            continue
+        k, v = line.split('=', 1)
+        k = k.strip()
+        if k and k.replace('_', '').isalnum():
+            out[k] = v.strip()
+    state = out.get('state', '')
+    if state not in ('ok', 'degraded', 'failed'):
+        return None
+    return {
+        'state': state,
+        'reason': out.get('reason', ''),
+        'ts': out.get('ts', ''),
+        'source': out.get('source', 'init'),
+    }
+
+
 @app.route('/api/firewall/status', methods=['GET'])
 def get_firewall_status():
     """检测 fw4 和 nftables 运行状态"""
@@ -3247,6 +3754,17 @@ def get_firewall_status():
                 init_content = f.read()
             init_has_fw4_stop = 'firewall stop' in init_content and 'firewall disable' in init_content
 
+        # init 脚本的开机恢复状态（P1-34 的「上报」那一半）
+        #
+        # init 侧在开机恢复规则集失败时会把状态写进
+        # /var/run/nftables-web-recovery.status（key=value，0600 root:root）：
+        #   state=ok|degraded|failed   reason=为什么   ts=什么时候   source=init
+        #
+        # 没有它的话，面板只看得见「规则集文件在不在」，看不见
+        # 「系统现在跑的**是不是过期策略**」—— 这正是 P1-34 的原话：
+        # 「开机加载失败会把设备永久钉死在过期 .lastgood 策略上，面板仍报成功」。
+        recovery = _read_recovery_status()
+
         return jsonify({
             "success": True,
             "fw4_active": fw4_active,       # true=fw4在运行(红点), false=已停止(绿点)
@@ -3254,7 +3772,11 @@ def get_firewall_status():
             "init_exists": init_exists,
             "init_enabled": init_enabled,
             "init_has_fw4_stop": init_has_fw4_stop,
-            "init_up_to_date": init_exists and init_enabled and init_has_fw4_stop
+            "init_up_to_date": init_exists and init_enabled and init_has_fw4_stop,
+            "recovery": recovery,
+            # 非 ok 就是「现在跑的策略不是我们想要的那个」——
+            # degraded = 回退到 .lastgood（上一版策略），failed = 连它都不可用。
+            "recovery_degraded": bool(recovery and recovery.get('state') != 'ok'),
         })
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
@@ -3543,6 +4065,59 @@ def _ensure_ipv6_cron():
 
 # === IPv6 辅助函数和 API ===
 
+def _ipv6_hextets(addr):
+    """把一个 IPv6 地址拆成 8 个 16 进制组（**不补零**），非法返回 None。
+
+    为什么不用 `addr.split(':')`
+    ---------------------------
+    IPv6 的文本表示允许把连续的全零段压缩成 `::`，于是：
+
+        '240e:390:4944:b191::1' → split(':') → ['240e','390','4944','b191','','1']
+        '2001:db8::1'          → split(':') → ['2001','db8','','','1']
+
+    段数根本对不上（前一种 6 段、后一种 5 段，而真实地址都是 8 段），
+    任何按「前 4 段」「后 4 段」切的算法都会在 `::` 的位置上错位。
+
+    这里交给 ipaddress 解析（它知道 `::` 展开成几个零段），
+    再按数值输出，格式与原来 `split(':')` 得到的文本一致
+    （'240e' 而不是 '240e'、'1' 而不是 '0001'），所以正常地址的输出不变。
+    """
+    try:
+        raw = ipaddress.IPv6Address(str(addr).strip())
+    except (ValueError, TypeError):
+        return None
+    h = raw.packed.hex()
+    return ['%x' % int(h[i:i + 4], 16) for i in range(0, 32, 4)]
+
+
+def _ipv6_prefix4(addr):
+    """取 IPv6 地址的**前 4 段**（即它所在的 /64 前缀）。
+
+    为什么不能手工切字符串（P2-12）
+    -----------------------------
+    原来的写法是：
+
+        segments = addr_full.split(':')
+        prefix = ':'.join(segments[:4])
+
+    对 '240e:390:4944:b191::1' 这种（前 4 段非零、后面被 `::` 压缩）
+    恰好算对。但地址里 `::` 出现在前面时就全错了：
+
+        '2001:db8::1' → split(':') = ['2001','db8','','','1']
+                      → join(segments[:4]) = '2001:db8::'
+                      → 拼上后缀 '2001:db8:::abcd:ef01:...'   ← 三个冒号，非法 IPv6
+
+    算错之后**不报错**：nft 会拒绝这个地址，IPv6 端口转发静默失效，
+    而面板一路报「已更新 N 条 IPv6 地址」。
+
+    现在交给 ipaddress 解析后再取前 4 段，`::` 在哪都不会错位。
+    """
+    hextets = _ipv6_hextets(addr)
+    if not hextets:
+        return ""
+    return ':'.join(hextets[:4])
+
+
 def _get_wan_ipv6_prefix():
     """获取公网 IPv6 前缀（前4段）和完整地址，优先从 WAN 接口获取，回退到 LAN 接口"""
     config = load_config()
@@ -3562,8 +4137,12 @@ def _get_wan_ipv6_prefix():
                     idx = parts.index('inet6')
                     addr_full = parts[idx + 1].split('/')[0]
                     if addr_full and addr_full != '::':
-                        segments = addr_full.split(':')
-                        prefix = ':'.join(segments[:4])
+                        # 前缀必须按 IPv6 语义算，不能靠 split(':') 切（P2-12）
+                        prefix = _ipv6_prefix4(addr_full)
+                        if not prefix:
+                            print(f'[WARN] IPv6 地址无法解析为前缀，已跳过: {addr_full!r}',
+                                  flush=True)
+                            continue
                         return addr_full, prefix
         return "", ""
 
@@ -3576,11 +4155,29 @@ def _get_wan_ipv6_prefix():
 
 
 def _extract_ipv6_suffix(addr):
-    """提取 IPv6 地址的最后4段作为后缀"""
-    segments = addr.split(':')
-    if len(segments) < 4:
+    """提取 IPv6 地址的**最后 4 段**作为后缀（配合前缀拼成完整地址）。
+
+    与前缀同一个坑（P2-12）：`addr.split(':')` 在 `::` 出现时会错位 ——
+    '2001:db8::1' 的 split 结果是 ['2001','db8','','','1']，取后 4 段得到
+    '2001:db8::1'（只有 3 段还带 `::`），拼到前缀后面就成了非法地址。
+    现在按 IPv6 语义取最后 4 个 16 进制组。
+    """
+    text = str(addr or '').strip()
+    if not text:
         return ""
-    return ':'.join(segments[-4:])
+    if '/' in text:
+        text = text.split('/', 1)[0]
+    hextets = _ipv6_hextets(text)
+    if hextets:
+        return ':'.join(hextets[-4:])
+    # 兼容「只写后 4 段」的简写（老版本配置里出现过这种写法）：
+    # 没有 `::`、每段都是 1-4 位十六进制 ⇒ 直接按段取最后 4 段。
+    # 注意这里**不做补零**：段数不足 4 段时仍然判为无效（与旧行为一致），
+    # 免得凭空造出一个「看着像地址」的串。
+    parts = text.split(':')
+    if 4 <= len(parts) <= 8 and all(re.fullmatch(r'[0-9a-fA-F]{1,4}', p) for p in parts):
+        return ':'.join(parts[-4:])
+    return ""
 
 
 @app.route('/api/network/wan-ipv6', methods=['GET'])
@@ -3593,6 +4190,153 @@ def get_wan_ipv6():
         return jsonify({"success": True, **info})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
+
+
+# ══════════════════════════════════════════════════════════════════════
+# DDNS 的 IPv6 中转文件（P2-13 / P2-14）
+# ══════════════════════════════════════════════════════════════════════
+#
+# 中转文件是什么
+# --------------
+# DDNS 的 ip_script 是 `/bin/cat /tmp/ddns-ipv6-N`：
+#   N = 0  → 路由器本机的公网 IPv6
+#   N ≥ 1  → 第 N 条转发规则对应的完整 IPv6
+# 面板/定时脚本把拼好的地址写进去，ddns-scripts 再 cat 出来发布到 DNS。
+#
+# 两个坑
+# ------
+# P2-13「过期文件从不失效」
+#   规则被删掉、target_ipv6 被清空之后，/tmp/ddns-ipv6-N 还躺在那儿
+#   （/tmp 是 tmpfs，要重启才清）。DDNS 的 ip_script 还在 cat 它 ⇒
+#   继续把**已经作废的地址**发布到公网 DNS。目标机器早就搬走了，
+#   DNS 记录还指着旧地址，而面板上「规则已删除」看起来一切正常。
+#   修法：规则消失时把对应的中转文件**删掉**（不是留空文件 ——
+#   留空文件的话 ip_script 读到空串，ddns-scripts 会把它当成「地址为空」
+#   继续往 DNS 上推，反而更糟）。
+#
+# P2-14「可预测的名字 + 不防软链」
+#   /tmp 是共享目录（1777 sticky）。别的本地用户可以**提前建好**同名路径：
+#       ln -s /etc/shadow /tmp/ddns-ipv6-0
+#   面板是 root 进程，`open(path, 'w')` 会**跟着软链写** ⇒ 直接把目标
+#   文件截断重写 —— 这是 root 权限的任意文件写/删。
+#   修法（见 _write_ddns_relay）：
+#       · 名字随机化 + O_EXCL（别人猜不到、也抢先建不了）
+#       · O_NOFOLLOW（万一还是被抢先建了软链，也**不跟随**）
+#       · os.replace 原子换名（replace 同样不跟随软链，目标路径上
+#         预埋的软链只会被整体替换掉）
+#
+# 为什么**不**把目录换成 root 专用目录
+# ----------------------------------
+# UCI 里存的 ip_script 是 `/bin/cat /tmp/ddns-ipv6-N`，是**存量部署**的事实。
+# 换目录 = 存量机器的 ip_script 指向旧路径，而新文件在新目录 ⇒
+# DDNS 读到空值，直到用户手动重存一次 DDNS 配置为止。
+# 为了一个「名字可预测」把已经在跑的 DDNS 打断，不划算。
+# 名字可预测本身不是漏洞，**跟随软链**才是 —— 上面三条把它堵死了。
+
+DDNS_RELAY_DIR = os.environ.get("NFTABLES_WEB_DDNS_RELAY_DIR", "/tmp")
+
+
+def _ddns_relay_path(idx):
+    """DDNS IPv6 中转文件的路径（与 UCI 里的 ip_script 必须一致）。"""
+    return os.path.join(DDNS_RELAY_DIR, f"ddns-ipv6-{idx}")
+
+
+def _ddns_relay_prefix():
+    """中转文件名前缀（从 ip_script 反解 ipv6_source 时用）。"""
+    return os.path.join(DDNS_RELAY_DIR, "ddns-ipv6-")
+
+
+def _write_ddns_relay(idx, content):
+    """安全地写 DDNS 中转文件，返回 (ok, err)。
+
+    为什么不能直接 open(path, 'w')
+    --------------------------
+    /tmp 是共享目录（1777 sticky），别的本地用户可以提前建好同名路径：
+      · 软链：面板是 root，`open(path,'w')` 跟着软链把目标**截断重写**
+        ⇒ root 权限的任意文件写；
+      · 普通文件：内容会被覆盖（无害，但会掩盖「谁写的」）。
+
+    做法（三步，缺一不可）：
+      1. tmp 用**随机名**（含 pid + 随机 hex）—— 别的用户猜不到名字，
+         也无法预先建好占位；
+      2. os.open(..., O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW, 0o600) 建文件：
+         O_EXCL 保证不会覆盖任何已存在的东西，O_NOFOLLOW 保证即使
+         名字被猜中也不跟随软链，mode 0600 保证内容落盘那一刻
+         别的本地用户就读不到（IPv6 地址本身也是信息）；
+      3. os.replace(tmp, 目标) 原子换名 —— replace **不跟随软链**，
+         目标路径上不管之前是软链还是文件，都会被替换掉。
+
+    返回 (False, err) 而不是抛异常：调用方要把它当成「这次更新失败」
+    如实上报 —— 静默跳过就变成「DDNS 悄悄继续发布旧地址」。
+    """
+    path = _ddns_relay_path(idx)
+    tmp_path = f"{path}.tmp.{os.getpid()}.{secrets.token_hex(6)}"
+    try:
+        fd = os.open(tmp_path,
+                     os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                     0o600)
+        try:
+            with os.fdopen(fd, 'w') as f:
+                fd = None
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+        finally:
+            if fd is not None:
+                os.close(fd)
+        os.replace(tmp_path, path)
+        return True, ''
+    except OSError as e:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return False, f'{type(e).__name__}: {e}'
+
+
+def _remove_ddns_relay(idx):
+    """删掉中转文件（规则被删 / 目标被清空时调用）。返回是否真的删掉了。"""
+    path = _ddns_relay_path(idx)
+    try:
+        os.unlink(path)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        print(f'[WARN] 删除中转文件 {path} 失败: {e}', flush=True)
+        return False
+
+
+def _cleanup_orphan_ddns_relays(keep_count):
+    """删掉编号 ≥ keep_count 的中转文件（对应的规则已经没了）。
+
+    为什么必须删
+    ----------
+    /tmp 是 tmpfs，规则删掉后残留的中转文件会一直留到重启。
+    DDNS 的 ip_script 还在 cat 它 ⇒ 继续把已作废的地址发布出去。
+
+    只处理本面板自己的命名（ddns-ipv6-<数字>），别的文件一律不碰。
+    """
+    removed = []
+    try:
+        names = os.listdir(DDNS_RELAY_DIR)
+    except OSError as e:
+        print(f'[WARN] 扫描中转文件目录失败（{DDNS_RELAY_DIR}: {e}）', flush=True)
+        return removed
+    for name in names:
+        m = re.fullmatch(r'ddns-ipv6-(\d+)', name)
+        if not m:
+            continue
+        if int(m.group(1)) < keep_count:
+            continue
+        path = os.path.join(DDNS_RELAY_DIR, name)
+        try:
+            os.unlink(path)
+            removed.append(name)
+        except OSError as e:
+            # sticky 目录下别人建的文件我们删不掉 —— 记日志，不当成功
+            print(f'[WARN] 清理过期中转文件 {path} 失败: {e}', flush=True)
+    return removed
 
 
 @app.route('/api/network/update-ipv6', methods=['POST'])
@@ -3615,11 +4359,15 @@ def update_ipv6():
         # 只改了内核 set，/tmp/ddns-ipv6-* 始终是空的 —— 阿里云 DDNS 和
         # 通用 DDNS（ip_script=/bin/cat /tmp/ddns-ipv6-N）读到的还是旧值，
         # IPv6 记录静默停在过期地址上，没有任何报错。
-        try:
-            with open("/tmp/ddns-ipv6-0", "w") as f:
-                f.write(f"{prefix}::1")
-        except OSError as e:
-            print(f"[WARN] 写 /tmp/ddns-ipv6-0 失败: {e}", flush=True)
+        #
+        # 写不进去必须**上报**，不能只打一条 WARN 就当成功 ——
+        # 中转文件是 DDNS 唯一的取数来源，写失败 = DDNS 继续发布旧地址，
+        # 而接口回「已更新 N 条」，用户完全看不出来。
+        relay_errors = []
+        ok0, err0 = _write_ddns_relay(0, f"{prefix}::1")
+        if not ok0:
+            relay_errors.append(f"中转文件 {_ddns_relay_path(0)} 写入失败（{err0}）")
+            print(f"[ERROR] 写 {_ddns_relay_path(0)} 失败: {err0}", flush=True)
 
         for idx, rule in enumerate(forward_rules, 1):
             set_name = f"nas_ip6_{idx}"
@@ -3635,6 +4383,10 @@ def update_ipv6():
                     "reason": "未配置 target_ipv6，已清空该集合",
                 })
                 _nft_set_write(['flush', 'set', 'inet', 'fw4', set_name])
+                # P2-13：目标被清空了，中转文件也必须删掉。
+                # 留着的话 DDNS 会继续把这条**已经作废**的地址发布出去，
+                # 而界面上「规则」明明已经没有 IPv6 目标了。
+                _remove_ddns_relay(idx)
                 continue
 
             full_ipv6 = f"{prefix}:{suffix}"
@@ -3668,11 +4420,20 @@ def update_ipv6():
                     "error": None,
                 })
                 # 与 cron 脚本一样把完整地址落到中转文件，DDNS 才读得到
-                try:
-                    with open(f"/tmp/ddns-ipv6-{idx}", "w") as f:
-                        f.write(full_ipv6)
-                except OSError as e:
-                    print(f"[WARN] 写 /tmp/ddns-ipv6-{idx} 失败: {e}", flush=True)
+                #
+                # 写失败**必须算失败**（P2-14 的配套）：内核 set 里已经是
+                # 新地址，中转文件里还是旧地址 ⇒ DDNS 发布的和实际生效的
+                # 不是同一个地址，而且没有任何地方会报这个不一致。
+                ok_w, err_w = _write_ddns_relay(idx, full_ipv6)
+                if not ok_w:
+                    print(f"[ERROR] 写 {_ddns_relay_path(idx)} 失败: {err_w}",
+                          flush=True)
+                    failed.append({
+                        "set_name": set_name,
+                        "target_ipv6": target_ipv6,
+                        "full_ipv6": full_ipv6,
+                        "error": f"中转文件写入失败（{err_w}）—— DDNS 会继续发布旧地址",
+                    })
             else:
                 err = ('nft 命令超时' if result is None
                        else (result.stderr or result.stdout or '').strip()
@@ -3685,6 +4446,24 @@ def update_ipv6():
                     "error": err or '未知错误',
                 })
 
+        # P2-13：规则数量变少后，编号更大的中转文件就是**残留** ——
+        # 对应的规则已经删了，DDNS 却还在发布它的地址。
+        # /tmp 是 tmpfs，这些残留要等到重启才消失。
+        orphans = _cleanup_orphan_ddns_relays(len(forward_rules) + 1)
+        if orphans:
+            print(f'[INFO] 已清理 {len(orphans)} 个过期中转文件: '
+                  f'{", ".join(sorted(orphans))}', flush=True)
+
+        # 路由器本机（0 号）中转文件写失败也要算失败 ——
+        # 它同样是 DDNS 的取数来源。
+        for msg in relay_errors:
+            failed.append({
+                "set_name": "ddns-ipv6-0",
+                "target_ipv6": "",
+                "full_ipv6": "",
+                "error": msg,
+            })
+
         # 汇总口径必须是「成功的条数」，不是「尝试的条数」。
         # 之前这里 len(updated) 数的是尝试，3 条里第 2 条失败也报「已更新 3 条」，
         # 顶层 success 还无条件是 True —— 前端只弹这个 message，
@@ -3696,6 +4475,8 @@ def update_ipv6():
             message = f"已更新 {len(updated)} 条 IPv6 地址"
             if skipped:
                 message += f"（{len(skipped)} 条未配置 IPv6 目标，已清空）"
+        if orphans:
+            message += f"（已清理 {len(orphans)} 个过期中转文件）"
 
         return jsonify({
             "success": not failed,
@@ -3714,42 +4495,234 @@ def update_ipv6():
 IPV6_CRON_SCRIPT = '''#!/bin/sh
 # IPv6 合集自动更新脚本 - 由 nftables-web 生成
 # 从 nftables-web 配置读取 IPv6 后缀，拼接 WAN 前缀后更新各规则对应的 nas_ip6_{i} 合集
-CONFIG="/etc/nftables/nftables-web-config.json"
-WAN_IF=$(jsonfilter -e '$.wan_if' $CONFIG 2>/dev/null || echo "pppoe-wan")
-LAN_IF=$(jsonfilter -e '$.lan_if' $CONFIG 2>/dev/null || echo "br-lan")
-PREFIX=$(ip -6 addr show dev "$WAN_IF" scope global 2>/dev/null | grep 'inet6' | head -1 | awk '{print $2}' | cut -d: -f1-4)
-if [ -z "$PREFIX" ]; then
-    PREFIX=$(ip -6 addr show dev "$LAN_IF" scope global 2>/dev/null | grep 'inet6' | head -1 | awk '{print $2}' | cut -d: -f1-4)
+#
+# ⚠️ 两条硬约束（P1-17 / P2-12）：
+#
+#   1. flush 与 add 必须是**同一个 nft 事务**（nft -f -）。
+#      原来这里是两条独立命令（nft flush set … 然后 nft add element …），
+#      而且**都不看返回码**。后果：
+#        · flush 与 add 之间有一个窗口，窗口里这个 set 是空的 ——
+#          正好落在这个窗口的 IPv6 转发包被丢弃；
+#        · add 失败时（地址被内核拒了、set 正在重建）set **长期为空**，
+#          而 cron 静默成功 —— IPv6 端口转发就这么没了，没人知道。
+#      现在合成一个事务：任一行失败则整体不生效，旧地址原地不动，
+#      并且**检查返回码**，失败写 stderr 并以非零退出（cron 会记进系统日志）。
+#
+#   2. 前缀必须按 IPv6 语义算，不能用 `cut -d: -f1-4` 切字符串。
+#      地址里出现 `::` 时切出来的是非法前缀，nft 直接拒收 ——
+#      而脚本同样不查返回码，于是「IPv6 更新成功」而实际一条规则都没生效。
+#      现在把原始地址交给 python3，由 ipaddress 展开 `::` 后取前 4 段。
+#
+# 环境变量（都有默认值，设备上直接跑不用带任何参数）：
+#   NFTW_CONFIG    配置文件路径
+#   NFTW_RELAY_DIR DDNS 中转文件目录（/tmp/ddns-ipv6-N）
+CONFIG="${NFTW_CONFIG:-/etc/nftables/nftables-web-config.json}"
+RELAY_DIR="${NFTW_RELAY_DIR:-/tmp}"
+WAN_IF=$(jsonfilter -e '$.wan_if' "$CONFIG" 2>/dev/null || echo "pppoe-wan")
+LAN_IF=$(jsonfilter -e '$.lan_if' "$CONFIG" 2>/dev/null || echo "br-lan")
+
+# 取**原始地址**（含掩码），前缀交给下面的 python 按 IPv6 语义算
+ADDR=$(ip -6 addr show dev "$WAN_IF" scope global 2>/dev/null | grep 'inet6' | head -1 | awk '{print $2}')
+if [ -z "$ADDR" ]; then
+    ADDR=$(ip -6 addr show dev "$LAN_IF" scope global 2>/dev/null | grep 'inet6' | head -1 | awk '{print $2}')
 fi
 
-if [ -z "$PREFIX" ]; then exit 0; fi
+# 没有 IPv6 地址 = 没有可更新的内容，正常退出
+if [ -z "$ADDR" ]; then exit 0; fi
 
-# 写入路由器本机 IPv6（DDNS 用）
-echo -n "$PREFIX::1" > /tmp/ddns-ipv6-0
-
-# 从配置读取每条规则的 target_ipv6 后缀，拼接并添加到对应的 nas_ip6_{i} 合集
+# 从配置读取每条规则的 target_ipv6 后缀，拼接并更新对应的 nas_ip6_{i} 合集
 # 使用 python3 解析 JSON（OpenWrt jsonfilter 不支持 [*] 通配符）
-python3 - "$CONFIG" "$PREFIX" << 'PYEOF'
-import json, subprocess, sys
-config_path, prefix = sys.argv[1], sys.argv[2]
-with open(config_path) as f:
-    config = json.load(f)
-for i, rule in enumerate(config.get("forward_rules", []), 1):
-    set_name = f"nas_ip6_{i}"
-    subprocess.run(["nft", "flush", "set", "inet", "fw4", set_name],
-                   capture_output=True, timeout=10)
-    suffix = rule.get("target_ipv6", "").strip()
-    if not suffix:
+python3 - "$CONFIG" "$ADDR" "$RELAY_DIR" << 'PYEOF'
+import ipaddress, json, os, re, secrets, subprocess, sys
+
+config_path, addr, relay_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+
+
+def fail(msg):
+    sys.stderr.write(msg + "\\n")
+
+
+def relay_path(idx):
+    return os.path.join(relay_dir, "ddns-ipv6-%d" % idx)
+
+
+def write_relay(idx, content):
+    """安全写中转文件（P2-14）。
+
+    为什么不能直接 open(path, "w")：
+    relay_dir 默认是 /tmp（共享目录，1777 sticky）。别的本地用户可以
+    **提前建好**同名路径 —— 尤其是软链：
+        ln -s /etc/shadow /tmp/ddns-ipv6-0
+    这个脚本以 root 跑，open(path, "w") 会**跟着软链**把目标文件截断
+    重写 —— root 权限的任意文件写。
+
+    做法：
+      · tmp 用随机名（pid + 随机 hex）—— 别人猜不到、也抢先建不了；
+      · os.open(O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW, 0600) ——
+        O_EXCL 不覆盖任何已存在的东西，O_NOFOLLOW 绝不跟随软链，
+        0600 让别的本地用户读不到地址（IPv6 地址本身就是信息）；
+      · os.replace 原子换名 —— replace 不跟随软链，目标路径上预埋的
+        软链只会被整体替换掉。
+    """
+    path = relay_path(idx)
+    tmp = "%s.tmp.%d.%s" % (path, os.getpid(), secrets.token_hex(6))
+    try:
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        try:
+            with os.fdopen(fd, "w") as f:
+                fd = None
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+        finally:
+            if fd is not None:
+                os.close(fd)
+        os.replace(tmp, path)
+    except OSError as e:
+        fail("写 %s 失败: %s" % (path, e))
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def drop_relay(idx):
+    """规则没了 ⇒ 中转文件必须删掉（P2-13）。
+
+    留着的话，DDNS 的 ip_script 还会 cat 到它，继续把**已经作废**的
+    地址发布到公网 DNS —— 而面板上「规则」明明已经删掉了。
+    （留空文件更糟：ddns-scripts 会把空串当成一个地址继续推。）
+    """
+    try:
+        os.unlink(relay_path(idx))
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        fail("删除 %s 失败: %s" % (relay_path(idx), e))
+
+
+def cleanup_orphans(keep):
+    """删掉编号 >= keep 的中转文件（对应的规则已经删了）。
+
+    /tmp 是 tmpfs，规则删掉后残留的文件会一直留到重启 ⇒ DDNS 继续
+    发布已作废的地址。只处理本面板自己的命名，别的文件一律不碰。
+    """
+    try:
+        names = os.listdir(relay_dir)
+    except OSError as e:
+        fail("扫描 %s 失败: %s" % (relay_dir, e))
+        return
+    for name in names:
+        m = re.fullmatch(r"ddns-ipv6-([0-9]+)", name)
+        if not m or int(m.group(1)) < keep:
+            continue
+        p = os.path.join(relay_dir, name)
+        try:
+            os.unlink(p)
+        except OSError as e:
+            fail("清理过期中转文件 %s 失败: %s" % (p, e))
+
+
+try:
+    with open(config_path) as f:
+        config = json.load(f)
+except Exception as e:
+    fail("读取配置失败: %s" % e)
+    sys.exit(1)
+
+
+def hextets(text):
+    """IPv6 → 8 个 16 进制组（不补零）。`::` 由 ipaddress 正确展开。"""
+    try:
+        raw = ipaddress.IPv6Address(text)
+    except ValueError:
+        return None
+    h = raw.packed.hex()
+    return ["%x" % int(h[i:i + 4], 16) for i in range(0, 32, 4)]
+
+
+def suffix_groups(text):
+    """取地址的**最后 4 段**（后缀）。
+
+    与面板侧 _extract_ipv6_suffix 保持同一口径：
+      · 合法 IPv6 地址 → 按 IPv6 语义取后 4 段（`::` 不会错位）；
+      · 「只写后 4 段」的简写（老配置）→ 按段直接取；
+      · 其它 → 空字符串（判为无效，不去猜）。
+    """
+    if not text:
+        return None
+    hx = hextets(text)
+    if hx:
+        return hx[-4:]
+    parts = text.split(":")
+    if 4 <= len(parts) <= 8 and all(
+            len(p) <= 4 and p and all(c in "0123456789abcdefABCDEF" for c in p)
+            for p in parts):
+        return parts[-4:]
+    return None
+
+
+# ── 前缀：取前 4 段（P2-12：不能靠切字符串）─────────────────────────
+addr_text = addr.split("/", 1)[0]
+hx = hextets(addr_text)
+if not hx:
+    fail("IPv6 地址非法: %r" % addr_text)
+    sys.exit(1)
+prefix = ":".join(hx[:4])
+
+# ── 写路由器本机 IPv6（DDNS 用）────────────────────────────────────
+# 走 write_relay：直接 open(path, "w") 会跟随别人预埋的软链（P2-14）。
+write_relay(0, prefix + "::1")
+
+rc = 0
+rules = config.get("forward_rules", [])
+if not isinstance(rules, list):
+    rules = []
+for i, rule in enumerate(rules, 1):
+    set_name = "nas_ip6_%d" % i
+    suffix = (rule.get("target_ipv6") or "").strip()
+    if "/" in suffix:
+        suffix = suffix.split("/", 1)[0]
+    sh = suffix_groups(suffix)
+    if not sh:
+        # 没配 IPv6 目标的规则：仍然要清空它的 set（配过的地址可能已被删掉），
+        # 并且**删掉它的中转文件**（P2-13）—— 留着的话 DDNS 会继续发布
+        # 这条已经作废的地址。
+        batch = "flush set inet fw4 %s\\n" % set_name
+        full = ""
+        drop_relay(i)
+    else:
+        suffix_4 = ":".join(sh[-4:])
+        full = "%s:%s" % (prefix, suffix_4)
+        # flush 与 add 在**同一个事务**里：任一行失败则整体不生效，
+        # 旧地址原地不动（不会再出现「set 被清空且没补回来」的空窗）。
+        batch = ("flush set inet fw4 %s\\n"
+                 "add element inet fw4 %s { %s }\\n" % (set_name, set_name, full))
+    try:
+        r = subprocess.run(["nft", "-f", "-"], input=batch,
+                           capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        fail("%s 更新失败: %s" % (set_name, e))
+        rc = 1
         continue
-    parts = suffix.split(":")
-    suffix_4 = ":".join(parts[-4:]) if len(parts) >= 4 else ""
-    if not suffix_4:
+    if r.returncode != 0:
+        # ⚠️ 必须看返回码：原来两条命令都不查，add 失败也当成功。
+        fail("%s 更新失败: %s" % (set_name, (r.stderr or r.stdout or "").strip()))
+        rc = 1
         continue
-    full = f"{prefix}:{suffix_4}"
-    subprocess.run(["nft", "add", "element", "inet", "fw4", set_name, "{", full, "}"],
-                   capture_output=True, timeout=10)
-    with open(f"/tmp/ddns-ipv6-{i}", "w") as f:
-        f.write(full)
+    if full:
+        if not write_relay(i, full):
+            rc = 1
+
+# 规则数量变少后，编号更大的中转文件就是残留 —— 对应的规则已经删了，
+# DDNS 却还在发布它的地址。/tmp 是 tmpfs，要等到重启才会消失（P2-13）。
+cleanup_orphans(len(rules) + 1)
+
+# 有任何一条失败就以非零退出 —— cron 会把 stderr 记进系统日志。
+# 「静默成功」正是这个缺陷最要命的地方。
+sys.exit(rc)
 PYEOF
 '''
 
@@ -3785,49 +4758,172 @@ def install_ipv6_cron():
 CHINA_IPS_SCRIPT = '''#!/bin/sh
 # 中国IP集合自动更新脚本
 # 从 GitHub 下载中国IP列表，转换为 nftables 集合格式
-NFT_FILE="/etc/nftables/china-ips.nft"
-URL="https://cdn.jsdelivr.net/gh/17mon/china_ip_list@master/china_ip_list.txt"
+#
+# ⚠️ 两条硬约束（P1-18 / P2-10）：
+#
+#   1. **完整性校验**（P1-18）
+#      原来下载到的列表**直接**当成防火墙策略写进规则集，没有任何校验。
+#      被截断（CDN 半截响应、代理截断）或者被投毒（上游被劫持 / 供应链污染）时，
+#      坏列表会**直接变成防火墙策略** ——
+#      而 china_ipv4 的语义是「不在集合内的一律 drop」，
+#      列表残缺 = 大量正常中国流量被当成境外流量丢掉，
+#      表现是「国内访问全断」，而面板/脚本一路报成功。
+#      现在校验两道：
+#        · **结构校验**：每条必须是合法 IPv4 / IPv4-CIDR（ipaddress 严格解析），
+#          且条目数不得低于下限 —— 截断会直接掉到下限以下；
+#        · **SHA-256 固定值**：第一次成功时把摘要固定到 sha 文件，
+#          之后每次下载都要对得上；对不上（上游正常更新、或被投毒）就
+#          **拒绝写入**，保留上一版可用列表，并把新摘要报出来给人工核对。
+#          需要接受上游更新时，人工核对后重新固定即可：
+#              echo <新摘要> > <sha 文件>
+#          （或显式设 CHINA_IPS_ALLOW_UPDATE=1 让脚本自动重新固定 ——
+#            这等于放弃本次校验，只在人工流程已经覆盖的场景用。）
+#
+#   2. **原子写**（P2-10）
+#      原来 `echo > "$NFT_FILE"` 然后一行行 `>>` 追加，是**原地重写**。
+#      写到一半被断电/被 kill，文件里就是「flush set」+ 半截元素 ——
+#      而这个文件是被规则集 include 进去的：下次 nft -f 规则集时
+#      china_ipv4 被 flush 掉、只补回半截 ⇒
+#      **所有不在半截列表里的中国 IP 全部被 drop**。
+#      现在先写同目录的临时文件，写完再原子换名（os.replace），
+#      读者要么看到旧版、要么看到新版，不存在「半截」这个状态。
+#
+# 环境变量（都有默认值，设备上直接跑不用带任何参数）：
+#   CHINA_IPS_NFT_FILE     nft 片段文件
+#   CHINA_IPS_SHA_FILE     SHA-256 固定值文件
+#   CHINA_IPS_URL          下载地址
+#   CHINA_IPS_MIN_ENTRIES  条目数下限
+#   CHINA_IPS_ALLOW_UPDATE 置 1 时接受上游变化并自动重新固定摘要
+NFT_FILE="${CHINA_IPS_NFT_FILE:-/etc/nftables/china-ips.nft}"
+SHA_FILE="${CHINA_IPS_SHA_FILE:-/etc/nftables/china-ips.sha256}"
+URL="${CHINA_IPS_URL:-https://cdn.jsdelivr.net/gh/17mon/china_ip_list@master/china_ip_list.txt}"
+MIN_ENTRIES="${CHINA_IPS_MIN_ENTRIES:-1000}"
+ALLOW_UPDATE="${CHINA_IPS_ALLOW_UPDATE:-0}"
 
-TMP=$(mktemp)
+TMP=$(mktemp) || exit 1
+trap 'rm -f "$TMP"' EXIT
+trap 'rm -f "$TMP"; exit 1' INT TERM
+
 wget -qO "$TMP" "$URL" 2>/dev/null
 if [ ! -s "$TMP" ]; then
-    echo "下载失败"
-    rm -f "$TMP"
+    echo "下载失败：$URL" >&2
     exit 1
 fi
 
-mkdir -p /etc/nftables
+# 校验 + 生成 + 原子替换都在 python 里做（python3 是面板本身的依赖，
+# 设备上一定有；ipaddress 用来严格判断每一条是不是合法 IPv4）。
+python3 - "$TMP" "$NFT_FILE" "$SHA_FILE" "$MIN_ENTRIES" "$ALLOW_UPDATE" << 'PYEOF'
+import hashlib, ipaddress, os, sys, tempfile, time
 
-# 生成 nftables 文件：先清空合集，再逐条添加
-echo "# 中国IP集合 - 自动生成 $(date)" > "$NFT_FILE"
-echo "flush set inet fw4 china_ipv4" >> "$NFT_FILE"
+src, nft_file, sha_file = sys.argv[1], sys.argv[2], sys.argv[3]
+min_entries = int(sys.argv[4])
+allow_update = sys.argv[5] == "1"
 
-COUNT=0
-ELEMENTS=""
-while IFS= read -r line; do
-    line=$(echo "$line" | tr -d '\\r' | grep -oE '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+(/[0-9]+)?')
-    if [ -n "$line" ]; then
-        if [ -n "$ELEMENTS" ]; then
-            ELEMENTS="${ELEMENTS}, "
-        fi
-        ELEMENTS="${ELEMENTS}${line}"
-        COUNT=$((COUNT+1))
-        # 每500条flush一次避免单行过长
-        if [ $((COUNT % 500)) -eq 0 ]; then
-            echo "add element inet fw4 china_ipv4 { ${ELEMENTS} }" >> "$NFT_FILE"
-            ELEMENTS=""
-        fi
-    fi
-done < "$TMP"
 
-# 写入剩余的
-if [ -n "$ELEMENTS" ]; then
-    echo "add element inet fw4 china_ipv4 { ${ELEMENTS} }" >> "$NFT_FILE"
-fi
+def die(msg):
+    sys.stderr.write(msg + "\\n")
+    sys.exit(1)
 
-rm -f "$TMP"
-echo "完成，共 $COUNT 条中国IP，已写入 $NFT_FILE"
-echo "请执行: nft -f /etc/nftables/china-ips.nft"
+
+try:
+    with open(src, "rb") as f:
+        raw = f.read()
+except OSError as e:
+    die("读取下载文件失败: %s" % e)
+
+digest = hashlib.sha256(raw).hexdigest()
+
+# ── 1. 结构校验：每条必须是合法 IPv4 / IPv4-CIDR ────────────────────
+entries = []
+for line in raw.decode("utf-8", "replace").splitlines():
+    text = line.strip()
+    if not text or text.startswith("#"):
+        continue
+    if "/" in text:
+        addr, _, plen = text.partition("/")
+        if not plen.isdigit():
+            continue
+        plen = int(plen)
+    else:
+        addr, plen = text, 32
+    try:
+        net = ipaddress.IPv4Network(addr + "/" + str(plen), strict=True)
+    except ValueError:
+        continue
+    entries.append(str(net))
+
+if len(entries) < min_entries:
+    die("列表条目数 %d 低于下限 %d，判定为被截断，已拒绝写入（原列表保持不变）"
+        % (len(entries), min_entries))
+
+# ── 2. SHA-256 固定值校验 ──────────────────────────────────────────
+pinned = ""
+if os.path.exists(sha_file):
+    try:
+        with open(sha_file) as f:
+            pinned = f.read().split()[0].strip().lower()
+    except (OSError, IndexError):
+        pinned = ""
+if pinned and pinned != digest and not allow_update:
+    die("SHA-256 校验失败：已固定 %s，本次下载 %s。\\n"
+        "上游列表已变化或可能被投毒，已拒绝写入（原列表保持不变）。\\n"
+        "请人工核对后执行：echo %s > %s  重新固定。"
+        % (pinned, digest, digest, sha_file))
+if pinned and pinned != digest:
+    sys.stderr.write("警告：SHA-256 与固定值不同（%s → %s），"
+                     "但 CHINA_IPS_ALLOW_UPDATE=1，已接受并重新固定。\\n"
+                     % (pinned, digest))
+
+# ── 3. 生成 nft 片段（先写临时文件，再原子替换）────────────────────
+lines = ["# 中国IP集合 - 自动生成 %s" % time.strftime("%Y-%m-%d %H:%M:%S"),
+         "flush set inet fw4 china_ipv4"]
+batch = []
+for entry in entries:
+    batch.append(entry)
+    if len(batch) >= 500:
+        lines.append("add element inet fw4 china_ipv4 { %s }" % ", ".join(batch))
+        batch = []
+if batch:
+    lines.append("add element inet fw4 china_ipv4 { %s }" % ", ".join(batch))
+content = "\\n".join(lines) + "\\n"
+
+dirname = os.path.dirname(nft_file) or "."
+try:
+    os.makedirs(dirname, exist_ok=True)
+except OSError as e:
+    die("创建目录失败: %s" % e)
+
+fd, tmp = tempfile.mkstemp(prefix=".china-ips.", dir=dirname)
+try:
+    with os.fdopen(fd, "w") as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o644)
+    # ← 原子替换：不存在「半截文件」这个状态（P2-10）
+    os.replace(tmp, nft_file)
+except OSError as e:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    die("写入 %s 失败: %s" % (nft_file, e))
+
+# ── 4. 成功之后才固定摘要（TOFU）──────────────────────────────────
+try:
+    tmp2 = sha_file + ".tmp"
+    with open(tmp2, "w") as f:
+        f.write("%s  china_ip_list.txt\\n" % digest)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp2, sha_file)
+except OSError as e:
+    sys.stderr.write("固定 SHA-256 失败（下次仍会重新固定）: %s\\n" % e)
+
+print("完成，共 %d 条中国IP，已写入 %s" % (len(entries), nft_file))
+print("SHA-256: %s" % digest)
+print("请执行: nft -f %s" % nft_file)
+PYEOF
 '''
 
 
@@ -3990,9 +5086,14 @@ def _parse_ddns_config():
     for svc in svc_list:
         svc['password'] = _mask_password(svc['password'])
         # 从 ip_script 反推 ipv6_source
+        #
+        # 用 _ddns_relay_prefix() 而不是写死 '/tmp/ddns-ipv6-'：
+        # 中转目录是可配的（测试沙箱指向临时目录），写死的话测试里
+        # 解析不出 idx，界面上的「IPv6 来源」会整个空掉。
         ip_script = svc.get('ip_script', '')
-        if svc.get('ip_source') == 'script' and '/tmp/ddns-ipv6-' in ip_script:
-            idx = ip_script.split('/tmp/ddns-ipv6-')[-1]
+        _relay_pfx = _ddns_relay_prefix()
+        if svc.get('ip_source') == 'script' and _relay_pfx in ip_script:
+            idx = ip_script.split(_relay_pfx)[-1]
             svc['ipv6_source'] = 'router' if idx == '0' else f'rule_{idx}'
         # 从 UCI domain 值反向拆分为 sub_domain 和 main_domain
         domain_val = svc.get('domain', '')
@@ -4102,7 +5203,7 @@ def get_ddns_config():
         for i in range(10):
             key = 'router' if i == 0 else f'rule_{i}'
             try:
-                with open(f'/tmp/ddns-ipv6-{i}') as f:
+                with open(_ddns_relay_path(i)) as f:
                     ipv6_addresses[key] = f.read().strip()
             except Exception:
                 pass
@@ -4137,6 +5238,68 @@ def _validate_ddns_services(services):
     return True, ""
 
 
+def _ddns_password_inventory():
+    """盘点 UCI 里各 DDNS service 的口令情况。
+
+    返回 (values, sections_without_password)
+      values                  —— {uci_name: 原始口令}，**只含确实设了口令的** section
+      sections_without_password —— {uci_name}，section 在但没设 password 这一项
+
+    为什么要分清「本来就没设口令」和「查不到」
+    ------------------------------------------
+    这两种情况在 `uci get` 看来都是「非零退出码」，但含义完全相反：
+      · 本来就没设 ⇒ 原值就是空 ⇒ 保存时写空是**对的**；
+      · 查不到     ⇒ uci 查询失败（锁、超时、环境异常）⇒ 照旧写空就等于
+        **把用户的口令静默清掉**（P1-41 的根因）。
+    分不清就一律当成「查不到」—— 宁可报错让用户重试，
+    也不能悄悄把口令抹了。
+
+    为什么结构用 `uci show`、值用 `uci get`
+    --------------------------------------
+    `uci show` 的输出里值是**转义**过的（单引号里的 ' 会写成 \'），
+    直接拿来当口令会把转义符一起存进去；而 `uci get` 打印的是原值。
+    所以：show 只用来回答「这个 section 有没有 password 这一项」，
+    get 用来取「原值到底是什么」。
+    """
+    values = {}
+    without = set()
+    try:
+        r = subprocess.run(['uci', 'show', 'ddns'],
+                           capture_output=True, text=True, timeout=10)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        print(f'[WARN] uci show ddns 失败（{type(e).__name__}: {e}），'
+              f'口令还原能力未知', flush=True)
+        return values, without
+    sections = []
+    has_pwd = set()
+    for line in (r.stdout or '').splitlines():
+        if '=' not in line:
+            continue
+        key = line.split('=', 1)[0]
+        parts = key.split('.')
+        if len(parts) < 2 or parts[0] != 'ddns':
+            continue
+        name = parts[1]
+        if name not in sections:
+            sections.append(name)
+        if len(parts) >= 3 and parts[2] == 'password':
+            has_pwd.add(name)
+    for name in sections:
+        if name not in has_pwd:
+            without.add(name)
+            continue
+        try:
+            g = subprocess.run(['uci', '-q', 'get', f'ddns.{name}.password'],
+                               capture_output=True, text=True, timeout=10)
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            # 读不出来 ⇒ 不放进 values ⇒ 后面会被判成「还原不了」而报错，
+            # 而不是被当成「原来就是空口令」。
+            continue
+        if g.returncode == 0:
+            values[name] = g.stdout.strip()
+    return values, without
+
+
 @app.route('/api/ddns/save', methods=['POST'])
 def save_ddns_config():
     """保存 DDNS 配置（先清除所有 service，再重建）"""
@@ -4150,20 +5313,56 @@ def save_ddns_config():
         ok, msg = _validate_ddns_services(services)
         if not ok:
             return jsonify({"success": False, "message": msg}), 400
-        # 1. 先获取现有的 service 名称和密码缓存
+        # 1. 先获取现有的 service 名称和口令情况
         existing = _parse_ddns_config()
-        # 缓存原始密码（掩码值跳过写入时使用）
         import re as _re
-        password_cache = {}
-        for svc in existing:
-            svc_name = svc.get('name', '')
-            uci_name = _re.sub(r'[^a-zA-Z0-9_]', '_', svc_name) or svc_name
-            # 从 UCI 读取原始未掩码密码
-            result = subprocess.run(
-                ['uci', '-q', 'get', f'ddns.{uci_name}.password'],
-                capture_output=True, text=True, timeout=10)
-            if result.returncode == 0 and result.stdout.strip():
-                password_cache[uci_name] = result.stdout.strip()
+        password_cache, no_password_sections = _ddns_password_inventory()
+        # 1b. 掩码口令必须**在动 UCI 之前**全部还原（P1-41）
+        #
+        # 原来是在重建循环里现取现用：
+        #     cached = password_cache.get(uci_name, '')
+        #     pwd = cached if cached else ''      ← 取不到就写空
+        # 而那时旧的 service 块已经被 `uci delete` 掉了 ⇒ 用户的服务商
+        # 口令被**静默清空**，接口还回「已保存 N 条 DDNS 记录」。
+        # 后果：DDNS 从此不再更新（凭据没了），而面板上一切正常。
+        #
+        # 现在：还原不成功就直接拒绝保存，并说清楚是哪一条。
+        # 顺序也不能换 —— 还原必须在删除之前做完，否则拒绝保存时
+        # 旧的 service 块已经被删掉了（配置被搞成半残）。
+        resolved_passwords = {}
+        unresolved = []
+        for i, svc in enumerate(services):
+            if not isinstance(svc, dict):
+                continue
+            svc_name = svc.get('name', f'ddns_{i + 1}')
+            uci_name = re.sub(r'[^a-zA-Z0-9_]', '_', svc_name) or f'ddns_{i + 1}'
+            pwd = str(svc.get('password', '') or '')
+            if '****' not in pwd:
+                # 不是掩码 = 用户自己填的（新口令或清空），照用
+                continue
+            original = password_cache.get(uci_name)
+            if original is None:
+                original = password_cache.get(svc_name)
+            if original is None and uci_name in no_password_sections:
+                # 这个 service 本来就没设过口令 ⇒ 空值是对的，
+                # 不属于「被清空」，不用报错。
+                original = ''
+            if original is None:
+                unresolved.append(f'{svc_name}（{uci_name}）')
+                continue
+            resolved_passwords[uci_name] = original
+        if unresolved:
+            # ⚠️ 失败必须**如实报错**，不能降级成「写空继续」——
+            # 那正是 P1-41 本身。此刻 UCI 还没被动过，配置是完好的。
+            print(f'[ERROR] 以下 DDNS 记录的口令掩码无法还原，已拒绝保存: '
+                  f'{", ".join(unresolved)}', flush=True)
+            return jsonify({
+                "success": False,
+                "code": "DDNS_PASSWORD_UNRESOLVED",
+                "message": ("以下 DDNS 记录的口令无法从现有配置中还原，已拒绝保存"
+                            "（继续保存会把口令清空）：" + "、".join(unresolved)
+                            + "。请在记录里重新填写完整口令后再保存。"),
+            }), 400
 
         # 2. 删除所有现有 service 块
         for svc in existing:
@@ -4208,15 +5407,22 @@ def save_ddns_config():
             if 'cloudflare' in svc.get('service_name', ''):
                 svc_username = 'Bearer'
             _uci_set(f'ddns.{uci_name}.username', svc_username)
-            # 密码：如果包含掩码标记则从缓存还原原始密码。
-            # 注意：这里绝对不能用 continue —— 密码只是 20 个字段之一，
+            # 口令：掩码值必须在**前面**（动 UCI 之前）就还原成原值，
+            # 这里只负责把还原后的值写回去。
+            #
+            # ⚠️ 这里绝对不能用 continue —— 口令只是 20 个字段之一，
             # continue 会连带跳过后面 interface/ip_source/ip_script/use_ipv6/
             # param_enc/check_interval/dns_server 等全部配置，
             # 造成「接口返回保存成功但该条 DDNS 记录配置残缺、静默不更新」。
+            #
+            # 也**不能**在这里「取不到就写空」—— 那就是 P1-41 本身：
+            # 用户的服务商口令被清空，DDNS 再也不更新，而接口报「已保存」。
+            # 还原不出来的情况已经在预校验阶段被挡掉（返回 400），
+            # 能走到这里的口令一定是「原值」或「用户新填的值」。
             pwd = svc.get('password', '')
-            if '****' in str(pwd):
-                cached_pwd = password_cache.get(uci_name, '')
-                pwd = cached_pwd if cached_pwd else ''   # 取不到就留空，不中断循环
+            pwd = str(pwd) if pwd is not None else ''
+            if '****' in pwd:
+                pwd = resolved_passwords.get(uci_name, '')
             _uci_set(f'ddns.{uci_name}.password', pwd)
             _uci_set(f'ddns.{uci_name}.interface', svc.get('interface', 'wan'))
             ipv6_source = svc.get('ipv6_source', '')
@@ -4255,8 +5461,13 @@ def save_ddns_config():
                     _uci_set(f'ddns.{uci_name}.ipv6_source', '')
                 else:
                     # 映射 ipv6_source 到 ip_script
+                    #
+                    # 路径来自 _ddns_relay_path()：ip_script 必须与
+                    # _write_ddns_relay() 写出去的位置**完全一致**，
+                    # 否则 DDNS 读的是一个永远不更新的旧路径。
                     _uci_set(f'ddns.{uci_name}.ip_source', 'script')
-                    _uci_set(f'ddns.{uci_name}.ip_script', f'/bin/cat /tmp/ddns-ipv6-{idx}')
+                    _uci_set(f'ddns.{uci_name}.ip_script',
+                             f'/bin/cat {_ddns_relay_path(idx)}')
                     _uci_set(f'ddns.{uci_name}.ipv6_source', ipv6_source)
             else:
                 _uci_set(f'ddns.{uci_name}.ip_source', svc.get('ip_source', 'network'))
@@ -4292,7 +5503,12 @@ def save_ddns_config():
     except subprocess.TimeoutExpired:
         return jsonify({"success": False, "message": "UCI 命令执行超时"}), 500
     except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
+        # ⚠️ 不要把 str(e) 回显给请求方：异常原文里可能带文件路径、
+        # 外部命令的 stderr，甚至口令片段。详情记到服务端日志，
+        # 请求方只拿到一句「保存失败」。
+        print(f'[ERROR] 保存 DDNS 配置失败: {type(e).__name__}: {e}', flush=True)
+        return jsonify({"success": False,
+                        "message": "保存 DDNS 配置失败，详情请查看面板日志"}), 500
 
 
 @app.route('/api/ddns/restart', methods=['POST'])
@@ -4384,6 +5600,9 @@ def _generate_ddns_update_script():
 import json, sys, os, urllib.request, urllib.parse, hmac, hashlib, base64, datetime, uuid
 
 CONFIG_PATH = "/etc/nftables/aliyun-ddns-config.json"
+# DDNS IPv6 中转文件目录 —— 必须与面板写出去的位置一致，
+# 否则这个脚本读到的是一份永远不更新的旧路径。
+RELAY_DIR = os.environ.get("NFTW_RELAY_DIR", "/tmp")
 
 def _sign(params, secret):
     qs = "&".join(f"{urllib.parse.quote(str(k), safe='')}={urllib.parse.quote(str(v), safe='')}" for k, v in sorted(params.items()))
@@ -4427,7 +5646,7 @@ try:
             idx = source_map.get(ipv6_source)
             if idx is not None:
                 try:
-                    with open(f"/tmp/ddns-ipv6-{idx}") as f:
+                    with open(os.path.join(RELAY_DIR, "ddns-ipv6-%s" % idx)) as f:
                         value = f.read().strip()
                 except:
                     pass
@@ -4692,12 +5911,40 @@ def aliyun_ddns_save():
             if rec.get(big) and not rec.get(small):
                 rec[small] = rec[big]
     # 如果 access_key_secret 是掩码值则保留原值
+    #
+    # ⚠️ 原来这里是 `if old: existing[...] = old.get(...)` ——
+    # 取不到原值时**掩码本身就被当成新口令存进去了**（"ab****ef" 变成了
+    # AccessKey secret），而接口回的是「配置已保存」。
+    # 用户以为存好了，DDNS 从此再也没更新过；阿里云那边报的是
+    # 「签名错误」，完全指不到「你存进去的是个掩码」。
+    #
+    # 现在取不到原值就**拒绝保存**，不落盘。
     if '****' in str(existing.get('access_key_secret', '')):
-        old = _load_aliyun_ddns_config()
-        if old:
-            existing['access_key_secret'] = old.get('access_key_secret', '')
+        old = _load_aliyun_ddns_config() or {}
+        old_secret = str(old.get('access_key_secret', '') or '')
+        if not old_secret:
+            print('[ERROR] AccessKey Secret 是掩码但读不到原值，已拒绝保存'
+                  '（否则会把掩码当成口令存进去）', flush=True)
+            return jsonify({
+                "success": False,
+                "code": "ALIYUN_SECRET_UNRESOLVED",
+                "message": ("读不到原有的 AccessKey Secret，无法把掩码值还原成真实口令，"
+                            "已拒绝保存（否则掩码会被当成口令存进去，阿里云会一直报签名错误）。"
+                            "请直接填写完整的 AccessKey Secret 后再保存。"),
+            }), 400
+        existing['access_key_secret'] = old_secret
 
-    _save_aliyun_ddns_config(existing)
+    try:
+        _save_aliyun_ddns_config(existing)
+    except OSError as e:
+        # 写不进去就是写不进去 —— 必须报错，不能假装保存成功。
+        # 详情记日志，不把 str(e) 回显给请求方（可能带路径/口令片段）。
+        print(f'[ERROR] 阿里云 DDNS 配置落盘失败: {type(e).__name__}: {e}',
+              flush=True)
+        return jsonify({
+            "success": False,
+            "message": "阿里云 DDNS 配置保存失败（无法写入配置文件），详情请查看面板日志",
+        }), 500
 
     # 生成自动更新脚本
     _generate_ddns_update_script()
@@ -4731,7 +5978,7 @@ def aliyun_ddns_test():
         idx = source_map.get(ipv6_source)
         if idx is not None:
             try:
-                with open(f'/tmp/ddns-ipv6-{idx}') as f:
+                with open(_ddns_relay_path(idx)) as f:
                     value = f.read().strip()
             except (IOError, OSError):
                 pass
@@ -4930,8 +6177,22 @@ def get_system_logs():
 
         # 取全量而不是 logread -l N：水位要按整个缓冲区算，
         # 而 logread -l N 在缓冲写满时返回的就是全部，再 slice 一次是白费。
+        # ⚠️ errors="replace" 不是可选项（P1-44）
+        #
+        # logread 把内核环形缓冲区**原样**吐出来，里面混着任何字节 ——
+        # 被截断的 UTF-8 序列、二进制内核日志、第三方程序塞进来的裸字节。
+        # text=True 默认用 locale 编码 + **严格解码**：只要缓冲区里有一个
+        # 解不开的字节，subprocess.run 就抛 UnicodeDecodeError。
+        #
+        # 而这个异常被下面那个 `except Exception` 一把接住 → 整个
+        # /api/system/logs 返回 500 ⇒ **整个日志页打不开**。
+        # 也就是说：一条乱码日志就能让运维看不到任何日志。
+        #
+        # 正确做法：解码时用 replace 把非法字节换成 U+FFFD。
+        # 解析不出来的行本来就已经计入 unparsed 单独返回，不会静默少行。
         result = subprocess.run(
-            ["logread"], capture_output=True, text=True, timeout=20
+            ["logread"], capture_output=True, text=True,
+            errors="replace", timeout=20
         )
         if result.returncode != 0:
             return jsonify({
@@ -5201,11 +6462,39 @@ def _lists_file_lock():
                 os.close(lock_fd)
 
 
-def load_lists():
+class ListsUnavailableError(RuntimeError):
+    """名单文件读不到（损坏 / 权限 / IO 错误）。
+
+    为什么读路径要分「宽松」和「严格」两种（P1-43）
+    ------------------------------------------------
+    读名单有两个完全不同的用途：
+
+      · **展示 / 生成规则**（build_rules、名单页读列表）
+        这里宽松一点是对的：一次坏文件不该让整个规则预览不可用，
+        读不到就当空，至少页面还能打开。
+
+      · **读-改-写**（_mutate_lists）
+        这里宽松就是**数据丢失**：读失败返回空结构 → 接着 save_lists
+        把这份「空」当成真实状态写回去 → 磁盘上原有的白/黑名单被整体抹掉，
+        而接口报的是成功。用户看到的是「名单被清空了」，
+        实际上是文件读不出来。
+
+    所以读-改-写那条路径必须用严格模式：**拿不到就报错**，
+    让调用方知道「没写成」，而不是把「没读到」固化成「名单是空的」。
+    """
+
+
+def load_lists(strict=False):
     """读取落盘名单成员。
 
-    返回 {set_name: [ip, ...]}。文件不存在/损坏时返回空结构并告警，
+    返回 {set_name: [ip, ...]}。
+
+    strict=False（默认，展示/生成规则用）：文件不存在/损坏时返回空结构并告警，
     不能让一次坏文件把整个名单读取路径搞崩（否则名单管理页整个不可用）。
+
+    strict=True（读-改-写用）：文件存在但**读不出来/解析不了**时抛
+    ListsUnavailableError —— 宁可报错，也不能让调用方把「读不到」
+    当成「确实是空的」再写回磁盘。
     """
     empty = {n: [] for n in sorted(VALID_SET_NAMES)}
     if not os.path.exists(LISTS_PATH):
@@ -5214,9 +6503,14 @@ def load_lists():
         with open(LISTS_PATH, 'r') as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
+        if strict:
+            raise ListsUnavailableError(f'名单文件读取失败: {e}')
         print(f'[WARN] 名单文件读取失败（本次按空名单处理）: {e}', flush=True)
         return empty
     if not isinstance(data, dict):
+        if strict:
+            raise ListsUnavailableError(
+                f'名单文件格式非法（顶层不是对象）: {type(data).__name__}')
         print(f'[WARN] 名单文件格式非法（本次按空名单处理）: {type(data).__name__}', flush=True)
         return empty
     out = dict(empty)
@@ -5224,7 +6518,30 @@ def load_lists():
         items = data.get(name)
         if not isinstance(items, list):
             continue
-        out[name] = [str(x).strip() for x in items if str(x).strip()]
+        # ⚠️ 每个元素都要校验是不是合法 IP（P2-15 / P2-29）。
+        #
+        # 这里原来只 strip 不校验 ⇒ 名单文件里塞一个
+        #     1.2.3.4, }; delete table inet fw4; #
+        # 就会在「生成规则集」时**原样**进 nftables 的 set 元素列表。
+        #
+        # 这就是「二次注入」：写入路径校验过一次（那是第一道），
+        # 但名单文件是可以被手工改坏的，而读-改-写路径会把它**原样写回去**
+        # —— 第二道没人管。
+        #
+        # 顺带按 set 名字定版本：allowed4/blacklist4 只收 IPv4，
+        # allowed6/blacklist6 只收 IPv6。放错版本的元素会让 nft 拒绝加载
+        # 整个 set（类型不匹配），比丢一个元素严重得多。
+        ver = 6 if name.endswith('6') else 4
+        good = []
+        for x in items:
+            ip = str(x).strip()
+            if not ip:
+                continue
+            if not _valid_ip(ip, ver):
+                print(f'[WARN] 名单 {name} 里有非法元素，已丢弃: {ip!r}', flush=True)
+                continue
+            good.append(ip)
+        out[name] = good
     return out
 
 
@@ -5240,10 +6557,23 @@ def save_lists(data):
         静默清空，下次「应用规则」再把这个空状态写进内核。
     并发丢失更新（两个请求各自读到旧快照、后写的把先写的覆盖回去）由 _mutate_lists
     里的 flock 解决，两者缺一不可。
+
+    ⚠️ **整份文件回写**的坑（P1-43）
+    ------------------------------
+    这份文件是「四个集合放在一起」的一个 JSON，所以任何一次写入都是整份覆盖。
+    只要调用方只给了其中一个集合，另外三个就会被写成空 —— 一次「加一个黑名单」
+    把整份白名单清空，而且是静默的。
+
+    现在：**data 里没出现的集合一律保留磁盘上的原值**，而不是当成空。
+    「全部清空」是显式把四个 key 都传成空列表的，不受影响。
     """
     os.makedirs(os.path.dirname(LISTS_PATH), exist_ok=True)
-    payload = {n: sorted({str(x).strip() for x in (data.get(n) or []) if str(x).strip()})
-               for n in sorted(VALID_SET_NAMES)}
+    # 没给到的集合 → 保留磁盘上的原值（整份回写不能变成「顺手清空别人」）
+    current = load_lists()
+    payload = {}
+    for n in sorted(VALID_SET_NAMES):
+        items = data.get(n) if (isinstance(data, dict) and n in data) else current.get(n)
+        payload[n] = sorted({str(x).strip() for x in (items or []) if str(x).strip()})
     tmp = f'{LISTS_PATH}.tmp.{os.getpid()}.{threading.get_ident()}'
     try:
         # 名单里是白/黑名单 IP。落盘那一刻就是 0600 ——
@@ -5270,9 +6600,13 @@ def _mutate_lists(set_name, add=(), remove=(), clear=False):
 
     整个读-改-写必须持排他锁：调用方是并发到达的（一次「全部清空」= 两个请求），
     不加锁时两个请求都读到旧快照，后写的会把先写的覆盖回去。
+
+    ⚠️ 读文件用**严格模式**（P1-43）：读失败抛异常而不是返回空结构。
+    否则「读不到」会被当成「名单是空的」再写回磁盘 —— 一次瞬时 IO 错误
+    就把整份白/黑名单抹掉，而接口报成功。
     """
     with _lists_file_lock():
-        data = load_lists()
+        data = load_lists(strict=True)
         cur = list(data.get(set_name, []))
         if clear:
             cur = []
@@ -5283,10 +6617,145 @@ def _mutate_lists(set_name, add=(), remove=(), clear=False):
                 cur.append(ip)
         data[set_name] = cur
         save_lists(data)
+        # 名单元素必须**同时**落进规则集文件（P1-42），否则重启即丢。
+        # 失败只记日志不抛：内核里的元素已经是生效的，
+        # 这里补的是「重启后还在」这件事，不该把已经成功的操作报成失败。
+        try:
+            _persist_list_elements_to_ruleset(data)
+        except Exception as e:
+            print(f'[WARN] 名单元素同步进规则集文件失败（重启后可能丢失）: '
+                  f'{type(e).__name__}: {e}', flush=True)
     return data
+
+
+# 规则集里需要同步名单元素的四个 set
+_LIST_SET_NAMES = ('allowed4', 'allowed6', 'blacklist4', 'blacklist6')
+
+
+def _format_list_elements(elements, want6):
+    """把名单元素格式化成一行的 nft elements 内容，逐个过 IP 校验。
+
+    返回 (合法元素列表, 被丢弃的条数)。丢弃的元素**不写进规则集** ——
+    这个文件会被 nft -f 直接执行，脏数据等于往防火墙里塞指令。
+    """
+    out, dropped = [], 0
+    for elem in (elements or []):
+        text = str(elem).strip()
+        if not text:
+            continue
+        try:
+            addr = ipaddress.ip_address(text)
+        except ValueError:
+            dropped += 1
+            continue
+        if (addr.version == 6) != want6:
+            dropped += 1
+            continue
+        out.append(text)
+    return out, dropped
+
+
+def _replace_set_elements(text, set_name, elements):
+    """把规则集文本里某个 set 的 elements 行换成给定元素。
+
+    只动 elements 这一行，set 块里的其它内容（type/flags/timeout）原样保留 ——
+    不能整份重新生成规则集，那会把「配置改了但还没应用」的变更提前写进磁盘，
+    重启后那些变更会自己生效，是另一种「看起来成功其实状态不对」。
+
+    返回 (新文本, 是否找到了这个 set 块)。
+    """
+    m = re.search(r'(?m)^([ \t]*)set\s+' + re.escape(set_name) + r'\s*\{', text)
+    if not m:
+        return text, False
+    indent = m.group(1)
+    body_start = m.end()
+    close = re.search(r'(?m)^' + re.escape(indent) + r'\}', text[body_start:])
+    if not close:
+        return text, False
+    body_end = body_start + close.start()
+    block = text[body_start:body_end]
+    # 去掉已有的 elements 行（可能有也可能没有）
+    new_block = re.sub(r'(?m)^[ \t]*elements\s*=.*\n?', '', block)
+    elems, dropped = _format_list_elements(elements, want6=set_name.endswith('6'))
+    if dropped:
+        print(f'[WARN] 名单 {set_name} 有 {dropped} 个非法元素未写入规则集', flush=True)
+    if elems:
+        line = f'{indent}    elements = {{ ' + ', '.join(elems) + ' }\n'
+        new_block = new_block.rstrip('\n') + '\n' + line
+    else:
+        new_block = new_block.rstrip('\n') + '\n'
+    return text[:body_start] + new_block + text[body_end:], True
+
+
+def _persist_list_elements_to_ruleset(lists):
+    """把名单元素同步进**已落盘的规则集文件**（P1-42）。
+
+    为什么必须做
+    ------------
+    名单元素有两个去处：
+
+      · 内核 nft set  —— 由 nft add/delete element 增量维护；
+      · 规则集文件    —— **只有点「应用规则」时才会被重写**。
+
+    而设备重启时加载的是**规则集文件**（init 脚本 nft -f 规则集），
+    不是内核内存。所以：加了个黑名单 → 内核里有了 → 但规则集文件里没有
+    → 下次重启，这个黑名单**静默消失**。用户以为还封着，实际已经放行。
+    这正是「名单元素从未持久化进规则集文件」的病根。
+
+    为什么不是整份重新生成规则集
+    ----------------------------
+    整份重生成（build_rules）会把「配置改了但还没点应用」的变更提前写进磁盘，
+    重启后这些变更会自己生效 —— 用户没点「应用」，规则却变了。
+    所以这里**只改四个名单 set 的 elements 行**，其余字节一律不动。
+    """
+    if not os.path.exists(RULES_PATH):
+        # 规则集从来没落过盘（还没应用过规则）→ 没有可同步的对象
+        return False
+    try:
+        with open(RULES_PATH, 'r', errors='replace') as f:
+            text = f.read()
+    except OSError as e:
+        raise RuntimeError(f'规则集文件读取失败: {e}')
+
+    new_text = text
+    found = False
+    for name in _LIST_SET_NAMES:
+        new_text, ok = _replace_set_elements(new_text, name,
+                                             (lists or {}).get(name) or [])
+        found = found or ok
+    if not found:
+        return False
+    if new_text == text:
+        return True
+
+    # 原子写：tmp + os.replace。规则集是开机要 nft -f 的文件，
+    # 写一半被断电 ⇒ 开机直接起不来防火墙。
+    tmp = RULES_PATH + '.tmp.lists'
+    _ensure_file_mode(tmp, 0o600)
+    try:
+        with open(tmp, 'w') as f:
+            f.write(new_text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, RULES_PATH)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return True
 
 # 历史/预设容量上限
 LIST_HISTORY_MAX = 100
+# IP 预设条数上限（P2-24）
+#
+# 为什么要有上限：预置名单是用户自己往上加的，原来没有任何限制。
+# 而读接口要为每条预设查一次内核 set ⇒ 条数越多，spawn 的 nft 子进程越多
+# ⇒ 一个普通 GET 就能把设备 CPU 拖垮。现在读接口已经改成「每个 set 查一次」
+# （与条数无关），但**写入**仍然要设上限：配置是无界的 JSON，
+# 几百 MB 的预设列表光是读回来就够面板喝一壶。
+PRESET_MAX = 500
 
 
 def _list_type_from_set(set_name):
@@ -5346,25 +6815,71 @@ def _next_preset_id(presets):
     return "p_" + uuid.uuid4().hex[:8]
 
 
-def _check_ip_in_set(ip, list_type):
-    """实时查询 IP 是否在对应 set 中。返回 bool（找不到 set 时返回 False）"""
-    set_name = ('allowed' if list_type == 'whitelist' else 'blacklist') + (
-        '6' if _detect_ip_version(ip) == 6 else '4'
-    )
+def _nft_set_members(set_name):
+    """一次 nft 查询取回某个 set 的全部成员，返回 set[str]。
+
+    为什么必须是「一次查询取全部」
+    ----------------------------
+    原来每条 IP 预设都单独跑一次 `nft list set`（`_check_ip_in_set`）。
+    预置名单是用户自己往上加的，条数**没有上限** ⇒ 一次
+    `GET /api/lists/presets` 就能 spawn 上百个子进程，每个还带 5 秒
+    timeout ⇒ 一个普通的 GET 请求就能把面板进程和设备 CPU 拖垮（P2-24）。
+
+    现在按 set 分组：一个请求最多 4 次 nft 查询（allowed4/allowed6/
+    blacklist4/blacklist6），与预设条数无关。
+    """
     try:
         result = subprocess.run(
             ['nft', 'list', 'set', 'inet', 'fw4', set_name],
             capture_output=True, text=True, timeout=5
         )
         if result.returncode != 0:
-            return False
+            return set()
         # 复用 _parse_nft_set_output 做精确匹配。
         # 原先用 `ip in stdout.split('elements',1)[-1]` 子串判断，
         # 会让 1.2.3.4 误匹配 11.2.3.45 / 1.2.3.400，
         # 且 'elements' 不存在时 [-1] 取整段输出导致必然误判。
-        return ip in _parse_nft_set_output(result.stdout)
+        return set(_parse_nft_set_output(result.stdout).keys())
     except Exception:
+        return set()
+
+
+def _preset_set_name(ip, list_type):
+    """预设 IP 落在哪个 set 里。IP 非法时返回 None。"""
+    ver = _detect_ip_version(ip)
+    if ver is None:
+        return None
+    return ('allowed' if list_type == 'whitelist' else 'blacklist') + (
+        '6' if ver == 6 else '4')
+
+
+def _check_ip_in_set(ip, list_type):
+    """实时查询 IP 是否在对应 set 中。返回 bool（找不到 set 时返回 False）"""
+    set_name = _preset_set_name(ip, list_type)
+    if not set_name:
         return False
+    return ip in _nft_set_members(set_name)
+
+
+def _presets_active_map(presets):
+    """一次算完所有预设的 is_active，返回 {下标: bool}。
+
+    与预设条数无关：最多 4 次 nft 查询（每个 set 一次）。
+    """
+    grouped = {}
+    for idx, p in enumerate(presets):
+        if not isinstance(p, dict):
+            continue
+        ip = p.get('ip', '')
+        set_name = _preset_set_name(ip, p.get('type', 'whitelist'))
+        if set_name:
+            grouped.setdefault(set_name, []).append((idx, ip))
+    out = {}
+    for set_name, items in grouped.items():
+        members = _nft_set_members(set_name)
+        for idx, ip in items:
+            out[idx] = ip in members
+    return out
 
 
 def _parse_nft_set_output(output):
@@ -5417,42 +6932,108 @@ def _nft_missing(action):
     }), 503
 
 
+class NftSetReadError(RuntimeError):
+    """读内核 set 失败。
+
+    为什么读失败必须**报错**而不是返回空集合（P2-25）
+    --------------------------------------------------
+    原来白/黑名单读接口是这么写的：
+
+        "allowed4": _parse_nft_set_output(result4.stdout) if result4.returncode == 0 else {}
+
+    nft 读失败（set 不存在、规则集被重建中、nft 卡住）时返回的是
+    **{} —— 空字典**，外层照样 `success: True`。
+
+    对用户来说这跟「名单真的空了」**完全一样**：他看到白名单一个 IP 都没有，
+    于是重新敲一遍、重新授权一遍。而实际上名单好好地在内核里躺着，
+    面板只是没读出来。更糟的是很多操作是「读不到就当空」起步的 ——
+    一次误判就可能把整份名单覆盖掉。
+
+    「拿不到」和「确实是空的」必须能被调用方区分开，这就是本异常存在的理由。
+    """
+
+
+def _nft_read_set(set_name, timeout=10):
+    """读一个内核 set 的成员。**读失败抛 NftSetReadError**，绝不返回空集合。
+
+    返回 {ip: expires_str|None}。
+    """
+    result = subprocess.run(['nft', 'list', 'set', 'inet', 'fw4', set_name],
+                             capture_output=True, text=True, timeout=timeout)
+    if result.returncode != 0:
+        # 注意：**不把 nft 的原始输出回显给请求方**（可能含路径/内部细节），
+        # 只把「哪个 set 读失败」这个事实带出去。
+        raise NftSetReadError(f'nft list set {set_name} 失败')
+    return _parse_nft_set_output(result.stdout)
+
+
+def _lists_read_error_response(e, action='读取'):
+    """名单读失败的统一应答：明确告诉调用方「拿不到」，而不是谎称「空的」。
+
+    ⚠️ 不回显 str(e)：异常原文可能带 nft 的原始输出/内部路径。
+    这里只回显**我们自己构造**的短描述（set 名 + 动作）。
+    """
+    return jsonify({
+        "success": False,
+        "code": "NFT_SET_READ_FAILED",
+        "message": f"{action}防火墙名单失败：{e}。内核规则集读取不到，"
+                   f"无法确认当前名单内容，请检查 nft 服务与规则集状态后重试。",
+    }), 500
+
+
 @app.route('/api/lists/whitelist', methods=['GET'])
 def get_whitelist():
-    """读取白名单 (allowed4 + allowed6)"""
+    """读取白名单 (allowed4 + allowed6)
+
+    ⚠️ 任何一个 set 读失败就**整个接口报错**（P2-25）。
+    原来是把读失败的 set 悄悄换成 {} 再 success: True ——
+    用户看到的「白名单是空的」和「面板没读出来」长得一模一样，
+    于是反复重新授权，而真正的原因（nft 读不到）从来没被说出来过。
+    """
     try:
-        result4 = subprocess.run(['nft', 'list', 'set', 'inet', 'fw4', 'allowed4'],
-                                 capture_output=True, text=True, timeout=10)
-        result6 = subprocess.run(['nft', 'list', 'set', 'inet', 'fw4', 'allowed6'],
-                                 capture_output=True, text=True, timeout=10)
+        allowed4 = _nft_read_set('allowed4')
+        allowed6 = _nft_read_set('allowed6')
         return jsonify({
             "success": True,
-            "allowed4": _parse_nft_set_output(result4.stdout) if result4.returncode == 0 else {},
-            "allowed6": _parse_nft_set_output(result6.stdout) if result6.returncode == 0 else {},
+            "allowed4": allowed4,
+            "allowed6": allowed6,
         })
     except FileNotFoundError:
         return _nft_missing('读取')
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
+    except subprocess.TimeoutExpired:
+        return jsonify({"success": False, "code": "NFT_SET_READ_FAILED",
+                        "message": "读取防火墙名单超时，无法确认当前名单内容。"}), 500
+    except NftSetReadError as e:
+        return _lists_read_error_response(e, '读取白名单')
+    except Exception:
+        return jsonify({"success": False, "code": "NFT_SET_READ_FAILED",
+                        "message": "读取防火墙名单失败，无法确认当前名单内容。"}), 500
 
 
 @app.route('/api/lists/blacklist', methods=['GET'])
 def get_blacklist():
-    """读取黑名单 (blacklist4 + blacklist6)"""
+    """读取黑名单 (blacklist4 + blacklist6)
+
+    与 get_whitelist 同一口径：**读失败即报错**，绝不报成功 + 空列表（P2-25）。
+    """
     try:
-        result4 = subprocess.run(['nft', 'list', 'set', 'inet', 'fw4', 'blacklist4'],
-                                 capture_output=True, text=True, timeout=10)
-        result6 = subprocess.run(['nft', 'list', 'set', 'inet', 'fw4', 'blacklist6'],
-                                 capture_output=True, text=True, timeout=10)
+        blacklist4 = _nft_read_set('blacklist4')
+        blacklist6 = _nft_read_set('blacklist6')
         return jsonify({
             "success": True,
-            "blacklist4": _parse_nft_set_output(result4.stdout) if result4.returncode == 0 else {},
-            "blacklist6": _parse_nft_set_output(result6.stdout) if result6.returncode == 0 else {},
+            "blacklist4": blacklist4,
+            "blacklist6": blacklist6,
         })
     except FileNotFoundError:
         return _nft_missing('读取')
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
+    except subprocess.TimeoutExpired:
+        return jsonify({"success": False, "code": "NFT_SET_READ_FAILED",
+                        "message": "读取防火墙名单超时，无法确认当前名单内容。"}), 500
+    except NftSetReadError as e:
+        return _lists_read_error_response(e, '读取黑名单')
+    except Exception:
+        return jsonify({"success": False, "code": "NFT_SET_READ_FAILED",
+                        "message": "读取防火墙名单失败，无法确认当前名单内容。"}), 500
 
 
 def _nft_set_write(args, timeout=10):
@@ -5589,10 +7170,18 @@ def list_get_presets():
     """列出所有 IP 预设（每个 preset 附带 is_active：当前是否在 set 里）"""
     config = load_config()
     presets = config.get('ip_presets', [])
+    if not isinstance(presets, list):
+        presets = []
+    # 容量上限：配置被手工改坏时可能塞进来一堆，这里只返回前 N 条
+    # （创建接口已经拦了，这里是第二道闸 —— 读取路径不该被数据量绑架）
+    if len(presets) > PRESET_MAX:
+        presets = presets[:PRESET_MAX]
+    # 一次算完所有 is_active：每个 set 一次 nft 查询，与预设条数无关（P2-24）
+    active = _presets_active_map(presets)
     enriched = []
-    for p in presets:
+    for idx, p in enumerate(presets):
         item = dict(p)
-        item['is_active'] = _check_ip_in_set(p.get('ip', ''), p.get('type', 'whitelist'))
+        item['is_active'] = bool(active.get(idx, False))
         enriched.append(item)
     return jsonify({'success': True, 'data': {'presets': enriched, 'total': len(enriched)}})
 
@@ -5615,6 +7204,16 @@ def list_create_preset():
 
     config = load_config()
     presets = config.setdefault('ip_presets', [])
+    if not isinstance(presets, list):
+        presets = []
+        config['ip_presets'] = presets
+    # 容量上限（P2-24）：原来预设条数无限制，而读接口要为每条查一次内核
+    # ⇒ 一个 GET 就能把设备 CPU 拖垮。读接口已经改成「每个 set 查一次」，
+    # 但写入也要设闸：配置是无界 JSON，几百 MB 的列表光读回来就够面板喝一壶。
+    if len(presets) >= PRESET_MAX:
+        return jsonify({'success': False,
+                        'message': f'预设数量已达上限（{PRESET_MAX} 条），'
+                                   f'请先删除一些再添加'}), 400
     # 同 IP + type 视为重复
     for p in presets:
         if p.get('ip') == ip and p.get('type') == list_type:
@@ -6099,6 +7698,15 @@ def _rp_cookie_domain(config):
     派生规则（与 base_domain 同一套语义）：
       · 键不存在 → 用 "." + base_domain 推导
       · 键存在但值为空 → 用户明确清空 → 不共享（各域名分别登录）
+
+    ⚠️ 「键不存在」这一支**只能读已落盘的 base_domain，不能自己从证书 SAN 推导**
+    （P2-17）：认证服务（auth_gateway._cookie_domain）读的是同一份配置、同一套规则，
+    而且它**刻意不猜**父域 —— 猜父域要 publicsuffix 列表，猜错就是
+    「cookie 莫名其妙不生效」。两边推导逻辑不一样的话，后果是
+    「面板说共享、网关不共享」，而且**面板上完全看不出来**（接口返回的是现算的生效值），
+    实际表现是「每换一个域名就要重登一次」。
+    base_domain 的推导由 `_rp_sync_base_domain` 负责，它**会落盘** ——
+    落盘之后两边读到的就是同一个值。
     """
     rp = config.get("reverse_proxy")
     settings = rp.get("settings") if isinstance(rp, dict) else {}
@@ -6112,7 +7720,13 @@ def _rp_cookie_domain(config):
         except ValueError:
             return ""
         return ("." + base) if base else ""
-    bd = _rp_base_domain(config)
+    bd = ""
+    if "base_domain" in settings:
+        try:
+            bd = _sanitize_rp_host(
+                str(settings.get("base_domain") or "").strip().lower())
+        except ValueError:
+            bd = ""
     return ("." + bd) if bd else ""
 
 
@@ -6153,6 +7767,19 @@ def _rp_sync_base_domain(config):
                 derived = s.lower()
                 break
     if derived:
+        # ⚠️ SAN 是**证书文件里的字节**，不是用户输入 —— 但证书是可以被
+        # 上传替换的（见 rp_upload_cert），所以它的内容归根结底是**不可信**的。
+        # 推出来的域名要直接进 nginx 的 `server_name` 和 cookie 的 `Domain` 属性，
+        # 落盘前必须过一遍净化（P2-18）：净化不过就**不落盘**，宁可不启用
+        # host 分发，也不能把一个来路不明的字符串写进 nginx 配置。
+        try:
+            derived = _sanitize_rp_host(derived)
+        except ValueError as e:
+            print(f'[WARN] 默认证书 SAN 推出的基础域名非法（{e}），已忽略：'
+                  f'{derived!r} —— 不启用 host 分发', flush=True)
+            return ""
+        if not derived:
+            return ""
         settings["base_domain"] = derived
         # cookie 共享域跟着走：用户没单独设过 cookie_domain 时，
         # 让它跟着 base_domain 一起生效，host 分发才能一次登录通用。
@@ -6353,14 +7980,28 @@ def _validate_rp_service(data, existing=None, all_rules=None):
 
     # 目标地址
     target = pick("target_address", "")
+    raw_target = str(target or '').strip()
+    # ⚠️ 必须和 _gateway_services 用**同一份**主机判定（P2-16）。
+    # 生成器那边对不合法的目标主机是**静默丢掉整条服务** ——
+    # 两边规则不一致的话，就是「API 报成功、nginx 配置里没有这条规则、
+    # 用户的反代压根没生效」，而且面板上完全看不出来。
+    #
+    # 这道检查必须放在 _sanitize_target_address **之前**，不能放在之后：
+    # 放在之后它是一段**永远轮不到的死代码** —— _sanitize_target_address
+    # 自己就会把超长/带空格的串拒掉，用户看到的是「无效域名格式」，
+    # 而那句话对真实原因毫无帮助（同一个函数还管端口越界、IPv4 段数）。
+    # 放在前面，它才是第一道关卡，错误文案也能说清「这不是一个能用的主机」。
+    _t_host = raw_target.rsplit(':', 1)[0] if ':' in raw_target else raw_target
+    if not _valid_upstream_host(_t_host):
+        return None, (f"目标地址 {_t_host!r} 不是有效的内网 IP 或接口名"
+                      "（生成网关配置时会被直接丢弃）")
     try:
-        clean["target_address"] = _sanitize_target_address(str(target or '').strip())
+        clean["target_address"] = _sanitize_target_address(raw_target)
     except ValueError as e:
         return None, str(e)
 
     # 域名型目标必须先确认解析得通。nginx 在 nginx -t 阶段就会解析 upstream
     # 域名，解析不到整份网关配置就生成失败（详见 _host_resolvable 的说明）。
-    _t_host = clean["target_address"].rsplit(':', 1)[0]
     if _host_resolvable(_t_host) is False:
         return None, (f"目标地址 {_t_host!r} 解析不到 IP。"
                       "nginx 生成配置时会立刻失败并让整个网关配置不可用，"
@@ -6602,6 +8243,174 @@ DNS_PROVIDERS = {
 }
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 第三方 DNS 凭据的独立存放（P1-20）
+# ══════════════════════════════════════════════════════════════════════
+#
+# 为什么必须拆出来
+# ----------------
+# 第三方 DNS 服务商（腾讯云 / Cloudflare / 华为云 / Porkbun / GoDaddy …）
+# 的 API token 原来**明文存在共享配置**里：
+#     /etc/nftables/nftables-web-config.json   0640 root:nftweb
+#
+# 0640 的含义是「nftweb 组可读」。而认证网关为了降权已经降到 nftweb
+# 用户 —— 它读得到整份共享配置，于是**服务商的 API token 也一起被
+# 降权后的进程读到了**。
+#
+# 拿到 Cloudflare token 就能改 DNS 记录（把网关的域名指到攻击者的机器，
+# 配上自己的证书就能劫持认证网关）；拿到腾讯云 SecretKey 就能改 DNSPod；
+# 拿到 Porkbun API Key 就能改 DNS 记录 —— 总之都是「把合法入口换成
+# 攻击者的机器」的能力。
+#
+# 拆开之后：
+#     共享配置           0640 root:nftweb  ← 只有「非机密」留在里面
+#     凭据独立文件      0600 root:root     ← 只有面板(root)读得到
+#
+# 向后兼容
+# --------
+# 升级前的老配置里凭据就在 `reverse_proxy.dns_credentials`。
+# 升级后：
+#   · 读到它 ⇒ 立刻搬进独立文件（读时迁移），用户不用重新配一遍；
+#   · 搬进独立文件成功后 ⇒ 把共享配置里的明文**抹掉**并落盘
+#     （只是「搬走」不删掉等于漏洞换了个地方）；
+#   · 搬不进去（写不进独立文件）⇒ **保留原值继续用**，绝不把用户的
+#     凭据弄丢（凭据没了 = 所有证书续期失败），并明确记日志。
+
+DNS_CREDENTIALS_PATH = os.environ.get(
+    "NFTABLES_WEB_DNS_CREDENTIALS_FILE",
+    "/etc/nftables/nftables-web-dns-credentials.json")
+# 凭据文件的目标权限：0600 root:root。
+# 与 _CONFIG_FILE_MODE（0640）**故意不同** —— 共享配置要给网关读，
+# 凭据文件只给面板读。
+DNS_CREDENTIALS_MODE = 0o600
+
+
+class DnsCredentialsStoreError(RuntimeError):
+    """第三方 DNS 凭据无法安全落盘（独立 0600 文件写不进去）。
+
+    为什么要有这个异常而不是静默降级
+    ------------------------------
+    「写不进独立文件」只有两条出路：
+      · 把凭据退回共享配置 ⇒ 降权后的网关又读得到 ⇒ 漏洞原样保留；
+      · 丢掉凭据 ⇒ 所有证书续期失败。
+    两条都不能接受，所以只能**报错**，让用户知道「凭据没存上」，
+    而不是回一句「保存成功」。
+    """
+
+
+def _load_dns_credentials_store():
+    """读第三方 DNS 凭据文件。读不到 / 坏掉 → 空字典（并记日志）。
+
+    ⚠️ 读不到**不等于**没有凭据：文件可能还没建（第一次用），
+    也可能权限/属主不对读不了。所以这里只返回空字典，
+    由调用方决定要不要报错 —— 绝不能在这里把「读不到」当成
+    「用户没配过」而覆盖掉已有的凭据。
+    """
+    try:
+        with open(DNS_CREDENTIALS_PATH, 'r') as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (json.JSONDecodeError, OSError) as e:
+        print(f'[ERROR] DNS 凭据文件读取失败（{DNS_CREDENTIALS_PATH}: '
+              f'{type(e).__name__}: {e}）—— 按「没有凭据」处理，'
+              f'请检查该文件的权限与内容', flush=True)
+        return {}
+    if not isinstance(data, dict):
+        print(f'[ERROR] DNS 凭据文件内容不是对象（{DNS_CREDENTIALS_PATH}），'
+              f'已忽略', flush=True)
+        return {}
+    return {k: v for k, v in data.items() if isinstance(v, dict)}
+
+
+def _save_dns_credentials_store(store):
+    """把第三方 DNS 凭据写进独立文件（0600 root:root，原子替换）。
+
+    落盘即正确 + 不跟随软链 + 原子换名
+    --------------------------------
+      · tmp 用 os.open(O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW, 0600) 建：
+        - O_EXCL：不会覆盖任何已存在的东西（也不会被抢占的名字骗到）；
+        - O_NOFOLLOW：万一 tmp 是软链，**不跟随**它写；
+        - 0600：内容落盘那一刻别的本地用户就读不到；
+      · os.replace 原子换名：读者要么看到旧文件、要么看到新文件。
+    """
+    directory = os.path.dirname(DNS_CREDENTIALS_PATH) or '.'
+    tmp_path = f"{DNS_CREDENTIALS_PATH}.tmp.{os.getpid()}.{secrets.token_hex(6)}"
+    payload = json.dumps(store, indent=2, ensure_ascii=False)
+    try:
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError as e:
+            # 目录建不出来（权限不足 / 父路径不是目录）也必须走同一条
+            # 错误路径 —— 不能让 OSError 直接冒出去（调用方只认
+            # DnsCredentialsStoreError）。
+            raise DnsCredentialsStoreError(
+                f'无法创建 DNS 凭据文件所在目录 {directory}: {e}') from e
+        fd = os.open(tmp_path,
+                     os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                     DNS_CREDENTIALS_MODE)
+        try:
+            with os.fdopen(fd, 'w') as f:
+                fd = None
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+        finally:
+            if fd is not None:
+                os.close(fd)
+        # fchmod：os.open 的 mode 会被 umask 削掉两位，这里补回来，
+        # 保证「落盘那一刻」就是 0600（而不是 0400/0000）。
+        try:
+            os.chmod(tmp_path, DNS_CREDENTIALS_MODE)
+        except OSError as e:
+            print(f'[WARN] 设置凭据文件权限失败（{tmp_path}: {e}）', flush=True)
+        # 属主固定 root:root —— 只有面板（root）读得到。
+        try:
+            os.chown(tmp_path, 0, 0)
+        except (OSError, AttributeError):
+            # 非 root 环境（测试沙箱）下没有权限，属主保持现状即可
+            pass
+        os.replace(tmp_path, DNS_CREDENTIALS_PATH)
+    except OSError as e:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise DnsCredentialsStoreError(
+            f'无法写入 DNS 凭据文件 {DNS_CREDENTIALS_PATH}: {e}') from e
+    return True
+
+
+def _merge_dns_credentials(store, extra):
+    """合并凭据：extra 里的同名 provider 覆盖 store 里的（用户刚填的值最新）。"""
+    merged = {k: v for k, v in (store or {}).items() if isinstance(v, dict)}
+    for pid, creds in (extra or {}).items():
+        if isinstance(creds, dict) and creds:
+            merged[pid] = creds
+    return merged
+
+
+def _dns_credentials_view(rp):
+    """凭据视图 = 独立文件里的 + 存量共享配置里还没迁走的。
+
+    存量配置（升级上来的机器）里的凭据还在 `rp["dns_credentials"]`。
+    这里把它们**并进视图**，这样：
+      · 界面上的「已配置」状态是对的；
+      · 证书续期能拿到凭据（不会因为「搬文件失败」就停摆）。
+    """
+    view = {}
+    store = _load_dns_credentials_store()
+    for pid, creds in store.items():
+        if isinstance(creds, dict) and creds:
+            view[pid] = creds
+    legacy = rp.get("dns_credentials")
+    if isinstance(legacy, dict):
+        for pid, creds in legacy.items():
+            if isinstance(creds, dict) and creds and not view.get(pid):
+                view[pid] = creds
+    return view
+
+
 def _get_dns_credentials(rp, provider_id):
     """获取某 DNS 提供商的凭证，阿里云自动从 DDNS 配置读取"""
     if provider_id == "ali":
@@ -6628,6 +8437,10 @@ def _get_rp_config():
     if not isinstance(rp.get("certificates"), list):
         rp["certificates"] = []
     rp.setdefault("settings", dict(RP_DEFAULT_SETTINGS))
+    # P1-20：凭据视图来自独立文件（0600），存量共享配置里的那份并进来。
+    # 真正的「搬走 + 抹掉明文」由 _migrate_dns_credentials_on_startup()
+    # 在启动时做一次（读路径不该有副作用）。
+    rp["dns_credentials"] = _dns_credentials_view(rp)
     return config, rp
 
 
@@ -6647,7 +8460,137 @@ def _save_rp_config(config):
     # 只做一次：_rp_sync_base_domain 只在 settings 里**没有**这两个键时补，
     # 用户手动清空之后就不会被改回来。
     _rp_sync_base_domain(config)
+    # ── P1-20：凭据不写进共享配置 ──────────────────────────────────
+    #
+    # 共享配置是 0640 root:nftweb，网关（降权到 nftweb）读得到。
+    # 凭据必须只落在 0600 root:root 的独立文件里。
+    #
+    # 顺序：**先写独立文件，写成功了才把它从共享配置里摘掉**。
+    # 反过来做（先摘再写）一旦写失败，凭据就没了 ——
+    # 所有证书续期失败，而且再也读不回来。
+    rp = config.get("reverse_proxy")
+    if isinstance(rp, dict) and rp.get("dns_credentials"):
+        creds = rp.get("dns_credentials")
+        try:
+            merged = _merge_dns_credentials(_load_dns_credentials_store(), creds)
+            _save_dns_credentials_store(merged)
+        except DnsCredentialsStoreError:
+            # 写不进去 ⇒ 共享配置里那份**原样保留**（不能丢凭据），
+            # 并把异常抛出去：调用方要告诉用户「没存上」，
+            # 而不是回一句「保存成功」（降权网关照样读得到明文）。
+            print(f'[ERROR] DNS 凭据未能写入独立文件 {DNS_CREDENTIALS_PATH}，'
+                  f'凭据仍留在共享配置中（未落盘新配置）', flush=True)
+            raise
+        rp.pop("dns_credentials", None)
     save_config(config)
+
+
+def _scrub_dns_credentials_from_file(path):
+    """把某个配置副本文件里的第三方 DNS 凭据抹掉（用于 .backup）。
+
+    为什么连 .backup 也要清
+    ----------------------
+    .backup 是共享配置的**同权限副本**（640 root:nftweb）。主文件清了
+    而备份留着 ⇒ 凭据照样能被降权后的网关进程读到 ——
+    漏洞等于没修。
+
+    返回 True 表示确实改过。
+    """
+    try:
+        with open(path, 'r') as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return False
+    rp = data.get("reverse_proxy")
+    if not isinstance(rp, dict) or not rp.get("dns_credentials"):
+        return False
+    rp.pop("dns_credentials", None)
+    tmp_path = path + '.tmp'
+    try:
+        _ensure_file_mode(tmp_path, _CONFIG_FILE_MODE)
+        with open(tmp_path, 'w') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_path, _CONFIG_FILE_MODE)
+        os.replace(tmp_path, path)
+        return True
+    except OSError as e:
+        print(f'[ERROR] 清理 {path} 里的 DNS 凭据失败: {e}', flush=True)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return False
+
+
+def _migrate_dns_credentials_on_startup():
+    """启动时把存量共享配置里的第三方 DNS 凭据迁到独立 0600 文件。
+
+    为什么必须在启动时做
+    ------------------
+    升级上来的机器，磁盘上的共享配置里**还带着**明文凭据。
+    只在「用户保存反代配置」时才迁 ⇒ 用户不碰那个页面，漏洞就一直挂着；
+    而网关进程（降权到 nftweb）读得到 640 root:nftweb 的共享配置，
+    于是服务商的 API token 一直对降权进程可见。
+
+    失败不阻断启动：凭据还在老地方（**没丢**），只是没迁成，
+    并明确记日志说明「凭据仍在共享配置里」。
+    """
+    try:
+        config = load_config()
+    except Exception as e:
+        print(f'[MIGRATE] DNS 凭据迁移跳过（读配置失败: '
+              f'{type(e).__name__}: {e}）', flush=True)
+        return False
+    rp = config.get("reverse_proxy")
+    if not isinstance(rp, dict):
+        return False
+    legacy = rp.get("dns_credentials")
+    if not isinstance(legacy, dict) or not legacy:
+        return False
+    try:
+        merged = _merge_dns_credentials(_load_dns_credentials_store(), legacy)
+        _save_dns_credentials_store(merged)
+    except DnsCredentialsStoreError as e:
+        print(f'[MIGRATE] DNS 凭据迁移失败（{e}）—— 凭据仍在共享配置里，'
+              f'未迁移（功能不受影响，但降权后的网关进程仍能读到这些 token）',
+              flush=True)
+        return False
+    # 凭据已经在独立文件里了 ⇒ 把共享配置里的明文抹掉并落盘
+    rp.pop("dns_credentials", None)
+    try:
+        save_config(config)
+    except Exception as e:
+        print(f'[MIGRATE] 清理共享配置里的 DNS 凭据失败（{type(e).__name__}: {e}）'
+              f'—— 凭据已迁到独立文件，但共享配置里仍有一份明文', flush=True)
+        return False
+    # .backup 是共享配置的同权限副本，里面也有一份明文 ⇒ 一起清
+    _scrub_dns_credentials_from_file(CONFIG_PATH + '.backup')
+    print(f'[MIGRATE] 第三方 DNS 凭据已迁到 {DNS_CREDENTIALS_PATH}'
+          f'（0600 root:root），共享配置里的明文已清除', flush=True)
+    return True
+
+
+@app.errorhandler(DnsCredentialsStoreError)
+def _handle_dns_credentials_store_error(e):
+    """凭据文件写不进去时的统一应答。
+
+    为什么单独一个 handler：_save_rp_config 有十来个调用点，
+    在每个调用点手写 try/except 迟早会漏一个 —— 漏掉的那个就是
+    「静默把凭据退回共享配置」的那条路。统一抛 + 统一格式化，改一处全覆盖。
+
+    这次操作整体中止（共享配置**没有**被写）：要么凭据安全落盘，
+    要么整个操作不做 —— 不能出现「一半改了、一半没改」。
+    """
+    print(f'[ERROR] DNS 凭据保存失败: {e}', flush=True)
+    return jsonify({
+        'success': False,
+        'code': 'DNS_CREDENTIALS_STORE_FAILED',
+        'message': ('第三方 DNS 凭据未能安全保存（无法写入独立凭据文件），'
+                    '已中止本次操作。凭据没有丢失，仍保留在原处；'
+                    '详情请查看面板日志。'),
+    }), 500
 
 
 def _find_rp_rule(rp, rule_id):
@@ -7455,6 +9398,23 @@ def _is_managed_conf(conf_path):
         return False
 
 
+def _valid_upstream_host(host):
+    """上游后端主机是否可接受：接口名 / IPv4 / IPv6。
+
+    ⚠️ 这个判定**必须**和 _validate_rp_service 用**同一份**（P2-16）。
+
+    两边各写一套的后果不是「多点重复」：
+    生成器（_gateway_services）对不合法的目标主机是 **continue —— 静默丢掉
+    整条服务**。于是「校验那边放行、生成器这边丢弃」时，
+    API 报告「保存成功」，但 nginx 配置里**根本没有这条规则** ⇒
+    用户的反代服务压根没生效，而面板上一切正常、用户查不出原因。
+    """
+    h = str(host or '').strip()
+    if not h:
+        return False
+    return bool(_RE_IFACE.match(h) or _valid_ip(h, 6) or _valid_ip(h, 4))
+
+
 def _gateway_services(config):
     """取出参与网关分发的服务列表（已启用 + 有合法 path 前缀）。
 
@@ -7489,7 +9449,12 @@ def _gateway_services(config):
         host, port = host.strip(), port.strip()
         if not host or not _is_port(port):
             continue
-        if not (_RE_IFACE.match(host) or _valid_ip(host, 6) or _valid_ip(host, 4)):
+        if not _valid_upstream_host(host):
+            # 静默丢弃是「API 报成功但规则没生效」的来源（P2-16）。
+            # 正常路径下走不到这里（_validate_rp_service 用同一份判定挡住了），
+            # 真走到（配置被手工改坏）也要留一条日志，不能悄悄少一条服务。
+            print(f'[WARN] 反代服务「{r.get("name")}」的目标主机 {host!r} 非法，'
+                  f'已从网关配置中剔除', flush=True)
             continue
         # 对外域名：脏值直接丢掉（不开 host 分发），但**绝不**因此丢掉整条服务 ——
         # 一个写坏的可选字段不该让路径前缀入口也跟着消失。
@@ -7675,7 +9640,16 @@ def _nginx_service_location(L, rule, prefix, protocol, host, tport,
     L.append(f"    # ---- {name} ----")
     L.append(f"    location {loc_path} {{")
     L.append(f"        proxy_pass {protocol}://{host}:{tport}/;")
-    L.append("        proxy_set_header Host $http_host;")
+    # ⚠️ 用 $host，**不用** $http_host（P2-19）。
+    #
+    # $http_host 是**客户端发来的原始 Host 头**（含端口、含任何乱七八糟的内容），
+    # 把它转给上游就是标准的 Host Header Injection：
+    # 上游常用它拼「密码重置链接」「按 Host 生成跳转」⇒ 攻击者能把自己
+    # 的域名塞进这些链接，发给受害者。
+    #
+    # $host 是 nginx **校验过**的主机名（已按 server_name 匹配、已去端口、
+    # 已小写规范化）—— 同一份生成器里另外三处转发 Host 用的都是它。
+    L.append("        proxy_set_header Host $host;")
     L.append("        proxy_set_header X-Real-IP $remote_addr;")
     L.append("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
     L.append("        proxy_set_header X-Forwarded-Proto $scheme;")
@@ -7882,6 +9856,46 @@ def _nginx_service_location(L, rule, prefix, protocol, host, tport,
     L.append("")
 
 
+def _safe_ssl_path(path, default=""):
+    """证书 / 私钥路径校验：必须落在 NGINX_SSL_DIR 之下，且不含 nginx 语法字符。
+
+    为什么必须校验（P2-7）
+    --------------------
+    这个路径会**原样**进 nginx 配置：
+
+        ssl_certificate {cert_path};
+        ssl_certificate_key {key_path};
+
+    nginx 配置里 `;` 是语句分隔符、`}` 结束 block ⇒ 配置里写成
+
+        /etc/nftables/x.pem; include /etc/nginx/evil.conf;
+
+    就能把**任意 nginx 指令**插进网关配置 —— 而网关配置是 root 跑的
+    nginx 加载的（`include` 能把任意文件塞进配置上下文）。
+
+    证书本来就只该在 NGINX_SSL_DIR 下面（面板自己放进去的），
+    所以「必须在这个目录之下」既堵住了注入，又不会误伤正常用法。
+
+    返回 realpath（消掉 `..` 和符号链接），非法时返回 default。
+    """
+    raw = str(path or "").strip()
+    if not raw:
+        return default
+    # nginx 语法字符一律拒绝
+    if any(c in raw for c in ' ;{}\n\r\t\'"`$'):
+        return default
+    try:
+        real = os.path.realpath(raw)
+        base = os.path.realpath(NGINX_SSL_DIR)
+    except OSError:
+        return default
+    if not real or not base:
+        return default
+    if real != base and not real.startswith(base.rstrip('/') + '/'):
+        return default
+    return real
+
+
 def _generate_gateway_nginx_conf(config):
     """生成单端口认证网关的 nginx 配置。
 
@@ -7939,8 +9953,15 @@ def _generate_gateway_nginx_conf(config):
         # 回落到面板自签/自带证书
         cert_path, key_path = NFTABLES_WEB_CERT, NFTABLES_WEB_KEY
     else:
-        cert_path = chosen.get("cert_path", "")
-        key_path = chosen.get("key_path", "")
+        # ⚠️ 这两个路径会**原样**进 nginx 的 ssl_certificate 指令（P2-7）。
+        # 配置文件里的 reverse_proxy.certificates[].cert_path 是可写字段 ⇒
+        # 不校验就是 nginx 配置注入（能 include 任意文件）。
+        cert_path = _safe_ssl_path(chosen.get("cert_path", ""))
+        key_path = _safe_ssl_path(chosen.get("key_path", ""))
+        if not cert_path or not key_path:
+            print('[WARN] 默认证书路径非法或不在 SSL 目录内，回落到面板自带证书',
+                  flush=True)
+            cert_path, key_path = NFTABLES_WEB_CERT, NFTABLES_WEB_KEY
 
     lan_cidr = _safe_cidr(config.get("lan_subnet4"), "192.168.0.0/16")
     tls_min = settings.get("tls_min_version", "TLSv1.2")
@@ -8079,16 +10100,35 @@ def _deploy_gateway_nginx(config=None):
     try:
         os.makedirs(NGINX_CONF_DIR, exist_ok=True)
         if enabled:
+            # ⚠️ **先校验候选内容，再替换正式文件**（P1-47）
+            #
+            # 原来的写法是：
+            #     tmp = conf_path + '.tmp'
+            #     open(tmp,'w').write(content)
+            #     ok, msg = _nginx_test()      # ← 这一步测的是**旧配置**
+            #     os.replace(tmp, conf_path)   # ← 新配置此刻才真正生效
+            #     ok, msg = _nginx_test()      # ← 这一步才测到新配置
+            #
+            # 关键在于 nginx 的 include 是 `include conf.d/*.conf;`，
+            # 而临时文件叫 `00-nftables-web-gateway.conf.tmp` —— **匹配不上 *.conf**。
+            # 所以第一次 `nginx -t` 根本没解析候选内容，它测的是替换前那份配置，
+            # 通过是必然的。「先校验后替换」这句注释是假的：
+            # 实际顺序是「先替换（坏配置已生效）后校验（失败再回滚）」。
+            #
+            # 而「失败再回滚」中间有一段窗口：坏配置已经躺在磁盘上。
+            # 这段时间里进程被杀 / 断电 / 机器重启，坏配置就留在盘上了 ——
+            # 下次 nginx 启动直接失败 ⇒ **整台设备的 nginx 起不来**。
+            #
+            # 现在先在**临时 include 目录**里用 `nginx -t -c` 真解析一遍候选内容，
+            # 正式目录一个字节都没动。解析不过就直接拒绝，磁盘上不留任何痕迹。
+            ok, msg = _nginx_test_candidate(content)
+            if not ok:
+                # 正式配置一个字节都没动 ⇒ 不需要回滚，只需清掉快照。
+                shutil.rmtree(backup_dir, ignore_errors=True)
+                return False, f"网关配置校验失败：{msg}（正式配置未改动）"
             tmp = conf_path + '.tmp'
             with open(tmp, 'w') as f:
                 f.write(content)
-            ok, msg = _nginx_test()
-            if not ok:
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
-                return _undo(f"网关配置校验失败：{msg}")
             os.replace(tmp, conf_path)
         else:
             # 只删自己那个文件
@@ -8141,6 +10181,95 @@ def _deploy_gateway_nginx(config=None):
         return True, "认证网关已停用，配置已移除"
     except Exception as e:
         return _undo(f"部署网关配置异常：{e}")
+
+
+def _nginx_test_main_conf(conf_dir, workdir):
+    """构造一份用于「候选配置校验」的临时主配置（P1-47）。
+
+    只 include **候选目录**（不 include 正式 conf.d）：
+      · 正式目录里可能有用户自己的站点配置，与本次变更无关，
+        不该影响候选配置的校验结果；
+      · 只 include 候选目录，才能确定「这次校验过的就是候选内容」。
+
+    临时路径全部指到 workdir：nginx -t 会去检查/创建这些目录，
+    指到正式目录会留下垃圾，指到系统目录可能没权限。
+    """
+    def _p(*parts):
+        return os.path.join(workdir, *parts)
+
+    return (
+        "worker_processes 1;\n"
+        "error_log stderr;\n"
+        f"pid {_p('nginx.pid')};\n"
+        "events { worker_connections 64; }\n"
+        "http {\n"
+        "    access_log off;\n"
+        f"    client_body_temp_path {_p('client_body')};\n"
+        f"    proxy_temp_path {_p('proxy')};\n"
+        f"    fastcgi_temp_path {_p('fastcgi')};\n"
+        f"    uwsgi_temp_path {_p('uwsgi')};\n"
+        f"    scgi_temp_path {_p('scgi')};\n"
+        f"    include {conf_dir}/*.conf;\n"
+        "}\n"
+    )
+
+
+def _nginx_test_candidate(content, timeout=10):
+    """在**不碰正式配置**的前提下校验候选 nginx 配置。返回 (ok, message)。
+
+    为什么必须有这一步（P1-47）
+    --------------------------
+    正式流程里那第一次 `nginx -t` 是**假校验**：候选内容写在
+    `xxx.conf.tmp` 里，而 nginx 的 include 是 `conf.d/*.conf`，
+    根本匹配不上 ⇒ nginx 解析的是**替换前**那份配置，通过是必然的。
+    于是「先校验后替换」实际是「先替换后校验」，
+    坏配置会在磁盘上存在一段时间（进程被杀/断电就留下永久损坏的配置，
+    下次 nginx 起不来）。
+
+    这里把候选配置放进一个**临时 include 目录**，用一份临时主配置把
+    nginx 的解析范围指向那个目录，跑 `nginx -t -c <临时主配置>`：
+      · 候选内容**确实被解析**（不是走过场）；
+      · 正式目录一个字节都没动。
+
+    临时目录用完即删。
+    """
+    import tempfile   # 局部导入：不碰文件顶部那行共享 import
+    tmpdir = tempfile.mkdtemp(prefix='nftw-nginx-cand-')
+    try:
+        cand_dir = os.path.join(tmpdir, 'conf.d')
+        os.makedirs(cand_dir, exist_ok=True)
+        cand_path = os.path.join(cand_dir, GATEWAY_CONF_NAME)
+        with open(cand_path, 'w') as f:
+            f.write(content)
+        main_path = os.path.join(tmpdir, 'nginx.conf')
+        with open(main_path, 'w') as f:
+            f.write(_nginx_test_main_conf(cand_dir, tmpdir))
+        try:
+            result = subprocess.run(["nginx", "-t", "-c", main_path],
+                                    capture_output=True, text=True, timeout=timeout)
+        except FileNotFoundError:
+            # 没有 nginx ⇒ 根本没法解析候选配置。
+            # 这里**不能**当成「校验通过」——退回问现有配置的那次检查
+            #（_nginx_test 在没有 nginx 时会返回「nginx 未安装」，
+            #  于是下发照样失败，与旧行为一致）。
+            # 这一步存在的意义是：让「校验用的那一次 nginx -t」
+            # 与「正式配置装好后的那一次 nginx -t」走**同一个判定口径**，
+            # 免得出现「候选没校验、装完才校验」的窗口。
+            return _nginx_test()
+        except subprocess.TimeoutExpired:
+            return False, "nginx -t 命令超时"
+        output = result.stderr or result.stdout or ""
+        if result.returncode != 0:
+            return False, output.strip()
+        # 与 _nginx_test 同一口径：只关心 error 行，warn 可忽略
+        for line in output.splitlines():
+            if "error" in line.lower():
+                return False, line.strip()
+        return True, "nginx 配置语法正确"
+    except OSError as e:
+        return False, f"无法准备候选配置校验环境: {e}"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _nginx_test():
@@ -8408,41 +10537,75 @@ def _renew_due_certs():
     返回 (renewed, errors)：renewed 是续成功的域名列表，errors 是
     「该续但没续成」的原因列表 —— 这部分必须让用户看得见，
     静默失败等于没做。
+
+    ⚠️ 每张证书**单独** try/except（P1-40）
+    -------------------------------
+    原来整个循环体没有异常保护。任何一个未捕获的异常都会**中止剩下
+    所有证书的续期**：
+      · 域名不合法 → _acme_renew 里的 _sanitize_domain 抛 ValueError；
+      · 配置里那条证书记录不是 dict → c.get 抛 AttributeError；
+      · acme.sh 调用异常、磁盘满、权限不足 …
+    后果被放大了好几倍：**一张坏证书 ⇒ 全部证书停止续期** ⇒
+    全部陆续过期 ⇒ 网关的 TLS 证书集体失效，
+    而日志里只有一行 traceback，没有任何地方说「还有 N 张没续」。
+    （这张坏证书自己还会**每 30 分钟**再炸一次，把同样的事重演一遍。）
     """
     config, rp = _get_rp_config()
     renewed = []
     errors = []
     for c in list(rp.get("certificates", [])):
-        if c.get("source") != "auto":
-            continue
-        if not c.get("auto_renew"):
-            continue
-        domain = c.get("domain", "")
-        cert_path = c.get("cert_path", "")
-        _exp, days = _get_cert_expiry(cert_path)
-        if days < 0:
-            errors.append(f"{domain}: 读不到证书有效期（文件缺失或格式不对）")
-            continue
+        domain = ''
         try:
-            renew_days = int(c.get("renew_days") or 60)
-        except (TypeError, ValueError):
-            renew_days = 60
-        if days > renew_days:
-            continue
-        provider = c.get("dns_provider") or "ali"
-        creds = _get_dns_credentials(rp, provider)
-        if not creds:
-            errors.append(f"{domain}: 缺少 {provider} 的 DNS 凭证，无法自动续期")
-            continue
-        ok, res = _acme_renew(domain, provider, creds)
-        if not ok:
-            errors.append(f"{domain}: {res.get('error', '续期失败')}")
-            continue
-        c["expires_at"] = res.get("new_expires_at")
-        c["days_remaining"] = res.get("days_remaining")
-        renewed.append(domain)
+            if not isinstance(c, dict):
+                # 配置被手工改坏时这一条可能不是对象
+                errors.append(f"证书记录格式非法（{type(c).__name__}），已跳过")
+                continue
+            if c.get("source") != "auto":
+                continue
+            if not c.get("auto_renew"):
+                continue
+            domain = c.get("domain", "")
+            cert_path = c.get("cert_path", "")
+            _exp, days = _get_cert_expiry(cert_path)
+            if days < 0:
+                errors.append(f"{domain}: 读不到证书有效期（文件缺失或格式不对）")
+                continue
+            try:
+                renew_days = int(c.get("renew_days") or 60)
+            except (TypeError, ValueError):
+                renew_days = 60
+            if days > renew_days:
+                continue
+            provider = c.get("dns_provider") or "ali"
+            creds = _get_dns_credentials(rp, provider)
+            if not creds:
+                errors.append(f"{domain}: 缺少 {provider} 的 DNS 凭证，无法自动续期")
+                continue
+            ok, res = _acme_renew(domain, provider, creds)
+            if not ok:
+                errors.append(f"{domain}: {res.get('error', '续期失败')}")
+                continue
+            c["expires_at"] = res.get("new_expires_at")
+            c["days_remaining"] = res.get("days_remaining")
+            renewed.append(domain)
+        except Exception as e:
+            # 一张证书出问题**绝不能**连累剩下的证书。
+            # 记下原因，继续下一张 —— 这正是 P1-40 的修复点。
+            label = domain or '(未知域名)'
+            print(f'[ERROR] 证书 {label} 续期异常（已跳过这张，'
+                  f'其余证书继续续期）: {type(e).__name__}: {e}', flush=True)
+            errors.append(f"{label}: 续期异常（{type(e).__name__}）—— "
+                          f"已跳过这一张，其余证书继续续期")
     if renewed:
-        _save_rp_config(config)
+        try:
+            _save_rp_config(config)
+        except Exception as e:
+            # 续期本身成功了，只是「新的到期时间」没记进配置。
+            # 也要报出来 —— 否则下次还会再续一遍（重复续期不是坏事，
+            # 但用户看到的到期时间会一直是旧的）。
+            print(f'[ERROR] 续期结果落盘失败: {type(e).__name__}: {e}', flush=True)
+            errors.append(f"续期结果落盘失败（{type(e).__name__}）—— "
+                          f"证书已续期，但到期时间没有写进配置")
     return renewed, errors
 
 
@@ -8760,6 +10923,11 @@ def rp_detect_api_prefix():
     if not host or not _is_port(port):
         return jsonify({"success": False,
                         "message": "target_address 必须是 内网IP:端口"}), 400
+    # ⚠️ 目标必须落在 LAN 网段内（P2-9）：否则这个端点就是个通用抓取器，
+    # 返回值还能区分「超时/拒绝/404」⇒ 拿来扫 LAN 和公网都行。
+    if not _detect_target_allowed(host):
+        return jsonify({"success": False,
+                        "message": "target_address 必须是 LAN 网段内的内网 IP:端口"}), 400
     prefixes, err = _detect_upstream_api_prefixes(host, port, proto)
     return jsonify({"success": True,
                     "data": {"prefixes": prefixes, "error": err}})
@@ -8790,6 +10958,10 @@ def rp_detect_protocol_relative():
     if not host or not _is_port(port):
         return jsonify({"success": False,
                         "message": "target_address 必须是 内网IP:端口"}), 400
+    # ⚠️ 同 detect-api-prefix：目标必须在 LAN 网段内（P2-9）
+    if not _detect_target_allowed(host):
+        return jsonify({"success": False,
+                        "message": "target_address 必须是 LAN 网段内的内网 IP:端口"}), 400
     count, samples, err = _detect_upstream_protocol_relative(host, port, proto)
     return jsonify({"success": True,
                     "data": {"count": count, "samples": samples, "error": err}})
@@ -9216,7 +11388,58 @@ def rp_upload_cert():
 
 @app.route('/api/reverse-proxy/certificates/<cert_id>/download', methods=['GET'])
 def rp_download_cert(cert_id):
-    """打包下载证书（fullchain + key），前端需先 confirm 警告私钥风险"""
+    """打包下载证书（fullchain + key）。
+
+    ⚠️ 二次认证（P1-21）
+    ------------------
+    原来**任何面板会话**都能导出私钥。清单原话：「证书私钥下载端点任何面板
+    会话都能导出，无二次认证」。
+
+    私钥是**身份凭据**，导出它等于把身份交出去。而面板会话的存在理由
+    未必那么强：浏览器里可能有 XSS、用户可能把电脑借给别人、cookie 可能
+    被别的扩展读到。光「已登录」不足以授权导出私钥 —— 这是与「改密码」
+    同级别的操作，应该有同级别的确认。
+
+    要求：请求必须带 `X-Confirm-Password` 头，内容是**面板口令**。
+    用头而不是 query 参数：口令进 URL 会被写进 nginx access log、
+    浏览器历史、Referer —— 那等于换个地方泄露一次。
+
+    猜口令的成本必须和猜登录一样高 ⇒ 复用登录的限流表。
+
+    ⚠️ 这道检查放在**任何文件访问之前**：先确认再查证书存不存在，
+    否则未确认的调用者仍能靠 404/200 的差别把证书列表探出来。
+    """
+    ip = request.remote_addr or 'unknown'
+    allowed, retry_after = _check_rate_limit(ip)
+    if not allowed:
+        return jsonify({
+            'success': False,
+            'code': 'RATE_LIMITED',
+            'message': f'操作过于频繁，请 {retry_after} 秒后再试',
+        }), 429
+
+    confirm = (request.headers.get('X-Confirm-Password') or '').strip()
+    if not confirm:
+        return jsonify({
+            'success': False,
+            'code': 'CONFIRM_REQUIRED',
+            'message': '导出私钥需要二次确认：请提供面板口令。',
+        }), 403
+    if not _password_set():
+        return jsonify({
+            'success': False,
+            'code': 'NEED_SETUP',
+            'message': '系统尚未设置密码，无法二次确认',
+        }), 403
+    if not _verify_password(confirm, _read_password_hash()):
+        _record_login_failure(ip)
+        return jsonify({
+            'success': False,
+            'code': 'CONFIRM_FAILED',
+            'message': '口令不正确',
+        }), 403
+    _clear_login_failures(ip)
+
     config, rp = _get_rp_config()
     cert = _find_rp_cert(rp, cert_id)
     if not cert:
@@ -9673,6 +11896,9 @@ def auth_login():
     session['authenticated'] = True
     session.permanent = True
     session['last_active'] = time.time()
+    # 绝对生命周期的计时起点（P1-22）。必须在这里打：
+    # 会话建立的**那一刻**就是起点，之后再滑动也不会延长它。
+    _mark_session_start()
     # 盖上当时的世代号：之后改密码会让这个值对不上，本会话自动失效。
     session['auth_epoch'] = _current_token_epoch()
     return jsonify({'success': True, 'data': {'message': '登录成功'}})
@@ -9731,6 +11957,9 @@ def auth_setup():
     session['authenticated'] = True
     session.permanent = True
     session['last_active'] = time.time()
+    # 绝对生命周期的计时起点（P1-22）。必须在这里打：
+    # 会话建立的**那一刻**就是起点，之后再滑动也不会延长它。
+    _mark_session_start()
     session['auth_epoch'] = _current_token_epoch()
     return jsonify({'success': True, 'data': {'message': '密码设置成功，已自动登录'}})
 
@@ -9986,7 +12215,15 @@ def _apply_basic_lockdown(config=None):
             print(f'[WARN] basic lockdown 读配置失败，用保守默认: {e}', flush=True)
             config = {}
 
-    lan_if = str(config.get("lan_if", "") or "").strip() or "br-lan"
+    # ⚠️ lan_if 会被**原样**插进 nftables 的 `iifname "{lan_if}"` / `oifname "..."`
+    # —— 不校验就是**规则注入**（P2-11）：配置里写成
+    #     lo" ; delete table inet fw4; #
+    # 就能把任意 nft 指令插进兜底防火墙。
+    #
+    # 下面的 `_interface_exists` 检查能挡住绝大多数（接口名得真的存在），
+    # 但那是**存在性**检查，不是**格式**检查 —— 而且兜底规则是在
+    # 「防火墙已经不可用」的紧急路径上执行的，更不该有一处未校验的插值。
+    lan_if = _safe_iface(config.get("lan_if"), "br-lan")
 
     # 接口名必须真的存在。写错一个名字，规则照样加载成功、policy drop 照样
     # 生效，但没有任何一条 accept 匹配得上 —— 管理员被自己的兜底规则关在门外。
@@ -10583,6 +12820,34 @@ def _start_servers():
     """
     # ========== 启动时自动恢复 nftables ruleset ==========
     _auto_recover_ruleset_if_empty()
+
+    # ========== 启动时第三方 DNS 凭据迁移（P1-20）==================
+    # 存量共享配置（0640 root:nftweb）里带着明文的服务商 API token，
+    # 而降权后的网关进程（nftweb）读得到那份文件 ⇒ 凭据对降权进程可见。
+    # 升级后的第一次启动就把它们搬进 0600 root:root 的独立文件，
+    # 并把共享配置（含 .backup）里的明文抹掉。
+    #
+    # 失败不阻断启动：凭据还在老地方（**没丢**），只是没迁成，
+    # 迁移函数自己会明确记日志说明「凭据仍在共享配置里」。
+    try:
+        _migrate_dns_credentials_on_startup()
+    except Exception as e:
+        print(f'[MIGRATE] DNS 凭据迁移异常（不影响面板启动，'
+              f'凭据未丢失）: {type(e).__name__}: {e}', flush=True)
+
+    # ========== 启动时刷新 IPv6 自动更新脚本（P2-13 / P2-14）========
+    # cron 脚本是**另一个**写中转文件的地方（它才是主要写入方），
+    # 而脚本内容是升级前生成的旧版本 ⇒ 升级后不刷新的话，
+    # 旧脚本会继续「跟着软链写」（root 任意文件写）并且继续留下
+    # 永远不失效的中转文件。
+    #
+    # _ensure_ipv6_cron 是幂等的（只在内容变了才重写），
+    # 失败也不阻断启动（cron 装不上不影响面板本身）。
+    try:
+        _ensure_ipv6_cron()
+    except Exception as e:
+        print(f'[WARN] 刷新 IPv6 自动更新脚本失败（不影响面板启动）: '
+              f'{type(e).__name__}: {e}', flush=True)
 
     # ========== 启动时绝对上限的默认值迁移 ==========
     # _migrate_auth_absolute_timeout 只改内存 —— 读配置不该有副作用。

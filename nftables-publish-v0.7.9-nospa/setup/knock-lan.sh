@@ -59,20 +59,45 @@ if [ -z "$HOST" ] || [ -z "$PORTS" ]; then
         exit 1
     fi
     if command -v python3 >/dev/null 2>&1; then
-        eval "$(python3 - "$CONFIG" <<'PYEOF'
+        # ⚠️ 这里**不许 eval**（P1-39）。
+        #
+        # 老写法是让 python 打印 `HOST="..."` / `PORTS="..."` 再交给 shell 的
+        # eval 解析。配置里的 router_ip4 是**用户可写**的字段，写成
+        #     x"; rm -rf /; echo "
+        # 就能在 eval 里执行任意命令 ——
+        # 配置文件是**数据**，不是代码。
+        #
+        # 现在：python 只输出**纯值**（一行一个、不带引号），
+        # 用 sed 取出来，**完全不经过 shell 的二次解析**；
+        # 再叠加下面的 host 白名单校验，恶意值到不了任何命令里。
+        if ! CONFIG_VALS="$(python3 - "$CONFIG" <<'PYEOF'
 import json, sys
+
+def safe(s):
+    """只保留「值」能有的字符 —— 结果必须是数据，不能是代码。
+
+    允许：字母、数字、点、冒号（IPv6）、短横线、下划线
+    排除：引号、反引号、$、分号、管道、括号、空白、斜杠…
+    """
+    return "".join(ch for ch in str(s) if ch.isalnum() or ch in ".:_-")
+
 try:
     with open(sys.argv[1]) as f:
         c = json.load(f)
-    host = c.get("router_ip4", "")
-    ports = ",".join(str(c.get(f"knock{i}_port", i)) for i in (1, 2, 3, 4))
-    print(f'HOST="{host}"')
-    print(f'PORTS="{ports}"')
+    host = safe(c.get("router_ip4", "")) or "192.168.1.1"
+    ports = [safe(c.get(f"knock{i}_port", i)) for i in (1, 2, 3, 4)]
+    print(host)
+    print(",".join(ports))
 except Exception as e:
-    print(f'echo "ERROR: 解析 {sys.argv[1]} 失败: {e}" >&2', file=sys.stderr)
+    print(f"ERROR: 解析 {sys.argv[1]} 失败: {e}", file=sys.stderr)
     sys.exit(1)
 PYEOF
-        )"
+        )"; then
+            echo "ERROR: 解析配置 $CONFIG 失败" >&2
+            exit 1
+        fi
+        HOST=$(printf '%s\n' "$CONFIG_VALS" | sed -n '1p')
+        PORTS=$(printf '%s\n' "$CONFIG_VALS" | sed -n '2p')
     elif command -v jsonfilter >/dev/null 2>&1; then
         # OpenWrt 自带 jsonfilter
         HOST=$(jsonfilter -e '$.router_ip4' < "$CONFIG" 2>/dev/null || echo "")
@@ -106,6 +131,27 @@ for p in "$P1" "$P2" "$P3" "$P4"; do
     fi
 done
 
+# host 白名单：只接受 IP 或合法主机名（P1-38 的第一道防线）
+#
+# 为什么必须校验：host 会进 `bash -c` 的命令串（老写法）或 /dev/udp 的
+# 路径部分。带 `;` `$(...)` 的值会被 shell 解析成**额外的命令**；
+# 带 `/` 的值能穿越 /dev/udp/ 这个路径前缀。
+# 允许：数字、字母、点、冒号（IPv6）、短横线、下划线
+# 明确排除：斜杠、空白、引号、反引号、$、分号、管道、括号…
+valid_host() {
+    [ -n "$1" ] || return 1
+    case "$1" in
+        *[!0-9A-Za-z.:_-]*) return 1 ;;
+    esac
+    return 0
+}
+
+if ! valid_host "$HOST"; then
+    echo "ERROR: 非法的主机地址 '$HOST'" >&2
+    echo "  只允许 IP 或主机名（字母/数字/点/冒号/短横线/下划线）" >&2
+    exit 1
+fi
+
 echo "[LAN-Knock] target=$HOST ports=$P1 $P2 $P3 $P4 interval=${INTERVAL}s"
 
 # 发送单个 UDP 包
@@ -115,7 +161,14 @@ send_udp() {
     local host="$1" port="$2"
     if [ -n "${BASH_VERSION:-}" ]; then
         # bash 内置：用 timeout 限制阻塞时间
-        timeout 3 bash -c "exec 3<>/dev/udp/${host}/${port} && printf 'k' >&3" 2>/dev/null || true
+        #
+        # ⚠️ host/port **不能**插进命令串（P1-38）。
+        # 老写法：bash -c "exec 3<>/dev/udp/${host}/${port} && printf 'k' >&3"
+        # —— host 里带 `;` 或 `$(...)` 会被 shell 解析成**额外的命令**，
+        # 配置文件是数据，值不该被当代码执行。
+        # 现在：值作为**位置参数**传进去，命令串里只用 "$1"/"$2" 引用 ——
+        # 位置参数不会被再次解析 ⇒ 注入不成立。
+        timeout 3 bash -c 'exec 3<>/dev/udp/"$1"/"$2" && printf "k" >&3' _ "$host" "$port" 2>/dev/null || true
     elif command -v ncat >/dev/null 2>&1; then
         printf 'k' | ncat -u -w 2 "$host" "$port" 2>/dev/null || true
     elif command -v nc >/dev/null 2>&1; then
@@ -129,7 +182,15 @@ send_udp() {
 }
 
 for i in 1 2 3 4; do
-    port=$(eval echo \$P$i)
+    # ⚠️ 不用 `eval echo \$P$i` 取端口。
+    # eval 会把 $P1 的**值**再解析一遍：值里带 `$(...)` 就可能执行命令。
+    # 这里用 case 直接取，值从头到尾只被当数据。
+    case "$i" in
+        1) port="$P1" ;;
+        2) port="$P2" ;;
+        3) port="$P3" ;;
+        4) port="$P4" ;;
+    esac
     echo "[LAN-Knock] step $i -> $host:$port"
     send_udp "$HOST" "$port"
     if [ "$i" -lt 4 ]; then

@@ -1264,6 +1264,27 @@
                      !initEnabled ? '未启用' :
                      '版本过旧，需要更新'"></span>
           </div>
+          <!-- 开机恢复状态告警（P1-34）-->
+          <!--
+            init 脚本在开机恢复规则集失败时，会把状态写进
+            /var/run/nftables-web-recovery.status。没有这块提示的话，
+            面板只显示「规则已加载」，用户根本看不出设备现在跑的
+            其实是**过期策略**（回退到 .lastgood）。
+          -->
+          <div x-show="recoveryStatus && recoveryStatus.state !== 'ok'"
+               class="rounded border border-red-300 bg-red-50 px-4 py-3 mb-3">
+            <div class="text-sm font-medium text-red-800">
+              <span x-text="recoveryStatus && recoveryStatus.state === 'failed'
+                     ? '开机恢复失败：设备已退回平台防火墙' :
+                     '开机恢复降级：当前运行的是回退后的旧策略'"></span>
+            </div>
+            <div class="text-xs text-red-700 mt-1"
+                 x-show="recoveryStatus && recoveryStatus.reason"
+                 x-text="recoveryStatus ? recoveryStatus.reason : ''"></div>
+            <div class="text-xs text-red-600 mt-1"
+                 x-show="recoveryStatus && recoveryStatus.ts"
+                 x-text="recoveryStatus ? recoveryStatus.ts : ''"></div>
+          </div>
           <!-- 修复按钮 -->
           <div class="pt-2">
             <button @click="repairInitScript()" :disabled="repairing"

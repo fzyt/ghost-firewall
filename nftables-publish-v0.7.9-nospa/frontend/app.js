@@ -100,6 +100,8 @@ function app() {
     initEnabled: false,
     initHasFw4Stop: false,
     initUpToDate: false,
+    // init 脚本写的开机恢复状态（P1-34）：ok / degraded / failed / null(未知)
+    recoveryStatus: null,
     repairing: false,
 
     // 规则集健康 / 看门狗（/api/rules/health）。
@@ -344,16 +346,54 @@ function app() {
       try { await api.post('/api/auth/logout'); } catch (_) {}
       this.auth.authenticated = false;
       this.auth.loginPassword = '';
-      // 清空敏感数据避免泄露（下次登录会重新加载）
-      this.config = {};
-      this.rp = { rules: [], certificates: [], settings: {} };
+      this.clearSensitiveState();
     },
 
     handleAuthExpired() {
       this.auth.authenticated = false;
       this.auth.loginError = '会话已过期，请重新登录';
+      this.clearSensitiveState();
+    },
+
+    // 清空**所有含凭据**的状态（P2-20）。
+    //
+    // 原来只清了 config 和 rp，漏了三处：
+    //   · aliyun.accessKeySecret      —— 阿里云 AccessKey secret
+    //   · ddns.services[].password     —— DDNS 服务商口令
+    //   · networkConfig.wan_pppoe_password —— PPPoE 宽带口令
+    //
+    // 漏掉的后果不是「页面上少显示几个字」：这些值还在 Alpine state 里，
+    // 就还在 DOM 的 input value 里 —— 共享电脑上的下一个使用者按一下
+    // 方向键就能翻出来，或者直接在控制台里 `Alpine.$data` 一眼看全。
+    // 「登出」必须真的把凭据从浏览器里抹掉，不能只是把界面盖住。
+    //
+    // 清空后重新登录会由 loadAllData() 重新拉数据
+    // （loadDdns / loadNetworkConfig / loadReverseProxy）⇒ 不会让用户
+    // 每次登出都要重填一遍。
+    clearSensitiveState() {
       this.config = {};
       this.rp = { rules: [], certificates: [], settings: {} };
+      this.aliyun = {
+        installed: false,
+        configured: false,
+        accessKeyId: '',
+        accessKeySecret: '',
+        regionId: 'cn-hangzhou',
+        domain: '',
+        records: [],
+        localRecords: [],
+        ipv6Sources: [],
+        loading: false
+      };
+      if (this.ddns && Array.isArray(this.ddns.services)) {
+        this.ddns.services.forEach(s => {
+          if (!s) return;
+          s.password = '';
+          s.param_enc = '';
+        });
+      }
+      this.networkConfig.wan_pppoe_password = '';
+      this.pwModal = { show: false, old_password: '', new_password: '', confirm_password: '', loading: false, error: '' };
     },
 
     async loadAllData() {
@@ -1435,6 +1475,9 @@ function app() {
         this.initEnabled = data.init_enabled;
         this.initHasFw4Stop = data.init_has_fw4_stop;
         this.initUpToDate = data.init_up_to_date;
+        // 开机恢复状态（P1-34）：degraded/failed 时面板必须说清楚
+        // 「现在跑的是过期策略」，不能只报「规则已加载」。
+        this.recoveryStatus = data.recovery || null;
       } catch(e) {}
       await this.loadRulesHealth();
     },
@@ -2201,10 +2244,18 @@ function app() {
     },
 
     async downloadRpCert(cert) {
-      if (!confirm('将下载 ' + (cert.domain || '') + ' 的证书（含私钥），请妥善保管。\n\n继续？')) return;
+      // 导出私钥需要二次认证：后端要求 X-Confirm-Password 头里带面板口令。
+      //
+      // 口令走**请求头**而不是 query 参数：进 URL 的话会被 nginx access log、
+      // 浏览器历史、Referer 头记下来 —— 那等于换个地方又泄露一次。
+      const pw = prompt('导出「' + (cert.domain || '') + '」的证书包含私钥。\n\n请输入面板口令以确认：');
+      if (pw === null) return;
+      if (!pw) { this.showToast('已取消：未输入面板口令', 'error'); return; }
       this.rpUploading = true;
       try {
-        const resp = await fetch('/api/reverse-proxy/certificates/' + cert.id + '/download');
+        const resp = await fetch('/api/reverse-proxy/certificates/' + cert.id + '/download', {
+          headers: { 'X-Confirm-Password': pw },
+        });
         if (!resp.ok) {
           let msg = '下载失败';
           try {
