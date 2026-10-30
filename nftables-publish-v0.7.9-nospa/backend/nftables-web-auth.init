@@ -73,6 +73,30 @@ ensure_nftweb_user() {
     echo "  已创建 ${NFTWEB_USER} uid=${NFTWEB_UID} gid=${NFTWEB_GID}"
 }
 
+# 判断一个文件是不是**合法的 JSON 对象**。
+#   0 = 是（能当成 JSON 对象用）
+#   1 = 不是 / 判断不了
+#
+# 为什么必须是「对象」而不是「任意合法 JSON」：网关那边
+# load_revoked() 明确要求 isinstance(data, dict)，限流表那边
+# 遇到非 dict 也直接当空表处理 —— 播进去一个 [1,2] 或 "x"
+# 对网关来说跟坏文件没区别。
+#
+# 为什么用 python3 而不是 grep：JSON 里可能有嵌套、可能有转义引号，
+# 正则匹配出来的「端口/字段」是随机的。设备上 python3 是确定有的
+# （网关本身就是 python3 跑起来的），所以这里直接用它解析。
+_json_object_ok() {
+    [ -f "$1" ] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 -c 'import json,sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if isinstance(d, dict) else 1)
+' "$1" >/dev/null 2>&1
+}
+
 # 降权之后进程就建不出这些文件了（/etc/nftables 与 /var/log 都是 root 755），
 # 所以必须在启动前以 root 身份准备好。每次 start 都重跑一遍，
 # 兼作自愈：文件若被误删或被 app.py 重建成 root 属主，这里会修回来。
@@ -85,6 +109,29 @@ prepare_nftweb_files() {
     # → 登录全断」这个坑就会在某个随机时刻炸开。
     chgrp "$NFTWEB_USER" "$_cfgdir" || return 1
     chmod g+s "$_cfgdir" || return 1
+
+    # 目录本身的**模式位**也要归一化（Shannon 渗透测试 P2-28）。
+    #
+    # 原来只 chgrp + chmod g+s，模式位完全不管 —— 目录是 setup.sh 的
+    # `mkdir -p` 建的（755，umask 说了算），也可能被手工改成 777。
+    # 后果不是「文件权限没生效」，而是这个目录里躺着网关令牌密钥、面板
+    # 会话密钥、共享配置和口令哈希，而**目录对其他用户是可列可进的**：
+    # 里面的文件权限再严也没用，别的账号能进来一个个试探。
+    #
+    # 2750 的含义：
+    #   root      rwx   面板（root）要在这里建文件
+    #   nftweb    r-x   网关（降权后）要 traverse 进去打开 640 的文件
+    #   其他用户  ---   一律不许进
+    #
+    # 为什么 nftweb 组要 r：网关要按路径打开
+    # /etc/nftables/nftables-web-config.json，目录上有 x 才穿得过去，
+    # 有 r 才能列目录（排障时看得见文件在不在）。
+    #
+    # 为什么组里**没有**写权限：降权后的网关建不了新文件 —— 文件一律
+    # 由 root 侧预建（下面的令牌密钥 / 限流表 / 吊销表都是这么准备的）。
+    # 这条权限本来就没有（2755 的组也是 r-x），所以这里不改变网关的
+    # 任何既有行为，只是把「其他用户」那一份收干净。
+    chmod 2750 "$_cfgdir" || return 1
 
     # 密钥文件。两个，权限**相反** —— 别弄混：
     #
@@ -162,7 +209,40 @@ prepare_nftweb_files() {
         #
         # 限流表那边读不出来会退化成空表（fail-open，只多试几次），
         # 不受这个影响；但两个文件都播 {} 更干净。
-        [ -s "$_cfgdir/$f" ] || printf '{}' > "$_cfgdir/$f" || return 1
+        #
+        # 「非空但不是合法 JSON」也必须重播（Shannon 渗透测试 P2-4）。
+        #
+        # 原来只判「文件不存在或 0 字节」就播 {}，于是**写坏一半**的文件
+        # （写到一半断电、磁盘满、进程被 kill）会原样留着 —— 而它跟 0 字节
+        # 文件对网关是同一件事：读不出来。
+        #
+        # 对**吊销表**来说后果是致命的：load_revoked() 解析失败 → 进程刚起
+        # 没有 last-known-good → 返回 None → is_revoked() 对所有 jti 判为
+        # 「已吊销」（fail-closed）→ 登录接口照样返 200 并下发 token，
+        # 但那个 token 立刻作废，门户永远把你弹回登录页 —— 公网入口全挂，
+        # 而且**面板一点提示都没有**（它只看规则集，不看这两个文件）。
+        #
+        # 为什么重播 {} 不算「让已登出的 token 复活」的安全倒退：
+        #   · 文件**被删**的情况本来就已经重播 {} 了（上面的 -s 判空），
+        #     「坏文件」和「文件没了」对网关来说是同一件事。
+        #   · 网关进程内的 last-known-good 只在**进程活着**期间有效；
+        #     重启之后它本来就只剩磁盘上这份文件。文件坏了 = 吊销记录
+        #     已经不可信，这不是重播能挽回的。
+        #   · 保留坏内容另存一份（.corrupt），排障时能看到到底坏成什么样。
+        #
+        # 也就是说：可用性优先（网关得能登录），并且**如实留证据**。
+        if [ ! -s "$_cfgdir/$f" ]; then
+            printf '{}' > "$_cfgdir/$f" || return 1
+        elif ! _json_object_ok "$_cfgdir/$f"; then
+            _bad="$_cfgdir/$f.corrupt"
+            mv "$_cfgdir/$f" "$_bad" 2>/dev/null \
+                || cp "$_cfgdir/$f" "$_bad" 2>/dev/null || _bad=""
+            [ -n "$_bad" ] && chmod 600 "$_bad" 2>/dev/null
+            printf '{}' > "$_cfgdir/$f" || return 1
+            echo "nftables-web-auth: ${f} 不是合法 JSON（已损坏），已重播为 {}" >&2
+            [ -n "$_bad" ] && \
+                echo "nftables-web-auth: 坏内容留存于 ${_bad}" >&2
+        fi
         chown "${NFTWEB_UID}:${NFTWEB_GID}" "$_cfgdir/$f" || return 1
         chmod 600 "$_cfgdir/$f" || return 1
     done
@@ -177,16 +257,71 @@ prepare_nftweb_files() {
 }
 
 get_port() {
-    # 从配置里读认证端口，读不到就用默认 8444
+    # 认证网关的监听端口。
+    #
+    # 来源只有一处：共享配置 /etc/nftables/nftables-web-config.json 里的
+    # auth_api_port 字段，默认 8444（与 app.py 的 DEFAULT_CONFIG 一致）。
+    #
+    # ⚠️ 改了这个端口**必须重启网关进程**才生效 —— 端口是**进程启动时**
+    # 从环境变量 AUTH_API_PORT 传进去的（auth_gateway.py 读 env，不是
+    # 每个请求现读配置）。所以「改了配置没重启」= 面板去敲
+    # 127.0.0.1:<新端口>，网关却还听着旧端口 —— 面板显示「网关异常」，
+    # 而配置里明明写的是另一个数。面板侧要能看出「需要重启」。
+    #
+    # 为什么不用 grep/sed 解析 JSON：字段值可能带引号、可能嵌套、也可能
+    # 出现在别的键的值里，正则解析出来的端口是随机的。
+    #
+    # 解析顺序 jsonfilter → python3：
+    #   · jsonfilter 是 OpenWrt 的独立包（libubox），**不在 busybox 里**，
+    #     不保证装了 —— 原来只靠它，设备上没装时 p 恒为空，于是
+    #     auth_api_port **从来没被真正用上**，面板配的端口一律不生效，
+    #     而且是静默的。
+    #   · python3 设备上实测有（网关本身就是 python3 跑起来的）。
+    #   · 两个都没有 → 用默认 8444。
+    #
+    # 读不到配置 / JSON 坏了 / 端口不是 1-65535 的整数 → **回落到 8444
+    # 并打日志**。绝不把空值传下去：空值会让 auth_gateway.py 的
+    # int(os.environ["AUTH_API_PORT"]) 直接抛异常，网关起不来。
     local port="8444"
-    if [ -f /etc/nftables/nftables-web-config.json ]; then
-        local p
-        p=$(jsonfilter -e '$.auth_api_port' /etc/nftables/nftables-web-config.json 2>/dev/null)
-        case "$p" in
-            ''|*[!0-9]*) : ;;
-            *) port="$p" ;;
-        esac
+    local cfg="/etc/nftables/nftables-web-config.json"
+    local p=""
+
+    if [ -f "$cfg" ]; then
+        if command -v jsonfilter >/dev/null 2>&1; then
+            p=$(jsonfilter -e '$.auth_api_port' "$cfg" 2>/dev/null)
+        fi
+        if [ -z "$p" ] && command -v python3 >/dev/null 2>&1; then
+            p=$(python3 -c 'import json,sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+if isinstance(d, dict):
+    sys.stdout.write(str(d.get("auth_api_port", "") or "").strip())
+' "$cfg" 2>/dev/null)
+        fi
     fi
+
+    case "$p" in
+        '')
+            echo "nftables-web-auth: 读不到 ${cfg} 里的 auth_api_port，回落 8444" >&2
+            ;;
+        *[!0-9]*)
+            echo "nftables-web-auth: auth_api_port 不是数字（${p}），回落 8444" >&2
+            ;;
+        *)
+            # 端口必须是 1-65535 的整数。越界的值会让网关 bind 失败直接退出，
+            # 面板那边只看到「网关异常」，配置里明明写的是别的数 —— 极难查。
+            #
+            # 用 awk 判断而不是 $(( ))：ash 的算术把 "08444" 当八进制会直接
+            # 报错，awk 一律按十进制解析，还能顺手把前导零去掉。
+            if awk -v v="$p" 'BEGIN { exit !(v ~ /^[0-9]+$/ && v+0 >= 1 && v+0 <= 65535) }'; then
+                port=$(awk -v v="$p" 'BEGIN { printf "%d", v+0 }')
+            else
+                echo "nftables-web-auth: auth_api_port=${p} 不是 1-65535 的整数，回落 8444" >&2
+            fi
+            ;;
+    esac
     echo "$port"
 }
 
@@ -202,6 +337,8 @@ start() {
     fi
 
     local port
+    # 端口在**这里**定死成进程的环境变量 —— 改了配置里的 auth_api_port
+    # 必须重启本服务才生效（面板侧要能看出「需要重启」）。
     port=$(get_port)
 
     # ── 降权准备。任何一步失败都必须在这里停住：带着没配好的属主去启动，

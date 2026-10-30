@@ -11,37 +11,219 @@ LOG_FILE="/var/log/nftables-web.log"
 RECOVERY_LOG="/var/log/nftables-web-recovery.log"
 PID_FILE="/var/run/nftables-web.pid"
 
+# ── 规则集恢复链用到的路径 ──────────────────────────────────
+# 单独提出来，是为了让「校验 → 加载 → 复核 → 回滚」这几步指向同一份文件，
+# 免得出现「校验的是 A、装的是 B」这种最难查的错位。
+RULES_FILE="/etc/nftables.d/99-custom-rules.nft"
+LASTGOOD_FILE="/etc/nftables.d/99-custom-rules.nft.lastgood"
+CONFIG_FILE="/etc/nftables/nftables-web-config.json"
+# 开机恢复的**结论**写在这里。
+#
+# 为什么需要它：内核里的规则集是分不出「这是当前策略」还是「这是上一版
+# 策略」的 —— .lastgood 也是一条完整可用的规则集，nft -f 返回 0，复核也
+# 过得去。面板光看 nft 只能得到「正常」，于是设备就被悄悄钉死在过期策略
+# 上（Shannon 渗透测试 P1-34）。要区分只能有一个**机器可读**的状态源。
+#
+# 格式：key=value，每行一个。字段：
+#   state   ok | degraded | failed
+#   reason  人看的说明（不含换行）
+#   ts      写入时间
+#   source  固定 init
+#
+# 权限 0600 root:root —— 只有面板（root）读得到，网关（nftweb）不需要。
+STATUS_FILE="/var/run/nftables-web-recovery.status"
+
+# ══════════════════════════════════════════════════════════════════════
+# 开机规则集恢复
+#
+# 这一段是**开机必经路径**：规则集装不上，路由器要么全开要么全断。
+# 所以这里的原则是「失败要小、状态要准」，而不是「尽量把规则装上」。
+#
+# 三条铁律（Shannon 渗透测试 P1-32 / P1-33 / P1-34，2026-10-29）
+# ──────────────────────────────────────────────────────────────────────
+# ① 先校验、再停平台防火墙
+#
+#    原来的顺序是「先 /etc/init.d/firewall stop，再 disable，然后才 nft -f」。
+#    两个问题叠在一起：
+#      · disable 是**永久**的 —— 规则集没装上的话，设备下次开机照样是
+#        「fw4 不启动 + 本项目规则集也没有」＝ 彻底裸奔，而且没有任何提示。
+#      · 停 fw4 发生在**校验之前** —— 一份语法就坏掉的文件足够让设备
+#        在开机后直接没有防火墙。
+#    现在改成：nft -c 校验通过 → 才停 fw4（运行期）→ 装上 → **复核**通过
+#    → 才 disable。校验没过就一步都不动 fw4，平台防火墙继续替我们守着。
+#
+# ② nft 退出码 0 ≠ 规则集可用
+#
+#    语法合法但内容残缺的规则集（被截断的 flush ruleset、只剩半张表）
+#    会让 nft -f 返回 0，而内核里其实一条规则都没有 —— 面板却报「已加载」。
+#    装完必须做**功能性复核**（判据见 _ruleset_usable）。
+#
+# ③ 失败要回滚，更要**如实上报**
+#
+#    回退到 .lastgood 是对的（设备不能裸奔），但它是**上一版**策略。
+#    原来这里打的是「[OK] .lastgood 回退成功」，面板那边看规则集「正常」，
+#    设备就这么被钉死在过期策略上，没人知道。回退成功也是**降级**，
+#    必须打成 WARN/ERROR，并落一份状态文件给面板读。
+# ══════════════════════════════════════════════════════════════════════
+
+# 规则集「真的在位」的复核。
+#
+# 判据与 app.py 的 _ruleset_is_functional() **同口径** —— 两边必须一致，
+# 否则会出现「init 说成功、面板说异常」这种没法排查的分裂：
+#   ① nft list table inet fw4 返回 0        → 表在
+#   ② 输出里有 hook input                     → input 链真的挂了钩子
+#   ③ 输出里有 policy drop / policy reject    → 默认策略在（不是全放行）
+#   ④ 输出里有 type filter hook               → 是 filter 类型的钩子链
+# 少任何一条都判失败：「nft 退出码 0」证明不了规则集可用。
+_ruleset_usable() {
+    _out=$(nft list table inet fw4 2>/dev/null) || return 1
+    echo "$_out" | grep -q 'hook input' || return 1
+    echo "$_out" | grep -qE 'policy (drop|reject)' || return 1
+    echo "$_out" | grep -q 'type filter hook' || return 1
+    return 0
+}
+
+# 读共享配置里的 deploy_mode。
+#
+#   openwrt       → 本项目接管**整机**规则集（fw4 被停用是设计的一部分）
+#   linux_gateway → 只重建本项目自己的表/链，**平台防火墙必须继续跑**
+#
+# 读不到（配置缺失/损坏）时按空值返回，调用方当 openwrt 处理：
+# 那是本项目的默认部署形态；而且没有规则集文件时这一整段根本不会执行。
+#
+# 用 python3 读 JSON（不 grep/sed —— 嵌套和引号会踩坑）。
+_read_deploy_mode() {
+    _dm=""
+    if [ -f "$CONFIG_FILE" ] && command -v python3 >/dev/null 2>&1; then
+        _dm=$(python3 -c 'import json,sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+if isinstance(d, dict):
+    sys.stdout.write(str(d.get("deploy_mode", "") or "").strip())
+' "$CONFIG_FILE" 2>/dev/null)
+    fi
+    echo "$_dm"
+}
+
+# 把开机恢复的结论落成机器可读的状态文件（面板据此区分「已加载」与「已降级」）。
+_recovery_state() {
+    {
+        echo "state=$1"
+        echo "reason=$2"
+        echo "ts=$(date '+%Y-%m-%d %H:%M:%S')"
+        echo "source=init"
+    } > "$STATUS_FILE" 2>/dev/null || return 0
+    chmod 600 "$STATUS_FILE" 2>/dev/null
+    return 0
+}
+
+# 加载失败后的**回滚 + 上报**。
+#
+# 回滚材料是 .lastgood（上一版**成功**加载过的规则集）。但它同样要过
+# 校验和复核 —— 「nft 返回 0」不算数（见铁律 ②）。
+#
+# .lastgood 也不可用时，把平台防火墙重新拉起来：设备上至少还有 OpenWrt
+# 自带的那套防护，而不是彻底裸奔。
+_recovery_failed() {
+    _why="$1"
+
+    if [ -f "$LASTGOOD_FILE" ]; then
+        if nft -c -f "$LASTGOOD_FILE" >>"$RECOVERY_LOG" 2>&1; then
+            # 校验过了才停 fw4 —— .lastgood 同样是「flush ruleset 开头、
+            # 接管整表」的自定义规则集，fw4 必须让位。
+            [ "$_takeover" = "1" ] && /etc/init.d/firewall stop 2>/dev/null
+            if nft -f "$LASTGOOD_FILE" >>"$RECOVERY_LOG" 2>&1 && _ruleset_usable; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] 已回退到 .lastgood（**上一版**策略，不是当前配置）：${_why}" >>"$RECOVERY_LOG"
+                echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] 当前生效的是过期策略，请到面板点「应用规则」重新下发；在此之前设备一直跑这一版" >>"$RECOVERY_LOG"
+                _recovery_state degraded "${_why}；已回退到 .lastgood（上一版策略）"
+                return 0
+            fi
+            echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] .lastgood 加载或复核未通过，无法作为回滚材料" >>"$RECOVERY_LOG"
+        else
+            echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] .lastgood 校验不通过，无法作为回滚材料" >>"$RECOVERY_LOG"
+        fi
+    else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] 无 .lastgood 可回退" >>"$RECOVERY_LOG"
+    fi
+
+    # 两条路都走不通：把平台防火墙拉回来。设备不能裸奔。
+    if [ "$_takeover" = "1" ]; then
+        /etc/init.d/firewall enable 2>/dev/null
+        /etc/init.d/firewall start 2>/dev/null
+    fi
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] 已恢复平台防火墙（OpenWrt 自带规则集）；当前生效的不是本项目规则集：${_why}" >>"$RECOVERY_LOG"
+    _recovery_state failed "${_why}；已恢复平台防火墙"
+    return 1
+}
+
+# 开机加载自定义规则集。
+#
+# 返回 0 = 当前规则集可用；返回 1 = 走了降级路径（状态已落盘）。
+_restore_custom_ruleset() {
+    if [ ! -f "$RULES_FILE" ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] 自定义规则文件不存在，" \
+             "init 层不做任何加载，交由 Python 层按四级优先级恢复" >>"$RECOVERY_LOG"
+        return 0
+    fi
+
+    # deploy_mode 决定要不要动平台防火墙。
+    #
+    # linux_gateway 模式下本项目只重建自己的表/链（preamble 不 flush ruleset），
+    # 平台防火墙有自己的活干 —— 把它停掉既没必要也会弄坏宿主机。
+    _mode=$(_read_deploy_mode)
+    if [ "$_mode" = "linux_gateway" ]; then
+        _takeover=0
+    else
+        _takeover=1
+    fi
+
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] 启动：尝试加载自定义规则（deploy_mode=${_mode:-openwrt}）" >>"$RECOVERY_LOG"
+
+    # ① 先校验。nft -c 只检查不执行 —— 校验不过就**一步都不动** fw4。
+    if ! nft -c -f "$RULES_FILE" >>"$RECOVERY_LOG" 2>&1; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] 自定义规则校验不通过（nft -c 失败）：未停用平台防火墙、未加载任何规则" >>"$RECOVERY_LOG"
+        _recovery_failed "自定义规则校验不通过"
+        return 1
+    fi
+
+    # ② 校验通过，才停平台防火墙（**运行期**停用，永久停用留到复核之后）。
+    if [ "$_takeover" = "1" ]; then
+        /etc/init.d/firewall stop 2>/dev/null
+    fi
+
+    # ③ 加载。
+    if nft -f "$RULES_FILE" >>"$RECOVERY_LOG" 2>&1; then
+        # ④ 复核：退出码 0 不代表规则集可用。
+        if _ruleset_usable; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') [OK] 自定义规则加载成功" >>"$RECOVERY_LOG"
+            # ⑤ 复核通过才永久停用 fw4 —— 到这一步才敢确认「有可用规则集」。
+            if [ "$_takeover" = "1" ]; then
+                /etc/init.d/firewall disable 2>/dev/null
+            fi
+            _recovery_state ok "自定义规则已加载"
+            return 0
+        fi
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] 自定义规则 nft -f 返回 0，但功能性复核不通过（fw4 表不存在 / 没挂 hook / 没有 drop 默认策略）—— 按失败处理" >>"$RECOVERY_LOG"
+    else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] 自定义规则加载失败（nft -f 返回非 0）" >>"$RECOVERY_LOG"
+    fi
+
+    _recovery_failed "自定义规则加载失败"
+    return 1
+}
+
 start() {
     # 仅启动 Web 管理服务
     # 首次安装不会影响现有防火墙配置
 
-    # 如果已存在自定义规则文件，说明用户已配置过，自动恢复
-    # 注意：fw4 被停用是本项目的设计（自定义规则集以 flush ruleset 开头接管整表），
-    # 但 nft -f 的失败绝不能吞掉 —— 失败 = 路由器无防火墙且用户看不到任何提示。
-    # 失败时回退到 .lastgood，再失败则套用最小兜底防护（LAN 放行，WAN 拦截）。
-    if [ -f /etc/nftables.d/99-custom-rules.nft ]; then
-        /etc/init.d/firewall stop 2>/dev/null
-        /etc/init.d/firewall disable 2>/dev/null
-
-        echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] 启动：尝试加载自定义规则" >>"$RECOVERY_LOG"
-        if nft -f /etc/nftables.d/99-custom-rules.nft 2>>"$RECOVERY_LOG"; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') [OK] 自定义规则加载成功" >>"$RECOVERY_LOG"
-        elif [ -f /etc/nftables.d/99-custom-rules.nft.lastgood ]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] 自定义规则加载失败，已回退到 .lastgood" >>"$RECOVERY_LOG"
-            if nft -f /etc/nftables.d/99-custom-rules.nft.lastgood 2>>"$RECOVERY_LOG"; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') [OK] .lastgood 回退成功" >>"$RECOVERY_LOG"
-            else
-                echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] lastgood 规则也加载失败；" \
-                     "Python 层将接手（basic lockdown 兜底），当前防火墙状态未知" >>"$RECOVERY_LOG"
-            fi
-        else
-            echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] 自定义规则加载失败且无 .lastgood 备份；" \
-                 "Python 层将接手（basic lockdown 兜底），当前防火墙状态未知" >>"$RECOVERY_LOG"
-        fi
-    else
-        echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] 自定义规则文件不存在，" \
-             "init 层不做任何加载，交由 Python 层按四级优先级恢复" >>"$RECOVERY_LOG"
-    fi
+    # 规则恢复：先校验、再停平台防火墙、加载后再复核；失败则回滚并如实上报。
+    #
+    # 注意：恢复失败**不**让 start() 返回非 0 —— 面板必须照常起来，
+    # 否则用户就只能靠 SSH 才能看到「防火墙没装上」这件事。失败信息落在
+    # RECOVERY_LOG 和状态文件里。
+    _restore_custom_ruleset
 
     # 自动设置时区
     [ "$(uci -q get system.@system[0].timezone)" != "CST-8" ] && {

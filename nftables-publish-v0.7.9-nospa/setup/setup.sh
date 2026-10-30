@@ -1272,12 +1272,19 @@ init_config() {
     #                     v0.8.0 已删除后端的 5000 跳转器（它自 10-01 起就被
     #                     policy drop 拦住，从未可达），面板现在只有 5443 一个入口。
     #   trusted_ip4/6     用数组形式，与后端 _ip_set() 兼容。
+    #   auth_api_port     认证网关（进程 B）监听 127.0.0.1 的端口。
+    #                     **只有这一处来源**：面板写它，网关 init 脚本
+    #                     （backend/nftables-web-auth.init 的 get_port()）
+    #                     从这份配置读出来，作为 AUTH_API_PORT 传给网关进程。
+    #                     改了它必须**重启网关进程**才生效 —— 端口是进程
+    #                     启动时绑定的，不是每个请求现读配置。
     cat > "$CONFIG_FILE" <<EOF
 {
     "wan_if": "${WAN_IFACE}",
     "lan_if": "${LAN_IFACE}",
     "router_ip4": "${router_ip4}",
     "router_ip6": "",
+    "auth_api_port": 8444,
     "knock1_port": ${k1},
     "knock2_port": ${k2},
     "knock3_port": ${k3},
@@ -1318,8 +1325,19 @@ EOF
     #
     # 属组此刻多半还没建（nftweb 由 init 脚本创建），所以 chgrp 失败不致命
     # —— 网关 init 脚本启动前会把这份文件再修一次（它也在组可读名单里）。
+    #
+    # 但「组已经存在却还是 chgrp 失败」是另一回事：那份文件会以
+    # 0640 root:root 留在盘上，网关读不到（降权后的 nftweb 不在 root 组里），
+    # 而网关读不到配置是**静默回退默认值** —— 不报错，只是行为跟配置对不上。
+    # 这种失败不能默默咽掉。
     chmod 640 "$CONFIG_FILE"
-    chgrp nftweb "$CONFIG_FILE" 2>/dev/null || true
+    if ! chgrp nftweb "$CONFIG_FILE" 2>/dev/null; then
+        if grep -q '^nftweb:' /etc/group 2>/dev/null; then
+            warn "⚠️ 配置文件属组没能设成 nftweb（${CONFIG_FILE}），降权后的网关读不到它"
+            warn "    网关 init 脚本启动时会修正这份文件的属组，但在此之前网关用的是默认配置"
+        fi
+        # 组还不存在 = 全新安装，属正常（init 脚本开机时建组并修正属组）
+    fi
     ok "✅ 配置文件已生成: ${CONFIG_FILE}"
     echo -e "${YELLOW}  访问地址: https://${router_ip4}:5443  （HTTPS，自签证书需手动信任）${NC}"
     echo -e "${YELLOW}  注意: 面板仅局域网可达，公网入口尚未启用${NC}"
