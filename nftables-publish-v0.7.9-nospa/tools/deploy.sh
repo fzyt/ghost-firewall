@@ -70,6 +70,7 @@ RULE_MD5_BEFORE=""
 CRON_COUNT_BEFORE=""
 TOKEN_SECRET_MD5_BEFORE=""
 CHECK_FAILURES=()
+GW_PORT_CFG=""
 
 # ── 输出 ─────────────────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -588,17 +589,24 @@ phase_verify() {
     gpuid="$(rssh "awk '/^Uid:/{print \$2; exit}' '/proc/${gpid:-0}/status' 2>/dev/null" || true)"
     check_eq "网关进程在运行且 uid=1000（nftweb，降权未丢）" "1000" "$gpuid"
 
-    # 端口
+    # 端口一律**从配置里读**，不写死 —— 用户改过 gateway_port / auth_api_port
+    # 的话，写死的检查会对着一个没人监听的端口要结果。
+    local gw_on auth_port_cfg
+    gw_on="$(rssh "jsonfilter -i '$CFG_DIR/nftables-web-config.json' -e '@.gateway_enabled' 2>/dev/null" || true)"
+    gw_port_cfg="$(rssh "jsonfilter -i '$CFG_DIR/nftables-web-config.json' -e '@.gateway_port' 2>/dev/null" || true)"
+    auth_port_cfg="$(rssh "jsonfilter -i '$CFG_DIR/nftables-web-config.json' -e '@.auth_api_port' 2>/dev/null" || true)"
+    [ -n "$gw_port_cfg" ] || gw_port_cfg="$GW_PORT"
+    GW_PORT_CFG="$gw_port_cfg"
+    [ -n "$auth_port_cfg" ] || auth_port_cfg="$AUTH_PORT"
+
     # 注意：netstat 里一个端口可能有**两行**（IPv4 0.0.0.0 + IPv6 :::），
     # 所以不能用 `grep -c` 的结果去等值比较 —— 得判「>= 1」。
     # （第一版写成 == 1，被自检抓了个正着，然后自动回滚了。）
     local p_listen g_listen a_listen
     p_listen="$(rssh "netstat -tln 2>/dev/null | grep -c ':${PANEL_PORT} '" || true)"
     check_eq "面板端口 ${PANEL_PORT} 在监听" "yes" "$(count_to_yes "$p_listen")"
-    g_listen="$(rssh "netstat -tln 2>/dev/null | grep -c ':${GW_PORT} '" || true)"
-    check_eq "网关端口 ${GW_PORT} 在监听（nginx）" "yes" "$(count_to_yes "$g_listen")"
-    a_listen="$(rssh "netstat -tln 2>/dev/null | grep -c '127.0.0.1:${AUTH_PORT} '" || true)"
-    check_eq "认证 API ${AUTH_PORT} 在监听（仅 127.0.0.1）" "yes" "$(count_to_yes "$a_listen")"
+    a_listen="$(rssh "netstat -tln 2>/dev/null | grep -c '127.0.0.1:${auth_port_cfg} '" || true)"
+    check_eq "认证 API ${auth_port_cfg} 在监听（仅 127.0.0.1）" "yes" "$(count_to_yes "$a_listen")"
 
     # HTTP：面板绑的是 LAN 地址（不是 127.0.0.1），从监听套接字取地址
     REMOTE_LAN_ADDR="$(rssh "netstat -tln 2>/dev/null | awk '/:${PANEL_PORT} /{print \$4}' | head -1 | sed 's/:${PANEL_PORT}$//'" || true)"
@@ -611,10 +619,25 @@ phase_verify() {
         warn "取不到面板绑定地址，跳过面板 HTTP 检查"
     fi
 
+    # 公网入口（网关）的检查**按配置开关**走。
+    #
+    # gateway_enabled 默认就是 false —— 全新安装出来就是这样，
+    # 面板不会写 00-nftables-web-gateway.conf，8443 根本没人监听。
+    # 如果无条件要求 8443 在听，一次**成功的**全新安装会被自己的自检
+    # 判成失败，然后（在没有备份的全新路径上）以退出码 1 结束 ——
+    # 用户看到的是「部署失败」，实际部署是好的。这个坑必须在重置前修掉。
     local gcode acode
-    gcode="$(rssh "curl -sk -o /dev/null -w '%{http_code}' --max-time 8 https://127.0.0.1:${GW_PORT}/" || true)"
-    check_eq "网关 HTTPS 返回 200" "200" "$gcode"
-    acode="$(rssh "curl -s -o /dev/null -w '%{http_code}' --max-time 8 http://127.0.0.1:${AUTH_PORT}/auth/status" || true)"
+    if [ "$gw_on" = "1" ] || [ "$gw_on" = "true" ]; then
+        g_listen="$(rssh "netstat -tln 2>/dev/null | grep -c ':${gw_port_cfg} '" || true)"
+        check_eq "网关端口 ${gw_port_cfg} 在监听（nginx）" "yes" "$(count_to_yes "$g_listen")"
+        gcode="$(rssh "curl -sk -o /dev/null -w '%{http_code}' --max-time 8 https://127.0.0.1:${gw_port_cfg}/" || true)"
+        check_eq "网关 HTTPS 返回 200" "200" "$gcode"
+    else
+        warn "公网入口未启用（gateway_enabled=${gw_on:-未设置}）—— 跳过 ${gw_port_cfg} 端口的检查"
+        warn "  全新安装默认关闭公网入口，需要在面板里启用并配置反代规则后才会有 ${gw_port_cfg}"
+    fi
+
+    acode="$(rssh "curl -s -o /dev/null -w '%{http_code}' --max-time 8 http://127.0.0.1:${auth_port_cfg}/auth/status" || true)"
     check_eq "认证 API /auth/status 返回 200" "200" "$acode"
 
     # 权限（busybox ls -l：$1 权限位 $3 属主 $4 属组）
@@ -706,7 +729,7 @@ phase_summary() {
         panel_addr="$(rssh "netstat -tln 2>/dev/null | awk '/:${PANEL_PORT} /{print \$4}' | head -1 | sed 's/:${PANEL_PORT}$//'" || true)"
     fi
     echo "  面板:    https://${panel_addr:-<设备LAN地址>}:${PANEL_PORT}"
-    echo "  网关:    https://${HOST}:${GW_PORT}"
+    echo "  网关:    https://${HOST}:${GW_PORT_CFG:-$GW_PORT}"
     echo "  版本:    v$LOCAL_VERSION"
     if [ -n "$BACKUP_DIR" ]; then
         echo "  备份:    $BACKUP_DIR"
