@@ -64,6 +64,48 @@ AUDIT_LOG = os.environ.get(
 # 审计日志体积上限。日志落在 tmpfs 上（.224 的 /var -> /tmp），吃的是内存，
 # 所以必须有界；2 MiB ≈ 5900 条记录，轮转后总占用 ≤ 4 MiB。
 AUDIT_LOG_MAX_BYTES = int(os.environ.get("AUTH_AUDIT_LOG_MAX_BYTES", str(2 * 1024 * 1024)))
+# 审计日志的权限位。init 脚本建的是 0640（属主 nftweb），但网关**轮转时**
+# 用 `open(path, "a")` 重建文件 —— 那是 0666 & ~umask = 0644，
+# **world-readable**。审计里有源 IP、设备 ID、指纹、UA、原始 URI。
+# 所以这里定死一个值：所有创建 / 重建路径都用它，且轮转后必须回到它。
+AUDIT_LOG_MODE = 0o640
+
+# 审计写入的限流（每 IP 每分钟）。
+#
+# 2026-10-30：未认证者可以自由灌 —— /auth/verify 每被拒一次就写一行
+# verify_denied，一个脚本几分钟就能把 2 MiB 的文件写满并触发轮转，
+# 把**真正的登录成功记录**挤到上一代去（面板只读当前文件的尾部若干行，
+# 挤掉之后「谁登录过」就查不到了）。
+#
+# 阈值取 120 条/分钟：与 /auth/status 的只读限流同量级（那里是 120/60s），
+# 正常浏览器一次会话的认证相关请求也就个位数，120 留了十几倍余量。
+# 超出时**不静默丢弃** —— 合并成一条 audit_throttled 汇总，
+# 保留「发生了 N 次」这个事实（见 _audit_rate_gate）。
+AUDIT_RATE_WINDOW = 60
+AUDIT_RATE_MAX = 120
+
+# 三张表的容量上限（都会落盘，全量重写）。
+#
+# 2026-10-30：这三张表原来都**没有数量上限**。
+#   · 限流表：每条记录一个源 IP，一次失败就 json.load + truncate + 全量重写。
+#     攻击者用大量源 IP 就能把表撑到几十 MB，于是**每一次登录尝试**都要
+#     读写几十 MB —— 一次请求放大成一次磁盘写入，这是放大攻击面。
+#   · 吊销表：每个已认证请求都全量重读重解析整个文件，同上。
+#   · _RATE_FALLBACK：降级态的内存兜底，无界且从不清理。
+#
+# 上限取值 10000（限流表 / 吊销表）：
+#   · 一条限流记录约 100 字节 → 10000 条 ≈ 1 MB，落在 tmpfs 上可忽略；
+#   · 正常设备一辈子也攒不到这个数（一条记录 = 一次失败登录或一次登出，
+#     绝对 TTL 12 小时还会把过期条目剪掉）；
+#   · 攒到上限说明有人在**用大量源 IP 扫**，那正是要拦的场景。
+# 超限时的行为见各自的实现注释（限流表/吊销表：淘汰最老/最先过期的条目；
+# 内存兜底：淘汰最久没活动的条目）—— 一律**不拒绝新增**，
+# 否则攻击者只要把表填满就能让**新来的**攻击者不受限流（把防护变成后门）。
+RATELIMIT_MAX_IPS = int(os.environ.get("AUTH_RATELIMIT_MAX_IPS", "10000"))
+REVOKED_MAX_ENTRIES = int(os.environ.get("AUTH_REVOKED_MAX_ENTRIES", "10000"))
+# 内存兜底的容量上限。降级态没有落盘保护，一个内存炸弹就能把网关拖垮
+# （设备只有 1 GB 内存）。4096 条 ≈ 几百 KB，够用。
+RATE_FALLBACK_MAX_IPS = int(os.environ.get("AUTH_RATE_FALLBACK_MAX_IPS", "4096"))
 
 BIND_HOST = os.environ.get("AUTH_BIND_HOST", "127.0.0.1")
 BIND_PORT = int(os.environ.get("AUTH_API_PORT", "8444"))
@@ -225,8 +267,25 @@ def _harden_response(resp):
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("X-Frame-Options", "DENY")
     resp.headers.setdefault("Referrer-Policy", "no-referrer")
-    if request.is_secure or request.headers.get("X-Forwarded-Proto") == "https":
-        resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+    # HSTS：**无条件**下发（2026-10-30）。
+    #
+    # 原来是 `if request.is_secure or X-Forwarded-Proto == "https"` 才发。
+    # 但 nginx 终结 TLS，转给 Flask 的已经是明文 HTTP，request.is_secure
+    # 恒为 False —— 唯一的判据就是 X-Forwarded-Proto 头。
+    # 而 nginx 只有 /auth/ 那几个 location 转发 `X-Forwarded-Proto $scheme`，
+    # **`location = /`（门户页）不转发** —— 于是门户页永远拿不到 HSTS，
+    # 而同一个站点的 /auth/login 却有。浏览器对同一个 origin 的策略是按
+    # 响应头逐次判定的：登录页钉了 HSTS、门户页没钉 ⇒ 用户在门户页上
+    # 首访 http:// 不会被浏览器记住并升级。
+    #
+    # 为什么可以无条件发：这个网关**只**通过 nginx 的 HTTPS 入口对外，
+    # 8443 是 HTTPS-only。直连 127.0.0.1:8444 的明文访问只发生在本机，
+    # 而 HSTS 对 IP 字面量与 localhost 本来就不生效（浏览器忽略），
+    # 不会把本机的明文访问「钉死」成 https。
+    #
+    # ⚠️ 不带 includeSubDomains：网关可能和路由器上其它服务共用域名，
+    # 把子域一起钉死会误伤它们（与 /auth/login 原有策略保持一致）。
+    resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
     return resp
 
 
@@ -511,6 +570,7 @@ def revoke_jti(jti: str, exp: int) -> bool:
 
     写入失败仍然必须失败 —— 那是「登出看着成功了，其实令牌还活着」。
     """
+    global _REVOKED_LKG
     if not jti or exp <= int(time.time()):
         # 令牌本来就已过期，登不登销都不影响可用性
         return True
@@ -540,6 +600,24 @@ def revoke_jti(jti: str, exp: int) -> bool:
                 now = int(time.time())
                 data = {k: v for k, v in data.items()
                         if isinstance(v, int) and v > now}
+                # ── 容量上限（P2-3）────────────────────────────────────
+                # 吊销表原来只按 exp 剪枝，**没有数量上限**。一次登出/续期
+                # 写一条，绝对 TTL 12 小时 ⇒ 条目最长活 12 小时；高频登出
+                # 就能把它撑得很大，而**每个已认证请求都要全量重读重解析**
+                # 整个文件（is_revoked → load_revoked）—— 表越大，单个请求
+                # 越贵，等于把一次请求放大成一次全表解析。
+                #
+                # 超限时淘汰**最先过期**的条目：它们马上就要自己失效，
+                # 留着没有价值；而**刚刚写进去的这一条永远不淘汰** ——
+                # 淘汰掉它等于「吊销没落盘」，比表大一点严重得多。
+                #
+                # 为什么不改成「拒绝新增」：攻击者只要把表填满，
+                # 就能让**新来的**攻击者不受限流 —— 把防护变成后门。
+                if len(data) > REVOKED_MAX_ENTRIES:
+                    _victims = sorted((k for k in data if k != jti),
+                                      key=lambda k: data[k])
+                    for _k in _victims[:len(data) - REVOKED_MAX_ENTRIES]:
+                        data.pop(_k, None)
                 f.seek(0)
                 f.truncate()
                 json.dump(data, f)
@@ -557,12 +635,51 @@ def revoke_jti(jti: str, exp: int) -> bool:
             os.chmod(path, 0o600)
     except OSError:
         audit("revocation_chmod_failed")
+    # ── 写后立刻刷新 last-known-good（P1-3）──────────────────────────
+    # 原来这里**不刷新**：LKG 只在 load_revoked() 成功读到文件时才更新。
+    # 于是出现这条链：
+    #   ① 登出 → revoke_jti 写盘（文件里已经有这条吊销）
+    #   ② 文件随后被写坏 / 被截断 / 磁盘只写了一半
+    #   ③ 下一次鉴权 → load_revoked() 读不出来 → 退到 LKG
+    #      而那份 LKG 是**吊销之前**的快照 —— 刚登出的令牌当场复活。
+    # 「登出」这个本该一键切断的急停开关，恰好在最需要它的时刻失效。
+    #
+    # 写后立刻更新 LKG，这条链就断了：写盘成功 = 吊销成立，之后无论文件
+    # 怎么坏，退到的都是**含这次吊销**的快照。
+    _REVOKED_LKG = dict(data)
     return True
+
+
+def _mark_superseded(jti: str, exp: int) -> None:
+    """记下「这个 jti 已被续期取代」，本进程内不再认它。
+
+    见 _SUPERSEDED_JTI 的说明：滑动续期时旧令牌必须死掉，
+    而吊销表写不进去时它是唯一还能生效的地方。
+
+    容量上限：先删已过期的，再按上限淘汰**最先过期**的条目
+    （它们马上就要自己失效了，留着没价值）。
+    """
+    if not jti:
+        return
+    now = int(time.time())
+    _SUPERSEDED_JTI[jti] = exp
+    for k in [k for k, v in _SUPERSEDED_JTI.items()
+              if not isinstance(v, int) or v <= now]:
+        _SUPERSEDED_JTI.pop(k, None)
+    if len(_SUPERSEDED_JTI) > _SUPERSEDED_JTI_MAX:
+        victims = sorted(_SUPERSEDED_JTI.items(), key=lambda kv: kv[1])
+        for k, _v in victims[:len(_SUPERSEDED_JTI) - _SUPERSEDED_JTI_MAX]:
+            _SUPERSEDED_JTI.pop(k, None)
 
 
 def is_revoked(jti: str) -> bool:
     if not jti:
         return False
+    # 进程内「已被续期取代」的 jti —— 吊销表写不进去时的第二道保险。
+    # 查它**不依赖**磁盘，所以表坏了、表只读、表不存在都不影响这一层。
+    _sx = _SUPERSEDED_JTI.get(jti)
+    if isinstance(_sx, int) and _sx > int(time.time()):
+        return True
     data = load_revoked()
     if data is None:
         # 吊销表读不了、又没有 last-known-good 可退：判不出来就当已吊销。
@@ -620,10 +737,50 @@ def _ratelimit_degrade(e):
     audit("ratelimit_degraded", error=type(e).__name__)
 
 
+def _fallback_prune(now: float) -> None:
+    """给内存兜底表剪枝：先删已经完全过期的，再按上限淘汰最久没活动的。
+
+    为什么要有上限：降级态（限流表不可写）恰恰发生在最忙的时候 ——
+    磁盘满、目录变只读、tmpfs 被清。这时候再留一张无界的内存表，
+    就是把「限流表坏了」升级成「网关被内存炸弹打死」——
+    而这台设备总共只有 1 GB 内存。
+    """
+    # ① 已经彻底过期的：不在锁定期内，且失败记录全部超出窗口
+    for k in [k for k, v in _RATE_FALLBACK.items()
+              if isinstance(v, dict)
+              and not (isinstance(v.get("locked_until", 0), (int, float))
+                       and v.get("locked_until", 0) > now)
+              and not [t for t in (v.get("fails") or [])
+                       if isinstance(t, (int, float)) and now - t < RATE_LIMIT_WINDOW]]:
+        _RATE_FALLBACK.pop(k, None)
+    # ② 还超上限 → 淘汰最久没活动的那些。
+    #    同样是「不拒绝新增」：拒绝新增等于给攻击者一个「填满表就能
+    #    让新来的攻击者不受限流」的后门。
+    if len(_RATE_FALLBACK) > RATE_FALLBACK_MAX_IPS:
+        def _last_active(v):
+            if not isinstance(v, dict):
+                return 0.0
+            ts = [t for t in (v.get("fails") or []) if isinstance(t, (int, float))]
+            lu = v.get("locked_until", 0)
+            if isinstance(lu, (int, float)):
+                ts.append(lu)
+            return max(ts) if ts else 0.0
+        victims = sorted(_RATE_FALLBACK.items(), key=lambda kv: _last_active(kv[1]))
+        for k, _v in victims[:len(_RATE_FALLBACK) - RATE_FALLBACK_MAX_IPS]:
+            _RATE_FALLBACK.pop(k, None)
+
+
 def _ratelimit_fallback_mutate(ip: str, on_fail: bool):
     """限流表不可用时的内存版，语义与落盘版一致。
 
     同样要能真的挡住暴力破解 —— 降级不等于不设防，只是不跨重启累计。
+
+    2026-10-30（P2-2）：原来这张表**无界、从不清理**，而且「成功登录」
+    只是把该 IP 的记录**置成空 dict** —— 键还在。于是每个来过的源 IP
+    都永久占着一条，谁也不删它。
+    现在：
+      · 成功登录 → **删键**（不是置空）
+      · 失败路径每次改动后剪枝：先删已完全过期的，超上限再淘汰最久没活动的
     """
     now = time.time()
     rec = _RATE_FALLBACK.get(ip)
@@ -643,9 +800,18 @@ def _ratelimit_fallback_mutate(ip: str, on_fail: bool):
             rec = {"locked_until": now + RATE_LIMIT_LOCKOUT, "fails": fails}
         else:
             rec = {"locked_until": 0, "fails": fails}
+        _RATE_FALLBACK[ip] = rec
+        _fallback_prune(now)
     else:
-        rec = {}                       # 成功登录：清空该 IP 的失败记录
-    _RATE_FALLBACK[ip] = rec
+        # 成功登录：**删键**。
+        # 原来这里是 `rec = {}` 然后 `_RATE_FALLBACK[ip] = rec` ——
+        # 键还在，只是内容空了，所以每个见过的源 IP 都永久留下一条。
+        #
+        # ⚠️ 这里**必须**直接删键，不能靠后面的剪枝兜底：剪枝只清「已完全
+        # 过期」的条目，一条空记录会被它顺手清掉 —— 但那属于「碰巧被清掉」，
+        # 不是「成功登录就删键」这条语义本身。语义要写在删除动作上。
+        _RATE_FALLBACK.pop(ip, None)
+        return False, 0
     # 返回真实的锁定状态（与落盘版语义一致）：触发锁定的那一次也报 True。
     _lu = rec.get("locked_until", 0)
     _locked = isinstance(_lu, (int, float)) and _lu > now
@@ -712,6 +878,30 @@ def _mutate_ratelimit(ip: str, on_fail: bool):
                           or max(list(v.get("fails", []) or [0]) + [v.get("locked_until", 0)]) < cutoff]:
                     data.pop(k, None)
 
+                # ── 容量上限（P2-1）────────────────────────────────────
+                # 原来这张表**没有数量上限**，只有「按时间过期」的清理。
+                # 攻击者用大量源 IP 各试一次就能把表撑到几十 MB，而
+                # **每一次登录尝试都要 json.load + truncate + 全量重写**
+                # 整张表 —— 一个请求被放大成一次几十 MB 的磁盘写入，
+                # 磁盘越慢越容易被拖垮（.224 只有 1 GB 内存）。
+                #
+                # 超限时淘汰**最久没活动**的条目（它们离过期最近，
+                # 留着价值最低）。不改成「拒绝新增」：那等于给攻击者
+                # 一个「把表填满就能让新来的攻击者不受限流」的后门。
+                if len(data) > RATELIMIT_MAX_IPS:
+                    def _last_active(v):
+                        if not isinstance(v, dict):
+                            return 0.0
+                        ts = [t for t in (v.get("fails") or [])
+                              if isinstance(t, (int, float))]
+                        lu = v.get("locked_until", 0)
+                        if isinstance(lu, (int, float)):
+                            ts.append(lu)
+                        return max(ts) if ts else 0.0
+                    _victims = sorted(data.items(), key=lambda kv: _last_active(kv[1]))
+                    for _k, _v in _victims[:len(data) - RATELIMIT_MAX_IPS]:
+                        data.pop(_k, None)
+
                 f.seek(0)
                 f.truncate()
                 json.dump(data, f)
@@ -752,6 +942,58 @@ def _mutate_ratelimit(ip: str, on_fail: bool):
 _SYSLOG_EVENTS = {"login_ok": "info", "logout": "info",
                   "login_fail": "warn", "lockout": "err"}
 _SYSLOG_TAG = "nftables-web-auth"
+
+# 审计限流的状态（进程内，不落盘）。
+_AUDIT_HITS = {}          # ip -> [落盘时刻]
+_AUDIT_SUMMARY = {}       # ip -> {"count": n, "event": "...", "ts": ...}
+_AUDIT_RATE_LOCK = threading.Lock()
+# 限流状态表本身也不能无界：攻击者换着源 IP 打，每分钟就能塞进几千个键。
+_AUDIT_HITS_MAX = 4096
+
+# 这些事件**永远**落盘，绕过审计限流。
+#
+# 为什么必须豁免：审计限流绝不能变成「攻击者可以让审计彻底失效」的后门。
+# 攻击者只要能触发足够多的失败事件（刷 verify_denied 就行，那条路完全
+# 不需要凭据），就可能把 login_ok 一起挤掉 —— 于是「谁登录过」彻底查不到，
+# 而这恰恰是出事之后唯一真正要紧的问题。
+_AUDIT_ALWAYS = ("login_ok", "logout")
+
+# **会被未认证者随意触发**的事件 —— 只有这些才走限流。
+#
+# 限流针对的是「不需要任何凭据就能反复触发」的事件。限流范围必须**精确**：
+# 放得太宽会把内部事件、内部测试事件一起限掉（那等于给审计加了个
+# 说不清的静默丢弃），放得太窄又挡不住真正的灌爆路径。
+# 下面这份名单覆盖了本文件里全部「未认证请求能走到」的事件：
+#   verify_denied      —— 每个未认证请求都触发（最容易被灌的那条）
+#   verify_exception   —— 校验链路抛异常
+#   login_csrf_blocked —— 跨站登录尝试
+#   login_fail         —— 密码错误
+#   login_rate_limited —— 锁定期内的每次尝试
+#   unhandled_exception—— 兜底处理器
+# 其余事件（token_refreshed / logout / *_not_revoked / revocation_* …）
+# 都需要已经拿到凭据才能触发，限流它们没有意义，却会让「谁认证过」
+# 这类记录变得不完整。
+_AUDIT_FLOODABLE = ("verify_denied", "verify_exception", "login_csrf_blocked",
+                    "login_fail", "login_rate_limited", "unhandled_exception")
+
+# 进程内「已被取代」的 jti —— 滑动续期时旧令牌的第二道保险。
+#
+# 2026-10-30（P1-6）：滑动续期必须让**旧令牌死掉**。正常情况下
+# revoke_jti() 把它写进吊销表就够了；但吊销表写不进去时（目录只读、
+# 属主被改）它写不进去 —— 那正是「被取代的令牌继续有效」的窗口：
+# 服务端同时有两张有效令牌（旧的没死、新的又发出去），而攻击者手上
+# 那张恰恰是旧的，「登出」这个急停开关对它无效。
+#
+# 进程内这张表补上这一刀：续期时**无论吊销表写没写成功**，旧 jti 都进
+# 这里，is_revoked() 一并查它 ⇒ 旧令牌在本进程内立刻失效。
+# 浏览器拿到的是新令牌（Set-Cookie 正常下发），所以**用户不会被踢下线**，
+# 而攻击者手上的旧副本立刻作废 —— 这正是「续期」该有的语义。
+#
+# 局限（必须写清楚）：这张表**不跨进程重启**。吊销表可写时（正常情况）
+# 磁盘上也有记录，重启不影响；吊销表不可写时，重启后旧令牌会复活，
+# 直到它自己过期。所以这是「尽力而为」，不是「绝对保证」。
+_SUPERSEDED_JTI = {}
+_SUPERSEDED_JTI_MAX = 10000
 
 
 def _sanitize(value, limit=120):
@@ -811,27 +1053,196 @@ def _audit_maybe_rotate(path: str, incoming: int = 0) -> None:
         可以忽略；而留更多代在 tmpfs 上没有意义。
       · 面板的日志视图读的是**当前文件的尾部若干行**（app.py 里
         `raw_lines[-limit:]`），轮转后它照样读得到当前代，不受影响。
+
+    2026-10-30（P1-7 / P1-8 / P1-45）：轮转方式改了，原因是原来的方式
+    **在真机上永远不可能成功**。
+      · 原来的 `os.replace(path, path + ".1")` 需要**目录的写权限**。
+        真机上 /var/log 是 root:root 0755，而网关降权后是 uid 1000 ——
+        rename 要目录写权限，它没有。于是轮转永远失败，兜底分支只能
+        `open(path, "w")` **就地截断**：审计历史被清空，文件继续增长。
+        也就是说「出事那一刻最需要的那份记录」正好是最先被毁掉的。
+      · 现在分两种情况：
+          · 目录可写 → 仍然改名成 .1（保留上一代），并用 0640 重建新文件；
+          · 目录不可写（真机的常态）→ **就地轮转**：留下尾部若干行，
+            其余丢掉，重写同一个文件。就地重写只需要**文件自身的写权限**
+            （属主是网关自己），完全不碰目录 —— 这才是降权后能真的跑通的
+            那条路。
+      · 两种方式产出的新文件权限都必须回到 0640：原来的 `open(path, "a")`
+        重建出来的是 0666 & ~umask = **0644（world-readable）**，
+        而审计里有源 IP、设备 ID、指纹、UA、原始 URI。
     """
     try:
         if os.path.getsize(path) + incoming <= AUDIT_LOG_MAX_BYTES:
             return
     except OSError:
         return          # 文件不存在：紧接着的写入会新建，无需轮转
+    # 方式一：目录可写 → 改名保留上一代（原子，且天然「新一代覆盖上一代」）
     try:
-        # 用 replace 而不是 rename —— 它是原子的，旧的 .1 不会和新内容混在一起，
-        # 且天然完成「新一代覆盖上一代」。
-        os.replace(path, path + ".1")
+        if os.access(os.path.dirname(path) or ".", os.W_OK):
+            os.replace(path, path + ".1")
+            _ensure_audit_file(path)
+            return
     except OSError:
-        # 轮转不成（目录只读、跨设备等）就地截断：宁可丢历史，
-        # 也不能让文件继续无限长把 RAM 吃光。
+        pass
+    # 方式二：目录不可写（真机常态）→ 就地轮转，只用文件自身的写权限
+    _audit_rotate_in_place(path)
+
+
+def _audit_rotate_in_place(path: str) -> None:
+    """就地轮转：留下尾部若干行（总大小不超过上限的一半），其余丢掉。
+
+    为什么保留尾部而不是直接截断：直接截断 = 这一代的记录**全部**没了，
+    而「出事前后发生了什么」正好是最需要的那一段。保留尾部是在
+    「文件必须有界」和「别把关键记录一起扔了」之间的折中。
+
+    保留量按**字节预算**算（上限的一半），不是按固定行数 —— 行长随
+    内容变化（UA 长度、字段数量），按行数算出来的字节数会飘，
+    「文件必须有界」这条硬边界就不能保证了。至少保留一行，
+    否则一次轮转就把文件清空，跟直接截断没区别。
+
+    ⚠️ 就地重写不是原子的：面板正好在这一瞬间读，可能读到半截内容
+    （面板那边用 errors="replace" 读，不会崩，最坏是显示错乱）。
+    这比「轮转不了、日志无限长、RAM 被吃光」好得多。
+    """
+    try:
+        with open(path, "r", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        lines = []
+    budget = max(1, AUDIT_LOG_MAX_BYTES // 2)
+    keep, total = [], 0
+    for ln in reversed(lines):
+        sz = len(ln.encode("utf-8"))
+        if keep and total + sz > budget:
+            break
+        keep.append(ln)
+        total += sz
+    keep.reverse()
+    try:
+        with open(path, "w") as f:
+            f.writelines(keep)
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError:
+        # 连重写都不行 → 至少别让它继续无限长（宁可丢历史）
         try:
             open(path, "w").close()
         except OSError:
             pass
+    _ensure_audit_file(path)
+
+
+def _ensure_audit_file(path: str) -> None:
+    """确保审计文件存在，且权限不宽于 0640（world 不可读）。
+
+    用 os.open 而不是 open(path, "a")：后者建出来的是 0666 & ~umask
+    = 0644 —— 审计内容（源 IP / 设备 ID / 指纹 / UA）对全机可见。
+    """
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, AUDIT_LOG_MODE)
+    except OSError:
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        if (os.stat(path).st_mode & 0o777) & 0o007:
+            os.chmod(path, AUDIT_LOG_MODE)
+    except OSError:
+        pass
+
+
+def _audit_hits_prune(now: float) -> None:
+    """给审计限流的状态表剪枝（它自己也不能无界）。"""
+    for ip in [ip for ip, ts in _AUDIT_HITS.items()
+               if not ts or now - max(ts) >= AUDIT_RATE_WINDOW]:
+        _AUDIT_HITS.pop(ip, None)
+    for ip in [ip for ip, s in _AUDIT_SUMMARY.items()
+               if now - s.get("ts", 0) >= AUDIT_RATE_WINDOW * 2]:
+        _AUDIT_SUMMARY.pop(ip, None)
+    if len(_AUDIT_HITS) > _AUDIT_HITS_MAX:
+        victims = sorted(_AUDIT_HITS.items(),
+                         key=lambda kv: max(kv[1]) if kv[1] else 0)
+        for ip, _ in victims[:len(_AUDIT_HITS) - _AUDIT_HITS_MAX]:
+            _AUDIT_HITS.pop(ip, None)
+
+
+def _audit_rate_gate(ip: str, event: str):
+    """审计写入限流。返回 (本条是否照常写, 需要补写的汇总记录列表)。
+
+    超配额时**不静默丢弃**：被吞掉的条数合并进一条 `audit_throttled`
+    汇总记录（保留「发生了 N 次」这个事实），并且每满 100 条再补一条
+    带累计数的记录 —— 万一进程被打死，计数也不至于全丢。
+
+    丢掉审计记录比不写更糟：事后没人知道发生过什么。所以这里的取舍是
+    「合并」而不是「丢弃」。
+    """
+    now = time.time()
+    extras = []
+    with _AUDIT_RATE_LOCK:
+        hits = [t for t in _AUDIT_HITS.get(ip, []) if now - t < AUDIT_RATE_WINDOW]
+        summary = _AUDIT_SUMMARY.get(ip)
+        # 窗口翻篇 → 上一窗的汇总该落盘了（「那段时间被合并掉 N 条」）
+        if summary and now - summary.get("ts", 0) >= AUDIT_RATE_WINDOW:
+            extras.append({"event": "audit_throttled", "ip": ip,
+                           "suppressed": summary.get("count", 0),
+                           "kind": summary.get("event", ""),
+                           "reason": "audit_rate_limit",
+                           "window": AUDIT_RATE_WINDOW})
+            _AUDIT_SUMMARY.pop(ip, None)
+            summary = None
+        if len(hits) < AUDIT_RATE_MAX:
+            hits.append(now)
+            _AUDIT_HITS[ip] = hits
+            _audit_hits_prune(now)
+            return True, extras
+        # 超配额：本条不单独落盘，合并进汇总
+        _AUDIT_HITS[ip] = hits
+        if summary is None:
+            summary = {"count": 0, "event": event, "ts": now}
+            _AUDIT_SUMMARY[ip] = summary
+        summary["count"] += 1
+        if summary["count"] == 1 or summary["count"] % 100 == 0:
+            extras.append({"event": "audit_throttled", "ip": ip,
+                           "suppressed": summary["count"],
+                           "kind": summary.get("event", ""),
+                           "reason": "audit_rate_limit",
+                           "window": AUDIT_RATE_WINDOW})
+        _audit_hits_prune(now)
+        return False, extras
+
+
+def _audit_write(rec: dict) -> None:
+    """把一条审计记录落盘（含轮转）。任何失败都不抛 —— 审计不能阻断认证。"""
+    try:
+        line = json.dumps(rec, ensure_ascii=False) + "\n"
+        os.makedirs(os.path.dirname(AUDIT_LOG) or ".", exist_ok=True)
+        _audit_maybe_rotate(AUDIT_LOG, len(line.encode("utf-8")))
+        # 精确指定权限位：open(path, "a") 建出来的是 0644（world-readable）。
+        fd = os.open(AUDIT_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                     AUDIT_LOG_MODE)
+        try:
+            os.write(fd, line.encode("utf-8"))
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
 
 
 def audit(event: str, **fields):
-    """写审计日志。任何失败都不能影响认证流程本身。"""
+    """写审计日志。任何失败都不能影响认证流程本身。
+
+    2026-10-30（P1-45）：加了**写入限流**。
+    未认证者可以自由灌 —— /auth/verify 每被拒一次就写一行 verify_denied，
+    一个脚本几分钟就能把 2 MiB 的文件写满并触发轮转，把**真正的登录成功
+    记录**挤掉（面板只读当前文件的尾部若干行）—— 事后「谁登录过」就查不到。
+
+    但限流**绝不能**变成「攻击者可以让审计彻底失效」的后门：
+    `login_ok` / `logout` 永远落盘（见 _AUDIT_ALWAYS），
+    其余事件超配额时合并成 `audit_throttled` 汇总（保留「发生了 N 次」）。
+    """
+    rec = {}
     try:
         rec = {
             "ts": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -845,11 +1256,16 @@ def audit(event: str, **fields):
                     or request.path or "")[:200],
         }
         rec.update(fields)
-        line = json.dumps(rec, ensure_ascii=False) + "\n"
-        os.makedirs(os.path.dirname(AUDIT_LOG), exist_ok=True)
-        _audit_maybe_rotate(AUDIT_LOG, len(line.encode("utf-8")))
-        with open(AUDIT_LOG, "a") as f:
-            f.write(line)
+        allow, extras = True, []
+        # 只有「未认证者能随意触发」的事件才走限流（见 _AUDIT_FLOODABLE）。
+        # 限流范围必须精确：放得太宽会把内部事件也悄悄丢掉，
+        # 那等于给审计加了个说不清的静默丢弃。
+        if event in _AUDIT_FLOODABLE and event not in _AUDIT_ALWAYS:
+            allow, extras = _audit_rate_gate(str(rec.get("ip") or "-"), event)
+        if allow:
+            _audit_write(rec)
+        for ex in extras:
+            _audit_write(ex)
     except Exception:
         pass   # 审计失败不能反过来阻断认证
 
@@ -858,6 +1274,64 @@ def audit(event: str, **fields):
         _syslog(event, rec)
     except Exception:
         pass
+
+
+def _prepare_audit_log() -> None:
+    """在**降权之前**把审计日志的属主/权限摆正（此刻还是 root）。
+
+    为什么必须在降权前做
+    ------------------
+    降权之后进程就是 uid 1000 了，再也改不了属主 —— 而「改属主」正是
+    让审计日志**不可被网关自己篡改**的前提。
+
+    原来的属主是网关自己（init 脚本 `chown nftweb:nftweb`）。
+    后果：攻陷网关的进程（uid 1000）可以 chmod/chown **审计日志本身**
+    —— 把它改成 0000（让取证一条都读不到）、或者干脆清空。
+    也就是说「被攻陷的服务」能同时灭掉自己的痕迹，审计链在**最需要它**
+    的那一刻断掉。
+
+    改成属主 root、属组 = 网关的 gid、权限 0660：
+      · 网关（组内）照常写 —— 审计功能完全不受影响；
+      · 网关**改不了**属主/权限（不是属主），也**删不掉**（目录属 root）；
+      · 面板（root）照常读 —— app.py 的日志视图不受影响。
+
+    ⚠️ 这一步失败**不**让进程退出：审计写不进去最多是「少一份记录」，
+    而拒绝启动 = 公网唯一入口直接断掉 —— 那是更严重的后果。
+    但必须**大声告警**：静默失败会让人以为审计是完好的。
+    """
+    path = AUDIT_LOG
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    except OSError as e:
+        print(f"[WARN] 审计日志目录建不了（{type(e).__name__}）—— 审计记录写不进去",
+              flush=True)
+        return
+    try:
+        if not os.path.exists(path):
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                         AUDIT_LOG_MODE)
+            os.close(fd)
+    except OSError as e:
+        print(f"[WARN] 审计日志建不了（{type(e).__name__}）—— 审计记录写不进去",
+              flush=True)
+        return
+    try:
+        gid = int(os.environ.get("AUTH_DROP_GID", "").strip() or 0)
+    except ValueError:
+        gid = 0
+    try:
+        if os.geteuid() == 0 and gid > 0:
+            os.chown(path, 0, gid)
+            os.chmod(path, 0o660)
+        else:
+            # 不是 root（或不知道组）：至少把 world 可读收回来
+            if (os.stat(path).st_mode & 0o777) & 0o007:
+                os.chmod(path, AUDIT_LOG_MODE)
+    except OSError as e:
+        print(f"[WARN] 审计日志属主/权限调整失败（{type(e).__name__}）—— "
+              f"网关仍可写，但它也仍能改这份日志的权限", flush=True)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -923,6 +1397,28 @@ def is_lan_source(cfg) -> bool:
 
     顺带把 auth_lan_bypass 的缺省值从 True 改成 False：配置缺失时应当
     要求认证（fail-closed），而不是默认放行。
+
+    2026-10-30（P1-16）：**回环不再无条件当内网**。
+    原来这里有一句 `if addr.is_loopback: return True` —— 只要算出来的
+    客户端 IP 是回环，就判成「内网」，于是 /auth/verify 直接返 200
+    免凭据。
+
+    为什么这是个真问题（不是「本地进程反正已经赢了」）：
+      · 公网入口 nginx 的 `location = /`（门户页）与各服务的 location
+        都会 `proxy_set_header X-Real-IP $remote_addr`，所以**公网来客**
+        算出来的 IP 一定是他的真实公网 IP —— 远程打不到这条捷径。
+      · 但**从路由器本机**访问公网入口（curl https://127.0.0.1:8443/xxx/）
+        时 $remote_addr 就是 127.0.0.1 → 认证服务判成「内网」→ 免密 200。
+        于是**任何能在路由器上跑起来的进程**（被攻陷的低权服务、
+        容器里的程序、乃至一个能在路由器上打开网页的人）都能拿到
+        所有 public_access=true 服务的**免认证访问**。
+      · 更糟的是这条捷径还锚在客户端可控的 Host/X-Real-IP 上：
+        本地进程随手伪造一个内网 IP 就能冒充「内网设备」。
+
+    现在的语义：**内网 = 配出来的网段**（lan_subnet4 / lan_subnet6）。
+    回环不再是隐式豁免 —— 要让它算内网，显式把 127.0.0.0/8 配进去。
+    另外留了一个显式开关 `auth_lan_bypass_loopback`（默认关）：
+    确实需要「本机免密」的部署可以显式打开，而不是靠一条隐式规则。
     """
     if not cfg.get("auth_lan_bypass", False):
         return False
@@ -934,8 +1430,11 @@ def is_lan_source(cfg) -> bool:
     except ValueError:
         return False
 
+    # 回环豁免：**必须显式打开**（默认关）。
+    # 见上面 P1-16 的说明 —— 隐式的「回环即内网」等于把免认证发给了
+    # 路由器上任何能跑起来的进程。
     if addr.is_loopback:
-        return True
+        return bool(cfg.get("auth_lan_bypass_loopback", False))
 
     subnets = []
     for key in ("lan_subnet4", "lan_subnet6"):
@@ -946,12 +1445,15 @@ def is_lan_source(cfg) -> bool:
             net = ipaddress.ip_network(raw, strict=False)
         except ValueError:
             continue
-        # /0 匹配一切。留着它等于把「全员免认证」的开关交给一个手滑的输入：
-        # 实测把 lan_subnet4 设成 0.0.0.0/0 后，8.8.8.8 / 1.1.1.1 等公网 IP
-        # 全部 /auth/verify → 200 + X-Auth-Via: lan-bypass，且面板保存接口
-        # 不拦、risks 为空。配置可能被手改、被备份恢复、或被有写权限的人改，
-        # 所以这里必须**不理会 /0**，而不是信任它。
-        if net.prefixlen == 0:
+        # /0 **和 /1** 都不认（2026-10-30，P1-15）。
+        #
+        # 原来这里只挡 /0，/1 是漏的 —— 而 /1 匹配**半个 IPv4 地址空间**：
+        # 配成 0.0.0.0/1 时，8.8.8.8 / 1.1.1.1 等公网 IP 全部落进「内网」
+        # ⇒ 全部免认证，和 /0 的后果一样，只是范围小一半。
+        # 面板侧（app.py 的 validate_config）早就是 `prefixlen <= 1`，
+        # 网关这边还写着 `== 0` —— 同一个意图，两个守卫写歪了。
+        # 现在两边口径一致：<= 1 一律不认。
+        if net.prefixlen <= 1:
             continue
         subnets.append(net)
 
@@ -1149,11 +1651,19 @@ def auth_status():
         # 攻击者那张是更早的、jti 从未被吊销的旧 token。
         # 结果是「登出」这个本该能一键切断的急停开关对已泄露凭据无效。
         #
-        # 吊销失败不拦续期。注意这只针对「表**可读但不可写**」这一种故障
-        # （目录变只读、属主被改）。「表不可读」时 is_revoked 的 fail-closed
-        # 早就把请求拒了，压根走不到这里 —— 那是 MISC-02 刻意选的取舍。
-        # 这里抛异常同样糟：会被 except Exception 接住变成 500，
-        # 于是每一次需要续期的请求都失败，比「旧 token 多活一会儿」严重得多。
+        # 吊销失败**不拦续期**（这是本项目明确的取舍）：
+        # 吊销表写不进去时抛异常会被 except Exception 接住变成 500，
+        # 于是每一次需要续期的请求都失败 —— 比「旧令牌多活一会儿」
+        # 严重得多（那会把所有人踢回登录页）。
+        #
+        # 2026-10-30（P1-6）：「旧令牌多活一会儿」这件事被**收口**了 ——
+        # 失败不再等于「当成成功」：
+        #   ① 返回值照旧检查，失败照旧落审计（refresh_old_token_not_revoked）；
+        #   ② **旧 jti 进进程内的「已被取代」名单**（_mark_superseded），
+        #      is_revoked() 一并查它 ⇒ 旧令牌在本进程内立刻失效，
+        #      哪怕吊销表一个字都写不进去。
+        # 于是「被取代的令牌继续有效」这个窗口被关上了，而**用户不会被
+        # 踢下线**（浏览器拿到的是新令牌，Set-Cookie 照常下发）。
         if not revoke_jti(payload.get("jti", ""), exp):
             audit("refresh_old_token_not_revoked",
                   exp=exp, device=payload.get("dev"))
@@ -1163,6 +1673,9 @@ def auth_status():
             ttl,
             int(payload.get("iat", now)) + abs_to if abs_to else 0,
         )
+        # 新令牌签出来了 ⇒ 旧 jti 从此刻起作废（本进程内）。
+        # 放在签发之后：万一签发失败，旧令牌还能继续用，不至于两头落空。
+        _mark_superseded(payload.get("jti", ""), exp)
         _set_cookies(resp, new_tok, str(payload.get("dev", "")), raw=False)
         audit("token_refreshed", device=payload.get("dev"), fp=fingerprint())
     return resp
@@ -1279,7 +1792,16 @@ def auth_login():
     # 再次登录会签发新令牌，但旧令牌不作废 —— 一旦旧令牌泄露（XSS、
     # 日志、抓包），用户在面板里重新登录并不能把攻击者踢下线。
     # 实测：重新登录后旧令牌访问 /auth/portal 仍返回 200，剩余有效期 1799 秒。
-    _old = parse_token(request.cookies.get(COOKIE_TOKEN, ""))
+    #
+    # 2026-10-30（P1-1）：原来这里读的是 **cookie**：
+    #     _old = parse_token(request.cookies.get(COOKIE_TOKEN, ""))
+    # 于是 **Bearer 客户端**的旧令牌根本不会被吊销 —— 脚本/CLI 用
+    # `Authorization: Bearer` 登录时，cookie 里根本没有令牌，
+    # 旧令牌原封不动地继续有效（而且滑动续期下可能永不过期）。
+    # 这正是 2026-10-16 给 logout 修过的同一个类别的不对称：
+    # 那边已经改成走 `_extract_token()`（Bearer 优先、cookie 兜底），
+    # 登录这条路径漏了。现在两边用同一个函数。
+    _old = parse_token(_extract_token())
     if _old:
         # 旧令牌吊销失败**不能**拦住本次登录。吊销表一旦写不进去（只读挂载 /
         # 属主被改），在这里抛异常等于「谁都登不进」的自伤式拒绝服务 ——
@@ -1513,14 +2035,35 @@ def _authenticated() -> bool:
     取令牌同样走 `_extract_token`：Bearer 优先、cookie 兜底。直接读 cookie
     会让带 Bearer 的脚本客户端在这个端点上被无视（和第二批修的 logout 同一个
     类别的不对称）。
+
+    2026-10-30（P1-5）：补上**绝对 TTL**。
+    原来这条路径只查「令牌有效 + 世代号对 + 没被吊销」，唯独不查
+    「签发时间起算有没有超过绝对上限」。而 `_verify_or_deny`（nginx
+    auth_request 走的那条）是查的 —— 于是同一个令牌：
+      · 经 nginx 访问服务 → 401（绝对上限到了）
+      · 直接访问 /auth/portal → 200（照样吐服务清单）
+    12 小时前签发的令牌在 nginx 那条路已经被拒，却还能从门户这条门
+    读出全部反代服务清单 —— 前后不一致，最难排查的那种。
+    两条鉴权路径的判据必须一致：这里与 `_verify_or_deny` 用同一套
+    （`_absolute_ttl` + iat）。
     """
     cfg = load_gateway_config()
     if is_lan_source(cfg):
         return True
     payload = parse_token(_extract_token())
-    return (bool(payload)
-            and _payload_epoch_ok(payload, cfg)
-            and not is_revoked(payload.get("jti", "")))
+    if not payload:
+        return False
+    if not _payload_epoch_ok(payload, cfg):
+        return False
+    if is_revoked(payload.get("jti", "")):
+        return False
+    # 绝对上限：签发时间起算，超时强制重登（与 _verify_or_deny 同一判据）
+    abs_to = _absolute_ttl(cfg)
+    if abs_to:
+        now = int(time.time())
+        if now - int(payload.get("iat", now)) > abs_to:
+            return False
+    return True
 
 
 def _deny(reason: str):
@@ -1582,8 +2125,64 @@ def _is_locked(ip: str) -> bool:
     return _ratelimit_fallback_is_locked(ip)
 
 
+def _trusted_host_names(cfg) -> set:
+    """服务端**自己知道**的域名集合 —— CSRF 判定的锚点。
+
+    来源全部是落盘配置里的域名（认证服务只读不猜）：
+      · reverse_proxy.settings.base_domain   —— 面板从默认证书 SAN 推导并落盘
+      · reverse_proxy.settings.cookie_domain  —— cookie 共享域
+      · 每条反代规则的 host                  —— host 分发入口
+
+    为什么不能用请求的 Host 头当锚点：Host 是**客户端可控**的。
+    浏览器发起的跨站请求里，Host 永远是「受害者正在访问的那个主机」，
+    所以「Origin 的主机 == Host 的主机」这个判据挡不住 **DNS 重绑定**：
+    攻击者让 evil.com 解析到这台路由器，受害者浏览器于是发出
+    Host: evil.com + Origin: https://evil.com —— 旧判据放行，
+    攻击者就能借受害者的浏览器驱动登录（CSRF login）。
+    锚点必须是**服务端自己写的**域名，攻击者碰不到。
+    """
+    hosts = set()
+    rp = cfg.get("reverse_proxy")
+    rp = rp if isinstance(rp, dict) else {}
+    settings = rp.get("settings")
+    settings = settings if isinstance(settings, dict) else {}
+    for key in ("base_domain", "cookie_domain"):
+        raw = str(settings.get(key, "") or "").strip().lower().lstrip(".")
+        if raw:
+            hosts.add(raw)
+    rules = rp.get("rules")
+    for r in (rules or []):
+        if not isinstance(r, dict):
+            continue
+        h = str(r.get("host", "") or "").strip().lower()
+        if h:
+            hosts.add(h)
+    return hosts
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
 def _origin_host_mismatch(url: str) -> bool:
-    """Origin/Referer 的 host 与本次请求 host 不一致 → 判为跨站。"""
+    """Origin/Referer 与本服务是否不同源 → 判为跨站。
+
+    2026-10-30（P1-11）：锚点从「客户端可控的 Host 头」换成
+    **服务端自己知道的域名**（见 _trusted_host_names），并且**端口纳入比较**。
+
+    端口为什么必须比：浏览器的同源策略按 scheme + host + **port** 算。
+    同一个主机名的 8443 和 443 是两个不同的源 —— 只比主机名等于把
+    「同主机不同端口」这种跨源请求放过去了。
+
+    允许的端口：scheme 的默认端口（https=443 / http=80）+ 配置里的
+    **对外端口** gateway_port（设备 nginx 真正监听的那个）。
+    认证服务自己的内部端口（auth_api_port）不在其中 ——
+    浏览器看到的源永远是 nginx 那侧的端口。
+    """
     from urllib.parse import urlparse
     try:
         u = urlparse(url)
@@ -1600,13 +2199,47 @@ def _origin_host_mismatch(url: str) -> bool:
         host = (u.hostname or "").strip().lower()
         if not host:
             return True
-        # 必须比 hostname 而不是 netloc。netloc 里可以塞 userinfo：
-        #     Origin: https://192.168.100.224:x@evil/
-        # 旧代码 `u.netloc.split(":")[0]` 会取到 "192.168.100.224" 冒充通过，
-        # 实测同样 HTTP 200 登录成功（无冒号的 https://host@evil/ 则被正确
-        # 拦成 403，因为那时 split 拿到的是整个 netloc）。
-        # urlparse 的 .hostname 会正确剥掉 userinfo 和端口。
-        return host != (request.host or "").split(":")[0].strip().lower()
+        scheme = (u.scheme or "").lower()
+        # u.port 对非法端口会抛 ValueError → 走下面的 except → 判跨站。
+        port = u.port
+        if port is None:
+            port = 443 if scheme == "https" else 80
+
+        try:
+            cfg = load_gateway_config()
+        except Exception:
+            cfg = {}
+        # 请求自己的主机名（客户端可控，只在「配置里没有域名」时当锚）
+        req_host = (request.host or "").split(":")[0].strip().lower()
+
+        trusted = _trusted_host_names(cfg)
+        if trusted:
+            if host in trusted:
+                host_ok = True
+            elif any(host.endswith("." + t) for t in trusted):
+                # 共享域下的子域也算：base_domain=fzyto.top 时，
+                # 用户从 siyuan.fzyto.top 访问登录页是正常用法。
+                host_ok = True
+            elif _is_ip_literal(req_host) and host == req_host:
+                # 用 IP 直访的部署：IP 字面量**不可能**被 DNS 重绑定，
+                # 所以仍然认它 —— 否则 IP 访问直接登不进去。
+                host_ok = True
+            else:
+                host_ok = False
+        else:
+            # 配置里一个域名都没有 ⇒ 这是纯 IP 部署。没有域名可锚，
+            # DNS 重绑定（evil.com 解析到本机）也就无从谈起，
+            # 退回与 Host 头比较（与旧行为一致，不制造新的登录故障）。
+            host_ok = (host == req_host)
+        if not host_ok:
+            return True
+
+        allowed = {80, 443}
+        try:
+            allowed.add(int(cfg.get("gateway_port", 8443) or 8443))
+        except (TypeError, ValueError):
+            allowed.add(8443)
+        return port not in allowed
     except Exception:
         return True
 
@@ -1696,6 +2329,31 @@ def _effective_cookie_domain(cfg=None):
     return ""
 
 
+def _token_max_age(token: str, cfg=None) -> int:
+    """令牌 cookie 的 Max-Age —— 以**令牌自己的 exp** 为准。
+
+    2026-10-30（P1-14）：原来 `_set_cookies` 用的是 `_session_ttl(cfg)`
+    （滑动窗口 TTL，默认 1800 秒），而令牌的 exp 可能**比它短**：
+      · 绝对上限（auth_absolute_timeout）把 exp 卡在 `iat + 上限`，
+        离滑动窗口到期还早；
+      · 续期签发的新令牌 exp = min(now+ttl, 原 iat + 绝对上限)，同理。
+
+    于是出现「**cookie 比令牌活得久**」：令牌在服务端已经作废，
+    浏览器还一直带着它。表现是「明明刚登录成功，怎么又要登录」——
+    因为每个请求带过去的都是一张死令牌。
+    反过来（cookie 先死、令牌还活着）只是少登一次，无害。
+    所以 Max-Age 必须以令牌的真实寿命为准；解析不出来时才退回会话 TTL。
+    """
+    ttl = _session_ttl(cfg if cfg is not None else load_gateway_config())
+    payload = parse_token(token)
+    if not payload:
+        return ttl
+    exp = payload.get("exp")
+    if not isinstance(exp, int):
+        return ttl
+    return max(0, exp - int(time.time()))
+
+
 def _set_cookies(resp, token: str, device: str, clear: bool = False, raw: bool = True):
     """统一下发 cookie。
 
@@ -1715,9 +2373,9 @@ def _set_cookies(resp, token: str, device: str, clear: bool = False, raw: bool =
         return
     cfg = load_gateway_config()
     if token:
-        ttl = _session_ttl(cfg)
-        resp.set_cookie(COOKIE_TOKEN, token, max_age=ttl, httponly=True,
-                        secure=True, samesite="Lax", path="/", domain=cdom or None)
+        resp.set_cookie(COOKIE_TOKEN, token, max_age=_token_max_age(token, cfg),
+                        httponly=True, secure=True, samesite="Lax", path="/",
+                        domain=cdom or None)
     if device:
         resp.set_cookie(COOKIE_DEVICE, device, max_age=DEVICE_COOKIE_TTL,
                         httponly=True, secure=True, samesite="Lax", path="/",
@@ -1757,9 +2415,52 @@ def _assert_loopback_bind():
     0.0.0.0 意味着认证系统多一个可从公网直接触达的入口，是本项目
     安全模型里最不能破的一条（公网入口必须经 nginx auth_request）。
     提到模块加载时执行，导入即校验，绕过路径就没了。
+
+    ⚠️ 这一层查的是**环境变量**，不是事实 —— 2026-10-30（P1-12）
+    补了真正查内核里那个监听套接字的那一层（_assert_socket_loopback）。
+    两层都要：环境变量这一层管住「配置写错」，套接字那一层管住
+    「实际绑到了别处」。
     """
     if BIND_HOST not in ("127.0.0.1", "::1", "localhost"):
         print(f"[FATAL] 认证服务拒绝绑定 {BIND_HOST}：只允许 127.0.0.1/::1。"
+              f"公网入口必须经 nginx auth_request。", flush=True)
+        raise SystemExit(1)
+
+
+def _assert_socket_loopback(sock) -> None:
+    """检查**真实监听套接字**绑在哪 —— 不是回环就拒绝启动。
+
+    2026-10-30（P1-12）：原来只有 `_assert_loopback_bind()`，它看的是
+    **环境变量** AUTH_BIND_HOST。环境变量不是事实：
+      · `localhost` 解析到什么就是什么（/etc/hosts 是可改的文件）；
+      · 将来有人把 bind 地址换成别的，断言照样通过；
+      · 万一有一处代码用了另一个 bind 地址，这层完全看不见。
+
+    而这条断言保护的是本项目安全模型里最不能破的一条：
+    **认证服务只能绑回环**，公网入口必须经 nginx auth_request ——
+    绑 0.0.0.0 等于给认证系统开一个可从公网直接触达的入口。
+
+    `sock.getsockname()` 拿的是 bind() 之后的**真实地址**，
+    是内核层面的事实，不是配置层面的声明。
+
+    失败即退出（SystemExit(1)），与本文件其它校验一致：
+    「校验类的失败」绝不能变成「打印个警告然后继续跑」。
+    """
+    try:
+        addr = sock.getsockname()
+    except OSError as e:
+        print(f"[FATAL] 读不到监听套接字地址（{type(e).__name__}）—— 拒绝启动。",
+              flush=True)
+        raise SystemExit(1)
+    host = addr[0] if isinstance(addr, tuple) else addr
+    host = str(host or "").strip()
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        print(f"[FATAL] 监听地址 {host!r} 不是合法 IP —— 拒绝启动。", flush=True)
+        raise SystemExit(1)
+    if not ip.is_loopback:
+        print(f"[FATAL] 实际监听地址 {host} 不是回环 —— 拒绝启动。"
               f"公网入口必须经 nginx auth_request。", flush=True)
         raise SystemExit(1)
 
@@ -1856,6 +2557,8 @@ def _drop_privileges() -> bool:
 
 # 与 _assert_loopback_bind 同为模块级校验：导入即执行，WSGI 加载也逃不掉。
 _assert_loopback_bind()
+# 审计日志必须在**降权之前**摆正属主/权限 —— 降权之后就再也改不了属主了。
+_prepare_audit_log()
 _drop_privileges()
 
 
@@ -1871,4 +2574,18 @@ if __name__ == "__main__":
     print(f" * PBKDF2   : 并发闸门 {PBKDF2_GATE_SIZE} —— {PBKDF2_GATE_WHY}",
           flush=True)
 
-    app.run(host=BIND_HOST, port=BIND_PORT, threaded=True, debug=False)
+    # 用 make_server 而不是 app.run —— 只有拿到 server 对象才检查得了
+    # **真实监听套接字**（2026-10-30，P1-12）。app.run() 在内部建好
+    # server 就直接 serve_forever，套接字压根不经过我们的手。
+    from werkzeug.serving import make_server
+    try:
+        _srv = make_server(BIND_HOST, BIND_PORT, app, threaded=True)
+    except OSError as e:
+        print(f"[FATAL] 监听 {BIND_HOST}:{BIND_PORT} 失败（{type(e).__name__}: {e}）"
+              f" —— 拒绝启动。", flush=True)
+        raise SystemExit(1)
+    # 内核层面的事实：绑完之后的真实地址。不是回环 → 拒绝启动。
+    _assert_socket_loopback(_srv.socket)
+    print(f" * 监听地址 : {_srv.socket.getsockname()[0]}:{BIND_PORT}"
+          f"（已核验为回环）", flush=True)
+    _srv.serve_forever()
