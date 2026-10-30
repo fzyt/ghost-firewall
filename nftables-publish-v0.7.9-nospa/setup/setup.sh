@@ -807,8 +807,9 @@ ACME_DNSAPI_PLUGINS="dns_ali dns_tencent dns_cf dns_huaweicloud dns_porkbun dns_
 #   （200 / 0.85s）。
 #
 # 所以拆成两半分别拿：主脚本用 OpenWrt 裁剪版（上游已把它改成
-# #!/usr/bin/env sh，没有 bash 也能跑），插件按需从 raw.githubusercontent
-# 单独取（该域名国内可达，插件本身也是 sh 兼容的）。
+# #!/usr/bin/env sh，没有 bash 也能跑），插件按需单独取 ——
+# 优先 raw.githubusercontent，不通就退到 Gitee 上的官方镜像
+# （raw.githubusercontent 在国内是间歇性可达的，见下面的 base_list 注释）。
 install_acme() {
     info "========== 安装 acme.sh =========="
 
@@ -857,20 +858,62 @@ install_acme() {
     # ---- DNS 插件（面板的 DNS-01 验证全靠它们）----
     local dnsapi_dir="${acme_home}/dnsapi"
     mkdir -p "$dnsapi_dir"
-    local base="https://raw.githubusercontent.com/acmesh-official/acme.sh/master/dnsapi"
-    local p
+
+    # 插件来源。**按顺序试**，第一个通的就算数。
+    #
+    # 为什么要多个源（2026-10-30 在 .232 实测）：
+    #   raw.githubusercontent.com 在国内是**间歇性**可达的 ——
+    #   同一台机器上 12:07 一次 curl 0.365 秒就通了，
+    #   12:11 同样的命令连接直接超时。
+    #   更糟的是它失败起来很慢：`--max-time 60 --retry 2` 意味着
+    #   一个插件最坏要烧 3 分钟，6 个插件就是 **18 分钟**纯等待，
+    #   最后还一个都没下下来。
+    #   acme.sh 在 Gitee 上有官方镜像（neilpang/acme.sh），
+    #   实测直连 200 / 0~1 秒 ⇒ 国内网络下镜像才是主力，GitHub 是补充。
+    local base_list="https://raw.githubusercontent.com/acmesh-official/acme.sh/master/dnsapi
+https://gitee.com/neilpang/acme.sh/raw/master/dnsapi"
+
+    # 连续失败计数：所有插件都在同样的几个 host 上，
+    # 连着两个都拿不到 ⇒ 这些 host 就是不可达，继续试纯属浪费时间。
+    local consec_fail=0
+    local p base got
     for p in ${ACME_DNSAPI_PLUGINS}; do
         if [ -f "${dnsapi_dir}/${p}.sh" ]; then
             continue
         fi
+        if [ "$consec_fail" -ge 2 ]; then
+            warn "连续 ${consec_fail} 个插件取不到，判定下载源不可达 —— 跳过剩余插件"
+            warn "  面板的 DNS-01 证书申请会不可用（泛域名证书依赖它）"
+            warn "  修法：让设备能访问 raw.githubusercontent.com 或 gitee.com，"
+            warn "        或把 ${dnsapi_dir}/ 下的 dns_*.sh 手动拷进去"
+            break
+        fi
+
         info "下载 acme.sh DNS 插件 ${p}.sh ..."
-        if curl -fsSL --connect-timeout 15 --retry 2 --max-time 60 \
-             -o "${dnsapi_dir}/${p}.sh.part" "${base}/${p}.sh" 2>/dev/null; then
-            mv "${dnsapi_dir}/${p}.sh.part" "${dnsapi_dir}/${p}.sh"
-            chmod +x "${dnsapi_dir}/${p}.sh"
-        else
-            warn "插件 ${p}.sh 下载失败（该 DNS 提供商将不可用）"
+        got=""
+        for base in ${base_list}; do
+            # -4：OpenWrt 设备通常**没有 IPv6 默认路由**，而 DNS 又把 AAAA
+            #     排在前面 ⇒ 指定 IPv4 少一个变量（不影响功能，去掉一类抖动）
+            # --max-time 30 --retry 1：单个插件最坏 60 秒，而不是 3 分钟
+            if curl -4 -fsSL --connect-timeout 10 --retry 1 --max-time 30 \
+                    -o "${dnsapi_dir}/${p}.sh.part" "${base}/${p}.sh" 2>/dev/null; then
+                # ⚠️ 必须验大小：curl 拿到的是 404 页面时 -f 会报错，但
+                # 万一代理返回了一个 200 的错误页，落地的是垃圾内容。
+                if [ -s "${dnsapi_dir}/${p}.sh.part" ]; then
+                    mv "${dnsapi_dir}/${p}.sh.part" "${dnsapi_dir}/${p}.sh"
+                    chmod +x "${dnsapi_dir}/${p}.sh"
+                    got="yes"
+                    break
+                fi
+            fi
             mv -f "${dnsapi_dir}/${p}.sh.part" "${dnsapi_dir}/${p}.sh.part.failed" 2>/dev/null || true
+        done
+
+        if [ -n "$got" ]; then
+            consec_fail=0
+        else
+            consec_fail=$((consec_fail + 1))
+            warn "插件 ${p}.sh 下载失败（该 DNS 提供商将不可用）"
         fi
     done
 

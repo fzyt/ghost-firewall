@@ -233,6 +233,50 @@ def main():
     check('升级路径默认不动线上规则（--apply 才应用）',
           'APPLY' in deploy and 'phase_apply' in deploy)
 
+    # ── 8. acme.sh DNS 插件的下载不能白烧时间 ────────────────────────
+    #
+    # 2026-10-30 在 .232 实测：raw.githubusercontent.com 在国内是**间歇性**可达的
+    # （同一台机器 12:07 一次 curl 0.365 秒通了，12:11 同样命令连接直接超时）。
+    # 旧版 `--max-time 60 --retry 2` ⇒ 一个插件最坏 3 分钟，6 个 = 18 分钟纯等待，
+    # 最后还一个都没下下来。而 acme.sh 在 Gitee 上有官方镜像，实测 200 / 0~1 秒。
+    sec('8. acme.sh DNS 插件：多源 + 快速失败 + 有界耗时')
+
+    # 只切**插件下载循环**那一段（acme 主脚本的下载是另一回事，
+    # 参数不同，别混进来）
+    acme_fn = setup[setup.index('base_list='):] if 'base_list=' in setup else ''
+    acme_fn = acme_fn[:acme_fn.index('acme.sh 就绪')] if 'acme.sh 就绪' in acme_fn else acme_fn
+
+    check('插件清单还是那 6 个（少一个，那个 DNS 提供商就不可用）',
+          all(p in setup for p in
+              ('dns_ali', 'dns_tencent', 'dns_cf', 'dns_huaweicloud', 'dns_porkbun', 'dns_gd')))
+
+    check('插件下载有**多个源**（base_list）',
+          'base_list' in acme_fn and acme_fn.count('http') >= 2)
+    check('至少有一个非 GitHub 的源（国内镜像）',
+          'gitee.com' in acme_fn or 'mirror' in acme_fn,
+          'acme.sh 官方镜像在 Gitee 上，实测 200 / 0~1 秒')
+    check('源是按顺序试的（第一个通的就算数）',
+          re.search(r'for base in \$\{?base_list', acme_fn) is not None)
+
+    mt = re.search(r'--max-time (\d+)', acme_fn)
+    check('单次下载的超时被压住（≤30s，不是 60s）',
+          mt is not None and int(mt.group(1)) <= 30,
+          f'--max-time {mt.group(1) if mt else "?"}')
+    rt = re.search(r'--retry (\d+)', acme_fn)
+    check('重试次数被压住（≤1，不是 2）',
+          rt is not None and int(rt.group(1)) <= 1,
+          f'--retry {rt.group(1) if rt else "?"}')
+
+    check('连续失败会跳过剩余插件（源不可达就别硬试）',
+          re.search(r'consec_fail"?\s*-ge\s*2', acme_fn) is not None
+          and re.search(r'consec_fail"?\s*-ge\s*2.*?break', acme_fn, re.S) is not None)
+    check('跳过时会告诉用户怎么修（不能默默跳过）',
+          'gitee.com' in acme_fn and 'raw.githubusercontent.com' in acme_fn)
+    check('强制 IPv4（OpenWrt 设备通常没有 IPv6 默认路由）',
+          'curl -4' in acme_fn)
+    check('落地后校验非空（防止下到的是错误页）',
+          '-s "${dnsapi_dir}/${p}.sh.part"' in acme_fn)
+
     print('\n' + '=' * 60)
     print(f' 合计: ✅ {len(PASS)}   ❌ {len(FAIL)}')
     if FAIL:
