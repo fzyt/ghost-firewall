@@ -277,6 +277,49 @@ def main():
     check('落地后校验非空（防止下到的是错误页）',
           '-s "${dnsapi_dir}/${p}.sh.part"' in acme_fn)
 
+    # ── 9. 部署产物必须只含 git 跟踪的文件 ──────────────────────────
+    #
+    # 2026-10-30 在 .232 实测：frontend/index.html.bak（8 月的旧版管理 SPA
+    # 完整副本，107KB）在设备上，面板的 web 根目录正是 frontend/ ⇒
+    # 它被当静态文件对外提供（带会话 HTTP 200 直接能下）。
+    # 它是被 .gitignore 挡掉的，只因为部署脚本拷的是**整个目录**才上了设备。
+    #
+    # 连带问题：tar 覆盖只加/改不删 ⇒ 已从仓库删掉的文件会永远留在设备上，
+    # 变成跑着旧逻辑的死代码。
+    sec('9. 部署产物只含 git 跟踪的文件（且要清掉陈旧文件）')
+
+    check('传输由 git ls-files 清单驱动（不是 tar 整个目录）',
+          'git -C "$SRC" ls-files' in deploy)
+    check('tar 用 -T 读清单（--null 与 ls-files -z 配套）',
+          '--null -T "$track_list"' in deploy)
+    check('不再 tar 整个目录（. 会把 .gitignore 挡掉的东西一起带上）',
+          "-czf - . \\" not in deploy and 'tar -C "$SRC" --exclude' not in deploy)
+
+    # busybox 的 sort 不支持 -o：会把内容打到 stdout，混进差集输出里
+    # （踩过：114 个正常文件全被当成「陈旧」删掉，靠预检+回滚救回来）
+    check('设备侧不用 `sort -o`（busybox 不支持，会打到 stdout）',
+          'sort "$EXPECT" -o' not in deploy and 'sort $EXPECT -o' not in deploy)
+    check('设备侧差集用 grep -vxF -f（busybox 没有 comm）',
+          'grep -vxF -f "$EXPECT"' in deploy)
+    check('差集两边用 LC_ALL=C 排序（locale 不同会让差集失真）',
+          'LC_ALL=C sort' in deploy)
+    check('差集结果先写文件再 cat（stdout 里只该有差集本身）',
+          '/tmp/nftables-web-stale.list' in deploy)
+
+    # 安全网：差集超过上限就中止，绝不继续删
+    check('清理有数量上限（差集算法出错时中止而不是继续删）',
+          re.search(r'if \[ "\$N" -gt "\$LIMIT" \]', deploy) is not None)
+    check('删除动作在设备侧完成（清单不来回传 stdout）',
+          'device_remove_stale' in deploy and 'rm -f "$APP_DIR/$f"' in deploy)
+
+    # 自检：运行时产物不参与比对
+    check('自检排除 __pycache__ / *.pyc（运行时产物，判失败是误报）',
+          '__pycache__' in deploy and '\\.pyc$' in deploy)
+    check('自检用同一个差集函数（别写第二套逻辑）',
+          'stale="$(device_stale_files' in deploy)
+    check('源码目录必须在 git 仓库里（否则拿不到跟踪清单）',
+          '不在 git 仓库里' in deploy)
+
     print('\n' + '=' * 60)
     print(f' 合计: ✅ {len(PASS)}   ❌ {len(FAIL)}')
     if FAIL:

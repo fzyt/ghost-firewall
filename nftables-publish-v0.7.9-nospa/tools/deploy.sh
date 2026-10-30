@@ -159,6 +159,77 @@ rssh() { ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "$@"; }
 # 在设备上跑一段 sh 脚本（stdin）
 rsh()  { ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "sh -s"; }
 
+# ── 设备上「受管目录里不属于 git 跟踪清单」的文件 ─────────────────────
+#
+# 受管目录 = backend/ frontend/ tools/ tests/
+# （setup/ docker/ README 这些不在受管范围，不会被误删）
+#
+# 排除运行时产物：__pycache__ / *.pyc —— 它们每次服务启动都会被 Python
+# 重新生成，删了也留不住，拿它们判失败是**误报**（踩过：第一次加这条自检
+# 时就是被 __pycache__ 判红，然后自动回滚了，而部署其实没问题）。
+#
+# ⚠️ 两个踩过的坑，都写在这里免得再犯：
+#
+#  1) busybox 的 sort **不支持 -o**。`sort "$F" -o "$F"` 在设备上会把
+#     排序结果**打到 stdout** —— 混进下面的差集输出里，于是 114 个正常
+#     文件全被当成了「陈旧」并删掉（当场被预检抓到 → 自动回滚救回来）。
+#     所以这里**不在设备上排序**：清单在本地就已经排好序了。
+#
+#  2) 设备上没有 comm（busybox），用 grep -vxF -f 做差集；
+#     两边都必须是 LC_ALL=C 排序，否则 locale 不同会让差集完全失真
+#     （踩过：同一批文件同时出现在「多出」和「缺」两个列表里）。
+#
+# 结果先写到文件再 cat 出来 —— stdout 里只应该有差集本身，
+# 任何别的输出混进来都会变成「要删的文件」。
+device_stale_files() {
+    rssh 'APP_DIR=/opt/nftables-web-v2
+EXPECT=/tmp/nftables-web-track.list
+[ -f "$EXPECT" ] || exit 0
+find "$APP_DIR/backend" "$APP_DIR/frontend" "$APP_DIR/tools" "$APP_DIR/tests" -type f 2>/dev/null \
+  | sed "s|^$APP_DIR/||" \
+  | grep -v -E "__pycache__|\.pyc$|^tests/reports/" \
+  | LC_ALL=C sort > /tmp/nftables-web-actual.list 2>/dev/null
+LC_ALL=C grep -vxF -f "$EXPECT" /tmp/nftables-web-actual.list > /tmp/nftables-web-stale.list 2>/dev/null
+cat /tmp/nftables-web-stale.list' || true
+}
+
+# 删掉设备上的陈旧/未跟踪文件。**整个差集计算 + 删除都在设备侧完成**，
+# 文件清单不来回传 stdout —— 少一个能出错的环节。
+#
+# 数量上限是安全网：差集正常情况下只有个位数（最多一两个 .bak）。
+# 一旦超过上限，说明**差集算法出错了**（比如 busybox sort 的 -o 那个坑），
+# 这时候绝不能继续删 —— 直接中止，让部署停下来报错。
+device_remove_stale() {
+    local limit="$1"
+    # ⚠️ heredoc 用引号版（'EOS'）⇒ 里面的 $1 **不会**在本地展开，
+    #    设备上的 `sh -s` 又拿不到参数 ⇒ LIMIT 会是空的。
+    #    所以把 limit 作为 `sh -s` 的位置参数传过去（$1 才是它）。
+    rssh "sh -s -- '$limit'" <<'EOS' || return 1
+APP_DIR=/opt/nftables-web-v2
+EXPECT=/tmp/nftables-web-track.list
+LIMIT="$1"
+[ -f "$EXPECT" ] || exit 0
+find "$APP_DIR/backend" "$APP_DIR/frontend" "$APP_DIR/tools" "$APP_DIR/tests" -type f 2>/dev/null \
+  | sed "s|^$APP_DIR/||" \
+  | grep -v -E "__pycache__|\.pyc$|^tests/reports/" \
+  | LC_ALL=C sort > /tmp/nftables-web-actual.list 2>/dev/null
+LC_ALL=C grep -vxF -f "$EXPECT" /tmp/nftables-web-actual.list > /tmp/nftables-web-stale.list 2>/dev/null
+N=$(wc -l < /tmp/nftables-web-stale.list)
+echo "陈旧文件数: $N"
+if [ "$N" -gt "$LIMIT" ]; then
+    echo "❌ 超过上限 $LIMIT —— 差集算法可能出错了，不删"
+    echo "（前 5 个:）"
+    head -5 /tmp/nftables-web-stale.list
+    exit 3
+fi
+while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    rm -f "$APP_DIR/$f" && echo "  已删除 $f"
+done < /tmp/nftables-web-stale.list
+exit 0
+EOS
+}
+
 # ── 本地预检 ─────────────────────────────────────────────────────────
 precheck_local() {
     say "本地预检"
@@ -169,6 +240,14 @@ precheck_local() {
     ok "命令齐全"
     step "源码目录: $SRC"
     step "待部署版本: v$LOCAL_VERSION"
+    # 传输只传 **git 跟踪的文件**（清单驱动），所以源码目录必须在 git 仓库里。
+    # 不在的话后面拿不到清单 —— 与其那时才报错，不如现在说清楚。
+    if ! git -C "$SRC" rev-parse --git-dir >/dev/null 2>&1; then
+        die "源码目录不在 git 仓库里: $SRC
+     部署脚本只传 **git 跟踪的文件**（.gitignore 挡掉的东西不该上设备，
+     比如 frontend/index.html.bak 会被面板当静态文件对外提供），
+     所以必须从仓库里跑。"
+    fi
     if git -C "$SRC" rev-parse --git-dir >/dev/null 2>&1; then
         local rev branch dirty
         rev="$(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo '?')"
@@ -368,6 +447,45 @@ EOS
 phase_transfer() {
     say "阶段 4/9　传输文件"
 
+    # ------------------------------------------------------------
+    # 只传 **git 跟踪的文件**（清单驱动），不是整个目录
+    # ------------------------------------------------------------
+    #
+    # 为什么不能 tar 整个目录：目录里混着 .gitignore 挡掉的东西 ——
+    #   frontend/index.html.bak   8 月的旧版管理 SPA 完整副本（107KB），
+    #                             面板会把它当静态文件**对外提供**
+    #                             （2026-10-30 在 .232 实测：带会话 HTTP 200）
+    #   backend/__pycache__/*.pyc 旧字节码，会让新代码不生效
+    #   docker/.env               **每台机器各自的本机配置**（放行网段等）
+    #   docs/ backups/            本地文档与备份
+    # 这些都不是产品代码。整个目录传上去 = 把本机的东西泄到设备上。
+    #
+    # git ls-files 的输出是**相对当前目录**的（实测：在产品目录里跑
+    # `git ls-files -- .` 得到的是 backend/app.py 这种相对路径），
+    # 可以直接喂给 tar -T -。
+    local track_list
+    track_list="/tmp/nftables-web-track-$$.list"
+    if [ "$MODE" = "fresh" ]; then
+        git -C "$SRC" ls-files -z -- . > "$track_list" 2>/dev/null \
+            || { mv -f "$track_list" /tmp/ 2>/dev/null || true; die "读取 git 跟踪文件清单失败"; }
+    else
+        # 升级路径只覆盖这几处（跟之前一致），但仍然只取其中**被 git 跟踪**的
+        git -C "$SRC" ls-files -z -- backend frontend tools tests VERSION > "$track_list" 2>/dev/null \
+            || { mv -f "$track_list" /tmp/ 2>/dev/null || true; die "读取 git 跟踪文件清单失败"; }
+    fi
+    local nfiles
+    nfiles="$(tr '\0' '\n' < "$track_list" | grep -c . || true)"
+    [ "${nfiles:-0}" -gt 0 ] || { mv -f "$track_list" /tmp/ 2>/dev/null || true; die "git 跟踪文件清单是空的"; }
+    step "git 跟踪文件 $nfiles 个（只传这些，不传 .gitignore 挡掉的）"
+
+    # 受管目录的跟踪清单要单独一份送到设备上 —— 设备侧拿它做差集，
+    # 找出「不在仓库里却还在设备上」的文件（见 device_stale_files 的注释）。
+    local track_managed
+    track_managed="/tmp/nftables-web-managed-$$.list"
+    git -C "$SRC" ls-files -z -- backend frontend tools tests 2>/dev/null \
+        | tr '\0' '\n' | LC_ALL=C sort > "$track_managed" \
+        || { mv -f "$track_list" "$track_managed" /tmp/ 2>/dev/null || true; die "读取受管目录清单失败"; }
+
     if [ "$MODE" = "fresh" ]; then
         # 全新安装：先传到暂存目录，再由 setup.sh 复制到安装目录。
         # （不能直接传到 $APP_DIR 再让 setup.sh --local $APP_DIR ——
@@ -375,14 +493,15 @@ phase_transfer() {
         local stage="/tmp/nftables-web-stage"
         step "传到暂存目录 $stage"
         if [ "$DRY_RUN" = 1 ]; then
-            step "[dry-run] tar -C $SRC -czf - . | ssh ... tar -C $stage -xzf -"
+            step "[dry-run] tar -C $SRC --null -T <git清单> -czf - | ssh ... tar -C $stage -xzf -"
             step "[dry-run] sh $stage/setup/setup.sh --local $stage --force"
+            mv -f "$track_list" /tmp/ 2>/dev/null || true
             return 0
         fi
         rssh "rm -rf '$stage' && mkdir -p '$stage'"
-        # 整个仓库都传（去掉 .git），这样 setup.sh --local 复制出来的
-        # 安装目录跟官方 GitHub 安装路径一致（tools/ tests/ 也在里面）。
-        tar -C "$SRC" --exclude='.git' --exclude='__pycache__' -czf - . \
+        # 传整个仓库的**跟踪文件**，这样 setup.sh --local 复制出来的
+        # 安装目录跟官方 GitHub 安装路径一致（tools/ tests/ setup/ 也在里面）。
+        tar -C "$SRC" --null -T "$track_list" -czf - \
             | rssh "tar -C '$stage' -xzf -" || die "传输失败"
         ok "已传输到暂存目录"
 
@@ -391,6 +510,14 @@ phase_transfer() {
         rssh "sh '$stage/setup/setup.sh' --local '$stage' --force" \
             || die "setup.sh 失败（详见设备上 /var/log/nftables-web-setup.log）"
         ok "setup.sh 完成"
+
+        # 全新安装时安装目录是 setup.sh 从暂存目录拷出来的，暂存目录里
+        # 只有跟踪文件 ⇒ 理论上不会有陈旧文件。但设备上**可能本来就装过**
+        # 旧版本（setup.sh 是 cp -r 覆盖，不删），所以同样跑一次差集清理。
+        rssh "cat > /tmp/nftables-web-track.list" < "$track_managed" \
+            || die "传输跟踪清单失败"
+        device_remove_stale 20 || die "清理陈旧文件失败（差集超过上限，已中止；设备未被删改）"
+        mv -f "$track_list" "$track_managed" /tmp/ 2>/dev/null || true
         return 0
     fi
 
@@ -403,15 +530,34 @@ phase_transfer() {
     # 留着 10-27 的旧副本会误导人。
     step "覆盖 backend/ frontend/ tools/ tests/ VERSION"
     if [ "$DRY_RUN" = 1 ]; then
-        step "[dry-run] tar -C $SRC -czf - backend frontend tools tests VERSION | ssh ... tar -C $APP_DIR -xzf -"
+        step "[dry-run] tar -C $SRC --null -T <git清单> -czf - | ssh ... tar -C $APP_DIR -xzf -"
+        mv -f "$track_list" /tmp/ 2>/dev/null || true
         return 0
     fi
     rssh "mkdir -p '$APP_DIR'"
-    tar -C "$SRC" --exclude='tests/reports' --exclude='__pycache__' \
-        -czf - backend frontend tools tests VERSION \
+    tar -C "$SRC" --null -T "$track_list" -czf - \
         | rssh "tar -C '$APP_DIR' -xzf -" || die "传输失败"
-    # 清掉可能残留的 __pycache__（旧 .pyc 会让新代码不生效）
-    rssh "find '$APP_DIR/backend' -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true"
+
+    # ---- 清掉设备上的陈旧/未跟踪文件 ----
+    #
+    # tar 覆盖是「加 / 改」，**不「删」** —— 已从仓库删掉的文件会永远留在
+    # 设备上，变成跑着旧逻辑的死代码。2026-10-30 在 .232 实测：
+    # frontend/index.html.bak（8 月的旧版管理 SPA 完整副本，107KB）就在
+    # 设备上，而面板的 web 根目录正是 frontend/ ⇒ 它被当静态文件对外提供
+    # （带会话 HTTP 200 直接能下）。
+    #
+    # 所以这里拿 git 跟踪清单做差集，把「不在仓库里」的文件删掉。
+    # 只在**受管目录**里做（setup/ docker/ README 不在受管范围）。
+    # 差集计算 + 删除都在设备侧完成，文件清单不来回传 stdout。
+    rssh "cat > /tmp/nftables-web-track.list" < "$track_managed" \
+        || die "传输跟踪清单失败"
+    device_remove_stale 20 || die "清理陈旧文件失败（差集超过上限，已中止；设备未被删改）"
+
+    # busybox 的 find **不支持** `-exec ... {} +`（只支持 `{} \;`），
+    # 也不支持 `-delete` —— 原来那条清理命令在设备上是**静默失败**的。
+    # 这里逐个改成 busybox 真的支持的写法。
+    rssh "find '$APP_DIR' -name '__pycache__' -type d -prune -exec rm -rf {} \; 2>/dev/null || true"
+    rssh "find '$APP_DIR' -name '*.pyc' -type f -exec rm -f {} \; 2>/dev/null || true"
     # tests/reports/ 是**未跟踪的测试产物**（e2e 输出、旧的 Shannon 报告），
     # 不是产品代码也不是用户状态 —— 清掉，避免把上一轮的结论当成既有事实。
     # 注意这跟「只覆盖不删除」不冲突：那条规矩针对的是配置/口令/密钥/限流表，
@@ -423,6 +569,7 @@ phase_transfer() {
     rssh "cp -f '$APP_DIR/backend/nftables-web.init' '$PANEL_INIT' && chmod 755 '$PANEL_INIT'"
     rssh "cp -f '$APP_DIR/backend/nftables-web-auth.init' '$GW_INIT' && chmod 755 '$GW_INIT'"
     ok "init 脚本已更新"
+    mv -f "$track_list" "$track_managed" /tmp/ 2>/dev/null || true
 }
 
 # ── 阶段 5：权限与密钥 ──────────────────────────────────────────────
@@ -639,6 +786,25 @@ phase_verify() {
 
     acode="$(rssh "curl -s -o /dev/null -w '%{http_code}' --max-time 8 http://127.0.0.1:${auth_port_cfg}/auth/status" || true)"
     check_eq "认证 API /auth/status 返回 200" "200" "$acode"
+
+    # 受管目录里不该有「不在 git 跟踪清单里」的文件。
+    #
+    # 这条不是洁癖，两个理由：
+    #  ① 面板的 web 根目录就是 frontend/，落在那里的任何文件都会被 Flask
+    #     当静态资源**对外提供**。2026-10-30 在 .232 实测：
+    #     frontend/index.html.bak（8 月的旧版管理 SPA 完整副本，107KB）
+    #     带着会话能直接下到（HTTP 200）—— 而它是被 .gitignore 挡掉的，
+    #     只因为部署脚本拷的是**整个目录**才上了设备。
+    #  ② tar 覆盖只加/改不删 ⇒ 已从仓库删掉的文件会永远留在设备上，
+    #     变成跑着旧逻辑的死代码。
+    #
+    # 运行时产物（__pycache__ / *.pyc）**不参与比对** —— 它们每次服务启动
+    # 都会被 Python 重新生成，删了也留不住，拿它们判失败是误报
+    # （踩过：第一次加这条自检就是被 __pycache__ 判红 → 触发了自动回滚，
+    #  而部署其实没问题）。
+    local stale
+    stale="$(device_stale_files | head -5 | tr '\n' ' ')"
+    check_eq "受管目录里没有陈旧/未跟踪的文件（如 *.bak）" "" "$stale"
 
     # 权限（busybox ls -l：$1 权限位 $3 属主 $4 属组）
     local perms
