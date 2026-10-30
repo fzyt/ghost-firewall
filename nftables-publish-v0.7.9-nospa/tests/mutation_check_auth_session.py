@@ -188,10 +188,21 @@ MUTATIONS = [
      "        os.chown(path, -1, grp.getgrnam('nftweb').gr_gid)",
      "        os.chown(path, -1, os.getgid())"),
 
-    ("权限：chgrp 之后忘了 chmod 640（属组对了但组仍无读权限）",
+    # ⚠️ 这条变异在 2026-10-30 改造过 —— 原写法变成了**等价变异**。
+    #
+    # 原变异是「chgrp 之后忘了 chmod 640」。但口令文件现在**落盘那一刻**
+    # 就是 0640（`_write_password_hash` 里的 `_ensure_file_mode`）⇒
+    # `_apply_shared_secret_perms` 里那次 chmod 变成**冗余**，
+    # 去掉它文件权限也不变 ⇒ 测不到任何东西（全量回归实测漏网）。
+    #
+    # 改成真实可发生的退化方向：**chmod 写成了 600**。
+    # 属组对了但组仍无读权限 ⇒ 降权后的网关读不到密码文件。
+    # 这正是该函数注释里记着的历史 bug（「这一行以前写的是 chmod 600，
+    # 改一次密码就让网关再也读不到密码文件」）。
+    ("权限：chgrp 之后 chmod 写成了 600（属组对了但组仍无读权限）",
      APP,
      '    try:\n        os.chmod(path, 0o640)\n    except OSError:\n        pass',
-     '    pass'),
+     '    try:\n        os.chmod(path, 0o600)\n    except OSError:\n        pass'),
 
     ("权限：回退分支直接放行不 chmod（组不存在时文件权限失控）",
      APP,

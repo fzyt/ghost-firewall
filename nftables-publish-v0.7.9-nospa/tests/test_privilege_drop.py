@@ -435,23 +435,47 @@ check('master 必须是 root（worker 降权不等于 master 也降）',
 sec('PD-11  私钥权限：每次写入后都要补组读，否则 worker 读不到')
 
 _app_src = open(os.path.join(BACKEND, 'app.py'), encoding='utf-8').read()
+# 计数必须在**去掉注释行**的源码上做。
+# 2026-10-30 踩过：新增的说明性注释里写了 `os.chmod(key_path, 0o600)` 字样，
+# 于是「有几处 chmod」被数成 4（真实代码 3 处），把断言带偏了。
+# 注释里出现代码片段是**应该的**（解释为什么要那么写），所以要改的是计数口径，
+# 不是把注释改写含糊。
+_app_code = '\n'.join(l for l in _app_src.split('\n') if not l.strip().startswith('#'))
 check('_harden_key_for_nginx_worker 函数存在', '_harden_key_for_nginx_worker' in _app_src)
-_n_chmod = len(re.findall(r'os\.chmod\((?:key_path|NFTABLES_WEB_KEY),\s*0o600\)', _app_src))
+_n_chmod = len(re.findall(r'os\.chmod\((?:key_path|NFTABLES_WEB_KEY),\s*0o600\)', _app_code))
 # 关键：这里数的是**全部**调用点，不能按参数名过滤。
 # 原版写的是 re.findall(r'_harden_key_for_nginx_worker\((?:key_path|NFTABLES_WEB_KEY)\)'),
 # 而两条 ACME 路径传的是 `keyfile` 和 `os.path.join(cert_dir, "privkey.pem")` ——
 # 于是它们从来没进过统计。断言号称「补权限与 chmod 一一对应」，
 # 却对 P0-2「ACME 路径漏加固」完全失明，那条缺陷就是这样活下来的。
 # 现在改成数所有调用点，五条写入路径必须一条不少。
-_n_hard = len(re.findall(r'^\s+_harden_key_for_nginx_worker\(', _app_src, re.M))
+_n_hard = len(re.findall(r'^\s+_harden_key_for_nginx_worker\(', _app_code, re.M))
+# 2026-10-30 计数从 5 变成 7：上传/重传两条路径各自多了一次
+# **在 os.replace 之前**的提前加固（tmp 私钥落盘即最终形态，
+# 不必等 replace 之后再补 —— 那样中间有一段 0600 的过渡态）。
+# 7 = 5 条写入路径各一次 + 上传/重传各一次「replace 前提前加固」。
 check('三处 chmod(key, 600) 全部配了补权限', _n_chmod == 3, f'实际 {_n_chmod} 处')
-check('五条私钥写入路径都调了补权限（含两条不 chmod 的 ACME 路径）',
-      _n_hard == 5, f'实际 {_n_hard} 处')
-# 三条会 chmod 的路径必须是 chmod 之后紧跟加固：顺序反了等于去加固一个还没被改过的权限
-_ORDER_RE = r'os\.chmod\((?:key_path|NFTABLES_WEB_KEY),\s*0o600\)\s*\n\s*_harden_key_for_nginx_worker\('
+check('五条私钥写入路径都调了补权限（含两条不 chmod 的 ACME 路径）+ 两条 replace 前提前加固',
+      _n_hard == 7, f'实际 {_n_hard} 处')
+# 会 chmod 的路径必须在 chmod 之后跟着加固：顺序反了等于去加固一个还没被改过的权限
+_ORDER_RE = (r'os\.chmod\((?:key_path|NFTABLES_WEB_KEY),\s*0o600\)'
+              r'(?:\s*\n\s*#[^\n]*)*\s*\n\s*_harden_key_for_nginx_worker\(')
 check('chmod 之后紧跟补权限（顺序反了等于没加固）',
-      len(re.findall(_ORDER_RE, _app_src)) == 3,
-      f'实际匹配 {len(re.findall(_ORDER_RE, _app_src))} 处')
+      len(re.findall(_ORDER_RE, _app_code)) == 3,
+      f'实际匹配 {len(re.findall(_ORDER_RE, _app_code))} 处')
+
+# ── 2026-10-30 新增：私钥**落盘那一刻**就得是紧的 ──────────────────
+# 旧写法是 key_file.save(tmp) → os.replace(tmp, key_path) → os.chmod(key_path, 600)：
+# save() 按 umask 建 0644 的文件，replace 之后正式私钥也是 0644，
+# chmod 在**之后**才做 ⇒ 中间有一小段时间全设备的本地用户都能读到这个私钥。
+# 私钥泄露 = 身份凭据泄露，这个窗口不能靠「很短」来糊弄。
+check('_ensure_file_mode 辅助函数存在', 'def _ensure_file_mode(' in _app_src)
+check('上传路径：私钥 tmp 先按 0600 建好再写内容',
+      '_ensure_file_mode(tmp_k, 0o600)' in _app_code)
+check('私钥 tmp 在 replace 之前就补上 worker 组读权限（落盘即最终形态）',
+      len(re.findall(r'_harden_key_for_nginx_worker\(tmp_k\)', _app_code)) == 2,
+      f'实际 {len(re.findall(r"_harden_key_for_nginx_worker\(tmp_k\)", _app_code))} 处'
+      '（上传 + 重传各一处）')
 # 注意这里必须精确盯 OSError 那一支：函数里有两个 return False
 # （ImportError 分支 + OSError 分支），非贪婪的 `.*?return False`
 # 会匹配到第一个，把第二个改成 raise 也照样「通过」—— 变异验证实测过。

@@ -193,6 +193,8 @@ def _read_password_hash() -> str:
 
 def _write_password_hash(hash_str: str):
     os.makedirs(os.path.dirname(AUTH_PASSWORD_FILE), exist_ok=True)
+    # 口令哈希落盘那一刻就是 640（不是 umask 默认的 0644 再 chmod）
+    _ensure_file_mode(AUTH_PASSWORD_FILE, 0o640)
     with open(AUTH_PASSWORD_FILE, 'w') as f:
         json.dump({'hash': hash_str, 'created_at': datetime.datetime.now().isoformat()}, f)
     # 必须是 640 + root:nftweb，不是 600 —— 见 _apply_shared_secret_perms 的说明。
@@ -1028,10 +1030,16 @@ def save_config(config, _force=False):
             raise ConfigCorruptedError(_CORRUPT_REFUSAL.format(err=err, path=CONFIG_PATH))
     # 自动备份当前配置
     if os.path.exists(CONFIG_PATH):
+        # 备份里是**完整配置**（含 DDNS API token、reverse_proxy 凭据），
+        # 落盘那一刻就必须是 0640。
+        # shutil.copy 会先按 umask 建出文件（默认 0644 = 全设备可读），
+        # 拷完才 copystat 改权限 ⇒ 中间有一段谁都能读。
+        # 正确做法：先用目标权限把 .backup 建好再往里拷
+        # （open 对已存在文件只截断、不改权限 ⇒ 没有窗口）。
+        _ensure_file_mode(CONFIG_PATH + '.backup', _CONFIG_FILE_MODE)
         shutil.copy(CONFIG_PATH, CONFIG_PATH + '.backup')
-        # shutil.copy 不复制权限位，新建出来的 .backup 会落到 umask 默认值
-        # （通常 0644 = world-readable）。备份里同样有第三方 DNS 凭据，
-        # 收紧到与主文件一致。
+        # shutil.copy 末尾的 copystat 会把**源文件**的权限带过来；
+        # 源文件若被手工改宽了，这里再收紧一次。
         try:
             os.chmod(CONFIG_PATH + '.backup', _CONFIG_FILE_MODE)
         except OSError:
@@ -1041,9 +1049,13 @@ def save_config(config, _force=False):
     tmp_path = CONFIG_PATH + '.tmp'
     lock_path = CONFIG_PATH + '.lock'
     try:
-        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+        # ⚠️ os.open 不带 mode 时按 umask 建文件（0644 = world-readable）
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, _CONFIG_FILE_MODE)
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            # 落盘那一刻就是目标权限（见 _ensure_file_mode 的注释）——
+            # 旧写法是写完再 chmod，中间有一段谁都能读。
+            _ensure_file_mode(tmp_path, _CONFIG_FILE_MODE)
             with open(tmp_path, 'w') as f:
                 json.dump(config, f, indent=2, ensure_ascii=False)
                 f.flush()
@@ -1057,6 +1069,7 @@ def save_config(config, _force=False):
         # fcntl 不可用或锁失败：记录日志后回退到无锁模式（保留原子写）
         print(f"[WARNING] save_config 加锁失败（{type(e).__name__}: {e}），回退到无锁模式", flush=True)
         try:
+            _ensure_file_mode(tmp_path, _CONFIG_FILE_MODE)
             with open(tmp_path, 'w') as f:
                 json.dump(config, f, indent=2, ensure_ascii=False)
                 f.flush()
@@ -2509,7 +2522,12 @@ def restore_config():
         #    「恢复出来的旧配置」和「并发写入的新配置」互相覆盖，
         #    结果取决于谁最后落盘。
         try:
-            lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+            # ⚠️ 这个锁文件跟 save_config 是**同一个** CONFIG_PATH + '.lock'。
+            # 原来这里 os.open 不带 mode → 按 umask 建（默认 0644 = 全设备可读）。
+            # 更糟的是：save_config 随后用 O_CREAT 打开**已存在**的文件时，
+            # POSIX 不会改权限 —— 于是「先恢复配置、后保存配置」的话，
+            # 锁文件会**永远**停在 0644，谁都改不掉。
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, _CONFIG_FILE_MODE)
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
         except OSError as e:
             print(f'[WARN] restore_config 加锁失败（继续无锁恢复）: {e}', flush=True)
@@ -2519,7 +2537,16 @@ def restore_config():
         #    而 load_config 遇到截断 JSON 会当损坏处理 → 备份成
         #    .corrupted.* 后**静默回落到 DEFAULT_CONFIG**，
         #    等于「恢复配置」反而把配置弄丢了。
+        # 恢复用的 tmp：落盘那一刻就必须是 0640。
+        # shutil.copy 会先按 umask 建文件（默认 0644）拷完才 copystat ⇒ 有窗口。
+        # 顺序要紧：先用目标权限把 tmp 建好，再往里拷
+        # （open 对已存在文件只截断、不改权限 ⇒ 没有窗口）。
+        _ensure_file_mode(tmp_path, _CONFIG_FILE_MODE)
         shutil.copy(backup_path, tmp_path)
+        # copystat 会把**备份文件**的权限带过来；
+        # 备份文件要是被手工改宽了，恢复出来的主配置就跟着变宽 ——
+        # 主配置里有 DDNS token。落盘那一刻就钉死成 0640。
+        _ensure_file_mode(tmp_path, _CONFIG_FILE_MODE)
         with open(tmp_path, 'r') as f:
             json.load(f)          # 校验恢复出来的确实是完整 JSON
         os.replace(tmp_path, CONFIG_PATH)
@@ -3341,6 +3368,10 @@ def _apply_ruleset_locked(config):
 
     # 1. 先写临时文件做语法预检（nft -c 只检查不执行），校验通过才落到正式路径
     tmp_path = RULES_PATH + '.tmp'
+    # 规则集里含白/黑名单 IP 与信任 IP，权限不该由 umask 决定。
+    # tmp 落盘就是 0600 ⇒ os.replace 之后正式规则集也是 0600
+    # （nft 以 root 读，不受影响）。
+    _ensure_file_mode(tmp_path, 0o600)
     with open(tmp_path, 'w') as f:
         f.write(rules)
     try:
@@ -3362,6 +3393,8 @@ def _apply_ruleset_locked(config):
     if had_old:
         try:
             shutil.copy(RULES_PATH, lastgood)
+            # .lastgood 是回滚材料，权限同样不该由 umask 决定
+            os.chmod(lastgood, 0o600)
         except OSError as e:
             # 备份失败 = 没有回滚材料。接下来的 os.replace 会把旧文件覆盖掉，
             # 万一 nft -f 再失败就什么都恢复不了。所以这里直接中止。
@@ -4334,6 +4367,10 @@ def _load_aliyun_ddns_config():
 def _save_aliyun_ddns_config(config):
     """保存阿里云 DDNS 配置"""
     os.makedirs(os.path.dirname(ALIYUN_DDNS_CONFIG_PATH), exist_ok=True)
+    # ⚠️ 里面是 AccessKey secret。旧写法是 open(...,'w') 建 0644 的文件、
+    # 写完再 chmod 0600 —— 中间有一小段时间全设备的本地用户都能读。
+    # 现在落盘那一刻就是 0600（见 _ensure_file_mode 的注释）。
+    _ensure_file_mode(ALIYUN_DDNS_CONFIG_PATH, 0o600)
     with open(ALIYUN_DDNS_CONFIG_PATH, 'w') as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
     os.chmod(ALIYUN_DDNS_CONFIG_PATH, 0o600)
@@ -5139,7 +5176,10 @@ def _lists_file_lock():
     lock_fd = None
     try:
         os.makedirs(os.path.dirname(LISTS_LOCK_PATH), exist_ok=True)
-        lock_fd = os.open(LISTS_LOCK_PATH, os.O_CREAT | os.O_RDWR)
+        # ⚠️ os.open 不带 mode 时按 umask 建文件（默认 0644）——
+        #    锁文件同样不该对所有本地用户可读。
+        lock_fd = os.open(LISTS_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+        os.chmod(LISTS_LOCK_PATH, 0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
     except Exception as e:   # noqa: BLE001
         if not _LISTS_LOCK_WARNED:
@@ -5206,6 +5246,9 @@ def save_lists(data):
                for n in sorted(VALID_SET_NAMES)}
     tmp = f'{LISTS_PATH}.tmp.{os.getpid()}.{threading.get_ident()}'
     try:
+        # 名单里是白/黑名单 IP。落盘那一刻就是 0600 ——
+        # 旧写法由 umask 决定（默认 0644 = 所有本地用户可读）。
+        _ensure_file_mode(tmp, 0o600)
         with open(tmp, 'w') as f:
             json.dump(payload, f, indent=2, ensure_ascii=False)
             f.flush()
@@ -5760,6 +5803,50 @@ NFTABLES_WEB_KEY = os.path.join(NFTABLES_WEB_SSL_DIR, "privkey.pem")
 # 但 worker 才是真正处理公网流量的进程 —— 它以 root 运行的话，nginx 侧
 # 任何一处漏洞都直接等于整台机器沦陷，和认证网关那半个问题是同一类。
 NGINX_WORKER_USER = "nobody"
+
+
+def _ensure_file_mode(path, mode=0o600, gid=None):
+    """把 path 的权限设成 mode，**在内容写进去之前**做。
+
+    为什么需要它：「先写再 chmod」是有窗口的
+    -----------------------------------------
+    `open(path, 'w')` 按 umask 建文件（默认 0644），等写完再 chmod 0600 ——
+    中间那一小段时间里文件对**所有本地用户**可读。窗口很短，但：
+
+      · TLS 私钥泄露 = 身份凭据泄露，不是「信息泄露」
+      · 窗口正好覆盖「写完 → 校验通过 → replace」这段，
+        在慢盘/大文件上可以是几十毫秒到几秒
+      · 靠「窗口短」来保证安全，是把安全建立在调度时序上
+
+    POSIX 的一个特性正好能治这个：`open(path, 'w')` 对**已存在**的文件
+    只截断、**不改权限**。所以「先用目标权限把文件建好，再往里写」，
+    内容落盘的那一刻权限就是对的 —— 没有「先 0644 再 chmod 0600」的窗口。
+
+    gid 不为空时额外 chgrp 到该组（nginx worker 要读私钥，见
+    `_harden_key_for_nginx_worker`）。
+
+    返回 True/False：False 表示权限没设成功（调用方要不要因此中止，
+    由调用方决定 —— 证书该存还是要存，但降权失败得让人知道）。
+    """
+    ok = True
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY, mode)
+        os.close(fd)
+    except OSError as e:
+        ok = False
+        print(f'[WARN] 预建文件失败（{path}: {e}），继续', flush=True)
+    try:
+        os.chmod(path, mode)
+    except OSError as e:
+        ok = False
+        print(f'[WARN] 设置权限失败（{path}: {e}）', flush=True)
+    if gid is not None:
+        try:
+            os.chown(path, 0, gid)
+        except (OSError, AttributeError) as e:
+            ok = False
+            print(f'[WARN] 设置属组失败（{path}: {e}）', flush=True)
+    return ok
 
 
 def _harden_key_for_nginx_worker(path):
@@ -9018,6 +9105,15 @@ def rp_upload_cert():
     tmp_c = fullchain_path + ".upload.tmp"
     tmp_k = key_path + ".upload.tmp"
     try:
+        # ⚠️ 私钥必须在**落盘那一刻**就是紧的。
+        # 旧写法是 key_file.save(tmp_k) → os.replace(tmp_k, key_path)
+        # → os.chmod(key_path, 0o600)：save() 按 umask 建 0644 的文件，
+        # replace 之后正式私钥也是 0644，chmod 在**之后**才做 ——
+        # 中间有一小段时间，全设备的本地用户都能读到这个私钥。
+        # 私钥泄露 = 身份凭据泄露，这个窗口不能靠「很短」来糊弄。
+        # 现在：先按目标权限把 tmp 建好（save 对已存在文件不改权限），
+        # 再写内容 ⇒ 私钥落盘即 0600，replace 之后也是 0600。
+        _ensure_file_mode(tmp_k, 0o600)
         cert_file.save(tmp_c)
         key_file.save(tmp_k)
         ok, why = _cert_key_pair_ok(tmp_c, tmp_k)
@@ -9026,6 +9122,9 @@ def rp_upload_cert():
             _unlink_quiet(tmp_k)
             return jsonify({"success": False,
                             "message": f"证书校验未通过：{why}"}), 400
+        # worker 的组读权限在 replace **之前**给好 ⇒ 正式私钥一落地
+        # 就是 640 root:<worker 组>，不需要再有「先 0600 再放宽」的过渡态。
+        _harden_key_for_nginx_worker(tmp_k)
         os.replace(tmp_c, fullchain_path)
         os.replace(tmp_k, key_path)
     except Exception as e:
@@ -9033,6 +9132,7 @@ def rp_upload_cert():
         _unlink_quiet(tmp_k)
         return jsonify({"success": False, "message": f"写入证书失败: {e}"}), 500
 
+    # 兜底再 harden 一次（幂等）：万一上面 chgrp 失败，这里补上
     os.chmod(key_path, 0o600)
     _harden_key_for_nginx_worker(key_path)
 
@@ -9170,6 +9270,8 @@ def rp_reupload_cert(cert_id):
     try:
         tmp_c = cert_path + ".reupload.tmp"
         tmp_k = key_path + ".reupload.tmp"
+        # 同 upload：私钥落盘那一刻就得是紧的（见 rp_upload_cert 的注释）
+        _ensure_file_mode(tmp_k, 0o600)
         cert_file.save(tmp_c)
         key_file.save(tmp_k)
         # 同 upload：先校验再覆盖。传错私钥时原来能用的证书必须保住 ——
@@ -9180,6 +9282,7 @@ def rp_reupload_cert(cert_id):
             _unlink_quiet(tmp_k)
             return jsonify({"success": False,
                             "message": f"证书校验未通过：{why}"}), 400
+        _harden_key_for_nginx_worker(tmp_k)
         os.replace(tmp_c, cert_path)
         os.replace(tmp_k, key_path)
         os.chmod(key_path, 0o600)

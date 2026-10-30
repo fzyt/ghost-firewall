@@ -195,16 +195,33 @@ MUTATIONS = [
      '            raise ConfigCorruptedError(_CORRUPT_REFUSAL.format(err=err, path=CONFIG_PATH))\n',
      '    if False:\n        pass\n', 1),
 
+    # 锚点要跟上 2026-10-30 的改动：备份落盘前多了一行 _ensure_file_mode
+    # 和一段说明注释（.backup 的权限窗口修复）。锚点里少这些就匹配不上
+    # ⇒ 变异被跳过 ⇒ 那条缺陷就没人守了。
     ('FIX-9 save_config 的守卫挪到备份之后（唯一完好的恢复材料被覆盖）', 'app',
      '    if not _force:\n'
      '        bad, err = _config_corrupted()\n'
      '        if bad:\n'
      '            raise ConfigCorruptedError(_CORRUPT_REFUSAL.format(err=err, path=CONFIG_PATH))\n'
      '    # 自动备份当前配置\n'
-     "    if os.path.exists(CONFIG_PATH):\n"
+     '    if os.path.exists(CONFIG_PATH):\n'
+     '        # 备份里是**完整配置**（含 DDNS API token、reverse_proxy 凭据），\n'
+     '        # 落盘那一刻就必须是 0640。\n'
+     '        # shutil.copy 会先按 umask 建出文件（默认 0644 = 全设备可读），\n'
+     '        # 拷完才 copystat 改权限 ⇒ 中间有一段谁都能读。\n'
+     '        # 正确做法：先用目标权限把 .backup 建好再往里拷\n'
+     '        # （open 对已存在文件只截断、不改权限 ⇒ 没有窗口）。\n'
+     "        _ensure_file_mode(CONFIG_PATH + '.backup', _CONFIG_FILE_MODE)\n"
      "        shutil.copy(CONFIG_PATH, CONFIG_PATH + '.backup')\n",
      '    # 自动备份当前配置\n'
-     "    if os.path.exists(CONFIG_PATH):\n"
+     '    if os.path.exists(CONFIG_PATH):\n'
+     '        # 备份里是**完整配置**（含 DDNS API token、reverse_proxy 凭据），\n'
+     '        # 落盘那一刻就必须是 0640。\n'
+     '        # shutil.copy 会先按 umask 建出文件（默认 0644 = 全设备可读），\n'
+     '        # 拷完才 copystat 改权限 ⇒ 中间有一段谁都能读。\n'
+     '        # 正确做法：先用目标权限把 .backup 建好再往里拷\n'
+     '        # （open 对已存在文件只截断、不改权限 ⇒ 没有窗口）。\n'
+     "        _ensure_file_mode(CONFIG_PATH + '.backup', _CONFIG_FILE_MODE)\n"
      "        shutil.copy(CONFIG_PATH, CONFIG_PATH + '.backup')\n"
      '    if not _force:\n'
      '        bad, err = _config_corrupted()\n'
