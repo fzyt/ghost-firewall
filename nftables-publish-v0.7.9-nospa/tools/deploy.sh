@@ -374,12 +374,14 @@ phase_transfer() {
         local stage="/tmp/nftables-web-stage"
         step "传到暂存目录 $stage"
         if [ "$DRY_RUN" = 1 ]; then
-            step "[dry-run] tar -C $SRC -czf - backend frontend setup VERSION | ssh ... tar -C $stage -xzf -"
+            step "[dry-run] tar -C $SRC -czf - . | ssh ... tar -C $stage -xzf -"
             step "[dry-run] sh $stage/setup/setup.sh --local $stage --force"
             return 0
         fi
         rssh "rm -rf '$stage' && mkdir -p '$stage'"
-        tar -C "$SRC" -czf - backend frontend setup VERSION \
+        # 整个仓库都传（去掉 .git），这样 setup.sh --local 复制出来的
+        # 安装目录跟官方 GitHub 安装路径一致（tools/ tests/ 也在里面）。
+        tar -C "$SRC" --exclude='.git' --exclude='__pycache__' -czf - . \
             | rssh "tar -C '$stage' -xzf -" || die "传输失败"
         ok "已传输到暂存目录"
 
@@ -394,16 +396,26 @@ phase_transfer() {
     # 升级：覆盖代码。frontend/ 也要 —— 面板的 UI 是从 ../frontend 提供的
     # （app.py: send_from_directory('../frontend', 'index.html')），
     # 不是 backend/static/（后者是网关自己的登录页和门户）。
-    step "覆盖 backend/ frontend/ VERSION"
+    #
+    # tools/ tests/ 也一起同步：设备上要跑真机复验脚本
+    # （tools/verify-fixes.sh、tests/nft_semantic_check.sh），
+    # 留着 10-27 的旧副本会误导人。
+    step "覆盖 backend/ frontend/ tools/ tests/ VERSION"
     if [ "$DRY_RUN" = 1 ]; then
-        step "[dry-run] tar -C $SRC -czf - backend frontend VERSION | ssh ... tar -C $APP_DIR -xzf -"
+        step "[dry-run] tar -C $SRC -czf - backend frontend tools tests VERSION | ssh ... tar -C $APP_DIR -xzf -"
         return 0
     fi
     rssh "mkdir -p '$APP_DIR'"
-    tar -C "$SRC" -czf - backend frontend VERSION \
+    tar -C "$SRC" --exclude='tests/reports' --exclude='__pycache__' \
+        -czf - backend frontend tools tests VERSION \
         | rssh "tar -C '$APP_DIR' -xzf -" || die "传输失败"
     # 清掉可能残留的 __pycache__（旧 .pyc 会让新代码不生效）
     rssh "find '$APP_DIR/backend' -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true"
+    # tests/reports/ 是**未跟踪的测试产物**（e2e 输出、旧的 Shannon 报告），
+    # 不是产品代码也不是用户状态 —— 清掉，避免把上一轮的结论当成既有事实。
+    # 注意这跟「只覆盖不删除」不冲突：那条规矩针对的是配置/口令/密钥/限流表，
+    # 这些是**用户状态**，删了就回不来；测试产物是随时能重新生成的。
+    rssh "rm -rf '$APP_DIR/tests/reports' 2>/dev/null || true"
     ok "代码已覆盖"
 
     step "安装 init 脚本"
