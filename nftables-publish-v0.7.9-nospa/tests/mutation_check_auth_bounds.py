@@ -86,15 +86,16 @@ MUTATIONS = [
      "        if os.path.getsize(path) + incoming <= AUDIT_LOG_MAX_BYTES:",
      "        if os.path.getsize(path) < AUDIT_LOG_MAX_BYTES:"),
 
-    ("轮转失败时不再就地截断（文件继续无限长吃 RAM）",
+    # ⚠️ 锚点 2026-10-30 更新：审计轮转改成「目录可写 → 改名保留上一代；
+    # 目录不可写（真机常态）→ 就地轮转（_audit_rotate_in_place）」两段式，
+    # 旧锚点（"就地截断 open(path,'w').close()"）已不存在。
+    # 锚点失配等于这条缺陷从此没人守，所以必须跟着实现一起改。
+    ("轮转失败时不再就地轮转（文件继续无限长吃 RAM）",
      AG,
-     "        # 轮转不成（目录只读、跨设备等）就地截断：宁可丢历史，\n"
-     "        # 也不能让文件继续无限长把 RAM 吃光。\n"
-     "        try:\n"
-     "            open(path, \"w\").close()\n"
-     "        except OSError:\n"
-     "            pass",
-     "        pass"),
+     "    # 方式二：目录不可写（真机常态）→ 就地轮转，只用文件自身的写权限\n"
+     "    _audit_rotate_in_place(path)",
+     "    # 方式二：目录不可写（真机常态）→ 就地轮转，只用文件自身的写权限\n"
+     "    pass"),
 
     ("轮转用 rename 代替 replace（.1 可能残留旧内容，总占用翻倍）",
      AG,
@@ -145,16 +146,13 @@ MUTATIONS = [
      "    if False:\n"
      "        _RATELIMIT_DEGRADED[\"warned\"] = True"),
 
+    # ⚠️ 锚点 2026-10-30 更新：原来这条用「后面紧跟 def _origin_host_mismatch」
+    # 定位，P1-11 修复在两者之间插入了 _trusted_host_names，锚点失配。
+    # 改成直接锚住那一行 return 本身。
     ("限流表：上锁判定退回只读文件（降级期间暴力破解防护被悄悄关掉）",
      AG,
-     "    return _ratelimit_fallback_is_locked(ip)\n"
-     "\n"
-     "\n"
-     "def _origin_host_mismatch",
-     "    return False\n"
-     "\n"
-     "\n"
-     "def _origin_host_mismatch"),
+     "    return _ratelimit_fallback_is_locked(ip)",
+     "    return False"),
 ]
 
 # 等价变异：行为不变，不计漏过。

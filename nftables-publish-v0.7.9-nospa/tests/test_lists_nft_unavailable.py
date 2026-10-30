@@ -115,18 +115,34 @@ def main():
         app.subprocess.run = real_run
 
     # ── 2. nft 在，但 set 读不出来（returncode != 0）──────────
-    # 这不是"nft 不可用"，是"规则集里没有这个 set" —— 200 + 空，不该报错。
-    sec('2. nft 在但 set 读不到（returncode != 0）→ 200 + 空，不报错')
+    # ⚠️ 行为在 P2-25 之后**翻转了**。
+    #
+    # 原来这里是「200 + 空列表 + success=true」—— 那正是 P2-25 说的缺陷：
+    # nft 读失败（set 不存在 / 规则集正在重建 / nft 卡住）时返回空集合，
+    # 对用户来说跟「名单真的空了」**完全一样** ⇒ 他看到白名单一个 IP 都没有，
+    # 于是重新敲一遍、重新授权一遍 —— 而名单好好地在内核里躺着。
+    # 「读不到」和「是空的」必须区分开。
+    #
+    # 现在读失败一律 500 + code=NFT_SET_READ_FAILED，明确告诉调用方
+    # 「拿不到」，而不是谎称「空的」。
+    sec('2. nft 在但 set 读不到（returncode != 0）→ 500 + NFT_SET_READ_FAILED')
 
     app.subprocess.run = lambda *a, **k: FakeProc(returncode=1, stdout='')
     try:
         for ep in ('/api/lists/whitelist', '/api/lists/blacklist'):
             r = client.get(ep)
-            body = r.get_json()
-            check(f'{ep} 返回 200', r.status_code == 200, f'实际={r.status_code}')
-            check(f'{ep} success=true', body.get('success') is True)
-            check(f'{ep} 不带 NFT_UNAVAILABLE',
-                  body.get('code') != 'NFT_UNAVAILABLE')
+            body = r.get_json() or {}
+            check(f'{ep} 返回 500（读不到 ≠ 是空的）',
+                  r.status_code == 500, f'实际={r.status_code}')
+            check(f'{ep} success=false', body.get('success') is False,
+                  str(body)[:120])
+            check(f'{ep} 带 code=NFT_SET_READ_FAILED',
+                  body.get('code') == 'NFT_SET_READ_FAILED', str(body)[:120])
+            check(f'{ep} 不冒充 NFT_UNAVAILABLE（nft 本身是好的）',
+                  body.get('code') != 'NFT_UNAVAILABLE', str(body)[:120])
+            check(f'{ep} 没有把空集合当成结果返回',
+                  'allowed4' not in body and 'blacklist4' not in body,
+                  str(body)[:120])
     finally:
         app.subprocess.run = real_run
 

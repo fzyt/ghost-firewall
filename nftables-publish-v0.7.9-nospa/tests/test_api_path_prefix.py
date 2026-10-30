@@ -383,6 +383,12 @@ sec('6  POST /api/reverse-proxy/detect-api-prefix —— 端点契约')
 app = fresh()
 app.app.before_request_funcs[None] = []
 app.app.config['TESTING'] = True
+# ⚠️ P2-9 之后 detect-* 端点只接受「**IP 字面量**且落在 LAN 网段内」的目标 ——
+# 端点本质是个通用抓取器，能区分「连不上/超时/404/500」⇒ 当成端口扫描器用。
+# 这个用例的被探测目标是回环上的临时服务器，所以把沙箱配置里的 lan_subnet4
+# 设成 127.0.0.0/8（只影响这个沙箱，不碰生产逻辑，也不放宽面板的实际判定）。
+with open(app.CONFIG_PATH, 'w', encoding='utf-8') as f:
+    json.dump({'lan_subnet4': '127.0.0.0/8'}, f)
 cli = app.app.test_client()
 
 srv, port = start_server(json.dumps({
@@ -432,18 +438,33 @@ r = cli.post('/api/reverse-proxy/detect-api-prefix', json={})
 check('空 body → 400（不 500）', r.status_code == 400, str(r.status_code))
 
 # 地址里带 scheme 也要能解析
+#
+# ⚠️ P2-9 之后端点只接受「IP 字面量」，但 **scheme 会被先剥掉**再判定 ——
+# 所以 'http://127.0.0.1:8080' 剥完 scheme 剩下的仍是 IP 字面量，允许。
+# 被拒的是**剥完 scheme 后不是 IP 字面量**的情况（域名 ⇒ DNS rebinding）。
 srv, port = start_server(json.dumps({'paths': {'/api/x': {}}}).encode())
 try:
     r = cli.post('/api/reverse-proxy/detect-api-prefix',
                  json={'target_address': f'http://127.0.0.1:{port}',
                        'target_protocol': 'http'})
     body = r.get_json() or {}
-    check('地址带 scheme 也能探测', r.status_code == 200, str(r.status_code))
+    check('地址带 scheme 也能探测（剥 scheme 后仍是 IP 字面量）',
+          r.status_code == 200, str(r.status_code))
     check('带 scheme 时前缀探测正确',
           '/api/' in ((body.get('data') or {}).get('prefixes') or []),
           str((body.get('data') or {}).get('prefixes')))
 finally:
     srv.shutdown()
+
+# 剥掉 scheme 之后不是 IP 字面量 ⇒ 必须拒绝（域名会走 DNS ⇒ rebinding）
+r = cli.post('/api/reverse-proxy/detect-api-prefix',
+             json={'target_address': 'http://evil.example.com:8080',
+                   'target_protocol': 'http'})
+body = r.get_json() or {}
+check('带 scheme 的域名 → 400（剥 scheme 后不是 IP 字面量）',
+      r.status_code == 400, str(r.status_code))
+check('域名被拒时给出可读原因',
+      bool(body.get('message')), str(body)[:120])
 
 # ─────────────────────────────────────────────────────────────
 sec('7  端到端：生成的配置能不能真的把 /api/ 改写掉')

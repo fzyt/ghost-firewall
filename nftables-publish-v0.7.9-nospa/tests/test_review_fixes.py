@@ -144,6 +144,23 @@ d4 = tempfile.mkdtemp()
 app4.NGINX_CONF_DIR = d4
 app4._nginx_test = lambda: (False, '语法错误')
 app4._nginx_reload = lambda: (True, 'ok')
+# ⚠️ 2026-10-30 补：必须让流程**走到 _undo**。
+#
+# P1-47 之后有**两道**校验：
+#   ① _nginx_test_candidate(content) —— 候选内容单独解析（正式目录没动）
+#   ② _nginx_test()                 —— 替换**之后**再解析一次
+# ① 不过就**直接返回、不回滚**（正式配置一个字节没动，不需要回滚）。
+# 而本机没有 nginx，① 会退回 _nginx_test() → 也返回 False ⇒ 永远停在 ①，
+# _undo 那条路径根本走不到 —— 于是「_undo 的顺序错误」这个变异观察不到，
+# 会被判成漏网。
+#
+# _undo 的**真实**触发场景是：候选内容单独解析通过，但**连同用户自己的站点
+# 配置一起**解析失败（配置冲突）。这里就构造它：
+#   · 打桩生成器 → content 非空（否则函数在生成阶段就提前返回）
+#   · 打桩候选校验 → 通过
+#   · _nginx_test 仍打桩成失败 → 替换后校验失败 → 走 _undo
+app4._generate_gateway_nginx_conf = lambda cfg: "# 候选配置\nserver { listen 8443; }\n"
+app4._nginx_test_candidate = lambda content, timeout=10: (True, 'ok')
 prev = os.path.join(d4, app4.GATEWAY_CONF_NAME)
 open(prev, 'w').write(app4.GATEWAY_CONF_MARKER + '\n# 上一版\n')
 user3 = os.path.join(d4, 'my-own.conf')
@@ -152,6 +169,17 @@ ok4, msg4 = app4._deploy_gateway_nginx({**base_cfg(), 'gateway_enabled': True,
                                         'reverse_proxy': {'rules': [], 'certificates': [],
                                                           'settings': dict(app4.RP_DEFAULT_SETTINGS)}})
 check('nginx -t 失败时网关自己回滚', ok4 is False, msg4[:60])
+# ⚠️ 光断言「返回失败」守不住回滚本身。
+#
+# 「回滚」有两种坏法，只看返回值**都**是 False：
+#   ① 正确：恢复快照 → 旧配置还在；
+#   ② 错误：**先把快照删掉**再恢复 → 恢复必然失败 → 旧配置全丢
+#      （用户在 conf.d 下自己放的站点配置也跟着没了）。
+# ② 的返回值也是 False，所以必须额外断言「原配置还在」。
+check('nginx -t 失败时回滚恢复了上一版网关配置',
+      os.path.exists(prev), f'存在={os.path.exists(prev)}')
+check('nginx -t 失败时回滚恢复了用户自己的站点配置',
+      os.path.exists(user3), f'存在={os.path.exists(user3)}')
 check('回滚后旧的网关配置仍在', os.path.exists(prev))
 check('回滚不会删掉用户自己放在 conf.d 的站点配置',
       os.path.exists(user3), '用户 conf.d 里的站点配置被回滚误删')

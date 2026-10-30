@@ -110,23 +110,25 @@ MUTATIONS = [
      '    pass  # 变异：内联逻辑被删掉', 1),
 
     # ── FIX-6  手动更新 IPv6 不写 DDNS 中转文件 ─────────────────────
-    ('FIX-6 手动更新 IPv6 不写 /tmp/ddns-ipv6-0', 'app',
-     '            with open("/tmp/ddns-ipv6-0", "w") as f:\n'
-     '                f.write(f"{prefix}::1")',
-     '            pass  # 变异：DDNS 读不到本机地址', 1),
+    # ⚠️ 锚点 2026-10-30 全部重写：P2-14 把裸 open("/tmp/ddns-ipv6-N", "w")
+    # 换成了 _write_ddns_relay（随机名 tmp + O_EXCL|O_NOFOLLOW + 0600 +
+    # os.replace 原子换名），P2-13 又加了过期中转文件的清理。
+    # 旧的字面量锚点全部失配 ⇒ 这三条变异被**静默跳过** ⇒ 那条缺陷没人守。
+    ('FIX-6 手动更新 IPv6 不写本机地址的中转文件', 'app',
+     '        ok0, err0 = _write_ddns_relay(0, f"{prefix}::1")',
+     '        ok0, err0 = True, ""  # 变异：DDNS 读不到本机地址', 1),
 
     # 锚点缩进跟着 FIX-12 的改动一起挪了位置（写中转文件移进了成功分支），
     # 变异脚本必须跟着代码走 —— 锚点对不上就跳过，不改就是让变异名存实亡。
-    ('FIX-6 手动更新 IPv6 不写 /tmp/ddns-ipv6-{idx}', 'app',
-     '                    with open(f"/tmp/ddns-ipv6-{idx}", "w") as f:\n'
-     '                        f.write(full_ipv6)',
-     '                    pass  # 变异：DDNS 读不到转发地址', 1),
+    ('FIX-6 手动更新 IPv6 不写各条转发的中转文件', 'app',
+     '                ok_w, err_w = _write_ddns_relay(idx, full_ipv6)',
+     '                ok_w, err_w = True, ""  # 变异：DDNS 读不到转发地址', 1),
 
+    # 写失败必须**如实返回失败**，不能抛异常 —— 抛异常会让整个 update_ipv6
+    # 接口 500，把「DDNS 中转文件写不进去」变成一个看不出原因的故障。
     ('FIX-6 写中转文件失败时改成抛异常（一个 IO 错误让整个接口 500）', 'app',
-     '        except OSError as e:\n'
-     '            print(f"[WARN] 写 /tmp/ddns-ipv6-0 失败: {e}", flush=True)',
-     '        except ValueError as e:\n'
-     '            print(f"[WARN] 写 /tmp/ddns-ipv6-0 失败: {e}", flush=True)', 1),
+     "        return False, f'{type(e).__name__}: {e}'",
+     "        raise OSError(f'{type(e).__name__}: {e}')  # 变异：改成抛", 1),
 
     # ── FIX-7  上传/重传不校验配对 ──────────────────────────────────
     ('FIX-7 公钥取出来却不比较（校验形同虚设，正是原来的 bug）', 'app',
@@ -195,38 +197,16 @@ MUTATIONS = [
      '            raise ConfigCorruptedError(_CORRUPT_REFUSAL.format(err=err, path=CONFIG_PATH))\n',
      '    if False:\n        pass\n', 1),
 
+    # ⚠️ 2026-10-30：这条升级成下面的**复合变异**。
+    # 原因：P1-30 把「备份 + 正式写入」整段移进了 flock 里，守卫与备份块之间
+    # 隔了二十来行 → 「把守卫整块挪到备份之后」没法再用一次替换表达，
+    # 锚点只能匹配 0 次 ⇒ 变异被静默跳过 ⇒ 那条缺陷就没人守了。
+    # 复合变异分两步做同一件事：① 删掉开头的守卫；② 在备份块**内部**补一个。
+    # 效果与原意相同：备份发生时守卫还没跑 ⇒ .backup 被损坏配置覆盖。
+
     # 锚点要跟上 2026-10-30 的改动：备份落盘前多了一行 _ensure_file_mode
     # 和一段说明注释（.backup 的权限窗口修复）。锚点里少这些就匹配不上
     # ⇒ 变异被跳过 ⇒ 那条缺陷就没人守了。
-    ('FIX-9 save_config 的守卫挪到备份之后（唯一完好的恢复材料被覆盖）', 'app',
-     '    if not _force:\n'
-     '        bad, err = _config_corrupted()\n'
-     '        if bad:\n'
-     '            raise ConfigCorruptedError(_CORRUPT_REFUSAL.format(err=err, path=CONFIG_PATH))\n'
-     '    # 自动备份当前配置\n'
-     '    if os.path.exists(CONFIG_PATH):\n'
-     '        # 备份里是**完整配置**（含 DDNS API token、reverse_proxy 凭据），\n'
-     '        # 落盘那一刻就必须是 0640。\n'
-     '        # shutil.copy 会先按 umask 建出文件（默认 0644 = 全设备可读），\n'
-     '        # 拷完才 copystat 改权限 ⇒ 中间有一段谁都能读。\n'
-     '        # 正确做法：先用目标权限把 .backup 建好再往里拷\n'
-     '        # （open 对已存在文件只截断、不改权限 ⇒ 没有窗口）。\n'
-     "        _ensure_file_mode(CONFIG_PATH + '.backup', _CONFIG_FILE_MODE)\n"
-     "        shutil.copy(CONFIG_PATH, CONFIG_PATH + '.backup')\n",
-     '    # 自动备份当前配置\n'
-     '    if os.path.exists(CONFIG_PATH):\n'
-     '        # 备份里是**完整配置**（含 DDNS API token、reverse_proxy 凭据），\n'
-     '        # 落盘那一刻就必须是 0640。\n'
-     '        # shutil.copy 会先按 umask 建出文件（默认 0644 = 全设备可读），\n'
-     '        # 拷完才 copystat 改权限 ⇒ 中间有一段谁都能读。\n'
-     '        # 正确做法：先用目标权限把 .backup 建好再往里拷\n'
-     '        # （open 对已存在文件只截断、不改权限 ⇒ 没有窗口）。\n'
-     "        _ensure_file_mode(CONFIG_PATH + '.backup', _CONFIG_FILE_MODE)\n"
-     "        shutil.copy(CONFIG_PATH, CONFIG_PATH + '.backup')\n"
-     '    if not _force:\n'
-     '        bad, err = _config_corrupted()\n'
-     '        if bad:\n'
-     '            raise ConfigCorruptedError(_CORRUPT_REFUSAL.format(err=err, path=CONFIG_PATH))\n', 1),
 
     ('FIX-9 restart_network 改回自己写盘自己跑 nft -f', 'app',
      '        ok, message = _apply_ruleset(config)\n'
@@ -445,6 +425,42 @@ MUTATIONS = [
      '        # udp dport $KNOCK4_PORT ip6 saddr @knock3_done6 \\\n', 1),
 ]
 
+# 复合变异：一次改**多处**。
+#
+# 为什么需要它（2026-10-30）
+# -------------------------
+# 「把 save_config 的损坏守卫挪到备份之后」这个退化，需要**移动**一段代码
+# （从函数开头挪到备份块内部）。单次替换做不到 —— 一旦守卫与备份块之间
+# 隔了别的代码（P1-30 把备份移进 flock 后就隔了二十来行），锚点就再也
+# 匹配不上 ⇒ 变异被**静默跳过** ⇒ 那条缺陷从此没人守。
+#
+# 复合变异分两步做同一件事：
+#   ① 删掉函数开头的守卫块；
+#   ② 在备份块**内部**补一个守卫。
+# 效果与原意完全相同：备份发生时守卫还没跑 ⇒ .backup 被损坏的配置覆盖
+# ⇒ 唯一完好的恢复材料被毁掉。
+#
+# 格式：(描述, [(文件键, 旧文本, 新文本), ...])
+MUTATIONS_MULTI = [
+    ('FIX-9 save_config 的守卫挪到备份之后（唯一完好的恢复材料被覆盖）',
+     [('app',
+       '    if not _force:\n'
+       '        bad, err = _config_corrupted()\n'
+       '        if bad:\n'
+       '            raise ConfigCorruptedError(_CORRUPT_REFUSAL.format(err=err, path=CONFIG_PATH))\n',
+       ''),
+      ('app',
+       "            _ensure_file_mode(CONFIG_PATH + '.backup', _CONFIG_FILE_MODE)\n"
+       "            shutil.copy(CONFIG_PATH, CONFIG_PATH + '.backup')\n",
+       "            _ensure_file_mode(CONFIG_PATH + '.backup', _CONFIG_FILE_MODE)\n"
+       "            shutil.copy(CONFIG_PATH, CONFIG_PATH + '.backup')\n"
+       "            if not _force:\n"
+       "                bad, err = _config_corrupted()\n"
+       "                if bad:\n"
+       "                    raise ConfigCorruptedError("
+       "_CORRUPT_REFUSAL.format(err=err, path=CONFIG_PATH))\n")]),
+]
+
 
 def run_tests():
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1')
@@ -482,6 +498,32 @@ def main():
             skipped += 1
             continue
         open(FILES[key], 'w', encoding='utf-8').write(src.replace(old, new))
+        rc, out = run_tests()
+        fails = out.count('❌')
+        if rc != 0:
+            print(f'  ✅ {desc} —— 被捕获（{fails} 条断言失败）')
+            caught += 1
+        else:
+            print(f'  ❌ {desc} —— 测试仍然全绿（无效变异！）')
+            missed += 1
+            missed_list.append(desc)
+        restore()
+
+    # ── 复合变异：一次改**多处**（见 MUTATIONS_MULTI 的说明）────────
+    for desc, edits in MUTATIONS_MULTI:
+        srcs = {key: originals[key] for key, _o, _n in edits}
+        ok = True
+        for key, old, _new in edits:
+            if srcs[key].count(old) != 1:
+                print(f'  ⚠️  {desc} —— 锚点 {key} 出现 {srcs[key].count(old)} 次（期望 1），跳过')
+                ok = False
+                break
+        if not ok:
+            skipped += 1
+            continue
+        for key, old, new in edits:
+            srcs[key] = srcs[key].replace(old, new, 1)
+            open(FILES[key], 'w', encoding='utf-8').write(srcs[key])
         rc, out = run_tests()
         fails = out.count('❌')
         if rc != 0:

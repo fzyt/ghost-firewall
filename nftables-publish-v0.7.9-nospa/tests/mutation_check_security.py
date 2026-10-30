@@ -32,7 +32,15 @@ TEST = os.path.join(ROOT, 'tests', 'test_security_fixes.py')
 # 让替换悄悄失配 —— 变异脚本会打印「变异未生效」并跳过，而跳过在肉眼扫一遍输出
 # 时非常容易看成「通过」。
 _SEC3_BLOCK_RE = re.compile(
-    r'(    _old = parse_token\(request\.cookies\.get\(COOKIE_TOKEN, ""\)\)\n'
+    # ⚠️ 2026-10-30 更新：P1-1 修复把旧令牌的读取从
+    #     parse_token(request.cookies.get(COOKIE_TOKEN, ""))
+    # 改成了
+    #     parse_token(_extract_token())
+    # （Bearer 优先、cookie 兜底 —— 原来只读 cookie，Bearer 客户端的旧令牌
+    #   根本不会被吊销）。
+    # 正则写死旧写法 ⇒ 两条 SEC-3 变异**静默不生效** ⇒ 变异脚本报
+    # 「未生效」时很容易被当成「通过」。这里两种写法都接受。
+    r'(    _old = parse_token\((?:_extract_token\(\)|request\.cookies\.get\(COOKIE_TOKEN, ""\))\)\n'
     r'    if _old:\n.*?\n\n)'
     r'(?=    did = device_id_from_request\(\))',
     re.S)
@@ -86,10 +94,12 @@ MUTATIONS = [
 
     ('SEC-3 登录时不吊销旧令牌',
      GW,
-     lambda s: re.sub(
-         r'    _old = parse_token\(request\.cookies\.get\(COOKIE_TOKEN, ""\)\)\n'
-         r'    if _old:\n.*?\n\n(?=    did = device_id_from_request\(\))',
-         '', s, count=1, flags=re.S),
+     # ⚠️ 这里原来有一份**自己的内联正则**（写死了旧的
+     # parse_token(request.cookies.get(COOKIE_TOKEN, ""))），
+     # P1-1 修复改成 parse_token(_extract_token()) 之后它就匹配不上了 ⇒
+     # 变异静默不生效 ⇒ 脚本报「未生效」，而「未生效」很容易被当成「通过」。
+     # 现在复用 _SEC3_BLOCK_RE（两种写法都接受），不再各写一份。
+     lambda s: re.sub(_SEC3_BLOCK_RE, '', s, count=1),
      '重新登录后旧令牌仍然有效'),
 
     ('SEC-3 吊销挪到签发之后（顺序反了）',

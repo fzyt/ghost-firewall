@@ -123,17 +123,25 @@ MUTATIONS = [
     #
     # 改成**双重退化**：预建和事后 chmod 一起去掉 ⇒ 真的写出 umask 默认的 0644。
     # 这才是这条变异要测的退化方向。
+    # ⚠️ 锚点 2026-10-30 更新：P1-30 把「备份 + 正式写入」整段移进了
+    # flock 里（原来在锁外），所以这几行的缩进从 12 空格变成 8 空格。
+    # 锚点失配等于这条缺陷从此没人守，必须跟着实现一起改。
+    #
+    # ⚠️ 教训（2026-10-30 实测）：这条锚点第一次改好后，被另一个并行跑的
+    # 变异脚本的 MutationGuard「残留快照清理」冲回去了 —— 那个清理会把
+    # 快照里的**所有**文件写回，不只是它自己改的那几个。
+    # 所以：**跑变异脚本期间不要改仓库里任何 git 跟踪的文件**。
     ("P0-7  save_config 既不预建权限也不 chmod（写出来就是 umask 默认的 0644）",
      APP,
-     "            _ensure_file_mode(tmp_path, _CONFIG_FILE_MODE)\n"
-     "            with open(tmp_path, 'w') as f:\n"
-     "                json.dump(config, f, indent=2, ensure_ascii=False)\n"
-     "                f.flush()\n"
-     "                os.fsync(f.fileno())\n"
-     "            os.chmod(tmp_path, _CONFIG_FILE_MODE)\n"
-     "            os.replace(tmp_path, CONFIG_PATH)\n",
-     "            with open(tmp_path, 'w') as f:\n"
-     "                json.dump(config, f, indent=2, ensure_ascii=False)\n"
+     "        _ensure_file_mode(tmp_path, _CONFIG_FILE_MODE)\n"
+     "        with open(tmp_path, 'w') as f:\n"
+     "            json.dump(config, f, indent=2, ensure_ascii=False)\n"
+     "            f.flush()\n"
+     "            os.fsync(f.fileno())\n"
+     "        os.chmod(tmp_path, _CONFIG_FILE_MODE)\n"
+     "        os.replace(tmp_path, CONFIG_PATH)\n",
+     "        with open(tmp_path, 'w') as f:\n"
+     "            json.dump(config, f, indent=2, ensure_ascii=False)\n"
      "                f.flush()\n"
      "                os.fsync(f.fileno())\n"
      "            os.replace(tmp_path, CONFIG_PATH)\n"),
@@ -208,14 +216,17 @@ MUTATIONS = [
      "                        idx = _m.group(1)\n",
      "                        idx = _src.replace('rule_', '')\n"),
 
+    # ⚠️ 锚点 2026-10-30 更新：P1-41 修复改了这条附近的注释与代码 ——
+    # 「密码缓存」改成「口令情况」，后面还多了一行 _ddns_password_inventory()。
+    # 锚点失配 = 变异被跳过 = 那条缺陷从此没人守，必须跟着实现一起改。
     ("P0-9  预校验挪到「删除现有 service」之后（非法值留下半成品配置）",
      APP,
      "        ok, msg = _validate_ddns_services(services)\n"
      "        if not ok:\n"
      "            return jsonify({\"success\": False, \"message\": msg}), 400\n"
-     "        # 1. 先获取现有的 service 名称和密码缓存\n"
+     "        # 1. 先获取现有的 service 名称和口令情况\n"
      "        existing = _parse_ddns_config()\n",
-     "        # 1. 先获取现有的 service 名称和密码缓存\n"
+     "        # 1. 先获取现有的 service 名称和口令情况\n"
      "        existing = _parse_ddns_config()\n"
      "        ok, msg = _validate_ddns_services(services)\n"
      "        if not ok:\n"

@@ -76,6 +76,18 @@ MUTATIONS = [
      '        try:\n            shutil.rmtree(NGINX_CONF_DIR, ignore_errors=True)\n'
      '            shutil.copytree(backup_dir, NGINX_CONF_DIR)\n        except Exception as e:', 1),
 
+    # ⚠️ 2026-10-30 新增：_deploy_all_rules 里还有**第二条**回滚路径
+    # （_rollback），形状与 _undo 一样但多一行 _nginx_reload()。
+    # 只守 _undo 那条的话，另一条路径的同型顺序错误就没人守。
+    ('_rollback 把快照清理挪到 copytree 之前（同型顺序错误）', 'app',
+     '        try:\n            shutil.rmtree(NGINX_CONF_DIR, ignore_errors=True)\n'
+     '            shutil.copytree(backup_dir, NGINX_CONF_DIR)\n'
+     '            _nginx_reload()\n        except Exception as e:',
+     '        shutil.rmtree(backup_dir, ignore_errors=True)\n'
+     '        try:\n            shutil.rmtree(NGINX_CONF_DIR, ignore_errors=True)\n'
+     '            shutil.copytree(backup_dir, NGINX_CONF_DIR)\n'
+     '            _nginx_reload()\n        except Exception as e:', 1),
+
     ('不再清理 v0.8.0 遗留的无认证站点 conf', 'app',
      '                if _is_managed_conf(full):', '                if False:', 1),
 
@@ -108,17 +120,23 @@ MUTATIONS = [
      '        except Exception as e:\n'
      "            print(f'[WARN] nginx conf 回滚失败: {e}', flush=True)", 1),
 
-    ('名单回填去掉 IP 校验（nft 注入回归）', 'eng',
-     '            except ValueError:\n                dropped += 1\n                continue',
-     '            except ValueError:\n                lines.append(elem)\n                continue', 1),
+    # ⚠️ 2026-10-30：原来这里有一条「名单回填去掉 IP 校验（nft 注入回归）」的
+    # **单拆**变异，已升级成下面的**复合变异**（两道防线一起拆）。
+    # 原因：P2-29 修复给「非法名单元素不进规则集」加了**第二道**防线
+    # （app.py 的 load_lists 按 set 版本再过一遍 _valid_ip）。只拆 template_engine
+    # 这一道，app.py 那道照样把非法元素挡掉 ⇒ 结论仍成立 ⇒ 变成等价变异、
+    # 判成漏网。守住这个结论需要**两道一起拆**，见 MUTATIONS_MULTI。
+    # 复合变异拆得更多，守住的是同一个结论 —— 不是把覆盖弄丢了。
 
     # 锚点曾写死 4 空格缩进（_mutate_lists 裸跑的形状）。2026-10-15 修名单落盘
     # 并发（P0-B）时给整个读-改-写套了 _lists_file_lock()，函数体多缩进一层，
     # 锚点匹配 0 次导致这条变异被**静默跳过** —— 变异覆盖悄悄少一条比挂了更糟。
     # 这里同步换锚点，变异代表的仍是同一个原始危害：save_lists 不再被调用。
+    # 2026-10-30 又更新一次：P1-43 把 load_lists 改成严格模式后，
+    # save_lists(data) 后面不再紧跟 return data（多了规则集持久化那段）。
     ('名单落盘变成空操作', 'app',
-     '        data[set_name] = cur\n        save_lists(data)\n    return data',
-     '        data[set_name] = cur\n    return data', 1),
+     '        data[set_name] = cur\n        save_lists(data)\n',
+     '        data[set_name] = cur\n', 1),
 
     ('配置损坏守卫去掉', 'app',
      '    refused = _config_corrupted_response()\n    if refused is not None:\n        return refused',
@@ -156,6 +174,31 @@ MUTATIONS = [
      '        ip saddr @blacklist4 log prefix "[BLACKLIST4-FWD] " drop\n'
      '        ip6 saddr @blacklist6 log prefix "[BLACKLIST6-FWD] " drop\n',
      '', 1),
+]
+
+# 复合变异：一次拆**多处**。
+#
+# 为什么需要它（2026-10-30）
+# -------------------------
+# P2-29 修复后，「非法名单元素不会进规则集」这个结论由**两道**防线保证：
+#   ① app.py 的 load_lists —— 按 set 版本再过一遍 _valid_ip，非法元素丢弃；
+#   ② template_engine 的回填 —— 元素不合法就丢弃并计数。
+#
+# 单独拆任何一道，结论**仍然成立** ⇒ 那两条「拆一道」的变异都变成等价变异
+# （测试照样全绿，判成漏网）。这不是测试有洞，是「防线的数量变了」，
+# 变异脚本必须跟着变：只有**两道一起拆**才能观察到破坏。
+#
+# 格式：(描述, [(文件键, 旧文本, 新文本), ...])
+MUTATIONS_MULTI = [
+    ('名单元素的两道防线同时拆掉（非法元素真的进了规则集 = nft 注入）',
+     [('eng',
+       '            except ValueError:\n                dropped += 1\n                continue',
+       '            except ValueError:\n                lines.append(elem)\n                continue'),
+      ('app',
+       "            if not _valid_ip(ip, ver):\n"
+       "                print(f'[WARN] 名单 {name} 里有非法元素，已丢弃: {ip!r}', flush=True)\n"
+       "                continue\n",
+       '')]),
 ]
 
 
@@ -199,6 +242,34 @@ def main():
             skipped += 1
             continue
         open(FILES[key], 'w', encoding='utf-8').write(src.replace(old, new))
+        rc, out = run_tests()
+        fails = out.count('❌')
+        if rc != 0:
+            print(f'  ✅ {desc} —— 被捕获（{fails} 条断言失败）')
+            caught += 1
+        else:
+            print(f'  ❌ {desc} —— 测试仍然全绿（无效变异！）')
+            missed += 1
+            missed_list.append(desc)
+        restore()
+
+    # ── 复合变异：一次拆多处 ────────────────────────────────────
+    # 拆多处才能观察到破坏 —— 见 MUTATIONS_MULTI 的说明。
+    for desc, edits in MUTATIONS_MULTI:
+        srcs = {key: originals[key] for key, _o, _n in edits}
+        ok = True
+        for key, old, _new in edits:
+            n = srcs[key].count(old)
+            if n != 1:
+                print(f'  ⚠️  {desc} —— 锚点 {key} 出现 {n} 次（期望 1），跳过')
+                ok = False
+                break
+        if not ok:
+            skipped += 1
+            continue
+        for key, old, new in edits:
+            srcs[key] = srcs[key].replace(old, new, 1)
+            open(FILES[key], 'w', encoding='utf-8').write(srcs[key])
         rc, out = run_tests()
         fails = out.count('❌')
         if rc != 0:

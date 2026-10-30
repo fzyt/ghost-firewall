@@ -197,25 +197,65 @@ for fn in ('rp_create_rule', 'rp_update_rule'):
 sec('FIX-6  手动更新 IPv6 写中转文件')
 
 _ipv6 = fn_src(APP_SRC, 'update_ipv6')
-# 断言必须盯 open() 调用本身。只找 '/tmp/ddns-ipv6-0' 这个字面量的话，
-# 旁边 print("[WARN] 写 /tmp/ddns-ipv6-0 失败") 里也有同样的串 —— 变异把
-# 真正的写入删掉、把警告留着，测试照样全绿。这已经是第三次被注释/旁证字面量骗了。
-_writes = re.findall(r'with open\((f?)"/tmp/ddns-ipv6-(0|\{idx\})",\s*"w"\)', _ipv6)
-check('update_ipv6 写 /tmp/ddns-ipv6-0（路由器本机地址）',
-      ('', '0') in _writes,
-      'DDNS 的 ip_script 读的就是这个文件；已匹配到 ' + str(_writes))
-check('update_ipv6 写 /tmp/ddns-ipv6-{idx}（各条转发）',
-      ('f', '{idx}') in _writes,
-      '已匹配到 ' + str(_writes))
-check('两处写入都在（不是只写本机地址）', len(_writes) == 2, str(_writes))
+_relay = fn_src(APP_SRC, '_write_ddns_relay')
 
-# 每处写入都必须被 try/except OSError 包住：写不进去是环境问题，
-# 让整个接口 500 反而把「DDNS 输入缺失」变成一个看不出原因的故障。
-_guards = re.findall(r'try:\s*\n(?:[^\n]*\n)*?[^\n]*with open\([^\n]*ddns-ipv6[^\n]*\n(?:[^\n]*\n)*?\s*except OSError[^\n]*:\s*\n\s*print\(',
-                     strip_comments(_ipv6))
-check('两处写入都包了 try/except OSError（IO 失败不阻断主流程）',
-      len(_guards) == 2,
-      f'匹配到 {len(_guards)} 处 —— 保护数与写入数不等就说明有裸写的')
+# ⚠️ FIX-6 在 P2-14 之后**行为翻转了**，断言必须跟着翻。
+#
+# 原来查的是 `open("/tmp/ddns-ipv6-N", "w")` 裸写 + 「两处都包了
+# try/except OSError（IO 失败不阻断主流程）」。
+#
+# 两个问题：
+#   1. 裸写会**跟随软链** —— /tmp 是 1777 sticky 共享目录，别的本地用户
+#      可以提前建好同名软链，面板是 root ⇒ open(path,'w') 跟着软链把目标
+#      截断重写 = root 权限的任意文件写（P2-14）。
+#   2. 「IO 失败不阻断主流程」这条**本身就是缺陷**：写不进去 = DDNS
+#      继续发布**上一个旧地址**，用户以为地址更新了。静默跳过 = 谎报成功。
+#
+# 现在：中转文件走 _write_ddns_relay（随机名 tmp + O_EXCL|O_NOFOLLOW +
+# 0600 + os.replace 原子换名），写失败**如实上报**、不阻断也不谎报成功。
+
+check('update_ipv6 不再有裸 open("/tmp/ddns-ipv6-N", "w") 写入',
+      re.search(r'with open\([^)]*ddns-ipv6[^)]*["\']w["\']', _ipv6) is None,
+      '仍有裸写（会跟随软链）')
+
+_relay_calls = re.findall(r'_write_ddns_relay\(', _ipv6)
+check('update_ipv6 通过 _write_ddns_relay 写中转文件（本机地址 + 各条转发）',
+      len(_relay_calls) >= 2, f'匹配到 {len(_relay_calls)} 处')
+
+check('_write_ddns_relay 用 O_NOFOLLOW（不跟随软链）',
+      'O_NOFOLLOW' in _relay)
+check('_write_ddns_relay 用 O_EXCL（不覆盖任何已存在的东西）',
+      'O_EXCL' in _relay)
+check('_write_ddns_relay 建文件即 0600（落盘那一刻就不可读）',
+      '0o600' in _relay)
+check('_write_ddns_relay 用 os.replace 原子换名（不跟随软链）',
+      'os.replace' in _relay)
+check('_write_ddns_relay 用随机 tmp 名（别的用户猜不到）',
+      'secrets.token_hex' in _relay)
+
+# ⚠️ 这条要盯**写失败时的返回形态**。
+# 「写失败时抛异常」和「写失败时返回 (False, err)」在 update_ipv6 那侧
+# 表现一样（都进错误列表），所以只看调用方是分不出来的 ——
+# 必须盯被调函数自己：它必须**返回**失败，不能 raise。
+# 抛出去的后果：update_ipv6 整个 500，把「中转文件写不进去」变成一个
+# 看不出原因的接口错误（用户看到 500，实际是磁盘/权限问题）。
+check('_write_ddns_relay 写失败时返回 (False, err) 而不是抛异常',
+      re.search(r'except OSError as e:.*?return False,', _relay, re.S) is not None
+      and 'raise' not in _relay,
+      '写失败会抛出去（一个 IO 错误让整个接口 500）')
+
+# 写失败必须**如实上报**，不能静默跳过（静默 = DDNS 继续发布旧地址）
+check('写失败进错误列表（不是静默跳过）',
+      'relay_errors' in _ipv6 or 'failed' in _ipv6,
+      '写失败没有进错误列表')
+check('写失败会打 ERROR 级日志',
+      re.search(r'print\(f?["\']\[ERROR\]', _ipv6) is not None,
+      '写失败没有 ERROR 日志')
+
+# 过期的中转文件要有人清（P2-13）
+check('过期的中转文件会被清理（P2-13）',
+      '_cleanup_orphan_ddns_relays' in _ipv6,
+      '没有清理过期中转文件的调用')
 
 # ─────────────────────────────────────────────────────────────
 sec('FIX-7  上传/重传校验证书与私钥配对')

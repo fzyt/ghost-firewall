@@ -32,6 +32,8 @@ from _mutation_guard import MutationGuard  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEST = os.path.join(ROOT, "tests", "test_auth_session_lifecycle.py")
+# 额外要跑的测试（见 run_test 的说明）：吊销表 LKG 刷新的观察点在这里。
+TESTS_EXTRA = os.path.join(ROOT, "tests", "test_gateway_auth_fixes.py")
 AG = os.path.join(ROOT, "backend", "auth_gateway.py")
 APP = os.path.join(ROOT, "backend", "app.py")
 
@@ -47,10 +49,18 @@ MUTATIONS = [
      '        if _REVOKED_LKG is None:\n            return None\n        return _REVOKED_LKG',
      '        return {}'),
 
-    ("MISC-02：成功读之后不更新 LKG（进程内没有可退的副本）",
+    # ⚠️ 2026-10-30 更新：P1-3 修复给吊销表加了**写后立刻刷新 LKG**
+    # （revoke_jti 里的 _REVOKED_LKG = dict(data)）。于是「读成功不刷新 LKG」
+    # 这一条**单独拆掉不再有效果** —— 吊销路径照样会刷新 ⇒ 变成等价变异。
+    #
+    # 「刚登出的令牌会复活」这条链要真的成立，必须**两个刷新点都没了**：
+    # 读的那次不刷新（load_revoked）+ 写的那次不刷新（revoke_jti）。
+    # 所以「两个刷新点一起拆」放��下面的 MUTATIONS_MULTI（复合变异），
+    # 这里只留「写的那次」这一条单独的。
+    ("MISC-02：吊销落盘后不刷新 LKG（刚登出的令牌当场复活）",
      AG,
-     '    _REVOKED_LKG = data\n    return data',
-     '    return data'),
+     '    _REVOKED_LKG = dict(data)\n    return True',
+     '    return True'),
 
     ("MISC-02：判不出来时改回放行（fail-open）",
      AG,
@@ -135,14 +145,14 @@ MUTATIONS = [
 
     ("P3：不再下发 HSTS",
      AG,
-     '        resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000")',
-     '        pass  # mutated'),
+     '    resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000")',
+     '    pass  # mutated'),
 
     ("P3：HSTS 带上 includeSubDomains（会误伤同域其它服务）",
      AG,
-     '        resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000")',
-     '        resp.headers.setdefault("Strict-Transport-Security",\n'
-     '                                "max-age=31536000; includeSubDomains")'),
+     '    resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000")',
+     '    resp.headers.setdefault("Strict-Transport-Security",\n'
+     '                            "max-age=31536000; includeSubDomains")'),
 
     ("P3：兜底改成硬覆盖（把静态资源的 no-cache 也改成 no-store）",
      AG,
@@ -260,9 +270,9 @@ MUTATIONS = [
     ("revoke_jti：chmod 收紧失败被当成吊销失败（一次权限动作踢掉所有人）",
      AG,
      '    except OSError:\n'
-     '        audit("revocation_chmod_failed")\n'
-     '    return True',
+     '        audit("revocation_chmod_failed")',
      '    except OSError:\n'
+     '        audit("revocation_chmod_failed")\n'
      '        return False'),
 
     ("logout：吊销失败也返回 200（令牌还活着却报登出成功）",
@@ -373,19 +383,18 @@ MUTATIONS = [
     # 「密码都改了，页面还能打开」。这类「一条路径查了、另一条没查」的洞
     # 只有在**两个端点都打**的时候才暴露得出来。
 
+    # ⚠️ 锚点 2026-10-30 更新：P1-5 给 _authenticated 补了**绝对 TTL**，
+    # 原来的「合并成一行 return (bool(payload) and ...)」被拆成了逐行 return False，
+    # 旧锚点失效。改成锚住 epoch 判据本身。
     ("门户：_authenticated 不查 epoch（改密码后页面照样 200）",
      AG,
-     "    return (bool(payload)\n"
-     "            and _payload_epoch_ok(payload, cfg)\n"
-     "            and not is_revoked(payload.get(\"jti\", \"\")))",
-     "    return bool(payload) and not is_revoked(payload.get(\"jti\", \"\"))"),
+     "    if not _payload_epoch_ok(payload, cfg):\n        return False",
+     "    if False and not _payload_epoch_ok(payload, cfg):\n        return False"),
 
     ("门户：_authenticated 退回只读 cookie（Bearer 客户端被无视）",
      AG,
-     "    payload = parse_token(_extract_token())\n"
-     "    return (bool(payload)",
-     "    payload = parse_token(request.cookies.get(COOKIE_TOKEN, \"\"))\n"
-     "    return (bool(payload)"),
+     "    payload = parse_token(_extract_token())\n    if not payload:\n        return False",
+     "    payload = parse_token(request.cookies.get(COOKIE_TOKEN, \"\"))\n    if not payload:\n        return False"),
 
     ("epoch 判据被摘掉（两条路径都不再作废旧令牌）",
      AG,
@@ -396,6 +405,29 @@ MUTATIONS = [
 
 ]
 
+# 复合变异：一次拆**多处**。
+#
+# 为什么需要它（2026-10-30）
+# -------------------------
+# LKG（last-known-good 快照）有**两个**刷新点：
+#   ① load_revoked —— 读成功后更新；
+#   ② revoke_jti  —— 写成功后更新（P1-3 新加的）。
+#
+# 单独拆任何一处，LKG 仍会被另一处更新 ⇒ 结论「刚登出的令牌不会复活」仍成立
+# ⇒ 那条变异是**等价变异**（拆了也没用）。
+# 要观察到「刚登出的令牌当场复活」，必须**两处一起拆**。
+#
+# 格式：(描述, [(路径, 旧文本, 新文本), ...])
+MUTATIONS_MULTI = [
+    ("MISC-02：两个 LKG 刷新点都不更新（刚登出的令牌当场复活）",
+     [(AG,
+       '    _REVOKED_LKG = data\n    return data',
+       '    return data'),
+      (AG,
+       '    _REVOKED_LKG = dict(data)\n    return True',
+       '    return True')]),
+]
+
 # 等价变异：行为不变，不计漏过。
 EQUIVALENT = {
     "MISC-01：_token_epoch 恒返回 0":
@@ -404,9 +436,33 @@ EQUIVALENT = {
 
 
 def run_test():
+    """跑本脚本的测试。
+
+    ⚠️ 除了本脚本自己的测试，还要跑 **网关侧认证批** 的测试
+    （tests/test_gateway_auth_fixes.py）。
+
+    原因：这两条 LKG 变异（「读成功后不更新快照」「吊销落盘后不刷新快照」）
+    在本脚本自己的测试里**没有观察点** —— 旧测试文件只测会话生命周期，
+    不测吊销表的快照刷新。变异改下去之后旧测试照样全绿 ⇒ 判成「漏过」，
+    但这不是测试有洞，是**这个脚本跑错了测试集**。
+
+    守这两条的是网关侧的测试（P1-3「吊销表写盘后立刻刷新 last-known-good」）。
+    把它一起跑进来，两条变异才有牙齿；反过来，网关侧的变异脚本
+    （mutation_check_gateway_auth_fixes.py）也守着同一批，双保险。
+    """
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
-    return subprocess.run([sys.executable, TEST], capture_output=True,
-                          text=True, cwd=ROOT, env=env, timeout=600)
+    outs = []
+    rc = 0
+    for t in (TEST, TESTS_EXTRA):
+        r = subprocess.run([sys.executable, t], capture_output=True,
+                           text=True, cwd=ROOT, env=env, timeout=600)
+        rc = rc or r.returncode
+        outs.append(r.stdout + r.stderr)
+    class _R:
+        returncode = rc
+        stdout = "\n".join(outs)
+        stderr = ""
+    return _R()
 
 
 def main():
@@ -451,6 +507,41 @@ def main():
             equivalents.append((desc, EQUIVALENT[desc]))
             print(f"    ⚖️  等价变异（已归类）：{desc}")
             print(f"       理由：{EQUIVALENT[desc]}")
+        else:
+            missed += 1
+            misses.append(desc)
+            print(f"    ❌ 漏过：{desc}")
+
+    # ── 复合变异：一次拆多处（见 MUTATIONS_MULTI 的说明）────────────
+    for desc, edits in MUTATIONS_MULTI:
+        srcs = {}
+        ok = True
+        for path, old, _new in edits:
+            if path not in srcs:
+                with open(path, encoding="utf-8") as f:
+                    srcs[path] = f.read()
+            if srcs[path].count(old) != 1:
+                print(f"    ⚠️  锚点未命中（跳过）：{desc}")
+                missed += 1
+                misses.append(f"{desc} —— 锚点未命中")
+                ok = False
+                break
+        if not ok:
+            continue
+        try:
+            for path, old, new in edits:
+                srcs[path] = srcs[path].replace(old, new, 1)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(srcs[path])
+            r = run_test()
+        finally:
+            for path, content in srcs.items():
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content)          # 无条件还原
+
+        if r.returncode != 0:
+            caught += 1
+            print(f"    ✅ 捕获：{desc}")
         else:
             missed += 1
             misses.append(desc)

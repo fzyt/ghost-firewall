@@ -48,15 +48,20 @@ MUTATIONS = [
      '        host = (u.hostname or "").strip().lower()\n        if not host:\n            return True',
      '        host = (u.hostname or "").strip().lower()\n        if not host:\n            return False'),
 
-    ("CSRF：整个判断反过来（跨站放行、同站拦截）",
+    # ⚠️ 锚点 2026-10-30 更新：P1-11 修复把 CSRF 的判定从
+    # 「Origin 的主机 == Host 头的���机」换成了**服务端自己知道的域名**
+    # （_trusted_host_names）+ 端口纳入比较。旧锚点
+    # 「return host != (request.host or "").split(":")[0]...」已经不存在了 ——
+    # 锚点失配等于这条缺陷从此没人守，所以必须跟着实现一起改。
+    ("CSRF：跨站判定反转（host 不匹配反而算同源）",
      AG,
-     '        return host != (request.host or "").split(":")[0].strip().lower()',
-     '        return host == (request.host or "").split(":")[0].strip().lower()'),
+     "        if not host_ok:\n            return True",
+     "        if not host_ok:\n            return False"),
 
     ("CSRF：异常分支改成放行（fail-open）",
      AG,
-     '        return host != (request.host or "").split(":")[0].strip().lower()\n    except Exception:\n        return True',
-     '        return host != (request.host or "").split(":")[0].strip().lower()\n    except Exception:\n        return False'),
+     "        return port not in allowed\n    except Exception:\n        return True",
+     "        return port not in allowed\n    except Exception:\n        return False"),
 
     # ── 1. 请求体上限 ──────────────────────────────────────────
     ("Flask：拿掉 MAX_CONTENT_LENGTH",

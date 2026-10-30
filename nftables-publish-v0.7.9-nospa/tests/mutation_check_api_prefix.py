@@ -147,10 +147,12 @@ APP_MUTANTS = [
      '            segs.add(parts[0])',
      "            segs.add('/'.join(parts))"),
 
+    # ⚠️ 锚点 2026-10-30 更新：P2-9 修复把错误信息改成**不回显 URL 与异常原文**
+    # （能区分「超时/拒绝/404/500」的错误信息就是端口扫描器 oracle）。
+    # 旧锚点「return [], f"读取 {url} 失败：{type(e).__name__}: {e}"」已不存在。
+    # 「失败时必须给出原因」这条性质没变 —— 只是原因换成了固定文案。
     ('探测失败时不给出原因（前端只能显示「没探测到」）',
-     '    except Exception as e:\n'
-     '        return [], f"读取 {url} 失败：{type(e).__name__}: {e}"',
-     '    except Exception as e:\n'
+     '        return [], "探测失败：目标无响应，或不是提供 openapi.json 的服务"',
      '        return [], ""'),
 
     # ── 端点契约 ────────────────────────────────────────────────────
@@ -179,13 +181,21 @@ APP_MUTANTS = [
      '        return jsonify({"success": False,\n'
      '                        "message": "target_protocol 只允许 http 或 https"}), 400'),
 
+    # ⚠️ 2026-10-30 更新：P2-9 给 detect-* 端点加了**第二道**门
+    # （_detect_target_allowed：目标必须在 LAN 网段内）。空 target_address
+    # 现在被**两道**门都能拦下 ⇒ 只拆「地址格式」那一道，
+    # 空 body 依然返回 400 ⇒ 变异静默失效（测试照样全绿）。
+    # 要观察到破坏，必须**两道一起拆** —— 这才是这条变异要测的东西。
     ('探测端点不再校验地址格式（空 body 会 500 而不是 400）',
      '    if not host or not _is_port(port):\n'
      '        return jsonify({"success": False,\n'
-     '                        "message": "target_address 必须是 内网IP:端口"}), 400',
-     '    if False:\n'
+     '                        "message": "target_address 必须是 内网IP:端口"}), 400\n'
+     '    # ⚠️ 目标必须落在 LAN 网段内（P2-9）：否则这个端点就是个通用抓取器，\n'
+     '    # 返回值还能区分「超时/拒绝/404」⇒ 拿来扫 LAN 和公网都行。\n'
+     '    if not _detect_target_allowed(host):\n'
      '        return jsonify({"success": False,\n'
-     '                        "message": "target_address 必须是 内网IP:端口"}), 400'),
+     '                        "message": "target_address 必须是 LAN 网段内的内网 IP:端口"}), 400',
+     '    pass  # 变异：两道校验都拆掉'),
 ]
 
 JS_MUTANTS = [
