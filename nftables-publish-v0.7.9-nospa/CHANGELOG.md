@@ -94,6 +94,42 @@
 原来只是「有 VERSION 文件时用它」，没有时仍然报一个**看起来对但其实过期**
 的版本号，比不显示还糟。
 
+### 修复：保存配置时整页渲染崩掉（Alpine x-for 键撞车）
+
+用**真实浏览器**（Playwright）在 `.232` 上点「保存配置」时，**7 个页面全部**抛同一个
+JS 异常：
+
+```
+Alpine Expression Error: Cannot read properties of undefined (reading 'after')
+Expression: "diffModal.diff?.added_sample || []"
+Alpine Warning: Duplicate key on x-for
+```
+
+根因在 Alpine 3.15.8 的 x-for 重排逻辑：键重复时 `a[b]` 取到 undefined，
+Alpine **只是警告**然后继续执行 `C.after(nt)` ⇒ TypeError，整个弹窗的渲染就断了。
+
+而前端的写法是 `:key="line"` —— **拿行内容当键**。`added_sample` 是规则文本的行，
+规则里空行、重复的 `}`、重复的注释都有：实测规则模板
+（`backend/templates/nftables.conf`）**前 15 行里空行就出现 3 次**
+⇒ 用行内容当键**必然**重复 ⇒ 必然崩。
+
+改成用下标当键（`x-for="(line, idx) in ..." :key="idx"`），与本文件里其它 6 处
+列表 x-for 的写法一致；`diffModal.risks` 的 `:key="risk.message"` 一并改掉 ——
+两条告警文案相同就会撞 key，是同一个坑。
+
+**为什么 curl 级验收查不出来**：HTTP 200、配置也确实存下去了，崩的是浏览器里的
+Alpine 渲染。README 里「面板前端是 Alpine.js SPA，必须有真实浏览器才能验证」那条
+不是客套话 —— 这个 bug 就是 curl 查了 20 轮都没查出来的。
+
+新增 `tests/test_frontend_xfor_keys.js`（14 条）：每个 x-for 必须有 `:key`；
+`:key` 必须是「唯一」的形式（索引 / `id` / `key` / `ip`，**不用内容本身**）；
+并从规则模板里**证明**前 15 行确实有重复行（把 bug 的前提钉死，不是凭感觉）。
+变异验证：把 `added_sample` 改回 `:key="line"`，3 条断言同时变红。
+
+真机验证：部署后重跑 e2e 全量点击，**error 7 → 0**，`pageerror` 归零、
+Alpine 警告归零（剩余 18 条页面级日志全是「按设计拒绝」：设备无公网 IPv6、
+PPPoE 未填账号）。
+
 ### 修复：acme.sh DNS 插件下载会白等 18 分钟
 
 `raw.githubusercontent.com` 在国内是**间歇性**可达的 —— 同一台 `.232` 上，
