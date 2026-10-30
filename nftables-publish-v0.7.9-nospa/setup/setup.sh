@@ -12,6 +12,13 @@ set -e
 # 变量定义
 # ============================================================
 VERSION="0.7.9.1"
+# 上面这个是兜底值。真实版本从同级的 VERSION 文件读 ——
+# 写死的后果是「装的是 v0.8.7 的代码，屏幕上写的是 v0.7.9.1」。
+_VERSION_FILE="$(dirname "$0")/../VERSION"
+if [ -f "$_VERSION_FILE" ]; then
+    _v="$(tr -d ' \t\n\r' < "$_VERSION_FILE" 2>/dev/null)"
+    [ -n "$_v" ] && VERSION="$_v"
+fi
 PROJECT_NAME="nftables-web-v2"
 INSTALL_DIR="/opt/nftables-web-v2"
 CONFIG_DIR="/etc/nftables"
@@ -1162,7 +1169,15 @@ init_config() {
 }
 EOF
 
-    chmod 600 "$CONFIG_FILE"
+    # 0640 而不是 0600：网关（uid 1000 nftweb）是**独立进程**，要读这份
+    # 配置（会话 TTL / LAN 豁免 / 令牌世代号都在里面）。它读不到时会
+    # **静默回退到默认值**（auth_gateway.py 的 load_gateway_config 注释：
+    # 读失败返回空 dict）—— 不报错，只是行为跟配置对不上，最难查。
+    #
+    # 属组此刻多半还没建（nftweb 由 init 脚本创建），所以 chgrp 失败不致命
+    # —— 网关 init 脚本启动前会把这份文件再修一次（它也在组可读名单里）。
+    chmod 640 "$CONFIG_FILE"
+    chgrp nftweb "$CONFIG_FILE" 2>/dev/null || true
     ok "✅ 配置文件已生成: ${CONFIG_FILE}"
     echo -e "${YELLOW}  访问地址: https://${router_ip4}:5443  （HTTPS，自签证书需手动信任）${NC}"
     echo -e "${YELLOW}  注意: 面板仅局域网可达，公网入口尚未启用${NC}"

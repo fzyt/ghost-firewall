@@ -144,9 +144,12 @@ MUTATIONS = [
     #
     # 面板的会话签名密钥必须 0600 root:root —— 网关（公网可达的降权
     # 进程）读不到它，攻陷网关才签不出面板管理员 session。
+    # 锚点跟着 init 脚本一起改过：组可读名单里后来加了
+    # nftables-web-config.json（网关要读配置，否则静默回退默认值）。
+    # 锚点不跟着改 → 「锚点未命中（跳过）」→ 这条变异根本没跑过。
     ('M10 init 把面板会话密钥也放进 nftweb 组可读的循环（网关能读面板签名密钥）',
-     INIT, [('    for f in nftables-web-password; do',
-             '    for f in nftables-web-password nftables-web-session-secret; do')]),
+     INIT, [('    for f in nftables-web-password nftables-web-config.json; do',
+             '    for f in nftables-web-password nftables-web-config.json nftables-web-session-secret; do')]),
 
     ('M11 init 把面板会话密钥改成 640（组可读 → 网关能读）',
      INIT, [('    chmod 600 "$_sesssecret" || return 1',

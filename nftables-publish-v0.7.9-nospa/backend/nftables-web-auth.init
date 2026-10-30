@@ -133,7 +133,13 @@ prepare_nftweb_files() {
     # 暴露面和原来的 600 等价，但网关读得到。
     # ⚠️ 这里**不能**包含 nftables-web-session-secret —— 那是面板的
     # 会话签名密钥，给了组读权限就等于把面板管理员会话的能力递给网关。
-    for f in nftables-web-password; do
+    #
+    # nftables-web-config.json 也在这一类里：网关要读它（会话 TTL、
+    # LAN 豁免、令牌世代号都在里面）。少了这一步，网关读不到配置就
+    # **静默回退到默认值**（load_gateway_config 的注释写得很清楚：
+    # 读失败返回空 dict）—— 不报错，只是行为跟配置对不上，
+    # 全新安装时最容易踩（setup.sh 写的是 0600）。
+    for f in nftables-web-password nftables-web-config.json; do
         [ -f "$_cfgdir/$f" ] || continue
         chgrp "$NFTWEB_USER" "$_cfgdir/$f" || return 1
         chmod 640 "$_cfgdir/$f" || return 1

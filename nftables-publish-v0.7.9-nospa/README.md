@@ -55,13 +55,51 @@ sh /tmp/setup.sh
 sh /tmp/setup.sh --force
 ```
 
+## 升级部署（开发机执行）
+
+`setup.sh` 面向**全新安装**。已有设备上的**版本升级**用 `tools/deploy.sh`：
+
+```bash
+./tools/deploy.sh --host 192.168.100.233              # 升级（只换代码）
+./tools/deploy.sh --host 192.168.100.233 --apply      # 升级并应用规则集
+./tools/deploy.sh --host 192.168.100.233 --dry-run    # 只打印计划
+```
+
+九个阶段：连通+身份确认 → 判定路径 → 备份 → 传输 → 权限与密钥 → 语法预检
+→ 重启服务 → 应用（可选）→ 自检。任何一步失败**自动回滚**。
+
+几条刻意的设计：
+
+- **只覆盖，不删除。** 配置、口令、密钥、限流表一个都不碰。老的
+  `redeploy.sh` 里的 `rm -rf $APP` 会把「谁能进这台路由器」的凭据一起删掉。
+- **换代码 ≠ 生效。** 规则集（`/etc/nftables.d/99-custom-rules.nft`）和 nginx
+  网关配置都是面板**运行时**生成的，部署代码不会让它们变 —— 想生效要么在面板里
+  点「应用」，要么部署时加 `--apply`。
+- **令牌密钥不能变。** `/etc/nftables/nftables-web-secret` 变了 = 所有设备的
+  网关令牌全部作废 = 用户全部要重新登录。脚本部署前后比对 md5，不一致会大声报。
+- **不重启路由器**，只重启本项目的两个服务。
+- 自检会验：两个进程的 uid（面板 root / 网关 nftweb）、三个端口、
+  三个 HTTP 200、四个关键文件的权限、**网关的 gid == 配置文件的组 gid**
+  （读不到配置时网关会**静默退回默认值**，不报错）、版本号、
+  以及「规则集 md5 与 crontab 条数没被改动」。
+
+设备上每次部署都会留一份备份（含一份 `restore.sh`），备份目录
+`/root/nftables-web-backups/<时间戳>/`，默认保留最近 5 份。手工回滚：
+
+```bash
+ssh root@192.168.100.233 'sh /root/nftables-web-backups/<时间戳>/restore.sh'
+```
+
 ## 项目结构
 
 ```
 nftables-publish-v0.7.9-nospa/
 ├── setup/
-│   ├── setup.sh                  # 一键安装脚本
+│   ├── setup.sh                  # 一键安装脚本（全新设备）
 │   └── knock-*.sh|.py|.ps1       # 端口敲门客户端（LAN / WAN）
+├── tools/
+│   ├── deploy.sh                 # 升级部署脚本（开发机执行，SSH 驱动设备）
+│   └── verify-fixes.sh           # 真机复验（拷到设备上跑）
 └── backend/
     ├── app.py                    # 进程 A：管理面板（5443，仅 LAN）
     ├── auth_gateway.py           # 进程 B：认证 API（127.0.0.1）
