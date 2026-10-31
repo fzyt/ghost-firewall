@@ -160,9 +160,17 @@ APP_MUTANTS = [
 ]
 
 SH_MUTANTS = [
+    # 锚点跟着源码走 —— main() 改成阶段调度（run_stage）后，调用形式变了，
+    # 锚点也必须跟着变，否则这条变异会被静默跳过（等于让变异名存实亡）。
+    # 锚点跟着源码走 —— main() 改成阶段调度（run_stage）后，调用形式变了，
+    # 锚点也必须跟着变，否则这条变异会被静默跳过（等于让变异名存实亡）。
+    #
+    # ⚠️ 锚点用的是**整条 run_stage 调用**（含对齐用的空格），
+    #    以后 main() 里这段对齐一变，锚点就会失配 ⇒ 变异被跳过 ⇒
+    #    回归会报「锚点未命中」—— 那时候要改的是锚点，不是把这条变异删掉。
     ('setup.sh 不再调 close_luci_ports',
-     "    setup_nftables\n    close_luci_ports\n    show_summary",
-     "    setup_nftables\n    show_summary"),
+     'run_stage "关闭 LuCI 80/443" stage_luci_done   close_luci_ports',
+     'run_stage "关闭 LuCI 80/443" stage_luci_done   :'),
     # 兜底从「无条件查 8443」改成「按配置的 gateway_port 查，且只在网关启用时查」。
     # 锚点跟着源码走 —— 锚点对不上时变异会被静默跳过，等于让变异名存实亡。
     ('setup.sh 关完不按配置的网关端口兜底确认',

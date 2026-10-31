@@ -30,6 +30,12 @@ CONFIG_DIR="/etc/nftables"
 CONFIG_FILE="${CONFIG_DIR}/nftables-web-config.json"
 NFTABLES_CONF="/etc/nftables.conf"
 INITD_SCRIPT="/etc/init.d/nftables-web"
+# 认证服务的 init 脚本（单独一个变量：既是安装目标，也是"服务阶段已完成"的判据之一）
+AUTH_INITD_SCRIPT="/etc/init.d/nftables-web-auth"
+# LuCI 的两个开关点。25.x 的 LuCI 由 uhttpd 提供，老版本由 nginx 提供 ——
+# 两个都要认（见 stage_luci_done 的注释）。
+UHTTPd_CONF="/etc/config/uhttpd"
+NGINX_UCI_CONF="/etc/config/nginx"
 LOG_FILE="/var/log/nftables-web-setup.log"
 GITHUB_REPO="fzyt/ghost-firewall"
 ACME_EMAIL="admin@example.com"
@@ -46,6 +52,32 @@ ACME_EMAIL="admin@example.com"
 #   Let's Encrypt：不要邮箱、无 EAB、签发快。
 ACME_CA_URL="https://acme-v02.api.letsencrypt.org/directory"
 ARG_FORCE=0
+
+# ------------------------------------------------------------
+# 断点续装：阶段状态
+# ------------------------------------------------------------
+#
+# 目标（用户要求，2026-10-31）：
+#   「保证用户能一个命令完成安装；走到哪一步报错了，就提示可以重新执行
+#     sh 安装程序继续重试；之前完成的检测到就直接跳过」
+#
+# STATE_FILE 只是一份**流水账**（给人看的：上次跑到哪、什么时间），
+# 真正的"是否已完成"判据是每个阶段自己的 check 函数 —— 它看的是**产物**
+# （文件在不在、内容对不对），不是"上次跑过没跑过"的标记。
+# 这么分的原因：状态文件可能被删、被清、被手工改，而产物不会说谎；
+# 反过来光看状态文件的话，清掉状态文件就会把一台装好的机器重新装一遍。
+STATE_DIR="/var/lib/nftables-web"
+STATE_FILE="${STATE_DIR}/setup.state"
+
+# CURRENT_STAGE：当前正在执行的阶段名。失败提示里要告诉用户"卡在哪一步"。
+CURRENT_STAGE="启动"
+# INSTALL_COMPLETED：全部阶段都过了才置 1。EXIT trap 用它判断"该不该给重试指引"。
+INSTALL_COMPLETED=0
+# RETRY_HINT_SHOWN：重试指引只打一次（die 和 EXIT trap 都可能想打）。
+RETRY_HINT_SHOWN=0
+
+# 面板端口。服务阶段的"已完成"判据要靠它（文件在 ≠ 服务活着）。
+PANEL_PORT=5443
 
 # 自动检测包管理器
 detect_pkg_manager() {
@@ -89,12 +121,66 @@ pkg_install_apk() {
         attempt=$((attempt + 1))
         if [ "$attempt" -le "$PKG_RETRY" ]; then
             warn "  安装 ${pkg} 失败（第 ${attempt} 次尝试），刷新索引后重试..."
-            # 重下索引：上一次的失败很可能把 .adb 拉残了
-            apk update >/dev/null 2>&1 || true
+            # 重下索引：上一次的失败很可能把 .adb 拉残了。
+            # ⚠️ 这一步会带上超时和国内镜像切换 —— 原来的裸 `apk update`
+            #   在坏源上要卡 4 分钟，重试 3 次 = 白等 12 分钟还必然失败。
+            apk_update_with_failover || true
             sleep $((attempt * 2))
         fi
     done
-    warn "安装失败: ${pkg}（已重试 $PKG_RETRY 次）"
+
+    # ---- 兜底：换一条下载路径，手工下包再本地安装 ----
+    #
+    # 为什么需要（2026-10-30/31 在 .156 / .142 / .230 连续三台复现）：
+    #   `apk add` 在 OpenWrt 上是**外调 wget** 下载包体的，而设备上的
+    #   /usr/bin/wget 是指向 /bin/uclient-fetch 的软链（busybox 自带），
+    #   下载大包时会中途断流 ⇒ apk 校验哈希对不上：
+    #       ADB integrity error
+    #   同一个事务里的其它包（openssl-util / socat / ca-certificates）
+    #   会被一起带崩。
+    #
+    #   而 `apk fetch` 用的是 apk **自带**的下载器（不走外部 wget），
+    #   实测同一个包（nginx-full 446421 字节）下载得干干净净。
+    #   ⇒ 换下载器就绕开了故障点。
+    if apk_install_via_local_file "$pkg"; then
+        ok "  ✅ ${pkg} 已通过「下载到本地再安装」的方式装上"
+        return 0
+    fi
+
+    warn "安装失败: ${pkg}（已重试 $PKG_RETRY 次 + 本地文件兜底）"
+    return 1
+}
+
+# 兜底安装：apk fetch 下到本地，再 apk add 本地文件。
+#
+# ⚠️ 关于 --allow-untrusted：
+#   apk 对**独立的 .apk 文件**用的是另一套签名信任链 —— 实测直接装本地文件
+#   会报 "UNTRUSTED signature"（设备的 /etc/apk/keys 里只有
+#   openwrt-25.12.pem，仓库索引里的签名并不进本地信任库）。
+#   正常路径（apk add <包名>，从仓库装）仍然**完整校验签名**，
+#   这里只在正常路径已经失败之后才用，且包的来源就是当前配置的镜像。
+apk_install_via_local_file() {
+    local pkg="$1"
+    local work="/tmp/apk-local.$$"
+    mkdir -p "$work" 2>/dev/null || return 1
+
+    if ! ( cd "$work" && apk fetch "$pkg" >/dev/null 2>&1 ); then
+        rm -rf "$work"
+        return 1
+    fi
+
+    local f
+    f="$(ls "$work"/*.apk 2>/dev/null | head -1)"
+    if [ -z "$f" ]; then
+        rm -rf "$work"
+        return 1
+    fi
+
+    if apk add --no-cache --allow-untrusted "$f"; then
+        rm -rf "$work"
+        return 0
+    fi
+    rm -rf "$work"
     return 1
 }
 
@@ -333,11 +419,191 @@ check_nginx_modules() {
     ok "✅ nginx 模块自检通过（auth_request 就绪）"
 }
 
+# ============================================================
+# 带超时的命令执行（OpenWrt 上没有 timeout 命令）
+# ============================================================
+#
+# 为什么需要（2026-10-31 在 .230 实测）：
+#   OpenWrt 官方源 downloads.openwrt.org 在这个网络里会**卡死** ——
+#   `apk update` 跑了 4 分钟还没结束。而 setup.sh 原本是裸调 `apk update`，
+#   ⇒ 装机的第一件事就挂住，用户既看不到进度也拿不到错误，只能干等；
+#   就算等下来，失败后只有一句 warn，然后每个包再撞一次同样的墙。
+#
+# busybox ash 没有 timeout，但有 /proc —— 用「后台跑 + 轮询 /proc/<pid>」
+# 实现超时，超时就把那一个进程 kill -9 掉。
+#
+# ⚠️ 判存活用 `[ -d /proc/$pid ]` 而不是 `kill -0 $pid`：
+#   busybox 的 kill 不支持 `-0`（"test if process exists"）这个语义，
+#   传 -0 会被当成信号名报错，"还活着吗"这个问题就问错了。
+run_with_timeout() {
+    local limit="$1"; shift
+    "$@" &
+    local pid=$!
+    local waited=0
+    local rc=0
+    while [ -d "/proc/$pid" ]; do
+        if [ "$waited" -ge "$limit" ]; then
+            warn "命令超时（${limit}s），已终止: $*"
+            kill -9 "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || rc=$?
+            return 124
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    wait "$pid" 2>/dev/null || rc=$?
+    return $rc
+}
+
+# ------------------------------------------------------------
+# apk 源（镜像）切换
+# ------------------------------------------------------------
+#
+# 为什么需要（2026-10-30/31 在 .156 / .142 / .230 连续三台复现）：
+#   OpenWrt 官方源在国内网络**大文件会截断**：
+#       WARNING: fetching .../packages.adb: unexpected end of file
+#   小文件（108KB）能下 ⇒ 手工单测会误判成"源没问题"，
+#   而 apk update / apk add 走的正是大文件路径。
+#   切到国内镜像后实测：apk update 3 秒完成，可见包数 7654 → 11252。
+#
+# 切换方式：**只替换 URL 里的主机部分**，路径原样保留：
+#   https://mirror.nju.edu.cn/openwrt/releases/25.12.5/...
+#   https://mirrors.ustc.edu.cn/openwrt/releases/25.12.5/...
+# 这样不用知道 OpenWrt 的仓库布局（每个版本/架构的路径都不一样），
+# 也不用解析 uci 的 distfeeds —— 只换 host，路径照旧。
+#
+# 顺序按实测速度排：中科大（.230 上 apk update 3 秒）→ 南大（.232 设备自带）
+# → 清华。官方源留作最后手段（它在本网络会卡死，不该排在前面）。
+APK_MIRROR_CANDIDATES="mirrors.ustc.edu.cn mirror.nju.edu.cn mirrors.tuna.tsinghua.edu.cn"
+
+# apk 的仓库清单文件在哪。OpenWrt 25.x 是 /etc/apk/repositories.d/distfeeds.list，
+# 老版本是 /etc/apk/repositories —— 两个都认。
+apk_repo_file() {
+    local c
+    for c in /etc/apk/repositories.d/distfeeds.list /etc/apk/repositories; do
+        if [ -f "$c" ]; then
+            echo "$c"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 把仓库清单里的主机换成 $1。失败返回 1（保持原状）。
+switch_apk_mirror() {
+    local host="$1"
+    local repo
+    repo="$(apk_repo_file)" || return 1
+    # 原始配置只备份一次：反复切换时不要把 .orig 覆盖成中间态。
+    if [ ! -f "${repo}.orig" ]; then
+        cp "$repo" "${repo}.orig" 2>/dev/null || true
+    fi
+    local tmp="${repo}.nftweb.tmp"
+    # 只替换每行里第一个 "://<host>/" 的主机部分。
+    # ⚠️ 分隔符用 # 而不是 / —— 主机名里没有 #，但 URL 路径里全是 /。
+    sed "s#://[^/]*/#://${host}/#" "$repo" > "$tmp" 2>/dev/null || return 1
+    if [ ! -s "$tmp" ] || ! grep -q "${host}" "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+    mv "$tmp" "$repo" || { rm -f "$tmp"; return 1; }
+    return 0
+}
+
+# 跑一次 apk update 并判断**结果**，不是只看退出码。
+#
+# ⚠️ apk update 遇到被截断的索引时**可能仍然返回 0**（只打一条 WARNING）——
+#   这就是"手工测小文件能下、正式跑却失败"的根源。
+#   所以必须扫输出里的错误特征：
+#       WARNING: fetching .../packages.adb: unexpected end of file
+apk_update_once() {
+    local timeout="$1"
+    local out="/tmp/apk-update.$$.log"
+    local rc=0
+    run_with_timeout "$timeout" apk update > "$out" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        if [ "$rc" -eq 124 ]; then
+            warn "apk update 超时（${timeout}s）"
+        else
+            warn "apk update 失败（退出码 ${rc}）"
+        fi
+        tail -3 "$out" 2>/dev/null | while IFS= read -r line; do warn "  ${line}"; done
+        rm -f "$out"
+        return 1
+    fi
+    local bad
+    bad="$(grep -E "unexpected end of file|ERROR:" "$out" 2>/dev/null | head -1)"
+    rm -f "$out"
+    if [ -n "$bad" ]; then
+        warn "apk update 报错: ${bad}"
+        return 1
+    fi
+    return 0
+}
+
+# 更新索引：当前源 → 依次试国内镜像。
+#
+# 失败时把仓库配置**还原**成原始状态：不能把设备留在一个我们随手挑的、
+# 用户从没选过的源上（那会让后面"换个源就好了"的排查彻底失去参照系）。
+apk_update_with_failover() {
+    local timeout="${APK_UPDATE_TIMEOUT:-180}"
+    local host repo
+    # 仓库清单路径要先拿到：后面打印备份位置、失败还原都要用。
+    repo="$(apk_repo_file)" || repo=""
+
+    if apk_update_once "$timeout"; then
+        ok "✅ apk 索引就绪"
+        return 0
+    fi
+
+    warn "当前 apk 源不可用或超时，尝试切换国内镜像..."
+    for host in ${APK_MIRROR_CANDIDATES}; do
+        if switch_apk_mirror "$host"; then
+            info "已切换 apk 源 → ${host}（原始配置备份在 ${repo}.orig）"
+            if apk_update_once "$timeout"; then
+                ok "✅ apk 索引就绪（镜像 ${host}）"
+                return 0
+            fi
+        fi
+    done
+
+    if [ -n "$repo" ] && [ -f "${repo}.orig" ]; then
+        cp "${repo}.orig" "$repo" 2>/dev/null || true
+        warn "已还原原始 apk 源配置"
+    fi
+    return 1
+}
+
 pkg_update() {
     case "$PKG_MANAGER" in
-        opkg) opkg update ;;
-        apk) apk update ;;
+        opkg)
+            run_with_timeout "${OPKG_UPDATE_TIMEOUT:-180}" opkg update
+            ;;
+        apk)
+            apk_update_with_failover
+            ;;
     esac
+}
+
+# ------------------------------------------------------------
+# 释放 apk 的**包体**缓存（保留索引）
+# ------------------------------------------------------------
+#
+# apk 下载的 .apk 包体缓存在 /var/cache/apk/ —— 那是在 **overlay** 上
+# （不是 tmpfs）。OpenWrt 常见的 80~90MB overlay，几 MB 就能把盘撑满，
+# 撑满之后 apk 装不动、日志写不进去、设备表现为一堆莫名其妙的失败。
+#
+# ⚠️ 只删 *.apk（包体），**保留 APKINDEX.*.tar.gz（索引）**：
+#   索引删了的话，后面每个包都要重下一遍全量索引（15 个包 = 15 次全量下载）。
+#   索引在国产网络是最容易被截断的那一坨，留着它反而能省掉重复踩坑。
+free_package_cache() {
+    [ "$PKG_MANAGER" = "apk" ] || return 0
+    local n
+    n="$(ls /var/cache/apk/*.apk 2>/dev/null | wc -l)"
+    if [ "${n:-0}" -gt 0 ]; then
+        rm -f /var/cache/apk/*.apk 2>/dev/null || true
+        info "已清理 apk 包缓存（${n} 个 .apk），索引保留（避免重复下载被截断的索引）"
+    fi
 }
 
 # 参数解析
@@ -358,7 +624,10 @@ log() {
     local level="$1"; shift
     local ts
     ts="$(date '+%Y-%m-%d %H:%M:%S')"
-    echo -e "${ts} [${level}] $*" | tee -a "$LOG_FILE"
+    # ⚠️ tee 失败不能把整个安装带崩。
+    #   日志写不进去（磁盘满 / 目录不存在）本身是"记录问题"，
+    #   不是"安装失败的原因" —— 吞掉它，脚本才能继续跑到真正的失败点。
+    echo -e "${ts} [${level}] $*" | tee -a "$LOG_FILE" || true
 }
 
 info()  { log "INFO " "$*"; }
@@ -366,10 +635,266 @@ warn()  { log "WARN " "${YELLOW}$*${NC}"; }
 error() { log "ERROR" "${RED}$*${NC}"; }
 ok()    { log "OK   " "${GREEN}$*${NC}"; }
 
+# ------------------------------------------------------------
+# 失败时的「重跑即可续装」指引
+# ------------------------------------------------------------
+#
+# 为什么每次失败都要打这段（用户要求，2026-10-31）：
+#   旧版失败就是一句 "安装中止，请检查上方日志。" —— 用户看到的是
+#   一个**没有出口**的现场：不知道跑到哪了，不知道重跑会不会把已经
+#   装好的东西弄坏，只能从头再来，或者干脆放弃。
+#
+#   这段话要回答三个问题：
+#     1. 卡在哪一步？（CURRENT_STAGE）
+#     2. 重跑安全吗？（已完成的阶段会自动跳过）
+#     3. 重跑用什么命令？（原样给出，包括 --local 这种不能丢的参数）
+print_retry_hint() {
+    if [ "$RETRY_HINT_SHOWN" -eq 1 ]; then
+        return 0
+    fi
+    RETRY_HINT_SHOWN=1
+    local cmd="sh $(basename "$0")"
+    if [ -n "$ARG_LOCAL" ]; then
+        cmd="${cmd} --local ${ARG_LOCAL}"
+    fi
+    echo ""
+    echo -e "${RED}════════════════════════════════════════════════${NC}"
+    echo -e "${RED}  ❌ 安装未完成 —— 停在【${CURRENT_STAGE}】阶段${NC}"
+    echo -e "${RED}════════════════════════════════════════════════${NC}"
+    echo "  已完成的阶段会自动跳过，重新执行下面这条命令即可从断点继续："
+    echo -e "    ${BLUE}${cmd}${NC}"
+    echo "  失败详情见日志: ${LOG_FILE}"
+    echo "  （加 --force 可强制重做所有阶段）"
+}
+
 die() {
     error "$@"
-    error "安装中止，请检查上方日志。"
+    error "安装中止。"
+    print_retry_hint
     exit 1
+}
+
+# ------------------------------------------------------------
+# EXIT 兜底
+# ------------------------------------------------------------
+#
+# die() 会自己打指引，但脚本还有**不是 die 的失败路径**：
+#   set -e 撞上任何一条没兜住的命令、某个函数返回非 0、
+#   被 Ctrl-C / SSH 断连打断……
+# 这些路径如果不处理，用户看到的就是一行 bash 的报错，完全不知道
+# "重跑一下" 就能续上。EXIT trap 把这个口补上。
+#
+# ⚠️ busybox ash 支持 EXIT trap（实测 ash -c "trap ... EXIT" 正常触发）。
+#   陷阱执行时 $? 是脚本的退出码，必须在 trap 里第一时间取出来。
+on_exit() {
+    local rc="$1"
+    if [ "$rc" -ne 0 ] && [ "$INSTALL_COMPLETED" -eq 0 ] && [ "$RETRY_HINT_SHOWN" -eq 0 ]; then
+        error "安装意外中断（退出码 ${rc}）。"
+        print_retry_hint
+    fi
+}
+trap 'on_exit $?' EXIT
+
+# ============================================================
+# 阶段化执行（断点续装）
+# ============================================================
+#
+# 每个阶段配一个 check 函数，返回 0 表示「这一步的产物已经在位」。
+# 判据是**产物本身**，不是"上次跑过"的标记 —— 所以：
+#   · 中途被打断 → 重跑时前面的阶段被跳过，从断点接着走
+#   · 手工删了某个文件 → 那一阶段会自动重做
+#   · 换了新版本 → 版本比对不过 → 部署阶段自动重做
+mark_stage() {
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    printf '%s\t%s\n' "$1" "$(date '+%Y-%m-%d %H:%M:%S')" >> "$STATE_FILE" 2>/dev/null || true
+}
+
+run_stage() {
+    local name="$1" check_fn="$2" act_fn="$3"
+    CURRENT_STAGE="$name"
+    # --force 时不跳过任何阶段（用户明确要求重做时用）。
+    if [ "$ARG_FORCE" -eq 0 ] && "$check_fn" >/dev/null 2>&1; then
+        info "⏭ 【${name}】已完成 —— 跳过"
+        mark_stage "${name}: skipped"
+        return 0
+    fi
+    info "---------- 【${name}】开始 ----------"
+    # ⚠️ 这里**不能**写成 `if ! "$act_fn"; then ...`。
+    #   set -e 在 if 的条件里是失效的 ⇒ act_fn 内部某条命令失败也不会中止，
+    #   函数会接着往下跑，把"装到一半"的现场当成装好了。
+    #   直接调用，让 set -e 正常工作：失败即中止，EXIT trap 给重试指引。
+    "$act_fn"
+    mark_stage "${name}: done"
+    ok "✅ 【${name}】完成"
+}
+
+# ------------------------------------------------------------
+# 各阶段的「已完成」判据
+# ------------------------------------------------------------
+
+# 依赖：python/flask/requests/blinker 能 import + nginx 带 auth_request。
+stage_deps_done() {
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 -c "import flask, requests, blinker" >/dev/null 2>&1 || return 1
+    command -v nginx >/dev/null 2>&1 || return 1
+    nginx -V 2>&1 | grep -q "http_auth_request_module" || return 1
+    return 0
+}
+
+# acme.sh：主脚本 + 6 个 DNS 插件 + 固定好的 CA。
+stage_acme_done() {
+    local home="${HOME}/.acme.sh"
+    [ -f "$home/acme.sh" ] || return 1
+    local p
+    for p in ${ACME_DNSAPI_PLUGINS}; do
+        [ -s "$home/dnsapi/$p.sh" ] || return 1
+    done
+    # 没有 DEFAULT_ACME_SERVER ⇒ 后端调 acme.sh --issue 会走 ZeroSSL，
+    # 而 ZeroSSL 强制要邮箱 ⇒ 面板点「申请证书」必然失败（见 install_acme 的注释）。
+    grep -q "DEFAULT_ACME_SERVER" "$home/account.conf" 2>/dev/null || return 1
+    return 0
+}
+
+# nginx：本脚本管理的站点配置在位。
+stage_nginx_done() {
+    local f="/etc/nginx/conf.d/nftables-web.conf"
+    [ -f "$f" ] || return 1
+    grep -q "Managed by nftables-web-v2 setup.sh" "$f" 2>/dev/null || return 1
+    return 0
+}
+
+# 项目文件：代码在位，且版本与本次要装的一致。
+stage_deploy_done() {
+    [ -f "$INSTALL_DIR/backend/app.py" ] || return 1
+    [ -f "$INSTALL_DIR/frontend/index.html" ] || return 1
+    # ⚠️ VERSION 文件**不存在**时也要判成"没装"。
+    #   老版 setup.sh 装出来的目录里根本没有这个文件 —— 版本未知，
+    #   可能比本次要装的旧得多。判成"已完成"就等于"新代码永远装不上"，
+    #   重跑一百遍也还是旧代码（这正是"重装成假成功"的典型形态）。
+    [ -f "${INSTALL_DIR}/VERSION" ] || return 1
+    # 版本比对：装了旧版代码就重装（否则"重跑一遍"会把新版本悄悄跳过）。
+    local v
+    v="$(tr -d ' \t\n\r' < "${INSTALL_DIR}/VERSION" 2>/dev/null)"
+    [ -n "$v" ] || return 1
+    [ "$v" = "$VERSION" ] || return 1
+
+    # ⚠️ 光看版本号**不够** —— 还要看**这次要装的源**是不是已经装上去了。
+    #
+    #   版本号相同、内容不同的情况真实存在：改了代码但没 bump VERSION
+    #   （补丁版忘了改版本号 / 同一 tag 重新出了个包）。
+    #   这时只看版本号 ⇒ "要装的东西还没装"会被判成"已完成" ⇒
+    #   setup.sh 跳过部署 ⇒ 设备上跑的还是旧代码，而用户以为装好了。
+    #
+    #   比对**整棵代码树**（源里有的每一个文件，逐个比 md5）：
+    #   · 只比一个代表文件是不够的 —— 2026-10-31 在 .232 实测：
+    #     一次测试把 frontend/index.html 覆盖成了测试文件，
+    #     而 backend/app.py 没变 ⇒ 只比 app.py 的判据完全没发现，
+    #     "已完成"照报 ⇒ 面板前端坏着，而安装器说装好了。
+    #   · 只比"源里有的文件"：安装目录里可能多出运行时产物
+    #     （__pycache__/*.pyc），那些不算进来，否则永远判成"没装"。
+    if [ -n "$ARG_LOCAL" ]; then
+        deploy_tree_matches "$ARG_LOCAL" "$INSTALL_DIR" || return 1
+    fi
+    return 0
+}
+
+# 按**给定的文件清单**算一棵树的 md5 汇总。
+# 用相对路径（清单里就是相对路径）⇒ 两边输出天然可比。
+tree_sum() {
+    local root="$1" list="$2" f
+    (
+        cd "$root" 2>/dev/null || exit 1
+        printf '%s\n' "$list" | while IFS= read -r f; do
+            if [ -f "$f" ]; then
+                md5sum "$f"
+            fi
+        done | md5sum 2>/dev/null | cut -d" " -f1
+    )
+}
+
+# 源树与安装目录在"源里有的那些文件"上是否完全一致。
+#
+# 返回 0 = 一致（已装好）；非 0 = 不一致（要重装）。
+# ⚠️ md5sum 不可用时 sum 为空 ⇒ 判成"不一致" ⇒ 走重装。
+#    这是安全的方向：多拷一次，总比留着旧代码强。
+deploy_tree_matches() {
+    local src="$1" dst="$2"
+    [ -d "$src/backend" ] || return 1
+    [ -d "$src/frontend" ] || return 1
+    [ -d "$dst/backend" ] || return 1
+    [ -d "$dst/frontend" ] || return 1
+
+    local list
+    list="$(cd "$src" 2>/dev/null && find backend frontend -type f \
+                ! -path '*/__pycache__/*' ! -name '*.pyc' ! -name '*.pyo' \
+                2>/dev/null | LC_ALL=C sort)"
+    [ -n "$list" ] || return 1
+
+    local src_sum dst_sum
+    src_sum="$(tree_sum "$src" "$list")"
+    dst_sum="$(tree_sum "$dst" "$list")"
+    [ -n "$src_sum" ] || return 1
+    [ "$src_sum" = "$dst_sum" ] || return 1
+    return 0
+}
+
+# 配置：文件在位**且是合法 JSON**。
+#
+# ⚠️ 必须验 JSON 合法性：配置被截断时面板会静默回退到默认配置
+#   （trusted_ip4 变成 192.168.100.2 之类），接口照样返回 success，
+#   现场看不出任何异常 —— 只看"文件存在"会把一台配错了的机器判成装好了。
+stage_config_done() {
+    [ -f "$CONFIG_FILE" ] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$CONFIG_FILE" >/dev/null 2>&1 || return 1
+    return 0
+}
+
+# ubus：守护进程活着（init.d 服务依赖它）。
+stage_ubus_done() {
+    ubus list >/dev/null 2>&1
+}
+
+# 服务：init 脚本在位**且面板端口在监听**。
+#
+# ⚠️ 「文件在」不等于「服务活着」：init 脚本拷到位但服务起不来
+#   （依赖缺失、配置语法错、端口被占）时，文件检查会误判成已完成，
+#   重跑时就把起不来的服务跳过去了 —— 正是"重跑也修不好"的经典成因。
+stage_service_done() {
+    [ -f "$INITD_SCRIPT" ] || return 1
+    [ -f "$AUTH_INITD_SCRIPT" ] || return 1
+    if netstat -lnt 2>/dev/null | grep -q ":${PANEL_PORT} "; then
+        return 0
+    fi
+    return 1
+}
+
+# nftables 引导规则：配置文件在位且是本脚本生成的。
+stage_nftables_done() {
+    [ -f "$NFTABLES_CONF" ] || return 1
+    grep -q "nftables-web-v2 引导配置" "$NFTABLES_CONF" 2>/dev/null || return 1
+    return 0
+}
+
+# LuCI：80/443 已经关掉（两种形态都认）。
+#
+# OpenWrt 24.10+ / 25.12 的 LuCI 由 **uhttpd** 提供（不是 nginx），
+# 开关点是 /etc/config/uhttpd 里的 enabled。老版本由 nginx 提供，
+# 开关点是 /etc/config/nginx 里的 _lan / _redirect2ssl 两个 section。
+stage_luci_done() {
+    if [ -f "$UHTTPd_CONF" ] && grep -q "/cgi-bin/luci" "$UHTTPd_CONF" 2>/dev/null; then
+        grep -q "option enabled '0'" "$UHTTPd_CONF" 2>/dev/null || return 1
+        if netstat -lnt 2>/dev/null | grep -qE ":80[[:space:]]|:443[[:space:]]"; then
+            return 1
+        fi
+        return 0
+    fi
+    if [ -f "$NGINX_UCI_CONF" ]; then
+        if grep -q "config server '_lan'\|config server '_redirect2ssl'" "$NGINX_UCI_CONF" 2>/dev/null; then
+            return 1
+        fi
+    fi
+    return 0
 }
 
 # ============================================================
@@ -600,6 +1125,11 @@ install_deps() {
     # 不先修的话，apk 会在事务中途把 wget 换成坏的那个，之后什么都下不来。
     repair_downloader
 
+    # 先把 apk 的**包体**缓存清掉：那是 overlay 上的空间，
+    # 80~90MB 的机器上被几个大包一撑就满了（满了之后 apk 装不动、
+    # 日志写不进去，设备表现为一堆莫名其妙的失败）。
+    free_package_cache
+
     pkg_update || warn "包列表更新失败，继续尝试安装..."
 
     # ⚠️ 顺序有讲究，别随手调换：
@@ -639,7 +1169,12 @@ install_deps() {
         ok "✅ libssl.so.3 就位（$ssl_lib）"
     fi
 
+    # ⚠️ curl 排在 nginx-full **前面**：它是 repair_downloader 的首选后端
+    #   （curl 链的是 mbedTLS，不依赖 libssl.so.3）。
+    #   排在后面的话，一旦 nginx-full 这类大包把事务带崩，
+    #   自愈时 curl 还没装上，只能退到 busybox 的 uclient-fetch。
     pkg_install \
+        curl \
         nftables \
         python3 python3-light python3-requests python3-flask \
         ddns-scripts \
@@ -647,7 +1182,7 @@ install_deps() {
         ddns-scripts-noip ddns-scripts-nsupdate \
         ddns-scripts-godaddy \
         nginx-full \
-        curl openssl-util socat \
+        openssl-util socat \
         ca-certificates
 
     # wget-ssl 单独放最后（理由见上）
@@ -1196,9 +1731,17 @@ warn_port_conflicts() {
 deploy_project() {
     info "========== 部署项目 =========="
 
-    # 检查目标目录是否已存在且非空
-    if [ -d "$INSTALL_DIR" ] && [ "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ] && [ "$ARG_FORCE" -ne 1 ]; then
-        if is_interactive; then
+    # ⚠️ 目标目录已存在时**不再静默跳过**（2026-10-31 改）。
+    #
+    #   旧行为：目录非空且非交互 ⇒ 打一句 warn 就 return。
+    #   后果是用户看到"安装完成"，设备上跑的还是**旧代码** ——
+    #   而用户以为自己装的是新版本。这种"假成功"比直接失败更难查。
+    #
+    #   新行为：默认覆盖。安装目录里只有代码，配置/口令/密钥都在
+    #   /etc/nftables，覆盖代码动不到它们。交互模式下仍然问一次，
+    #   避免手滑覆盖掉正在调试的现场。
+    if [ -d "$INSTALL_DIR" ] && [ "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ]; then
+        if [ "$ARG_FORCE" -ne 1 ] && is_interactive; then
             echo -e "${YELLOW}目标目录 ${INSTALL_DIR} 已存在且非空。${NC}"
             printf "是否覆盖？[y/N] "
             read -r answer
@@ -1207,9 +1750,7 @@ deploy_project() {
                 *) warn "跳过项目部署（目标目录已存在）"; return ;;
             esac
         else
-            warn "跳过项目部署（目标目录 ${INSTALL_DIR} 已存在且非空，非交互模式）"
-            warn "如需覆盖，请使用 --force 参数"
-            return
+            info "目标目录已存在，将覆盖安装目录（配置与凭据在 ${CONFIG_DIR}，不受影响）"
         fi
     fi
 
@@ -1221,6 +1762,14 @@ deploy_project() {
         fi
         mkdir -p "$INSTALL_DIR"
         cp -r "${ARG_LOCAL}/"* "$INSTALL_DIR/"
+        # 记下本次装进去的版本。
+        # 「已完成」判据要靠它比对：版本不同 ⇒ 阶段自动重做，
+        # 否则"重跑一遍"会把新版本悄悄跳过。
+        if [ -f "${ARG_LOCAL}/VERSION" ]; then
+            cp "${ARG_LOCAL}/VERSION" "${INSTALL_DIR}/VERSION"
+        else
+            printf '%s\n' "$VERSION" > "${INSTALL_DIR}/VERSION"
+        fi
         ok "✅ 本地部署完成"
         return
     fi
@@ -1265,6 +1814,7 @@ deploy_project() {
         fi
 
         rm -rf "$tmp_dir"
+        printf '%s\n' "$VERSION" > "${INSTALL_DIR}/VERSION"
         ok "✅ 项目部署完成 (${tag})"
     else
         rm -rf "$tmp_dir"
@@ -1475,7 +2025,7 @@ setup_service() {
     # 独立进程、独立 init、独立配置，只监听 127.0.0.1。
     # 没装起来不会影响面板，但网关会因此 502 —— 所以要显式提示。
     local auth_init="${INSTALL_DIR}/backend/nftables-web-auth.init"
-    local auth_initd="/etc/init.d/nftables-web-auth"
+    local auth_initd="$AUTH_INITD_SCRIPT"
     if [ -f "$auth_init" ]; then
         cp -f "$auth_init" "$auth_initd"
         chmod 755 "$auth_initd"
@@ -1770,8 +2320,17 @@ main() {
     echo -e "${BLUE}nftables-web-v2 安装脚本 v${VERSION}${NC}"
     echo ""
 
+    # ── 阶段 1：环境检查 ──────────────────────────────
+    # 环境检查本身是"检查"，没有产物可判 ⇒ 不走 run_stage，
+    # 但要把 CURRENT_STAGE 设对，失败提示才知道卡在哪。
+    CURRENT_STAGE="环境检查"
     check_env
-    install_deps
+
+    # ── 阶段 2~9：每个阶段都带「已完成就跳过」的判据 ──
+    #
+    # 顺序有讲究：依赖 → 磁盘 → acme → nginx → 代码 → 配置 → 服务 →
+    # 规则 → 关 LuCI。后面的阶段依赖前面的产物，顺序不能乱。
+    run_stage "依赖安装"     stage_deps_done    install_deps
 
     # 部署前再次检查空间
     local deploy_avail
@@ -1780,16 +2339,18 @@ main() {
         die "磁盘空间不足，无法部署项目文件（可用: $((deploy_avail/1024))MB，至少需要 5MB）"
     fi
 
-    install_acme
-    setup_nginx
-    deploy_project
-    init_config
-    ensure_ubus
-    setup_service
-    setup_nftables
-    close_luci_ports
+    run_stage "acme.sh 证书组件" stage_acme_done    install_acme
+    run_stage "nginx 配置"      stage_nginx_done   setup_nginx
+    run_stage "项目文件部署"     stage_deploy_done  deploy_project
+    run_stage "配置初始化"       stage_config_done  init_config
+    run_stage "ubus 服务"        stage_ubus_done    ensure_ubus
+    run_stage "服务注册与启动"   stage_service_done setup_service
+    run_stage "nftables 引导规则" stage_nftables_done setup_nftables
+    run_stage "关闭 LuCI 80/443" stage_luci_done   close_luci_ports
+
     show_summary
 
+    INSTALL_COMPLETED=1
     ok "✅ 全部完成！"
 }
 

@@ -402,7 +402,21 @@ check('对齐失败不阻断启动',
 sec('6. setup.sh 部署后自动关闭')
 sh = open(os.path.join(ROOT, 'setup', 'setup.sh'), encoding='utf-8').read()
 check('有 close_luci_ports 函数', 'close_luci_ports()' in sh)
-check('main 里调用了它', re.search(r'setup_nftables\s*\n\s*close_luci_ports', sh) is not None)
+# ⚠️ 这里断言的是**顺序**：先装 nftables 引导规则，再关 LuCI 80/443
+#    （反过来会把刚装好的规则集搞坏）。
+#    2026-10-31 起 main() 改成阶段调度（run_stage），调用形式从
+#    「setup_nftables\nclose_luci_ports」变成了带阶段名的 run_stage 行 ——
+#    所以不能再用字面量正则去匹配，必须**在 main() 函数体里比位置**。
+#    （顺序意图不变，只是判据跟着调用形式走。）
+_main_m = re.search(r'main\(\)\s*\{(.*?)\n\}', sh, re.S)
+_main_body = _main_m.group(1) if _main_m else ''
+_nft_at = _main_body.find('setup_nftables')
+_luci_at = _main_body.find('close_luci_ports')
+check('main 里调用了它（在 setup_nftables 之后 —— 顺序不能反）',
+      re.search(r'run_stage\s+"关闭 LuCI 80/443"\s+stage_luci_done\s+close_luci_ports',
+                _main_body) is not None
+      and _nft_at > 0 and _luci_at > 0 and _nft_at < _luci_at,
+      f'setup_nftables@{_nft_at} close_luci_ports@{_luci_at}')
 check('删的是渲染产物目标而非软链', 'rendered="/var/lib/nginx/uci.conf"' in sh)
 check('留了快照供面板还原', 'nginx-luci.snapshot' in sh)
 check('nginx -t 通过才 reload', 'nginx -t -c /etc/nginx/uci.conf' in sh)
