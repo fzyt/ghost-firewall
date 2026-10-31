@@ -7381,12 +7381,43 @@ def list_clear_history():
 #   · Debian/Ubuntu 包           /usr/bin/acme.sh
 # 面板的「申请证书 / 续期」全靠这个路径。原来写死 ~/.acme.sh 的直接
 # 后果：设备上装了 acme.sh，点了申请还是返回「acme.sh 未安装」。
+#
+# ⚠️ 为什么不能只写 "~/.acme.sh/acme.sh"（2026-10-31 在 .230 实测踩坑）：
+#
+#   **procd 启动的子进程默认 HOME=/**（不是 /root）。
+#   init 脚本里 `cd $APP_DIR && python3 app.py` 起的进程继承的就是这个
+#   HOME=，于是 os.path.expanduser("~") 展开成 **"/"**，
+#   "~/.acme.sh/acme.sh" → "/.acme.sh/acme.sh" → 不存在。
+#
+#   后果是"插件明明在却报缺少"：
+#     · setup.sh 把插件装到了 /root/.acme.sh/dnsapi/（真文件，验过）
+#     · 面板第一条检查路径 → /.acme.sh/dnsapi/dns_ali.sh（不存在）
+#     · 第二条路径跟着 acme.sh 走，而 acme.sh 退化到
+#       /usr/lib/acme/client/acme.sh（裁剪版），它的同级 dnsapi/ 也是空的
+#     · ⇒ 报「缺少 acme.sh DNS 插件 dns_ali.sh」，但文件就在 /root 下
+#
+#   只有**从 shell 手工启动**的进程（部署时 setup.sh 起的那个）
+#   才有 HOME=/root，所以"刚装完能用、重启后不能用了" ——
+#   .232 就是这个状态（还没重启过，侥幸能用）。
+#
+# 修法：**路径不依赖环境变量**。面板永远以 root 运行（init 脚本里就是
+# `python3 app.py`），root 的家目录就是 /root，所以直接写死。
+# 保留 "~" 候选是为了兼容非常规部署（比如面板被手工用别的 HOME 启动）。
 ACME_SH_CANDIDATES = (
-    "~/.acme.sh/acme.sh",
+    "/root/.acme.sh/acme.sh",       # ← setup.sh 装插件时用的就是这个目录
+    "~/.acme.sh/acme.sh",           # ← 兜底：非常规 HOME 的部署
     "/usr/lib/acme/client/acme.sh",
     "/usr/share/acme/acme.sh",
     "/usr/bin/acme.sh",
     "/usr/local/bin/acme.sh",
+)
+
+# acme.sh 的插件目录（dnsapi/）候选。
+# 同样**不依赖 HOME** —— 理由见上面的 ACME_SH_CANDIDATES 注释。
+# 顺序有讲究：先 /root（setup.sh 装插件的地方），再跟着主脚本走。
+ACME_DNSAPI_DIRS = (
+    "/root/.acme.sh/dnsapi",
+    "~/.acme.sh/dnsapi",
 )
 NGINX_SSL_DIR = os.environ.get(
     "NFTABLES_WEB_SSL_DIR", "/etc/nginx/ssl")
@@ -10325,12 +10356,41 @@ def _acme_sh_path():
     为什么每次调用都探测而不是模块级算一次：setup.sh 是在 app.py
     启动之后才把 acme.sh 装上的，模块级常量在 import 那一刻就已经
     固化了「不存在」这个结论，之后再也不会更新。
+
+    ⚠️ 候选里 "/root/.acme.sh/acme.sh" 必须排在 "~/.acme.sh/acme.sh"
+    前面：procd 启动的面板进程 HOME=/（见 ACME_SH_CANDIDATES 的注释），
+    expanduser("~") 会展开成 "/" —— 如果 "~" 那一行先命中了
+    /usr/lib/acme/client/acme.sh（裁剪版），就会拿到一个不带 dnsapi/
+    插件的 acme.sh，插件检查随之全盘落空。
     """
     for cand in ACME_SH_CANDIDATES:
         p = os.path.expanduser(cand)
         if os.path.isfile(p) and os.access(p, os.X_OK):
             return p
     return shutil.which("acme.sh")
+
+
+def _acme_plugin_paths(plugin_name):
+    """列出 acme.sh DNS 插件的所有可能落点。
+
+    为什么不能只查 expanduser("~/.acme.sh/dnsapi")：
+    面板进程由 procd 启动时 HOME=/（不是 /root），expanduser 展开成 "/"，
+    路径直接落空 —— 表现为「插件明明在 /root/.acme.sh/dnsapi/ 下，
+    面板却说缺少插件」（2026-10-31 在 .230 实测）。
+    """
+    dirs = list(ACME_DNSAPI_DIRS)
+    acme_sh = _acme_sh_path()
+    if acme_sh:
+        # 主脚本同级的 dnsapi/ —— acme.sh 的 LE_WORKING_DIR 默认是
+        # $HOME/.acme.sh，但装到别处时插件会跟着主脚本走。
+        dirs.append(os.path.join(os.path.dirname(acme_sh), "dnsapi"))
+    seen, out = set(), []
+    for d in dirs:
+        p = os.path.join(os.path.expanduser(d), plugin_name)
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
 
 
 def _acme_issue(domain, dns_provider="ali", dns_credentials=None, wildcard=False):
@@ -10366,18 +10426,17 @@ def _acme_issue(domain, dns_provider="ali", dns_credentials=None, wildcard=False
     # 只会抛一句看不懂的错，用户完全不知道是缺插件。
     #
     # 插件目录恒为 $LE_WORKING_DIR/dnsapi/，而 acme.sh 的 LE_WORKING_DIR
-    # 默认是 $HOME/.acme.sh（跟主脚本装在哪无关），所以两处都看一遍。
+    # 默认是 $HOME/.acme.sh（跟主脚本装在哪无关），所以几处都看一遍。
+    # 路径由 _acme_plugin_paths() 给，**不依赖 HOME 环境变量** ——
+    # procd 启动的面板进程 HOME=/ （见 ACME_SH_CANDIDATES 的注释）。
     plugin_name = provider["acme_param"] + ".sh"
-    plugin_paths = [
-        os.path.join(os.path.expanduser("~/.acme.sh/dnsapi"), plugin_name),
-        os.path.join(os.path.dirname(acme_sh), "dnsapi", plugin_name),
-    ]
+    plugin_paths = _acme_plugin_paths(plugin_name)
     if not any(os.path.exists(p) for p in plugin_paths):
         return False, {"error": (
             f"缺少 acme.sh DNS 插件 {plugin_name} —— "
             f"OpenWrt 的 opkg acme-acmesh 是裁剪版不含 DNS 插件，"
             f"需要完整版 acme.sh（setup.sh 会自动补装）"
-        )}
+        ), "log": "已查找的路径:\n  " + "\n  ".join(plugin_paths)}
 
     cert_dir = os.path.join(NGINX_SSL_DIR, domain)
     os.makedirs(cert_dir, exist_ok=True)

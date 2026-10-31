@@ -33,6 +33,18 @@ INITD_SCRIPT="/etc/init.d/nftables-web"
 LOG_FILE="/var/log/nftables-web-setup.log"
 GITHUB_REPO="fzyt/ghost-firewall"
 ACME_EMAIL="admin@example.com"
+
+# ACME CA 的目录地址。写进 ~/.acme.sh/account.conf 的 DEFAULT_ACME_SERVER。
+#
+# ⚠️ 为什么必须显式指定（2026-10-31 在 .232 / .230 实测）：
+#   acme.sh v3.1.3 硬编码 `DEFAULT_CA=$CA_ZEROSSL`（源码第 37 行），
+#   而 ZeroSSL **强制要求账户绑邮箱**，没有邮箱就抛
+#   "Please update your account with an email address first." 然后退出。
+#   后端调的是 `acme.sh --issue ...`（不带 --server）⇒ 必然走 ZeroSSL ⇒
+#   面板点「申请证书」**必然失败**，跟插件、跟阿里云凭据都无关。
+#
+#   Let's Encrypt：不要邮箱、无 EAB、签发快。
+ACME_CA_URL="https://acme-v02.api.letsencrypt.org/directory"
 ARG_FORCE=0
 
 # 自动检测包管理器
@@ -859,36 +871,86 @@ install_acme() {
     local dnsapi_dir="${acme_home}/dnsapi"
     mkdir -p "$dnsapi_dir"
 
-    # 插件来源。**按顺序试**，第一个通的就算数。
+    # ★ 优先用**随包携带**的插件（setup/vendor/acme-dnsapi/）。
     #
-    # 为什么要多个源（2026-10-30 在 .232 实测）：
-    #   raw.githubusercontent.com 在国内是**间歇性**可达的 ——
-    #   同一台机器上 12:07 一次 curl 0.365 秒就通了，
-    #   12:11 同样的命令连接直接超时。
-    #   更糟的是它失败起来很慢：`--max-time 60 --retry 2` 意味着
-    #   一个插件最坏要烧 3 分钟，6 个插件就是 **18 分钟**纯等待，
-    #   最后还一个都没下下来。
-    #   acme.sh 在 Gitee 上有官方镜像（neilpang/acme.sh），
-    #   实测直连 200 / 0~1 秒 ⇒ 国内网络下镜像才是主力，GitHub 是补充。
-    local base_list="https://raw.githubusercontent.com/acmesh-official/acme.sh/master/dnsapi
-https://gitee.com/neilpang/acme.sh/raw/master/dnsapi"
+    # 为什么改成随包分发（2026-10-31 在 .230 / .142 / .156 连续踩坑）：
+    #   ① raw.githubusercontent.com 在国内**间歇性**可达 —— 同一台机器上
+    #      12:07 一次 curl 0.365 秒就通，12:11 同样的命令直接超时。
+    #   ② 失败起来很慢：`--max-time 30 --retry 1` ⇒ 一个插件最坏烧 60 秒，
+    #      6 个插件就是 **6 分钟**纯等待，最后还可能一个都没下下来。
+    #   ③ setup.sh 原本只验「文件非空」，**不验内容是不是真插件** ——
+    #      代理返回一个 200 的错误页也会被当成插件存下来，
+    #      然后面板报「缺少 acme.sh DNS 插件」，而文件就在那儿。
+    #   ④ .142 上最终报的就是这个错：插件"装了"但面板找不到
+    #      （真正的根因是 HOME=/ ，见 backend/app.py 的 ACME_SH_CANDIDATES）。
+    #
+    # 随包分发把这 4 条全消灭了：52KB，纯 shell 脚本，无编译，
+    # 装的时候不碰网络。跟 vendor/blinker 是同一套路。
+    #
+    # 仍然保留网络下载作为**兜底**：用户只下一个 setup.sh（不带 vendor/）
+    # 的老用法不能因此坏掉。
+    local vendor_dnsapi=""
+    local vdir
+    for vdir in "$(dirname "$0")/vendor/acme-dnsapi" "$(dirname "$0")/../vendor/acme-dnsapi" \
+                "$(dirname "$0")/vendor" "$(dirname "$0")/../vendor"; do
+        # 候选可能是「插件目录本身」也可能是「装着插件的上级目录」，
+        # 两种布局都要认（跟下面 blinker 的处理一个道理）。
+        if [ -f "${vdir}/dns_ali.sh" ]; then
+            vendor_dnsapi="$vdir"; break
+        elif [ -f "${vdir}/acme-dnsapi/dns_ali.sh" ]; then
+            vendor_dnsapi="${vdir}/acme-dnsapi"; break
+        fi
+    done
 
-    # 连续失败计数：所有插件都在同样的几个 host 上，
-    # 连着两个都拿不到 ⇒ 这些 host 就是不可达，继续试纯属浪费时间。
+    local p v_ok
+    # 连续失败计数。**必须提到循环外** —— 它的语义是"连续几个插件都拿不到"，
+    # 放在循环内每次都重置成 0，就永远达不到阈值，止损逻辑形同虚设。
+    #
+    # 为什么还要留这个止损：随包分发是主路径，但**兜底的网络下载**仍然可能
+    # 遇到"源完全不可达"。这种情况下继续试每个插件要烧 6 分钟（6 × 60s），
+    # 而结果必然还是拿不到 —— 连着两个失败就说明 host 不可达，直接收手。
     local consec_fail=0
-    local p base got
     for p in ${ACME_DNSAPI_PLUGINS}; do
         if [ -f "${dnsapi_dir}/${p}.sh" ]; then
             continue
         fi
+
+        # ---- 路径 1：随包携带（首选，完全离线）----
+        v_ok=""
+        if [ -n "$vendor_dnsapi" ] && [ -f "${vendor_dnsapi}/${p}.sh" ]; then
+            # ⚠️ 验首行：随包文件也得防一手 —— 仓库里的文件被改成
+            # 错误页/空文件时，宁可不装也不要留个"看起来装好了"的假象。
+            if head -1 "${vendor_dnsapi}/${p}.sh" 2>/dev/null | grep -q '^#!'; then
+                cp "${vendor_dnsapi}/${p}.sh" "${dnsapi_dir}/${p}.sh" \
+                    && chmod +x "${dnsapi_dir}/${p}.sh" && v_ok="yes"
+            else
+                warn "随包插件 ${p}.sh 内容异常（首行不是 shebang），跳过"
+            fi
+        fi
+        if [ -n "$v_ok" ]; then
+            info "acme.sh DNS 插件 ${p}.sh 已就位（随包分发，离线）"
+            consec_fail=0
+            continue
+        fi
+
+        # ---- 路径 2：网络下载（兜底）----
+        # 插件来源。**按顺序试**，第一个通的就算数。
+        # Gitee 是 acme.sh 官方镜像，国内直连 200 / 0~1 秒，
+        # raw.githubusercontent 是补充。
+        local base_list="https://gitee.com/neilpang/acme.sh/raw/master/dnsapi
+https://raw.githubusercontent.com/acmesh-official/acme.sh/master/dnsapi"
+
+        # 连续失败计数：所有插件都在同样的几个 host 上，
+        # 连着两个都拿不到 ⇒ 这些 host 就是不可达，继续试纯属浪费时间。
         if [ "$consec_fail" -ge 2 ]; then
             warn "连续 ${consec_fail} 个插件取不到，判定下载源不可达 —— 跳过剩余插件"
             warn "  面板的 DNS-01 证书申请会不可用（泛域名证书依赖它）"
-            warn "  修法：让设备能访问 raw.githubusercontent.com 或 gitee.com，"
+            warn "  修法：让设备能访问 gitee.com 或 raw.githubusercontent.com，"
             warn "        或把 ${dnsapi_dir}/ 下的 dns_*.sh 手动拷进去"
             break
         fi
 
+        local base got
         info "下载 acme.sh DNS 插件 ${p}.sh ..."
         got=""
         for base in ${base_list}; do
@@ -897,9 +959,11 @@ https://gitee.com/neilpang/acme.sh/raw/master/dnsapi"
             # --max-time 30 --retry 1：单个插件最坏 60 秒，而不是 3 分钟
             if curl -4 -fsSL --connect-timeout 10 --retry 1 --max-time 30 \
                     -o "${dnsapi_dir}/${p}.sh.part" "${base}/${p}.sh" 2>/dev/null; then
-                # ⚠️ 必须验大小：curl 拿到的是 404 页面时 -f 会报错，但
-                # 万一代理返回了一个 200 的错误页，落地的是垃圾内容。
-                if [ -s "${dnsapi_dir}/${p}.sh.part" ]; then
+                # ⚠️ 必须验大小**和首行**：curl 拿到 404 页面时 -f 会报错，
+                # 但万一代理返回了一个 200 的错误页，落地的是垃圾内容。
+                # 只验「非空」不够 —— 200 错误页也是非空的。
+                if [ -s "${dnsapi_dir}/${p}.sh.part" ] \
+                   && head -1 "${dnsapi_dir}/${p}.sh.part" 2>/dev/null | grep -q '^#!'; then
                     mv "${dnsapi_dir}/${p}.sh.part" "${dnsapi_dir}/${p}.sh"
                     chmod +x "${dnsapi_dir}/${p}.sh"
                     got="yes"
@@ -916,6 +980,35 @@ https://gitee.com/neilpang/acme.sh/raw/master/dnsapi"
             warn "插件 ${p}.sh 下载失败（该 DNS 提供商将不可用）"
         fi
     done
+
+    # ---- ACME 账户与 CA 选择 ----
+    #
+    # ⚠️ 必须写 account.conf 里的 DEFAULT_ACME_SERVER（2026-10-31 实测）：
+    #
+    #   acme.sh v3.1.3 的第 37 行是 `DEFAULT_CA=$CA_ZEROSSL` ——
+    #   **默认 CA 硬编码是 ZeroSSL**。而 ZeroSSL 强制要求账户绑邮箱，
+    #   没有邮箱就直接抛这句然后退出：
+    #       "Please update your account with an email address first."
+    #
+    #   后端 app.py 调的是 `acme.sh --issue ...`（不带 --server），
+    #   于是走的必然是 ZeroSSL ⇒ 面板点「申请证书」**必然失败**，
+    #   跟插件装没装好、阿里云凭据对不对都无关。
+    #   （.232 和 .230 都实测复现过，报错一字不差。）
+    #
+    #   acme.sh 官方支持的持久化方式是 account.conf 里的
+    #   DEFAULT_ACME_SERVER 键（第 2919 行 _readaccountconf 读它）。
+    #   ⚠️ 没有 ca.conf 机制 —— 往 ca.conf 里写 CA_SERVER 是**无效**的，
+    #   那是本次排查踩过的弯路，别再试。
+    #
+    #   选 Let's Encrypt：不要邮箱、无 EAB 凭据、签发快、国内可达性尚可。
+    local account_conf="${acme_home}/account.conf"
+    if [ ! -f "$account_conf" ] || ! grep -q "DEFAULT_ACME_SERVER" "$account_conf" 2>/dev/null; then
+        printf 'DEFAULT_ACME_SERVER="%s"\n' "$ACME_CA_URL" > "$account_conf"
+        chmod 600 "$account_conf"
+        ok "已固定 ACME CA: ${ACME_CA_URL}"
+    else
+        info "ACME CA 已配置: $(grep DEFAULT_ACME_SERVER "$account_conf" 2>/dev/null | head -1)"
+    fi
 
     ok "✅ acme.sh 就绪: $acme_main（插件目录 $dnsapi_dir）"
 }

@@ -54,6 +54,11 @@ def fresh():
 APP_SRC = open(os.path.join(BACKEND, 'app.py'), encoding='utf-8').read()
 SETUP_SRC = open(os.path.join(ROOT, 'setup', 'setup.sh'), encoding='utf-8').read()
 APPJS_SRC = open(os.path.join(ROOT, 'frontend', 'app.js'), encoding='utf-8').read()
+# init 脚本（治本的一层：显式 export HOME=/root）
+INIT_SRC = open(os.path.join(BACKEND, 'nftables-web.init'), encoding='utf-8').read()
+# vendor 说明（随包分发的内容要交代来源和许可）
+VENDOR_README = open(os.path.join(ROOT, 'setup', 'vendor', 'README.md'),
+                      encoding='utf-8').read()
 INDEX_SRC = open(os.path.join(ROOT, 'frontend', 'index.html'), encoding='utf-8').read()
 
 # ─────────────────────────────────────────────────────────────
@@ -138,18 +143,28 @@ check('不再是写死的单路径常量',
 check('有 _acme_sh_path() 函数', hasattr(app, '_acme_sh_path'))
 
 # 打桩 os.path.isfile / access，验证候选顺序
+#
+# ⚠️ 2026-10-31 起 "/root/.acme.sh/acme.sh" **排在 "~" 前面** ——
+# 面板由 procd 启动时 HOME=/ （不是 /root），expanduser("~") 展开成 "/"，
+# 若 "~" 先命中就会拿到裁剪版的 /usr/lib/acme/client/acme.sh，
+# 它的同级 dnsapi/ 是空的 ⇒ 插件检查全盘落空（.230 实测）。
 _real_isfile, _real_access = app.os.path.isfile, app.os.access
 try:
     app.os.path.isfile = lambda p: p in (
+        '/root/.acme.sh/acme.sh',
         os.path.expanduser('~/.acme.sh/acme.sh'),
         '/usr/lib/acme/client/acme.sh')
     app.os.access = lambda p, mode: True
     got = app._acme_sh_path()
-    check('优先命中 ~/.acme.sh/acme.sh',
+    check('优先命中 /root/.acme.sh/acme.sh（写死路径，不依赖 HOME）',
+          got == '/root/.acme.sh/acme.sh', f'实际 {got}')
+    app.os.path.isfile = lambda p: p == os.path.expanduser('~/.acme.sh/acme.sh')
+    got = app._acme_sh_path()
+    check('/root 不存在时回落到 ~ 路径',
           got == os.path.expanduser('~/.acme.sh/acme.sh'), f'实际 {got}')
     app.os.path.isfile = lambda p: p == '/usr/lib/acme/client/acme.sh'
     got = app._acme_sh_path()
-    check('没有 ~/.acme.sh 时回落到 OpenWrt opkg 路径',
+    check('前两个都没有时回落到 OpenWrt opkg 路径',
           got == '/usr/lib/acme/client/acme.sh', f'实际 {got}')
 finally:
     app.os.path.isfile, app.os.access = _real_isfile, _real_access
@@ -351,7 +366,12 @@ check('清单覆盖面板支持的全部提供商',
           for p in ('dns_ali', 'dns_tencent', 'dns_cf')))
 check('install_acme 会复制 opkg 版主脚本',
       '/usr/lib/acme/client/acme.sh' in SETUP_SRC)
-check('install_acme 从 raw.githubusercontent 拉插件',
+# ⚠️ 2026-10-31 起：插件**优先从随包目录**拷，网络下载降级为兜底。
+# （原先只有网络下载，raw.githubusercontent 国内间歇性可达，
+#   失败时最坏烧 6 分钟，且只验「非空」会把 200 错误页当插件存下。）
+check('install_acme 优先用随包携带的插件',
+      'vendor/acme-dnsapi' in SETUP_SRC and '随包分发' in SETUP_SRC)
+check('网络下载仍保留为兜底',
       'raw.githubusercontent.com/acmesh-official/acme.sh' in SETUP_SRC)
 check('插件下载失败有告警', '插件 ${p}.sh 下载失败' in SETUP_SRC)
 
@@ -408,6 +428,141 @@ check('自动设默认的判断在 settings 赋值**之后**',
       f'auto@{i_auto} settings@{i_settings}')
 check('这段逻辑还带着解释为什么会冲掉手工配置',
       'sub_filter' in body or '手工' in body)
+
+# ─────────────────────────────────────────────────────────────
+sec('WC-13 acme.sh 路径探测不依赖 HOME 环境变量（2026-10-31 .230 实测）')
+
+# 现场：procd 启动的面板进程 HOME=/ （不是 /root），
+# 于是 os.path.expanduser("~") 展开成 "/"，
+# "~/.acme.sh/dnsapi/dns_ali.sh" → "/.acme.sh/dnsapi/dns_ali.sh" → 不存在。
+# 而插件**明明在** /root/.acme.sh/dnsapi/ 下 —— 面板却报「缺少插件」。
+#
+# 迷惑性在于：部署完当场能用（setup.sh 从 shell 起，HOME=/root），
+# 一重启就坏（procd 起，HOME=/）。.232 就是"还没重启所以侥幸能用"。
+#
+# 修法：候选里把 /root 写死并**排在 "~" 前面** ——
+# 面板永远以 root 运行，root 的家目录就是 /root，不该依赖环境变量。
+
+check('候选里有写死的 /root 路径',
+      '/root/.acme.sh/acme.sh' in app.ACME_SH_CANDIDATES)
+check('/root 候选排在 "~" 候选前面',
+      app.ACME_SH_CANDIDATES.index('/root/.acme.sh/acme.sh')
+      < app.ACME_SH_CANDIDATES.index('~/.acme.sh/acme.sh'),
+      str(app.ACME_SH_CANDIDATES))
+check('插件目录候选也含 /root',
+      '/root/.acme.sh/dnsapi' in app.ACME_DNSAPI_DIRS)
+check('插件目录候选里 /root 排在 "~" 前面',
+      app.ACME_DNSAPI_DIRS.index('/root/.acme.sh/dnsapi')
+      < app.ACME_DNSAPI_DIRS.index('~/.acme.sh/dnsapi'),
+      str(app.ACME_DNSAPI_DIRS))
+
+# 打桩：模拟 HOME=/ 的运行环境，验证仍能命中 /root 下的 acme.sh
+_real_expanduser = app.os.path.expanduser
+try:
+    def _expanduser_stub(path):
+        # 模拟 HOME=/：expanduser("~x") → "/x"
+        if path.startswith('~'):
+            return '/' + path[1:].lstrip('/')
+        return path
+    app.os.path.expanduser = _expanduser_stub
+    app.os.path.isfile = lambda p: p == '/root/.acme.sh/acme.sh'
+    app.os.access = lambda p, mode: True
+    got = app._acme_sh_path()
+    check('HOME=/ 时仍能命中 /root/.acme.sh/acme.sh',
+          got == '/root/.acme.sh/acme.sh', f'实际 {got}')
+finally:
+    app.os.path.expanduser = _real_expanduser
+    app.os.path.isfile, app.os.access = _real_isfile, _real_access
+
+# 插件路径列表：HOME=/ 时也必须含 /root 那条
+_real_expanduser = app.os.path.expanduser
+try:
+    app.os.path.expanduser = lambda path: (
+        '/' + path[1:].lstrip('/') if path.startswith('~') else path)
+    paths = app._acme_plugin_paths('dns_ali.sh')
+    check('插件路径列表含 /root/.acme.sh/dnsapi/dns_ali.sh',
+          '/root/.acme.sh/dnsapi/dns_ali.sh' in paths, str(paths))
+finally:
+    app.os.path.expanduser = _real_expanduser
+
+check('有 _acme_plugin_paths() 函数', hasattr(app, '_acme_plugin_paths'))
+check('缺插件时的报错带上「已查找的路径」（便于下次直接定位）',
+      '已查找的路径' in APP_SRC)
+
+# init 脚本必须显式 export HOME=/root —— 这是治本的一层
+check('init 脚本显式 export HOME=/root',
+      'export HOME=/root' in INIT_SRC,
+      '面板由 procd 启动时默认 HOME=/')
+check('init 脚本里 export HOME 在 python3 app.py 之前',
+      INIT_SRC.find('export HOME=/root') < INIT_SRC.find('python3 app.py')
+      if 'export HOME=/root' in INIT_SRC else False)
+
+# ─────────────────────────────────────────────────────────────
+sec('WC-14 setup.sh 固定 ACME CA，避开 ZeroSSL 的邮箱强制（2026-10-31 实测）')
+
+# acme.sh v3.1.3 源码第 37 行 `DEFAULT_CA=$CA_ZEROSSL` —— 默认 CA 硬编码。
+# ZeroSSL 强制要邮箱，没邮箱就抛 "Please update your account with an email
+# address first." 然后退出。后端调的是 `acme.sh --issue`（不带 --server），
+# ⇒ 面板点「申请证书」必然失败，跟插件、跟阿里云凭据都无关。
+# .232 和 .230 都实测复现过，报错一字不差。
+#
+# acme.sh 官方支持的持久化方式是 account.conf 的 DEFAULT_ACME_SERVER 键
+# （源码第 2919 行 _readaccountconf 读它）。
+# ⚠️ 没有 ca.conf 机制 —— 往 ca.conf 写 CA_SERVER 是**无效**的（踩过的弯路）。
+
+check('定义了 ACME_CA_URL 常量', 'ACME_CA_URL=' in SETUP_SRC)
+ca_url = re.search(r'ACME_CA_URL="([^"]+)"', SETUP_SRC)
+check('ACME_CA_URL 指向 letsencrypt',
+      ca_url and 'letsencrypt' in ca_url.group(1),
+      ca_url.group(1) if ca_url else '(未找到)')
+check('install_acme 会写 account.conf',
+      'account.conf' in SETUP_SRC)
+check('写的是 DEFAULT_ACME_SERVER 键（acme.sh 唯一支持的机制）',
+      'DEFAULT_ACME_SERVER' in SETUP_SRC)
+check('没往 ca.conf 里写 CA_SERVER（那是无效的）',
+      'CA_SERVER=' not in SETUP_SRC)
+
+# ─────────────────────────────────────────────────────────────
+sec('WC-15 acme.sh DNS 插件随包分发，不再依赖运行时下载')
+
+# 2026-10-31 在 .142 / .156 / .230 三台设备上连续踩到：
+#   · raw.githubusercontent.com 国内间歇性可达，失败时最坏烧 6 分钟
+#   · 老 setup.sh 只验「文件非空」不验内容，200 错误页被当成插件存下
+# 现在改成随包携带（跟 vendor/blinker 同一套路），网络下载降级为兜底。
+
+VENDOR_DIR = os.path.join(ROOT, 'setup', 'vendor', 'acme-dnsapi')
+check('vendor 目录存在', os.path.isdir(VENDOR_DIR))
+
+plugins = re.search(r'ACME_DNSAPI_PLUGINS="([^"]*)"', SETUP_SRC).group(1).split()
+check('插件清单非空', len(plugins) >= 6, str(plugins))
+missing = [p for p in plugins
+           if not os.path.isfile(os.path.join(VENDOR_DIR, p + '.sh'))]
+check('vendor 里每个插件都有对应文件', not missing, f'缺 {missing}')
+
+bad = []
+for p in plugins:
+    fp = os.path.join(VENDOR_DIR, p + '.sh')
+    if not os.path.isfile(fp):
+        continue
+    with open(fp, 'rb') as f:
+        head = f.readline()
+    size = os.path.getsize(fp)
+    if not head.startswith(b'#!') or size < 1000:
+        bad.append(f'{p}({size}B,{head[:20]!r})')
+check('vendor 插件首行是 shebang 且体积正常（非错误页）',
+      not bad, str(bad))
+
+check('setup.sh 会找 vendor/acme-dnsapi 目录',
+      'vendor/acme-dnsapi' in SETUP_SRC)
+check('setup.sh 有「随包分发」路径', '随包分发' in SETUP_SRC)
+check('安装时验首行（防错误页冒充插件）',
+      "grep -q '^#!'" in SETUP_SRC)
+check('网络下载仍保留为兜底（老用法不能坏）',
+      'raw.githubusercontent.com' in SETUP_SRC)
+check('vendor README 说明了 acme-dnsapi',
+      'acme-dnsapi' in VENDOR_README)
+check('vendor README 说明了许可（acme.sh 是 GPL-3.0）',
+      'GPL' in VENDOR_README)
 
 print()
 if FAIL:

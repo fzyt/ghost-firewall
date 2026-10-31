@@ -238,6 +238,20 @@ start() {
         return 0
     fi
     echo "Starting nftables-web..."
+    # ⚠️ 必须显式 export HOME=/root（2026-10-31 在 .230 实测踩坑）：
+    #
+    #   procd 启动的子进程默认 HOME=/（不是 /root）。面板里凡是走
+    #   os.path.expanduser("~") 的路径都会展开成 "/" —— 证书申请那套
+    #   就会去找 "/.acme.sh/dnsapi/dns_ali.sh"，找不到，于是报
+    #   「缺少 acme.sh DNS 插件」，而文件明明在 /root/.acme.sh/dnsapi/ 下。
+    #
+    #   现象很有迷惑性：**部署完当场能用，一重启就坏**
+    #   （部署时是 setup.sh 从 shell 起的进程，HOME=/root；
+    #     重启后是 procd 起的，HOME=/）。
+    #
+    #   后端 app.py 已经改成不依赖 HOME（路径写死 /root），
+    #   但这里仍然设上 —— 面板进程将来用到别的 ~ 路径时不会重蹈覆辙。
+    export HOME=/root
     cd "$APP_DIR" || return 1
     python3 app.py > "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
