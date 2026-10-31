@@ -454,14 +454,30 @@ def main():
 
     check('_valid_upstream_host 之外的判定不影响本条；查生成器',
           True)
+    # ⚠️ 作用域必须是 **_nginx_service_location** —— 那里才是「反代上游」
+    # 真正收到的 Host 头。
+    #
+    # 之前盯的是 _generate_gateway_nginx_conf，但它里面只剩「门户页」那一行
+    # Host 转发（面板自己的服务），反代上游那行在另一个函数里 ——
+    # 盯着不相干的地方，等于真出问题时测试照样全绿。
+    svc = src[src.index('def _nginx_service_location'):]
+    svc = svc[:svc.index('\ndef ')]
+    check('反代上游的 Host 头不是客户端可控的原始值',
+          'proxy_set_header Host $http_host;' not in svc,
+          '仍在转发客户端可控的 Host 头')
+    check('反代上游的 Host 头带服务端端口（思源 origin 校验要求）',
+          'proxy_set_header Host $host:$server_port;' in svc,
+          '没有改用 $host:$server_port')
+    check('X-Forwarded-Host 同样带端口（上游拼绝对 URL 时才指得对）',
+          'proxy_set_header X-Forwarded-Host $host:$server_port;' in svc,
+          'X-Forwarded-Host 丢了端口')
+    # 门户页 / 认证端点转发的是面板自己的服务，不是对外站点，
+    # 继续用不带端口的 $host —— 这条也要守住，别让人顺手改成 $http_host。
     gs2 = src[src.index('def _generate_gateway_nginx_conf'):]
     gs2 = gs2[:gs2.index('\ndef ')]
-    check('生成的配置里没有 proxy_set_header Host $http_host',
+    check('门户页转发同样不用 $http_host',
           'proxy_set_header Host $http_host;' not in gs2,
           '仍在转发客户端可控的 Host 头')
-    check('改成了 proxy_set_header Host $host',
-          'proxy_set_header Host $host;' in gs2,
-          '没有改用 $host')
 
     print('\n' + '=' * 66)
     print(f' 合计: ✅ {len(PASS)}   ❌ {len(FAIL)}')

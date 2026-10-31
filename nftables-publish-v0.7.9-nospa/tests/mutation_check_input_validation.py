@@ -130,7 +130,30 @@ MUTATIONS = [
                '        if not _valid_ip(host, 6):\n'
                '            # 静默丢弃是「API 报成功但规则没生效」的来源（P2-16）。')]),
 
+    # ⚠️ 锚点必须精确落在 **_nginx_service_location**（反代上游那行）上。
+    # 之前锚的是 `proxy_set_header Host $host;` —— 那串字面量在文件里出现三次
+    # （认证端点 ×2 + 门户页 ×1），真正要守的「反代上游」那行反而**打不到**：
+    # 变异打在了不相干的地方，测试是靠门户行变红才捕获的 —— 属于「碰巧捕获」，
+    # 哪天门户那行改了写法，这条变异就会变成「打空枪」（锚点失配 = 没人守）。
     ('M14 上游又收到客户端可控的 Host 头',
+     APP_PY, [('    L.append("        proxy_set_header Host $host:$server_port;")',
+               '    L.append("        proxy_set_header Host $http_host:$server_port;")')]),
+
+    # M14b 反代上游的 Host 头丢掉端口 —— 这是本轮修的真问题：
+    # 上游（思源）拿 Origin 头和 Host 头逐字节比对，端口不一致就
+    # 401「invalid request origin」⇒ 密码页能开、输完密码进不去主界面。
+    ('M14b 反代上游的 Host 头丢掉端口（上游 origin 校验会拒绝）',
+     APP_PY, [('    L.append("        proxy_set_header Host $host:$server_port;")',
+               '    L.append("        proxy_set_header Host $host;")')]),
+
+    # M14c X-Forwarded-Host 丢掉端口 —— 上游拼绝对 URL（回调地址、分享链接）
+    # 会指到 443，而网关根本不在 443 上。
+    ('M14c X-Forwarded-Host 丢掉端口',
+     APP_PY, [('    L.append("        proxy_set_header X-Forwarded-Host $host:$server_port;")',
+               '    L.append("        proxy_set_header X-Forwarded-Host $host;")')]),
+
+    # M14d 门户页转发改用客户端可控的 Host 头 —— 同样是 Host Header Injection。
+    ('M14d 门户页转发改用客户端可控的 Host 头',
      APP_PY, [('    L.append("        proxy_set_header Host $host;")',
                '    L.append("        proxy_set_header Host $http_host;")')]),
 ]

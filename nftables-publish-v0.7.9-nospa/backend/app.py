@@ -9671,7 +9671,7 @@ def _nginx_service_location(L, rule, prefix, protocol, host, tport,
     L.append(f"    # ---- {name} ----")
     L.append(f"    location {loc_path} {{")
     L.append(f"        proxy_pass {protocol}://{host}:{tport}/;")
-    # ⚠️ 用 $host，**不用** $http_host（P2-19）。
+    # ⚠️ 用 $host + **服务端端口**，不用 $http_host（P2-19）。
     #
     # $http_host 是**客户端发来的原始 Host 头**（含端口、含任何乱七八糟的内容），
     # 把它转给上游就是标准的 Host Header Injection：
@@ -9680,11 +9680,44 @@ def _nginx_service_location(L, rule, prefix, protocol, host, tport,
     #
     # $host 是 nginx **校验过**的主机名（已按 server_name 匹配、已去端口、
     # 已小写规范化）—— 同一份生成器里另外三处转发 Host 用的都是它。
-    L.append("        proxy_set_header Host $host;")
+    #
+    # ⚠️⚠️ 但**光有 $host 是不够的**：它不带端口，而上游会拿
+    # 「浏览器发来的 Origin 头」和「自己收到的 Host 头」逐字节比对，
+    # 用来挡跨站请求伪造。思源的实现（kernel/util/net.go）：
+    #
+    #     func originHostEquals(origin, host string) bool {
+    #         originHost := TrimSuffix(TrimSuffix(u.Host, ":80"), ":443")
+    #         host      := TrimSuffix(TrimSuffix(host,      ":80"), ":443")
+    #         return originHost == host
+    #     }
+    #     // 调用点：IsSessionOriginAllowed(origin, r.Host)
+    #
+    # 它只剥 :80 / :443，**其余端口必须原样相等**。
+    # 网关按设计就跑在 8443 这种高位端口上 ⇒ 浏览器发的是
+    #     Origin: https://siyuan.fzyto.top:8443
+    # 而只转发 $host 的话，上游收到的是
+    #     Host: siyuan.fzyto.top
+    # ⇒ 不相等 ⇒ 上游直接 401「Auth failed: invalid request origin」。
+    #
+    # 症状极具迷惑性：**密码页正常显示，输完密码却进不去主界面**，
+    # 前端拿到 401 反复重载，看起来像「思源加载还是有问题」。
+    #（真机复现：do:6807 思源经 .232:8443 反代，
+    #   Origin 带端口 → 401 invalid request origin；
+    #   把 Host 改成 $host:$server_port → 200 正常返回配置。）
+    #
+    # 所以这里拼 $host + **服务端自己的**端口 $server_port：
+    #   · 主机名部分仍是 nginx 校验过的 $host ⇒ 不引入 Host Header 注入
+    #   · 端口部分来自**服务端配置常量**，不是客户端可控的 ⇒ 同样安全
+    # 用 $server_port 而不是写死 gw_port：同一个 server 块若同时 listen
+    # 80 和 8443，$server_port 会随实际命中的监听端口变化，更准。
+    L.append("        proxy_set_header Host $host:$server_port;")
     L.append("        proxy_set_header X-Real-IP $remote_addr;")
     L.append("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
     L.append("        proxy_set_header X-Forwarded-Proto $scheme;")
-    L.append("        proxy_set_header X-Forwarded-Host $host;")
+    # X-Forwarded-Host 同样要带端口：它的语义是「客户端访问用的对外地址」，
+    # 丢了端口的话，上游用它拼绝对 URL（回调地址、分享链接）会指到 443，
+    # 而网关根本不在 443 上 ⇒ 又是「看起来能登录、点一下就坏」。
+    L.append("        proxy_set_header X-Forwarded-Host $host:$server_port;")
     L.append("        proxy_set_header X-Forwarded-Port $server_port;")
     L.append("        proxy_set_header X-Auth-User $auth_user;")
     L.append("        proxy_set_header X-Auth-Device $auth_device;")
