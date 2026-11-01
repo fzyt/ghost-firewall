@@ -31,3 +31,10 @@ tmp/
 
 # e2e 测试产物（每次跑都会变，不入库）
 nftables-publish-v0.7.9-nospa/tests/reports/
+
+# 抓包日志（HAR / DevTools 导出）
+# ⚠️ **绝不入库**：HAR 里带着思源的 authCode、网关的明文口令、
+#   以及 Set-Cookie 里的会话 token —— 一进版本库就是永久泄露，
+#   而 GitHub 上的 fzyt/ghost-firewall 是 **public** 仓库。
+#   要看现场就重新抓，抓完就放仓库外。
+抓包日志/
