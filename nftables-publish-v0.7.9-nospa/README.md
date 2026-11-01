@@ -2,7 +2,9 @@
 
 > 基于 OpenWrt 的防火墙 Web 管理面板
 
-**版本：** v0.8.0
+**版本：** v0.8.8
+
+> 仓库主页（功能速览 / 截图 / 安全设计）见 [根 README](../README.md)。
 
 Ghost Firewall 是一个运行在 OpenWrt 上的轻量防火墙管理工具，通过 Web 界面管理 nftables 规则，提供端口敲门、端口转发、DDNS、反向代理等功能。
 
@@ -40,7 +42,7 @@ Ghost Firewall 是一个运行在 OpenWrt 上的轻量防火墙管理工具，�
 要求 OpenWrt 系统（opkg 或 apk 包管理器），通过一键脚本安装：
 
 ```bash
-wget -O /tmp/setup.sh https://raw.githubusercontent.com/fzyt/ghost-firewall/main/setup/setup.sh
+wget -O /tmp/setup.sh https://raw.githubusercontent.com/fzyt/ghost-firewall/main/nftables-publish-v0.7.9-nospa/setup/setup.sh
 sh /tmp/setup.sh
 ```
 
