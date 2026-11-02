@@ -67,6 +67,23 @@
   --t-mid:   .28s;
   --t-slow:  .46s;
 
+  /* ── 间距尺度（4px 基数）──────────────────────────────
+     之前页面里的间距是一堆一次性值：2 / 3 / 5 / 7 / 9 / 13 / 14 /
+     16 / 18 / 20 / 22 … 同一个意思有三四种写法，
+     「卡片内边距 13px、网格间距 13px」这种巧合更是把两个
+     本该独立决策的量绑在了一起 —— 改一个必然误伤另一个。
+     换成 4 基数刻度后，节奏靠 token 说话，不再靠记忆；
+     需要新的间隔时先在刻度上找，找不到再考虑加一档。 */
+  --sp-1:  4px;
+  --sp-2:  8px;
+  --sp-3:  12px;
+  --sp-4:  16px;
+  --sp-5:  20px;
+  --sp-6:  24px;
+  --sp-8:  32px;
+  --sp-10: 40px;
+  --sp-12: 48px;
+
   /* 等宽字体栈：编号、路径、状态都走它 */
   --mono: ui-monospace, SFMono-Regular, Menlo, "Cascadia Mono",
           "Liberation Mono", "Noto Sans Mono CJK SC", monospace;
@@ -538,18 +555,31 @@ button.primary.busy .spinner { display: inline-block; }
 .ghost:active { transform: scale(.97); }
 .ghost[disabled] { opacity: .5; cursor: default; }
 
+/* 服务网格。
+ *
+ * 列数从 auto-fill minmax(198px) 改成**固定两列**（2026-11-01）：
+ *   之前是「宽度够就多塞一列」，1440px 上排成 4 列、每张 215px，
+ *   结果是「思源…」「AdGu…」「NAS …」全被截断 —— 服务名是最重要的
+ *   识别信息，反而成了最先被切掉的那个。
+ *   固定两列后每张卡 442px，名字和入口路径都放得下。
+ *
+ * 手机端一行一个：单列时卡片宽度就是屏幕宽度，名字有整行的余地，
+ * 不用在一行两个 174px 的小格子里辨认。 */
 .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(198px, 1fr));
-  gap: 13px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--sp-4);
 }
 
 /* ── 服务卡片 ──────────────────────────────────────────────
-   瘦成两行：
-     行 1  [首字母] 服务名 ·············· 路径（同一行右端）
-     行 2  [首字母] ● 公网 · 需认证                ↗
-   服务名在左、路径在右「同一行两端」—— 扫一眼就能对上名字和路径，
-   不用在两行之间来回找。
+   两列布局之后每张卡有 442px 宽，原来的「服务名在左、路径在右，
+   同一行两端」就会在中间拉出一大片空洞 —— 两端的东西其实是一组
+   （都是「这条服务是什么」），被 200px 的空白隔开就散了。
+   ⇒ 改成**名称与入口上下叠**（同一列，互相靠近），状态徽章
+     单独占右列（列表行尾的状态位，扫一眼就知道公网还是内网）。
+
+     行 1  [首字母] 服务名 ··············· ● 公网 · 需认证
+     行 2  [首字母] siyuan.fzyto.top                    ↗
    图标只留路径首字母：服务名随时会改，路径首字母不会跟着变。
    徽章去掉边框和底色，只留一个小圆点 —— 颜色本身就是信息，
    再套个框等于把同一句话说两遍。
@@ -559,12 +589,12 @@ button.primary.busy .spinner { display: inline-block; }
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   grid-template-areas:
-    "ico nm pt"
-    "ico tag tag";
+    "ico nm tag"
+    "ico pt .";
   align-items: center;
-  column-gap: 10px;
-  row-gap: 5px;
-  padding: 13px 14px 12px;
+  column-gap: var(--sp-3);
+  row-gap: var(--sp-1);
+  padding: var(--sp-3) var(--sp-4);
   border-radius: var(--r-lg);
   border: 1px solid var(--stroke);
   background: var(--surface);
@@ -592,13 +622,13 @@ button.primary.busy .spinner { display: inline-block; }
   transition: opacity var(--t-mid);
 }
 /* 指向感：右下角一枚 ↗，悬停/聚焦时浮出来。
-   放在**第二行**右侧 —— 第一行右端已经给了路径。
+   放在**第二行**右侧 —— 第一行右端已经给了状态徽章。
    用 \2197 转义而不是直接写字符：样式表的编码跟着引用它的文档走，
    写死字符等于赌它一定是 UTF-8。 */
 .tile::after {
   content: "\2197";
   position: absolute;
-  right: 13px; bottom: 10px;
+  right: var(--sp-4); bottom: var(--sp-3);
   font-size: 12px;
   line-height: 1;
   color: var(--fg-mute);
@@ -694,18 +724,18 @@ button.primary.busy .spinner { display: inline-block; }
 }
 .tile .nm {
   grid-area: nm;
-  font-size: 14.5px;
+  font-size: 15px;
   font-weight: 600;
+  letter-spacing: -.01em;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 入口路径：现在在服务名**下面**同一列，所以宽度跟着中间列走
+   （442px 的卡里能放 270px 左右），不再需要原来那个
+   「按 auto 轨道算的百分比 → 会把路径砍成 /…」的 max-width 补丁。 */
 .tile .pt {
   grid-area: pt;
-  justify-self: end;
-  /* 上限用 px 不用百分比：百分比是按**轨道**宽度算的，
-     而 auto 轨道此刻的宽度就是内容宽度，46% 会把路径砍成 "/…" */
-  max-width: 84px;
   font-size: 11.5px;
   color: var(--fg-mute);
   font-family: var(--mono);
@@ -719,6 +749,8 @@ button.primary.busy .spinner { display: inline-block; }
    只会让卡片多两行框线，显得啰嗦。 */
 .tag {
   grid-area: tag;
+  justify-self: end;
+  align-self: center;
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -785,10 +817,20 @@ button.primary.busy .spinner { display: inline-block; }
     0 18px 40px -22px rgba(0, 0, 0, .95);
 }
 
+/* 窄屏（手机）一行一个。
+   断点取 640px：两列时每张卡在 640px 宽的屏上只剩 ~290px，
+   名字又开始要截断 —— 与其等到截断才反应，不如窄了就直接单列。
+   单列时卡片宽度 = 内容宽度，名字有整行的余地。 */
+@media (max-width: 640px) {
+  .grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--sp-3);
+  }
+}
+
 @media (max-width: 420px) {
   .card { padding: 28px 22px 20px; }
   .portal { padding: 24px 15px 44px; }
-  .grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
   .p-head { padding: 14px 14px; }
 }
 

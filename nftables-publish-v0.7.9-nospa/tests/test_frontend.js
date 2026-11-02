@@ -215,7 +215,11 @@ function finish() {
   for (const f of ['login.html', 'portal.html']) {
     const html = fs.readFileSync(path.join(DIR, f), 'utf8');
     ok(f + ' 无内联 <script> 块', !/<script(?![^>]*\bsrc=)/i.test(html));
-    ok(f + ' 引外部 JS', /<script src="\/auth\/static\//.test(html));
+    // 门户页的静态资源路径是**占位符** {{STATIC_BASE}}（谁提供页面谁注入前缀，
+    // 见 auth_gateway.py 的 _read_portal_html）；登录页由认证服务独占，
+    // 写死 /auth/static/。两种写法都算「引了外部 JS」。
+    ok(f + ' 引外部 JS',
+       /<script src="(?:\/auth\/static\/|\{\{STATIC_BASE\}\})/i.test(html));
     ok(f + ' 无 on* 事件属性', !/\son[a-z]+=/i.test(html));
   }
   console.log('\n=== 5. 门户页不拼 innerHTML（防 XSS）===');

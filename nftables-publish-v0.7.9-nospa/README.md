@@ -2,7 +2,7 @@
 
 > 基于 OpenWrt 的防火墙 Web 管理面板
 
-**版本：** v0.8.8
+**版本：** v0.8.9
 
 > 仓库主页（功能速览 / 截图 / 安全设计）见 [根 README](../README.md)。
 
@@ -137,8 +137,16 @@ nftables-publish-v0.7.9-nospa/
     ├── template_engine.py        # 模板引擎
     ├── nftables-web.init         # 面板 init 脚本
     ├── nftables-web-auth.init    # 认证服务 init 脚本
-    └── templates/
-        └── nftables.conf         # nftables 规则模板
+    ├── templates/
+    │   └── nftables.conf         # nftables 规则模板
+    └── static/                   # 登录页 / 服务门户的前端（零依赖零构建）
+        ├── base.css              # 设计令牌 + 布局 + 服务卡片
+        ├── gate.css              # 「光之门」转场动画
+        ├── login.html/.js        # 登录页
+        ├── portal.html/.js       # 服务门户
+        ├── pixelfield.js         # 像素场背景引擎（光带扫过方块场）
+        ├── fx.js                 # 背景变体引擎（15 套生成艺术方案）
+        └── switcher.css/.js      # 背景变体切换器
 frontend/
 ├── index.html                    # 面板前端
 ├── app.js                        # 面板逻辑

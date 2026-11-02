@@ -86,7 +86,7 @@
     },
     moonstone: {
       label: '月白 Moonstone',
-      note: '银白单色，波速 −16% ⇒ 波长更长、段落更缓。对比最高。',
+      note: '银白单色，波速 −16% ⇒ 波长更长、段落更缓。对比最高。登录页用这一档。',
       palette: 'moonstone',
       params: {
         waves: [
@@ -95,6 +95,52 @@
           { k: 0.00545, om: 0.454, off: 4.20, dir: -0.35, w: 0.78 },
         ],
         distortAmp: 0.85,
+      },
+    },
+    /* ── 月白·乱晶（服务门户专用，2026-11-02）──────────────────
+     *
+     * 为什么不直接改 moonstone 那一档：
+     *   登录页（login.js）和门户页共用同一个引擎、同一个 style 名。
+     *   改 moonstone = 顺手把登录页的背景也改了 —— 那是**另一个页面**，
+     *   改版范围不该从「服务门户」溢出到「登录页」。
+     *   ⇒ 新开一档，moonstone 一字不动（登录页视觉零变化），
+     *     门户改用这一档。
+     *
+     * 这一档改了三件事：
+     *   ① 波速 ×1.9（om 0.504 → 0.958）：原来一轮 12 秒、整屏几乎看不出
+     *      在动；现在一轮 ~6.5 秒，光带明显在走。
+     *   ② 方块晶向杂乱：两层遮罩各转一个角度 + 整片遮罩缓慢自转。
+     *      原来两层遮罩比例固定 ⇒ 全屏方块是同一个晶向，看着像一片
+     *      梳过的斜纹，不像「长出来」的。
+     *   ③ 生成快慢：遮罩漂移 0.011 → 0.030（方块重新长成快约 2.7 倍），
+     *      余晖 0.80 → 0.72。画面动快了，alpha 下降的限速也得跟上
+     *      （hyst 0.05），否则卡在阈值上的格子降不下来 ⇒ 一片糊。
+     */
+    'moonstone-swirl': {
+      label: '月白·乱晶',
+      note: '银白单色。波速 ×1.9，光带明显在走；方块晶向杂乱（遮罩双层旋转 + 整片缓慢自转）。',
+      palette: 'moonstone',
+      params: {
+        waves: [
+          { k: 0.00580, om: 0.958, off: 0.00, dir: -0.30, w: 1.00 },
+          { k: 0.00625, om: 1.070, off: 2.10, dir: -0.25, w: 0.90 },
+          { k: 0.00545, om: 0.863, off: 4.20, dir: -0.35, w: 0.78 },
+        ],
+        distortAmp: 0.85,
+        /* 两层遮罩各自的旋转角（弧度）：0.22 ≈ 13°，0.88 ≈ 50°。
+           交叠出来的方块才有杂乱的晶向。 */
+        patchRot1: 0.22,
+        patchRot2: 0.88,
+        /* 整片遮罩缓慢自转（rad/s）：0.020 ⇒ 一圈约 5 分钟。
+           慢到几乎察觉不到，但看久了会觉得「背景在活」。 */
+        patchSpin: 0.020,
+        /* 波向摆动：光带斜度来回扫，而不是钉死一个角度。 */
+        dirSwing: 0.13,
+        dirSwingFreq: 0.065,
+        patchDrift: 0.030,
+        trail: 0.72,
+        hyst: 0.05,
+        lit: 0.15,
       },
     },
     dusk: {
@@ -161,6 +207,28 @@
     patchGain: 1.0,
     /* 分块遮罩的柔边宽度（越大越糊） */
     patchSoft: 1.0,
+    /* ── 分片遮罩的**方向**（2026-11-01 门户背景优化）────────
+       原来两层遮罩的采样比例是固定常量（x 1.15 / 0.77，y 1.05 / 1.05），
+       于是整屏方块是**同一个晶向**的拉长纹理 —— 看着像一片梳过的斜纹，
+       方块不是「长出来」的，是同一把梳子梳出来的。
+       现在给两层各一个独立的旋转角（patchRot1 / patchRot2），
+       再让整片遮罩随时间缓慢自转（patchSpin）：
+       方块的晶向既有空间上的差异，也有时间上的缓慢变化。
+       这几个值默认全是 0 ⇒ 不传时行为与原来逐位一致。 */
+    patchRot1: 0.0,
+    patchRot2: 0.0,
+    patchSpin: 0.0,        /* rad/s，整片遮罩的自转角速度 */
+    /* ── 波向摆动 ──────────────────────────────────────────
+       几道光带的法线角随时间缓慢摆动 ⇒ 光带的斜度来回扫，
+       而不是永远钉在同一个角度上。摆动只跟时间有关，
+       所以在「每步」里算一次就够，不必每格算。 */
+    dirSwing: 0.0,        /* 摆幅（弧度） */
+    /* 摆动频率（Hz）。⚠️ 默认必须是 0.0：
+       这一组新增参数的默认值**全是 0**，是「不传时与改版前逐位一致」的保证。
+       摆幅为 0 时频率取多少都不影响结果（0 × sin(...) 恒为 0），
+       但默认值非 0 会让那句话不成立，也会让人以为「不传也会摆」。
+       需要摆动的档（moonstone-swirl）自己显式写 0.065。 */
+    dirSwingFreq: 0.0,
     /* 亮度总增益 */
     gain: 1.0,
     /* 色阶切分：band 值 ≥ accentT 给浪身，≥ whiteT 给浪尖 */
@@ -307,6 +375,15 @@
     var rAmp = new Float32Array(0);        /* 每格固定亮度因子 */
     var rJit = new Float32Array(0);        /* 每格固定值域偏移 */
     var dphase = new Float32Array(0);      /* 每格抖动相位 */
+    /* 每道波当前的方向（sin/cos 各存一份）：方向摆动只跟时间有关，
+       每步算一次就够，不必每格重复算三角函数。
+       ⚠️ 用 Float64Array 而不是 Float32Array：Float32 只有 24 位有效位，
+          sin(-0.30) 存进去会变成 -0.29552021622657776（真值 -0.29552020666133955，
+          相对误差 3.2e-8）⇒ 采样点末位不同 ⇒ 「新参数不传时与改版前
+          **逐位一致**」这句话就不成立了。
+          这里只存 8 个数，内存不是问题，换成双精度没有代价。 */
+    var wSin = new Float64Array(8);
+    var wCos = new Float64Array(8);
 
     var fine = document.createElement('canvas');
     var fctx = fine.getContext('2d');
@@ -382,6 +459,24 @@
       var idx = 0;
       var bandCells = 0;
 
+      /* ── 方向随机化：两项都只跟时间有关，每步算一次 ────────
+         ① 波向摆动：每道波的法线角缓慢摆动，三道波各带一个
+            固定相位（wi * 2.1）⇒ 不同步，不会整片一起转。
+         ② 遮罩晶向：两层遮罩各自的旋转角 + 整片遮罩的缓慢自转。
+            旋转矩阵同理，每步算一次 cos/sin 就够。
+         这两项放进「每格」里算就是白算 —— 9000 格 × 30Hz = 27 万次
+         三角函数，挪到这一步里每步只有几次。 */
+      var swingT = tq * p.dirSwingFreq * 6.2831853;
+      for (var wi = 0; wi < nw; wi++) {
+        var wv0 = waves[wi];
+        var dir = wv0.dir + p.dirSwing * Math.sin(swingT + wi * 2.1);
+        wSin[wi] = Math.sin(dir);
+        wCos[wi] = Math.cos(dir);
+      }
+      var spin = p.patchSpin * tq;
+      var c1 = Math.cos(p.patchRot1 + spin), s1 = Math.sin(p.patchRot1 + spin);
+      var c2 = Math.cos(p.patchRot2 + spin), s2 = Math.sin(p.patchRot2 + spin);
+
       for (var cy = 0; cy < rows; cy++) {
         var py = cy * cell + cell * 0.5;
         for (var cx = 0; cx < cols; cx++) {
@@ -394,9 +489,9 @@
 
           /* ── 多道错相平行浪，取最强的一道 ───────────────── */
           var band = 0;
-          for (var wi = 0; wi < nw; wi++) {
-            var wv = waves[wi];
-            var uy = px * Math.sin(wv.dir) + py * Math.cos(wv.dir);
+          for (var wi2 = 0; wi2 < nw; wi2++) {
+            var wv = waves[wi2];
+            var uy = px * wSin[wi2] + py * wCos[wi2];
             var ph = wv.k * uy - wv.om * tq + wv.off + dz * p.distortAmp;
             var s = Math.sin(ph);
             if (s <= p.edge0) continue;
@@ -407,12 +502,19 @@
           /* ── 分片遮罩：把带碎成一块块 ─────────────────── */
           if (band > 0) {
             bandCells++;
+            /* 两层遮罩各带一个旋转角：采样坐标**先按各自角度转过去**，
+               再乘各向异性比例。转的是「纹理本身的方向」，
+               而漂移仍留在屏幕空间 —— 于是方块内部晶向杂乱，
+               整体仍朝一个方向流动（漂移方向不跟着转，
+               否则整片会像转盘一样旋）。 */
+            var u1x = px * p.patchScale, u1y = py * p.patchScale * 1.15;
             var n1 = sample(tex, NOISE_N,
-              px * p.patchScale + tq * p.patchDrift,
-              py * p.patchScale * 1.15 + tq * p.patchDrift * 0.8);
+              u1x * c1 - u1y * s1 + tq * p.patchDrift,
+              u1x * s1 + u1y * c1 + tq * p.patchDrift * 0.8);
+            var u2x = px * p.patchScale * 0.77 + 37.1, u2y = py * p.patchScale * 1.05 + 11.3;
             var n2 = sample(tex, NOISE_N,
-              px * p.patchScale * 0.77 + 37.1 + tq * p.patchDrift * 0.55,
-              py * p.patchScale * 1.05 + 11.3 + tq * p.patchDrift * 0.9);
+              u2x * c2 - u2y * s2 + tq * p.patchDrift * 0.55,
+              u2x * s2 + u2y * c2 + tq * p.patchDrift * 0.9);
             var m1 = sstep(p.patchA1, p.patchA1 + (p.patchB1 - p.patchA1) / p.patchSoft, n1);
             var m2 = sstep(p.patchA2, p.patchA2 + (p.patchB2 - p.patchA2) / p.patchSoft, n2);
             var mask = m1 * m2;

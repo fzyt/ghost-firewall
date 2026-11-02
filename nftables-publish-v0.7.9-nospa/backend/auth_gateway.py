@@ -44,7 +44,7 @@ import time
 
 import fcntl
 
-from flask import (Flask, Response, jsonify, request, send_from_directory)
+from flask import (Flask, Response, jsonify, make_response, request, send_from_directory)
 from werkzeug.exceptions import RequestEntityTooLarge
 
 # ══════════════════════════════════════════════════════════════════════
@@ -210,6 +210,17 @@ STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 STATIC_ALLOWED = frozenset({
     "base.css", "fingerprint.js", "login.html", "login.js",
     "portal.html", "portal.js", "pixelfield.js", "gate.css",
+    # 门户改版新增的三个文件（2026-11-02）：
+    #   fx.js        背景变体引擎（15 套生成艺术方案）
+    #   switcher.css 变体切换器面板样式
+    #   switcher.js  变体切换器逻辑 + 键盘 + 指针反馈层
+    #
+    # ⚠️ 白名单是**硬闸**：不在这里的文件，即使已经拷进 static 目录，
+    #   /auth/static/<file> 也会回 404（JSON 体，37 字节）。
+    #   门户页（portal.html）引用这三个文件 ⇒ 加文件进 static 目录时
+    #   **必须同步加进这里**，否则页面白屏（背景和切换器全 404）。
+    #   tests/test_portal_frontend.py 里有断言守着这条不变量。
+    "fx.js", "switcher.css", "switcher.js",
 })
 
 # 两个 HTML 页面的 CSP。两者只差 form-action：登录页有表单要提交到
@@ -1492,6 +1503,35 @@ def health():
     return jsonify({"ok": True, "service": "auth-gateway"})
 
 
+# ─────────────────────────────────────────────────────────────
+# 门户页的静态资源基址
+# ─────────────────────────────────────────────────────────────
+#
+# 门户页只有一份（backend/static/portal.html），但它**可能由两个不同的
+# 服务提供**，两边的静态资源前缀不一样：
+#
+#   · 网关本机的认证服务（网关主域名入口）
+#       → 资源在 /auth/static/（白名单 + 认证接口同源）
+#   · 被网关按域名反代的门户实例（ces.fzyto.top 这类入口）
+#       → 资源在那个实例自己的 /static/
+#       （网关 nginx 会把 /auth/static/ 抢到本机 8444，所以这一侧
+#         不能用 /auth/static/ 前缀）
+#
+# 页面写死任何一边，另一边都会 404 —— 而 404 的是 CSS/JS，
+# 表现是「页面能开但样式全丢、背景空白」，排查起来很费劲。
+#
+# ⇒ 页面里写占位符，**谁提供页面，谁注入自己的前缀**。
+#   门户实例侧注入 '/static/'，认证服务侧注入 '/auth/static/'。
+PORTAL_STATIC_BASE = '{{STATIC_BASE}}'
+
+
+def _read_portal_html(static_base='/auth/static/'):
+    """读门户页并注入静态资源基址。"""
+    with open(os.path.join(STATIC_DIR, 'portal.html'), encoding='utf-8') as f:
+        html = f.read()
+    return html.replace(PORTAL_STATIC_BASE, static_base)
+
+
 @app.route("/auth/static/<path:filename>")
 def static_files(filename):
     """登录页 / 门户页的静态资源。
@@ -1501,7 +1541,14 @@ def static_files(filename):
     """
     if filename not in STATIC_ALLOWED:
         return jsonify({"success": False, "code": "NOT_FOUND"}), 404
-    resp = send_from_directory(STATIC_DIR, filename)
+    # 门户页带占位符，必须注入基址后再发出去
+    # （否则页面里的资源地址是 "{{STATIC_BASE}}base.css"，全是死链）。
+    # ⚠️ CSP 只在下面设**一次** —— 就地再抄一份迟早分叉
+    #   （tests/test_functional_fixes.py 守着这条）。
+    if filename == "portal.html":
+        resp = make_response(_read_portal_html())
+    else:
+        resp = send_from_directory(STATIC_DIR, filename)
     resp.headers["Cache-Control"] = "no-cache"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     # HTML 必须带 CSP：白名单里的 login.html / portal.html 从这里也能直接取到，
@@ -1515,7 +1562,7 @@ def static_files(filename):
 @app.route("/")
 def portal_page():
     """门户页。真正的数据由 /auth/portal 以 JSON 提供。"""
-    resp = send_from_directory(STATIC_DIR, "portal.html")
+    resp = make_response(_read_portal_html('/auth/static/'))
     resp.headers["Cache-Control"] = "no-store"
     resp.headers["X-Robots-Tag"] = "noindex, nofollow"
     resp.headers["X-Content-Type-Options"] = "nosniff"

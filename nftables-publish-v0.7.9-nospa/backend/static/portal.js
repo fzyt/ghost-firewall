@@ -26,7 +26,7 @@
 
   /* ── 像素场背景 ───────────────────────────────────────────
    * 和门脸页同一个引擎（pixelfield.js），纯装饰。
-   * 用月白（moonstone）那套配色 —— 跟门脸页、登录页对齐，
+   * 用月白（moonstone-swirl）那套配色 —— 跟门脸页、登录页对齐，
    * 整站是同一种银白语言，不是三页三种色。
    * createStyle 会连配色带波形参数一起套上；引擎不存在或接口对不上
    * 就退回 mount()，再不行就什么都不画 —— 背景画不出来无所谓，
@@ -34,6 +34,11 @@
   (function mountField() {
     var canvas = document.getElementById('pix');
     if (!canvas || !window.GhostPixelField) return;
+    /* 装了变体引擎（fx.js）就别自己再挂一个 ——
+       两个引擎抢同一个 canvas 会互相覆盖：原生引擎每帧 fillRect 整屏，
+       把变体引擎画的东西抹掉，反之亦然 ⇒ 背景随机闪烁。
+       fx.js 在 portal.js **之前**加载，所以这里能直接看到 window.GhostFX。 */
+    if (window.GhostFX) return;
     try {
       var reduce = !!(window.matchMedia &&
         window.matchMedia('(prefers-reduced-motion: reduce)').matches);
@@ -42,8 +47,12 @@
         params: { lit: 0.12 },
         static: reduce,
       };
+      /* 用 'moonstone-swirl'（门户那一档：波速 ×1.9、方块晶向杂乱），
+         而不是 'moonstone'（登录页那一档，一字未动）。
+         这条分支是 **fx.js 没加载上时的降级路径** —— 背景要用同一档，
+         否则一掉脚本背景就「变回原版」，用户会以为页面坏了。 */
       if (window.GhostPixelField.createStyle) {
-        window.GhostPixelField.createStyle(canvas, 'moonstone', opt);
+        window.GhostPixelField.createStyle(canvas, 'moonstone-swirl', opt);
       } else if (window.GhostPixelField.mount) {
         window.GhostPixelField.mount(canvas, opt);
       }

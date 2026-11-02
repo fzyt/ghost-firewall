@@ -7,7 +7,7 @@
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-24.10%20%7C%2025.x-00c875.svg)](https://openwrt.org/)
 [![Python](https://img.shields.io/badge/python-3.x-3776ab.svg)](https://www.python.org/)
 [![Frontend](https://img.shields.io/badge/frontend-Alpine.js%20%2B%20Tailwind-2b8a76.svg)](./nftables-publish-v0.7.9-nospa/frontend/assets/alpine.js)
-[![Version](https://img.shields.io/badge/version-v0.8.8-orange.svg)](./nftables-publish-v0.7.9-nospa/VERSION)
+[![Version](https://img.shields.io/badge/version-v0.8.9-orange.svg)](./nftables-publish-v0.7.9-nospa/VERSION)
 
 Ghost Firewall（原内部代号 **nftables-web-v2**）是部署在 OpenWrt 路由器上的轻量防火墙控制台。
 它把 nftables 规则的日常操作搬到一个自签证书的 HTTPS 面板里，同时把「把内网服务暴露到公网」

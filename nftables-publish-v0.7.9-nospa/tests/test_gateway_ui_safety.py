@@ -279,7 +279,11 @@ check('gate.css 的门缝是「加速」展开的（朝镜头冲，而不是退�
 
 for _fname in ('portal.html', 'login.html'):
     _src = html_files.get(_fname, '')
-    check(f'{_fname} 引用了 gate.css', '/auth/static/gate.css' in _src)
+    # 门户页的静态资源路径是**占位符** {{STATIC_BASE}}（谁提供页面谁注入前缀，
+    # 见 auth_gateway.py 的 _read_portal_html）；登录页由认证服务独占，
+    # 写死 /auth/static/。两种写法都算「引用了 gate.css」。
+    check(f'{_fname} 引用了 gate.css',
+          re.search(r'(/auth/static/|\{\{STATIC_BASE\}\})gate\.css', _src) is not None)
     check(f'{_fname} 的门层用新结构',
           all(k in _src for k in ('gate__plane', 'gate__wash', 'gate__flash'))
           and 'gate__panel' not in _src and 'gate__seam' not in _src)
