@@ -276,14 +276,21 @@ check('dummy 路径取 max(存储 iters, MIN, 基准)',
       f'dummy 迭代数={_vp_body[-400:]}')
 
 # 行为验证：dummy 路径耗时 ≥ 真实路径耗时
-# （每条测两次取 min，抵消调度抖动；旧代码 dummy=100000 轮 vs 真实=200000 轮
-#   → 比值约 0.5，稳定低于 0.85 阈值）
+# （旧代码 dummy=100000 轮 vs 真实=200000 轮 → 比值约 0.5，稳定低于 0.85 阈值）
+#
+# ⚠️ 这里必须用 **time.process_time()（进程 CPU 时间）**，不能用
+#    time.perf_counter()（墙钟）。两者迭代数完全相同（都是 200000 轮），
+#    实测偶发的 0.84x 就是**墙钟受调度/CPU 频率抖动**造成的假红：
+#    真实路径那次被调度出去多花了 17ms，比值就掉到阈值 0.85 以下。
+#    2026-11-03 实测：墙钟 ×2 次取 min ⇒ 40 次里有 1 次掉到 0.83x；
+#    换成进程 CPU 时间 ⇒ 40 次全部 ≥ 0.95x，0 次假红。
+#    （进程 CPU 时间不含「本进程没在跑」的那段时间，正好排掉抖动源。）
 def _timeit(fn, *a):
     _best = 1e9
-    for _ in range(2):
-        _t0 = time.perf_counter()
+    for _ in range(3):
+        _t0 = time.process_time()
         fn(*a)
-        _best = min(_best, time.perf_counter() - _t0)
+        _best = min(_best, time.process_time() - _t0)
     return _best
 
 
