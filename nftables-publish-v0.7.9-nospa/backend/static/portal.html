@@ -16,13 +16,12 @@
 <title>服务门户 · Ghost Firewall</title>
 <link rel="stylesheet" href="{{STATIC_BASE}}base.css">
 <link rel="stylesheet" href="{{STATIC_BASE}}gate.css">
-<!-- 变体切换器面板。挂在最后，让它的样式能盖住 base.css 的通用规则。 -->
-<link rel="stylesheet" href="{{STATIC_BASE}}switcher.css">
 </head>
 <body>
 
-<!-- 像素场背景：默认走 pixelfield.js（和门脸页同一个引擎）。
-     装了 fx.js 之后由变体引擎接管，切换器可以换背景样式。
+<!-- 像素场背景：走 pixelfield.js（和门脸页同一个引擎）。
+     2026-11-02 起只有一套背景 —— 之前那 14 套「生成艺术」变体
+     （fx.js + switcher.*）已按用户要求全部删掉，不再有切换器。
      纯装饰，吃不到点击。 -->
 <canvas class="pixfield" id="pix" aria-hidden="true"></canvas>
 <div class="pix-scrim" aria-hidden="true"></div>
@@ -57,11 +56,6 @@
 
 <script src="{{STATIC_BASE}}fingerprint.js"></script>
 <script src="{{STATIC_BASE}}pixelfield.js"></script>
-<!-- 变体引擎。必须在 portal.js 之前：portal.js 用 window.GhostFX 判断
-     「背景是否已有人接管」，两个引擎同时挂同一个 canvas 会互相覆盖。 -->
-<script src="{{STATIC_BASE}}fx.js"></script>
 <script src="{{STATIC_BASE}}portal.js"></script>
-<!-- 切换器。最后加载：它要先把 portal.js 的自挂载停掉，再自己接管。 -->
-<script src="{{STATIC_BASE}}switcher.js"></script>
 </body>
 </html>

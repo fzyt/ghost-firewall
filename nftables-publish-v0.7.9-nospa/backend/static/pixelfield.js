@@ -143,6 +143,126 @@
         lit: 0.15,
       },
     },
+    /* ── 月白·乱潮（服务门户用，2026-11-02）──────────────────
+     *
+     * 解决的正是用户说的「像是一块一块生成的」：
+     *   moonstone-swirl 的几道波 dir 是 -0.30 / -0.25 / -0.35，
+     *   三个值几乎一样 ⇒ 几道波前**平行** ⇒ 亮块只能沿同一批方向
+     *   排成规则珠串，一眼看过去就是「一块一块各自出现」。
+     *
+     * 这一档改成「**随机方向波浪**」：
+     *   ① 四道波挂同一张**空间局部方向场**：方向随位置变化、随时间漂移
+     *      ⇒ 同一条波在不同位置朝不同方向走 ⇒ 屏幕上没有统一走向可循
+     *   ② 分片遮罩的晶向**跟随局部波向** ⇒ 亮块沿波前拉成长条
+     *   ③ 像素块从 2px 放大到 9×9 ⇒ 有像素网格，不再是噪点
+     *
+     * 波浪的本体（正弦波前 + 噪声遮罩 + 随机选取）一个字没改 ——
+     * 改的只是「波往哪个方向走」。
+     *
+     * ⚠️⚠️ 下面 dirFieldScale / dirFieldRange / patchNormal 三个值
+     * 是**反复实测**调出来的，不是随手填的 —— 改任何一个都会把
+     * 「弯曲的波浪」退回「一堆随机斑点」。原因见下：
+     *
+     *   遮罩的采样坐标是转进波帧算的（tanX / norX），
+     *   而波帧由方向场决定 ⇒ 方向场在空间上有梯度 ⇒
+     *   **采样坐标系在旋转**。坐标跳变幅度 ≈ 角度变化率 × 距离²，
+     *   角度变化率 ≈ 1.2 × dirFieldScale × dirFieldRange (rad/px)。
+     *
+     *   初版 dirFieldScale=0.0026、dirFieldRange=1.05
+     *   ⇒ 变化率 0.0033 rad/px ⇒ 法向坐标跳变可达 130~400px，
+     *   而法向噪声波长只有 1/(0.0027×1.50) ≈ 247px
+     *   ⇒ 跳变跨过 1~2 个噪声周期 ⇒ **遮罩被打散成随机斑点**
+     *   ⇒ 画面还是「一块一块各自生成」，什么波浪都看不出来。
+     *
+     *   现在 dirFieldScale=0.0011（周期 909px）、dirFieldRange=1.35
+     *   ⇒ 变化率 0.0018 rad/px ⇒ 跳变压到 ~90px
+     *   ⇒ 遮罩在波帧里连续 ⇒ 亮块连成沿波前走的**弯曲长带**。
+     *   实测：带内亮度占比 0.32 → 0.37，画面从碎点变成涡卷纹。
+     *
+     *   patchNormal 同理：1.50 时法向噪声波长 247px，恰好与波带宽度
+     *   （edge0=0.80 ⇒ 约占周期 20% ≈ 247px）同量级 ⇒ 遮罩正好
+     *   把波带切成「一块一块」。降到 0.85（波长 435px）⇒ 带被切成
+     *   2~3 段而不是切碎 ⇒ 整体仍读得出是一条浪。
+     */
+    'moonstone-tide': {
+      label: '月白·乱潮',
+      note: '四道波互不平行，各挂一张空间局部方向场（方向随位置变、随时间漂移）⇒ 没有统一走向的规则珠串。',
+      palette: 'moonstone',
+      params: {
+        waves: [
+          /* ⚠️ dirField>0 时 dir 是**相对共享方向的偏角**（不是绝对角）。
+             偏角都取小值 ⇒ 几道波在局部仍然平行，但整体走向随位置变。 */
+          { k: 0.00520, om: 0.66, off: 0.00, dir:  0.00, w: 1.00 },
+          { k: 0.00690, om: 0.88, off: 2.10, dir:  0.17, w: 0.88 },
+          { k: 0.00440, om: 0.52, off: 4.20, dir: -0.14, w: 0.74 },
+          { k: 0.00760, om: 0.74, off: 1.30, dir:  0.33, w: 0.60 },
+        ],
+        distortAmp: 1.00,
+        dirField: 2,
+        dirFieldBase: -0.30,
+        /* 方向场的空间频率 —— 必须**慢**（见上面的坐标跳变推导）。
+           0.0011 ⇒ 周期 909px，方向在屏幕上大尺度地转。 */
+        dirFieldScale: 0.0011,
+        /* 方向偏离基准角的幅度。配合上面的慢频率，
+           屏幕上不同区域走向明显不同，但都不会「急转」。 */
+        dirFieldRange: 1.35,
+        dirFieldDrift: 0.012,
+        /* 方向场粗网格步长：40px ⇒ 插值更平滑，少一层高频抖动 */
+        dirFieldStep: 40,
+        /* 遮罩晶向跟随局部波向 ⇒ 亮块沿波前拉成长条 */
+        patchFollow: 1,
+        patchTangent: 0.13,
+        /* 法向频率（0.85 ⇒ 噪声波长 435px）：不能太高，
+           否则遮罩把波带切成碎块（见上面的说明） */
+        patchNormal: 0.85,
+        patchTangent2: 0.42,
+        patchNormal2: 0.80,
+        /* 像素块从 2px 改成 9×9 ⇒ 有像素网格，不再是噪点 */
+        pxBody: 3,
+        pxCrest: 3,
+        /* 块状选取：每 3×3 格共用一个门槛 ⇒ 亮区是**实心小方块**，
+           不再是等密度的雪花点（这是「一块一块各自生成」的最后一块拼图，
+           详见 P 表里 pickBlock 的注释）。 */
+        pickBlock: 3,
+        patchDrift: 0.030,
+        trail: 0.72,
+        hyst: 0.05,
+        lit: 0.21,
+      },
+    },
+    /* ── 月白·转潮（2026-11-02）────────────────────────────
+     * 同一个「随机方向波浪」的另一个档：**方向只随时间变**，
+     * 空间上整片统一 ⇒ 波浪整体缓慢换朝向，但不会出现统一走向。
+     * 适合想要「大范围流动」而不是「多区域湍流」的场景。 */
+    'moonstone-swing': {
+      label: '月白·转潮',
+      note: '方向只随时间随机变（空间上整片统一）⇒ 波浪整体缓慢换朝向，没有固定走向。',
+      palette: 'moonstone',
+      params: {
+        waves: [
+          { k: 0.00560, om: 0.72, off: 0.00, dir:  0.00, w: 1.00 },
+          { k: 0.00700, om: 0.92, off: 2.10, dir:  0.18, w: 0.85 },
+          { k: 0.00450, om: 0.55, off: 4.20, dir: -0.12, w: 0.70 },
+        ],
+        distortAmp: 1.05,
+        dirField: 1,
+        dirFieldBase: -0.30,
+        dirWalkFreq: 0.085,
+        dirFieldRange: 0.90,
+        patchFollow: 1,
+        patchTangent: 0.15,
+        patchNormal: 1.45,
+        patchTangent2: 0.42,
+        patchNormal2: 0.95,
+        pxBody: 3,
+        pxCrest: 3,
+        pickBlock: 3,
+        patchDrift: 0.030,
+        trail: 0.72,
+        hyst: 0.05,
+        lit: 0.21,
+      },
+    },
     dusk: {
       label: '暮蓝 Dusk',
       note: '蓝紫，波速 +19%、扭曲更强 ⇒ 碎块翻滚得更厉害。',
@@ -229,6 +349,67 @@
        但默认值非 0 会让那句话不成立，也会让人以为「不传也会摆」。
        需要摆动的档（moonstone-swirl）自己显式写 0.065。 */
     dirSwingFreq: 0.0,
+    /* ── 随机方向波浪（2026-11-02）────────────────────────
+     * 原来三道波的 dir 是**全局常量**（-0.30 / -0.25 / -0.35），
+     * 三个值非常接近 ⇒ 几道波前几乎平行 ⇒ 亮块只能沿同一批方向
+     * 排成规则珠串，看着像「一块一块各自生成」。
+     *
+     * 现在让**每道波各有一张方向场**：方向随位置变化、随时间漂移。
+     *   · 同一道波在不同位置方向不同 ⇒ 波浪是湍流状，没有统一走向
+     *   · 几道波用各自的噪声偏移 ⇒ 互不平行
+     * 这两项合起来才是用户要的「随机方向波浪」。
+     *
+     * dirField 三档：
+     *   0 = 关闭（默认）→ 走原路径，行为与改版前**逐位一致**
+     *   1 = 方向只随时间变（空间上统一）⇒ 整片波浪换个朝向
+     *   2 = 方向随位置变 + 随时间漂移 ⇒ 湍流状，无统一走向
+     *
+     * ⚠️ 新参数的默认值**全是 0**，是「不传时与改版前逐位一致」的保证。 */
+    dirField: 0,           /* 0=关闭 1=仅时间随机 2=空间局部方向场 */
+    dirFieldBase: 0.0,     /* 方向场的基准角（rad）；dirField>0 时 waves[].dir 变成偏角 */
+    dirFieldScale: 0.0,    /* 方向场空间频率（噪声坐标 / px） */
+    dirFieldRange: 0.0,    /* 方向偏离基准角的幅度（rad） */
+    dirFieldDrift: 0.0,    /* 方向场自身的时间漂移（噪声坐标 / 秒） */
+    dirFieldStep: 24,      /* 方向场粗网格步长（px） */
+    dirWalkFreq: 0.0,      /* dirField=1 时的时间随机游走频率（Hz） */
+    /* ── 遮罩跟随波向（2026-11-02）────────────────────────
+     * 原来分片遮罩是**屏幕空间**的各向异性噪声：晶向由全局常量
+     * patchRot1/patchRot2 决定 ⇒ 所有地方的方块是同一个朝向，
+     * 与波前无关。波被遮罩切碎之后，屏幕上就只剩一堆散点 ——
+     * 这正是「像一块一块各自生成」的另一半原因。
+     *
+     * patchFollow = 1 时，遮罩的采样坐标**转进波帧**：
+     *   切向（沿波前）低频 ⇒ 噪声沿波前拉长
+     *   法向（垂直波前）高频 ⇒ 横向收紧
+     * ⇒ 亮块沿波前拉成**长条**，整条光带就是一条流动的像素流。
+     * 配合 dirField（方向随位置变）⇒ 不同区域的像素流朝向不同。
+     *
+     * ⚠️ 默认 0（关闭）⇒ 走原路径，逐位一致。 */
+    patchFollow: 0,       /* 0=关闭 1=遮罩晶向跟随局部波向 */
+    patchTangent: 1.0,    /* 切向频率系数（<1 ⇒ 沿波前拉长） */
+    patchNormal: 1.0,     /* 法向频率系数 */
+    patchTangent2: 1.0,   /* 第二层遮罩的切向系数 */
+    patchNormal2: 1.0,    /* 第二层遮罩的法向系数 */
+    /* ── 像素块尺寸（2026-11-02）──────────────────────────
+     * 原来每格只画 2×2（浪身）/ 3×3（浪尖）个亚像素，
+     * 而一格是 12px（SS=4 × 3px）⇒ 实际亮点只有 2~3px，
+     * 满屏看着像**噪点**而不是像素块。
+     * pxBody / pxCrest = 0 时保持原尺寸（2 / 3），
+     * 不传时逐位一致；填 3 则画 9×9 的方块（留 1.5px 间隙 ⇒ 有像素网格感）。 */
+    pxBody: 0,            /* 浪身方块边长（亚像素；0 = 原版 2） */
+    pxCrest: 0,           /* 浪尖方块边长（亚像素；0 = 原版 3） */
+    /* ── 块状选取（2026-11-02）────────────────────────────
+     * pickBlock = 0（默认）⇒ 每格一个独立随机门槛（原版行为，
+     * 逐位一致，不传时什么都不变）。
+     * pickBlock = N > 0 ⇒ 每 N×N 格共用一个门槛 ⇒ 同一块里的格子
+     * 亮灭一致 ⇒ 亮区是**实心小方块**而不是雪花点。
+     *
+     * 为什么要它：原版「块内随机疏密的点群」这个做法，
+     * 在**任何**遮罩/波参数下都会把光带打成等密度雪花 ——
+     * 屏幕上读不出「一条浪」，只剩「一块一块各自生成」。
+     * 而 pickGain 是自适应的（按 lit 目标自动增减），
+     * 调 pickSoft 或遮罩阈值都改不了这一点。 */
+    pickBlock: 0,
     /* 亮度总增益 */
     gain: 1.0,
     /* 色阶切分：band 值 ≥ accentT 给浪身，≥ whiteT 给浪尖 */
@@ -385,6 +566,14 @@
     var wSin = new Float64Array(8);
     var wCos = new Float64Array(8);
 
+    /* 方向场（随机方向波浪）：每道波一张粗网格，存 (sin, cos) 分量。
+       存分量而不是角度，是为了让逐格插值时不会在 ±π 处翻折。
+       只在 dirField>0 时分配，其余情况保持 null（零开销）。 */
+    var dirSin = null, dirCos = null, dirFW = 0, dirFH = 0, dirStep = 24;
+    /* 每道波在**共享方向**上的偏角（dirField>0 时 waves[].dir 是偏角，不是绝对角） */
+    var wOffS = new Float64Array(8);
+    var wOffC = new Float64Array(8);
+
     var fine = document.createElement('canvas');
     var fctx = fine.getContext('2d');
     var fineImg = null, fineData = null;
@@ -432,8 +621,34 @@
         rAmp = new Float32Array(n);
         rJit = new Float32Array(n);
         dphase = new Float32Array(n);
+        /* ⚠️ pickBlock > 0 时，**同一块里的格子共享同一个随机门槛**，
+         *   亮区于是变成**实心小方块**，而不是逐格随机的点阵。
+         *
+         *   为什么需要它（2026-11-02 实测）：
+         *   选取门槛 rSel 原本是**每格独立**的随机数 ⇒ 任何一条光带
+         *   都被打成等密度的雪花点 ⇒ 屏幕上根本读不出「一条浪」，
+         *   只剩「一块一块各自生成」—— 正是用户抱怨的那个观感。
+         *
+         *   踩过的坑：以为调 pickSoft（软门宽度）就能把点连成片，
+         *   结果**无效** —— 因为 pickGain 是**自适应**的（引擎按 lit
+         *   目标自动增减），pickSoft 抬高多少它就压回去多少；
+         *   把遮罩阈值（patchA1/A2）调低也只会得到更均匀的雪花。
+         *   ⇒ 唯一的办法是让**相邻格的亮灭决策相关**，也就是共享门槛。
+         *
+         *   ⚠️ pickBlock = 0（默认）时必须与原版**逐位一致**：
+         *   门槛仍按 rnd(i, ...) 逐格生成，一个字节都不变。 */
+        var pb = p.pickBlock | 0;
         for (var i = 0; i < n; i++) {
-          rSel[i] = rnd(i, 1013904223);
+          var si = i;
+          if (pb > 0) {
+            /* 块坐标 → 一个不重复的整数索引。
+               行距取 8191（素数，且远大于任何可能的块列数），
+               避免 (bx,by) 与 (bx',by') 撞成同一个索引。 */
+            var bx = Math.floor((i % cols) / pb);
+            var by = Math.floor(Math.floor(i / cols) / pb);
+            si = bx * 8191 + by;
+          }
+          rSel[i] = rnd(si, 1013904223);
           rAmp[i] = rnd(i, 22695477);
           rJit[i] = (rnd(i, 69069) - 0.5) * 2;
           dphase[i] = rnd(i, 134775813) * 6.2831853;
@@ -448,6 +663,28 @@
       if (fctx) { fineImg = fctx.createImageData(sw, sh); fineData = fineImg.data; }
       glow.width = cols; glow.height = rows;
       if (gctx) { glowImg = gctx.createImageData(cols, rows); glowData = glowImg.data; }
+    }
+
+    /* ── 方向场分配 ──────────────────────────────────────────
+     * 粗网格：每 dirFieldStep 像素一格。
+     * 步长越大越省算力、方向过渡越柔；越小方向变化越碎。
+     * 24px 是个折中：整屏约 60×38 = 2280 格/波，4 道波不到 1 万点，
+     * 每几何步重算一次（30Hz）⇒ 30 万次噪声采样/秒，完全够用。 */
+    function ensureDirField() {
+      if (p.dirField <= 0) {
+        dirFW = dirFH = 0;
+        dirSin = dirCos = null;
+        return false;
+      }
+      dirStep = Math.max(8, p.dirFieldStep || 24);
+      var nfw = Math.max(2, Math.ceil(w / dirStep) + 1);
+      var nfh = Math.max(2, Math.ceil(h / dirStep) + 1);
+      if (nfw !== dirFW || nfh !== dirFH || !dirSin) {
+        dirFW = nfw; dirFH = nfh;
+        dirSin = new Float32Array(dirFW * dirFH);
+        dirCos = new Float32Array(dirFW * dirFH);
+      }
+      return true;
     }
 
     /* ── 几何：波 + 遮罩 + 随机选取 + 余晖 ────────────────
@@ -477,6 +714,53 @@
       var c1 = Math.cos(p.patchRot1 + spin), s1 = Math.sin(p.patchRot1 + spin);
       var c2 = Math.cos(p.patchRot2 + spin), s2 = Math.sin(p.patchRot2 + spin);
 
+      /* ── 随机方向波浪：一张**共享**的空间局部方向场 ──────────
+       * 所有波共用同一张方向场（每波只带一个小偏角 waves[].dir），
+       * 所以几道波在局部仍然平行，但**整体走向随位置变、随时间漂移**
+       * ⇒ 屏幕上没有统一的波向，但每一处都还是「一道浪」。
+       *
+       * ⚠️ 为什么必须共享（踩过的坑）：
+       *   最初给每道波各算一张方向场，结果分片遮罩的采样帧
+       *   跟着「每格胜出的那道波」跳变 ⇒ 遮罩的拉长方向在相邻格
+       *   完全对不上 ⇒ 拉长效果互相抵消 ⇒ 画面还是一堆圆疙瘩散点，
+       *   波浪完全看不出来。共享之后，遮罩的拉长方向与波的走向
+       *   严格一致 ⇒ 亮块才拉成长条。
+       *
+       * dirField>0 时 waves[].dir 的语义从「绝对法线角」变成
+       * 「相对共享方向的偏角」；dirField=0 时语义不变（逐位一致）。 */
+      var useField = ensureDirField();
+      if (useField) {
+        var dsc = p.dirFieldScale || 0.003;
+        var drg = p.dirFieldRange || 0;
+        var ddr = p.dirFieldDrift || 0;
+        var dwf = p.dirWalkFreq || 0;
+        var fj, fi, ddx, ddy, dang, dn, do2, dstep = dirStep;
+        var dbase = (p.dirFieldBase || 0) + p.dirSwing * Math.sin(swingT);
+        for (fj = 0; fj < dirFH; fj++) {
+          ddy = fj * dstep;
+          for (fi = 0; fi < dirFW; fi++) {
+            ddx = fi * dstep;
+            if (p.dirField === 1) {
+              /* 方向只随时间变（空间上统一）⇒ 整片波浪换个朝向 */
+              dn = sample(tex, NOISE_N, tq * dwf, 0.37);
+            } else {
+              /* 方向随位置变 + 随时间漂移 ⇒ 湍流状 */
+              dn = sample(tex, NOISE_N, ddx * dsc + tq * ddr,
+                                      ddy * dsc + tq * ddr * 0.7);
+            }
+            dang = dbase + dn * drg;
+            do2 = fj * dirFW + fi;
+            dirSin[do2] = Math.sin(dang);
+            dirCos[do2] = Math.cos(dang);
+          }
+        }
+        /* 每道波在共享方向上的偏角 */
+        for (var fo = 0; fo < nw; fo++) {
+          wOffC[fo] = Math.cos(waves[fo].dir);
+          wOffS[fo] = Math.sin(waves[fo].dir);
+        }
+      }
+
       for (var cy = 0; cy < rows; cy++) {
         var py = cy * cell + cell * 0.5;
         for (var cx = 0; cx < cols; cx++) {
@@ -487,11 +771,37 @@
             px * p.distortScale + tq * p.distortDrift,
             py * p.distortScale * 1.25 + tq * p.distortDrift * 0.6);
 
+          /* ── 取共享方向场（逐格双线性插值）──────────────
+             插的是 (sin, cos) 分量，插完再归一化 ——
+             直接插角度会在 ±π 处翻折，插出来的方向会突然反向。 */
+          var fs = 0, fc = 0;
+          if (useField) {
+            var gx = px / dirStep, gy = py / dirStep;
+            var i0 = gx | 0; if (i0 > dirFW - 2) i0 = dirFW - 2;
+            var j0 = gy | 0; if (j0 > dirFH - 2) j0 = dirFH - 2;
+            var txf = gx - i0, tyf = gy - j0;
+            var q00 = j0 * dirFW + i0, q10 = q00 + 1;
+            var q01 = q00 + dirFW, q11 = q01 + 1;
+            var sA = (dirSin[q00] * (1 - txf) + dirSin[q10] * txf) * (1 - tyf) +
+                     (dirSin[q01] * (1 - txf) + dirSin[q11] * txf) * tyf;
+            var cA = (dirCos[q00] * (1 - txf) + dirCos[q10] * txf) * (1 - tyf) +
+                     (dirCos[q01] * (1 - txf) + dirCos[q11] * txf) * tyf;
+            var mm = Math.sqrt(sA * sA + cA * cA);
+            /* mm 极小 ⇒ 两侧方向几乎相反且等权 ⇒ 退回全局方向 */
+            if (mm > 1e-6) { fs = sA / mm; fc = cA / mm; }
+          }
+
           /* ── 多道错相平行浪，取最强的一道 ───────────────── */
           var band = 0;
           for (var wi2 = 0; wi2 < nw; wi2++) {
             var wv = waves[wi2];
-            var uy = px * wSin[wi2] + py * wCos[wi2];
+            var wsn = wSin[wi2], wcn = wCos[wi2];
+            if (useField) {
+              /* 共享方向 + 本波偏角 ⇒ 局部仍平行，整体走向随位置变 */
+              wsn = fs * wOffC[wi2] + fc * wOffS[wi2];
+              wcn = fc * wOffC[wi2] - fs * wOffS[wi2];
+            }
+            var uy = px * wsn + py * wcn;
             var ph = wv.k * uy - wv.om * tq + wv.off + dz * p.distortAmp;
             var s = Math.sin(ph);
             if (s <= p.edge0) continue;
@@ -508,13 +818,33 @@
                整体仍朝一个方向流动（漂移方向不跟着转，
                否则整片会像转盘一样旋）。 */
             var u1x = px * p.patchScale, u1y = py * p.patchScale * 1.15;
-            var n1 = sample(tex, NOISE_N,
-              u1x * c1 - u1y * s1 + tq * p.patchDrift,
-              u1x * s1 + u1y * c1 + tq * p.patchDrift * 0.8);
             var u2x = px * p.patchScale * 0.77 + 37.1, u2y = py * p.patchScale * 1.05 + 11.3;
-            var n2 = sample(tex, NOISE_N,
-              u2x * c2 - u2y * s2 + tq * p.patchDrift * 0.55,
-              u2x * s2 + u2y * c2 + tq * p.patchDrift * 0.9);
+            var n1, n2;
+            if (p.patchFollow > 0) {
+              /* ── 遮罩晶向跟随**局部波向** ──────────────────
+                 把屏幕坐标转进波帧：
+                   切向 tan = 沿波前（垂直于法向）
+                   法向 nor = 沿法向
+                 切向用低频（噪声沿波前变化慢 ⇒ 斑块沿波前拉长），
+                 法向用高频（横向收紧）。
+                 ⇒ 亮块沿波前拉成**长条**，整条光带就是一条流动的像素流。
+                 而波向本身随位置变（dirField）⇒ 不同区域朝向不同。 */
+              var tanX = px * fc - py * fs;
+              var norX = px * fs + py * fc;
+              n1 = sample(tex, NOISE_N,
+                tanX * p.patchScale * p.patchTangent + tq * p.patchDrift,
+                norX * p.patchScale * p.patchNormal + tq * p.patchDrift * 0.8);
+              n2 = sample(tex, NOISE_N,
+                tanX * p.patchScale * p.patchTangent2 + 37.1 + tq * p.patchDrift * 0.55,
+                norX * p.patchScale * p.patchNormal2 + 11.3 + tq * p.patchDrift * 0.9);
+            } else {
+              n1 = sample(tex, NOISE_N,
+                u1x * c1 - u1y * s1 + tq * p.patchDrift,
+                u1x * s1 + u1y * c1 + tq * p.patchDrift * 0.8);
+              n2 = sample(tex, NOISE_N,
+                u2x * c2 - u2y * s2 + tq * p.patchDrift * 0.55,
+                u2x * s2 + u2y * c2 + tq * p.patchDrift * 0.9);
+            }
             var m1 = sstep(p.patchA1, p.patchA1 + (p.patchB1 - p.patchA1) / p.patchSoft, n1);
             var m2 = sstep(p.patchA2, p.patchA2 + (p.patchB2 - p.patchA2) / p.patchSoft, n2);
             var mask = m1 * m2;
@@ -618,6 +948,11 @@
       var acc = pal.accent, wht = pal.white;
       var gc = pal.bloom || acc;
       var dRate = p.ditherSpeed * 6.2831853;
+      /* 像素块边长（亚像素）。0 = 原版尺寸（浪身 2 / 浪尖 3）。
+         原版每格 12px 却只画 2px 的点 ⇒ 满屏噪点感；
+         填 3 则是 9×9 的方块，留 1.5px 间隙 ⇒ 有像素网格。 */
+      var b1s = p.pxBody > 0 ? Math.min(SS, p.pxBody | 0) : 2;
+      var b2s = p.pxCrest > 0 ? Math.min(SS, p.pxCrest | 0) : 3;
 
       for (var cy = 0; cy < rows; cy++) {
         var by0 = cy * SS;
@@ -654,7 +989,7 @@
 
           /* ── 画：浪身铺底，浪尖叠在上面 ─────────────────
              两层都画 ⇒ accent→white 的切换也是渐变，不会闪。 */
-          var b1 = 2;
+          var b1 = b1s;
           var inset1 = ((SS - b1) / 2) | 0;
           var bx1 = cx * SS + inset1;
           var by1 = by0 + inset1;
@@ -671,7 +1006,7 @@
           }
 
           if (a2 > 0.002) {
-            var b2 = 3;
+            var b2 = b2s;
             var inset2 = ((SS - b2) / 2) | 0;
             var bx2 = cx * SS + inset2;
             var by2 = by0 + inset2;

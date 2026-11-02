@@ -1,4 +1,4 @@
-"""门户改版（背景变体引擎 + 网格重排）的静态回归测试。
+"""门户改版（网格重排 + 像素场随机方向波浪）的静态回归测试。
 
 运行:  python3 tests/test_portal_frontend.py
 
@@ -11,15 +11,17 @@
   PF-5  间距走 4px 基数 token
   PF-6  卡片内部改「名称与入口上下叠 + 状态右列」
   PF-7  登录页那一档背景参数一字未动（改版不外溢）
-  PF-8  门户那一档背景参数齐（波速 / 晶向 / 快慢）
+  PF-8  门户那一档（moonstone-tide）背景参数齐
   PF-9  新增的方向参数默认值全为 0（不传时逐位一致）
-  PF-10 变体引擎注册了 15 套方案，且 order 与变体表一致
-  PF-11 每个变体都有生成逻辑；生长类变体都有 warm 预热
-  PF-12 「白度渐变」钩子缺省仍是二值（不破坏先前的变体）
-  PF-13 变体引擎接管背景时，原生引擎不再自己挂一次
-  PF-14 脚本加载顺序正确
+  PF-10 随机方向波浪：方向场是**共享**的一张（不是每道波一张）
+  PF-11 分片遮罩晶向跟随局部波向（亮块沿波前拉成长条）
+  PF-12 像素块尺寸可配（0 = 原版 2px/3px，新档用 9×9 方块）
+  PF-13 14 套变体引擎与切换器**已彻底删除**（文件、引用、白名单、守卫）
+  PF-14 门户页的脚本加载顺序正确
   PF-15 CSP 没有被放宽，页面不引外部资源
-  PF-16 四个 JS 文件语法正确
+  PF-16 JS 文件语法正确
+  PF-17 页面里没有内联脚本 / 内联样式 / on* 事件属性
+  PF-18 门户页该引的都引了
 
 不碰网络、不碰真实配置：全部是源码文本解析 + node --check 语法校验。
 """
@@ -54,14 +56,124 @@ def has_file(name, base=STATIC):
     return os.path.isfile(os.path.join(base, name))
 
 
+# ─────────────────────────────────────────────────────────────
+# 注释剥离器
+#
+# 为什么需要（实测踩坑）：
+#   本项目的风格是「注释密度高」——注释里写满了 'moonstone-swirl'、
+#   'fx.js'、'https://siyuan.fzyto.top:8443/' 这类词条。
+#   如果「某东西不该出现」这类断言直接对**原文**做子串判断，
+#   注释会把它假红掉：
+#     · portal.html 注释写着「（fx.js + switcher.*）已按用户要求全部删掉」
+#       ⇒ 「门户页不再引用 fx.js」误报失败
+#     · portal.js 注释写着「'moonstone-swirl'（旧那档）仍在引擎里」
+#       ⇒ 「portal.js 不再用 moonstone-swirl」误报失败
+#     · portal.js 注释举了个跨域例子 https://siyuan.fzyto.top:8443/
+#       ⇒ 「portal.js 不引外部资源」误报失败
+#
+# ⇒ 凡是「这个东西不该出现」的判断，一律先剥注释再比对。
+#
+# ⚠️ 剥注释**必须区分注释和字符串字面量**：
+#   字符串里的 'https://x' 是真的外链（要红），
+#   注释里的 'https://x' 只是说明文字（要忽略）。
+#   所以下面用状态机逐字符走，遇到引号就整段原样保留。
+# ─────────────────────────────────────────────────────────────
+
+
+def strip_html_comments(src):
+    """去掉 HTML 注释（<!-- ... -->），其余原样保留。"""
+    return re.sub(r'<!--.*?-->', '', src, flags=re.S)
+
+
+# 正则字面量可能出现在「= ( 」等字符之后 —— 见到这种 '/' 不能当除号，
+# 更不能当注释起始。portal.js 里就有 path.match(/[A-Za-z0-9一-龥]/) 这种。
+_REGEX_PREV = set('(,=:[!&|?{};+-*%~^<>\n')
+
+
+def strip_js_comments(src):
+    """去掉 JS 注释，保留字符串/模板串/正则字面量的**原文**。
+
+    状态机逐字符走：
+      · //  → 行注释，直接跳到行尾
+      · /*  → 块注释，跳到 */
+      · 引号 → 整段字符串原样输出（含转义）
+      · '/' 且前一个非空白字符像正则起始 → 当正则字面量，整段原样输出
+    """
+    out = []
+    i, n = 0, len(src)
+    prev = ''          # 上一个**非空白**的输出字符
+    while i < n:
+        c = src[i]
+        if c == '/' and i + 1 < n and src[i + 1] == '/':
+            j = src.find('\n', i)
+            i = n if j < 0 else j
+            continue
+        if c == '/' and i + 1 < n and src[i + 1] == '*':
+            j = src.find('*/', i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        if c == '/' and (prev == '' or prev in _REGEX_PREV):
+            # 正则字面量：找到未转义且不在 [...] 内的 '/' 作为结束
+            j = i + 1
+            in_cls = False
+            while j < n:
+                if src[j] == '\\':
+                    j += 2
+                    continue
+                if src[j] == '[':
+                    in_cls = True
+                elif src[j] == ']':
+                    in_cls = False
+                elif src[j] == '/' and not in_cls:
+                    break
+                elif src[j] == '\n':
+                    break
+                j += 1
+            seg = src[i:min(j + 1, n)]
+            out.append(seg)
+            prev = '/'
+            i = min(j + 1, n)
+            continue
+        if c in ('"', "'", '`'):
+            q = c
+            out.append(c)
+            i += 1
+            while i < n:
+                if src[i] == '\\' and i + 1 < n:
+                    out.append(src[i:i + 2])
+                    i += 2
+                    continue
+                out.append(src[i])
+                if src[i] == q:
+                    i += 1
+                    break
+                i += 1
+            prev = q
+            continue
+        out.append(c)
+        if not c.isspace():
+            prev = c
+        i += 1
+    return ''.join(out)
+
+
 PORTAL_HTML = read('portal.html')
 BASE_CSS = read('base.css')
 PIXELFIELD = read('pixelfield.js')
 PORTAL_JS = read('portal.js')
-FX_JS = read('fx.js') if has_file('fx.js') else ''
-SWITCHER_JS = read('switcher.js') if has_file('switcher.js') else ''
-SWITCHER_CSS = read('switcher.css') if has_file('switcher.css') else ''
+FINGERPRINT_JS = read('fingerprint.js')
 GATEWAY_PY = read('auth_gateway.py', base=BACKEND)
+
+# 「这东西不该出现」类断言一律用剥掉注释的版本（见上面 strip_js_comments 的说明）
+PORTAL_HTML_CODE = strip_html_comments(PORTAL_HTML)
+PORTAL_JS_CODE = strip_js_comments(PORTAL_JS)
+PIXELFIELD_CODE = strip_js_comments(PIXELFIELD)
+FINGERPRINT_JS_CODE = strip_js_comments(FINGERPRINT_JS)
+
+# 2026-11-02：14 套变体引擎 + 切换器已删除。
+# 这里**故意不读** fx.js / switcher.* ——
+# 文件要是还在，下面 PF-13 会直接红（那才是真正的守门）。
+REMOVED_FILES = ('fx.js', 'switcher.css', 'switcher.js')
 
 
 def table_body(src, var_name):
@@ -123,10 +235,6 @@ def entry_block(body, key):
 
 STYLES_BODY = table_body(PIXELFIELD, 'STYLES')
 PARAMS_BODY = table_body(PIXELFIELD, 'P')
-# 变体分两张表：VARIANTS 是第一批（7 个「有语义的界面元素」），
-# GEN_VARIANTS 是第二批（8 个「像素生成方案」），运行时并进 VARIANTS。
-# 断言要两张表一起看 —— 只看其中一张会以为变体少了 8 个。
-VARIANTS_BODY = table_body(FX_JS, 'VARIANTS') + '\n' + table_body(FX_JS, 'GEN_VARIANTS')
 
 # ─────────────────────────────────────────────────────────────
 sec('PF-1  门户页引用的静态文件都在认证网关白名单里')
@@ -150,10 +258,15 @@ check('门户页引用的每个文件都在 STATIC_ALLOWED 里',
       not missing,
       '缺白名单: ' + ', '.join(missing) if missing else f'{len(set(refs))} 个引用全部有白名单')
 
-check('新增的三个文件都在白名单里',
-      all(f in allowed for f in ('fx.js', 'switcher.css', 'switcher.js')),
-      'fx.js / switcher.css / switcher.js')
+check('白名单里**没有**已删除的变体文件（列了但文件没了 ⇒ 僵尸条目）',
+      not any(f in allowed for f in REMOVED_FILES),
+      '仍在白名单: ' + ', '.join(f for f in REMOVED_FILES if f in allowed)
+      if any(f in allowed for f in REMOVED_FILES) else 'fx.js / switcher.* 已不在白名单')
 
+check('白名单只包含门户页真正需要的文件（不多不少）',
+      allowed == {'base.css', 'fingerprint.js', 'login.html', 'login.js',
+                  'portal.html', 'portal.js', 'pixelfield.js', 'gate.css'},
+      '实际: ' + ', '.join(sorted(allowed)))
 # ─────────────────────────────────────────────────────────────
 sec('PF-2  白名单里没有僵尸条目（列了但文件不在）')
 
@@ -237,89 +350,186 @@ check('moonstone 档没有被塞进方向随机化参数',
       'patchRot1' not in moon and 'patchSpin' not in moon)
 
 # ─────────────────────────────────────────────────────────────
-sec('PF-8  门户那一档背景参数齐')
+sec('PF-8  门户那一档（moonstone-tide）背景参数齐')
 
-swirl = entry_block(STYLES_BODY, 'moonstone-swirl')
-check('moonstone-swirl 档存在', bool(swirl))
-for name, val in (('patchRot1', '0.22'), ('patchRot2', '0.88'), ('patchSpin', '0.020'),
-                  ('dirSwing', '0.13'), ('dirSwingFreq', '0.065'),
+tide = entry_block(STYLES_BODY, 'moonstone-tide')
+check('moonstone-tide 档存在', bool(tide))
+for name, val in (('dirField', '2'), ('dirFieldBase', '-0.30'),
+                  ('dirFieldScale', '0.0011'),
+                  ('dirFieldRange', '1.35'), ('dirFieldDrift', '0.012'),
+                  ('dirFieldStep', '40'), ('patchFollow', '1'),
+                  ('patchTangent', '0.13'), ('patchNormal', '0.85'),
+                  ('patchTangent2', '0.42'), ('patchNormal2', '0.80'),
+                  ('pxBody', '3'), ('pxCrest', '3'), ('pickBlock', '3'),
                   ('patchDrift', '0.030'), ('trail', '0.72'), ('hyst', '0.05'),
-                  ('lit', '0.15')):
-    check(f'moonstone-swirl 的 {name} = {val}',
-          re.search(re.escape(name) + r':\s*' + re.escape(val), swirl) is not None)
-soms = re.findall(r'om:\s*([0-9.]+)', swirl)
-check('门户这一档波速约 ×1.9（0.504 → 0.958）',
-      soms[:3] == ['0.958', '1.070', '0.863'], f'实测 {soms[:3]}')
+                  ('lit', '0.21')):
+    check(f'moonstone-tide 的 {name} = {val}',
+          re.search(re.escape(name) + r':\s*' + re.escape(val), tide) is not None)
+
+# ⚠️ dirFieldScale 必须**小** —— 这不是随手填的，是实测出来的硬约束。
+#
+# 遮罩的采样坐标是转进波帧算的（tanX / norX），而波帧由方向场决定
+# ⇒ 方向场在空间上有梯度 ⇒ **采样坐标系在旋转**。
+# 坐标跳变幅度 ≈ 角度变化率 × 距离²，
+# 角度变化率 ≈ 1.2 × dirFieldScale × dirFieldRange (rad/px)。
+#
+# 初版 dirFieldScale=0.0026 + dirFieldRange=1.05 ⇒ 0.0033 rad/px
+# ⇒ 法向坐标跳变 130~400px，而法向噪声波长只有 247px
+# ⇒ 跳变跨过 1~2 个噪声周期 ⇒ 遮罩被打散成随机斑点
+# ⇒ 画面退回「一块一块各自生成」，**什么波浪都看不出来**。
+#
+# 降到 0.0011 ⇒ 0.0018 rad/px ⇒ 跳变 ~90px ⇒ 遮罩在波帧里连续
+# ⇒ 亮块连成沿波前走的弯曲长带（实测带内占比 0.32 → 0.37）。
+#
+# 所以这里守一个**上限**：一旦改大，画面就悄悄退回碎点了。
+ds = re.search(r'dirFieldScale:\s*([0-9.]+)', tide)
+check('moonstone-tide 的 dirFieldScale ≤ 0.0015（方向场变化必须慢，否则遮罩被打散成斑点）',
+      ds is not None and float(ds.group(1)) <= 0.0015,
+      f'实测 {ds.group(1) if ds else "没找到"}')
+
+# 同理，patchNormal 决定法向噪声波长 = 1/(patchScale × patchNormal)。
+# 它若与波带宽度同量级，遮罩正好把波带切成「一块一块」。
+pn = re.search(r'patchNormal:\s*([0-9.]+)', tide)
+check('moonstone-tide 的 patchNormal ≤ 1.0（法向噪声波长不能与波带同尺度）',
+      pn is not None and float(pn.group(1)) <= 1.0,
+      f'实测 {pn.group(1) if pn else "没找到"}')
+
+n_waves = len(re.findall(r'\{ k:', tide))
+check('moonstone-tide 用了 4 道波', n_waves == 4, f'实测 {n_waves} 道')
+
+# dirField>0 时 waves[].dir 是**相对共享方向的偏角**，必须是小值。
+# 一旦写成绝对角（像旧版 -0.30 / -0.25 / -0.35），几道波会各自乱转，
+# 遮罩的拉长方向跟着跳 ⇒ 拉长效果互相抵消 ⇒ 画面又回到一堆散点。
+dirs = [abs(float(x)) for x in re.findall(r'dir:\s*(-?[0-9.]+)', tide)]
+check('moonstone-tide 的 waves[].dir 都是小偏角（不是绝对角）',
+      bool(dirs) and all(d < 0.5 for d in dirs), f'实测 {dirs}')
+
+# 门户页自己传的亮度覆盖值必须和档位里的一致 ——
+# 两边不统一的话，实际观感就不是「档位 + 门户微调」，而是「档位被悄悄改掉」。
+check('portal.js 传的 params.lit = 0.21 与档位对齐',
+      'lit: 0.21' in PORTAL_JS_CODE)
 
 # ─────────────────────────────────────────────────────────────
 sec('PF-9  新增的方向参数默认值全为 0（不传时逐位一致）')
 
-for name in ('patchRot1', 'patchRot2', 'patchSpin', 'dirSwing', 'dirSwingFreq'):
+for name in ('patchRot1', 'patchRot2', 'patchSpin', 'dirSwing', 'dirSwingFreq',
+             'dirField', 'dirFieldBase', 'dirFieldScale', 'dirFieldRange',
+             'dirFieldDrift', 'dirWalkFreq', 'patchFollow', 'pxBody', 'pxCrest',
+             'pickBlock'):
     m2 = re.search(r'^\s+' + name + r':\s*([0-9.]+),', PARAMS_BODY, re.M)
     check(f'引擎默认参数 {name} = 0', m2 is not None and float(m2.group(1)) == 0.0,
+          f'实测 {m2.group(1) if m2 else "没找到"}')
+
+# 这几个是**倍率**，1.0 才是中性值（0 会把遮罩压成一条线）
+for name in ('patchTangent', 'patchNormal', 'patchTangent2', 'patchNormal2'):
+    m2 = re.search(r'^\s+' + name + r':\s*([0-9.]+),', PARAMS_BODY, re.M)
+    check(f'引擎默认参数 {name} = 1.0（中性倍率）',
+          m2 is not None and float(m2.group(1)) == 1.0,
           f'实测 {m2.group(1) if m2 else "没找到"}')
 
 check('方向摆动的 sin/cos 用双精度存（Float32 会丢末位 ⇒ 破坏「逐位一致」）',
       'new Float64Array(8)' in PIXELFIELD and 'new Float32Array(8)' not in PIXELFIELD)
 
-# ─────────────────────────────────────────────────────────────
-sec('PF-10 变体引擎注册了 15 套方案')
-
-check('fx.js 存在', bool(FX_JS))
-check('VARIANTS 表能定位到', bool(VARIANTS_BODY))
-keys = re.findall(r"^[ \t]{4}['\"]?([\w-]+)['\"]?[ \t]*:[ \t]*\{", VARIANTS_BODY, re.M)
-check('变体数量是 15', len(keys) == 15, f'实测 {len(keys)}：{keys}')
-check('变体 key 不重复', len(keys) == len(set(keys)))
-
-om = re.search(r'order:\s*\[(.*?)\]', FX_JS, re.S)
-order = re.findall(r"'([^']+)'", om.group(1)) if om else []
-check('order 数组长度与变体数一致', len(order) == len(keys), f'order {len(order)} 个')
-check('order 覆盖全部变体', set(order) == set(keys),
-      '差集: ' + str(set(order) ^ set(keys)))
+# 方向场的**步长**不是开关 —— 它没有「关闭」语义（关开关的是 dirField）。
+# 所以它的默认值不能是 0：0 会让粗网格退化成 1×1，方向场变成常数。
+m2 = re.search(r'^\s+dirFieldStep:\s*([0-9.]+),', PARAMS_BODY, re.M)
+check('引擎默认参数 dirFieldStep = 24（步长不是开关，不能是 0）',
+      m2 is not None and float(m2.group(1)) == 24.0,
+      f'实测 {m2.group(1) if m2 else "没找到"}')
 
 # ─────────────────────────────────────────────────────────────
-sec('PF-11 每个变体都有生成逻辑；生长类变体有 warm 预热')
+sec('PF-10 随机方向波浪：方向场是**共享**的一张')
 
-for k in keys:
-    if k == 'pixelfield':
-        continue
-    check(f'变体 {k} 有 update 逻辑', 'update:' in entry_block(VARIANTS_BODY, k))
-
-warm_defs = re.findall(r'warm:\s*(\d+)', VARIANTS_BODY)
-check('生长类变体定义了 warm 预热帧数', len(warm_defs) >= 8, f'{len(warm_defs)} 个变体有 warm')
-check('预热是真的空跑了 update',
-      re.search(r'for \(var i = 0; i < warm; i\+\+\)\s*def\.update', FX_JS) is not None,
-      '降级动效只画一帧，没有预热 ⇒ 像素还没长出来就是黑屏')
-
-# ─────────────────────────────────────────────────────────────
-sec('PF-12 「白度渐变」钩子缺省仍是二值')
-
-check('paint 里有 tint 钩子', 'def.tint' in FX_JS)
-check('没有 tint 时走二值分支（浪身/浪尖）',
-      re.search(r'var w = tint \? tint\(.*\) : \(this\.crest\[i\] \? 1 : 0\);', FX_JS) is not None)
+check('有 ensureDirField()（方向场按需分配）',
+      'function ensureDirField()' in PIXELFIELD)
+check('方向场只按网格大小分配一次（dirFW * dirFH，不是 × 波数）',
+      re.search(r'dirSin\s*=\s*new Float32Array\(dirFW \* dirFH\);', PIXELFIELD) is not None,
+      '每道波各一张 ⇒ 遮罩拉长方向在相邻格跳变 ⇒ 拉长互相抵消 ⇒ 又是散点')
+check('方向场是共享的（每波只带一个偏角）',
+      'wOffC' in PIXELFIELD and 'wOffS' in PIXELFIELD)
+check('逐格按偏角旋转共享方向',
+      re.search(r'wsn\s*=\s*fs\s*\*\s*wOffC\[wi2\]\s*\+\s*fc\s*\*\s*wOffS\[wi2\]',
+                PIXELFIELD) is not None)
+check('方向场分量插值后归一化（不归一化 ⇒ 模长随插值位置变 ⇒ 方向会飘）',
+      re.search(r'var mm = Math\.sqrt\(sA \* sA \+ cA \* cA\);', PIXELFIELD) is not None)
 
 # ─────────────────────────────────────────────────────────────
-sec('PF-13 变体引擎接管时，原生引擎不再自己挂一次')
+sec('PF-11 分片遮罩晶向跟随局部波向')
 
-check('portal.js 有 GhostFX 守卫',
-      re.search(r'if \(window\.GhostFX\)\s*return;', PORTAL_JS) is not None,
-      '两个引擎抢同一个 canvas 会互相覆盖')
-check('portal.js 的降级路径用 moonstone-swirl（与变体引擎同一档）',
-      "'moonstone-swirl'" in PORTAL_JS)
-check('portal.js 不再单独用 moonstone 那档',
-      re.search(r"createStyle\(canvas,\s*'moonstone'", PORTAL_JS) is None)
+check('引擎里有 patchFollow 开关', 'p.patchFollow > 0' in PIXELFIELD)
+check('遮罩采样坐标转进了波帧（切向 / 法向）',
+      re.search(r'var tanX = px \* fc - py \* fs;', PIXELFIELD) is not None and
+      re.search(r'var norX = px \* fs \+ py \* fc;', PIXELFIELD) is not None)
+check('切向低频 / 法向高频（沿波前拉长）',
+      re.search(r'tanX \* p\.patchScale \* p\.patchTangent', PIXELFIELD) is not None and
+      re.search(r'norX \* p\.patchScale \* p\.patchNormal', PIXELFIELD) is not None)
+check('关掉时走原来的屏幕空间路径（逐位一致）',
+      re.search(r'u1x \* c1 - u1y \* s1 \+ tq \* p\.patchDrift', PIXELFIELD) is not None)
 
 # ─────────────────────────────────────────────────────────────
-sec('PF-14 脚本加载顺序正确')
+sec('PF-12 像素块尺寸可配')
 
-i_fx = PORTAL_HTML.find('{{STATIC_BASE}}fx.js')
+check('有 pxBody / pxCrest 两个参数',
+      re.search(r'^\s+pxBody:\s*0,', PARAMS_BODY, re.M) is not None and
+      re.search(r'^\s+pxCrest:\s*0,', PARAMS_BODY, re.M) is not None)
+check('渲染层用参数决定方块边长（0 = 原版 2/3）',
+      re.search(r'var b1s = p\.pxBody > 0 \? Math\.min\(SS, p\.pxBody \| 0\) : 2;',
+                PIXELFIELD) is not None and
+      re.search(r'var b2s = p\.pxCrest > 0 \? Math\.min\(SS, p\.pxCrest \| 0\) : 3;',
+                PIXELFIELD) is not None)
+
+# ─────────────────────────────────────────────────────────────
+sec('PF-12b 块状选取（亮区是实心小方块，不是雪花点）')
+
+# 为什么需要它（2026-11-02 实测，踩了三次坑才定位到）：
+#   原版的选取门槛 rSel 是**每格独立**的随机数 ⇒ 任何一条光带
+#   都被打成等密度的雪花点 ⇒ 屏幕上根本读不出「一条浪」，
+#   只剩「一块一块各自生成」。
+#   试过三条路，全都无效：
+#     ① 调 pickSoft（软门宽度）—— 无效，pickGain 是**自适应**的
+#        （引擎按 lit 目标自动增减），pickSoft 抬高多少它压回去多少；
+#     ② 调遮罩阈值 patchA1/A2 —— 无效，只会把点阵变得更均匀（电视雪花）；
+#     ③ 调波参数 —— 无效，点阵密度由选取机制决定，跟波无关。
+#   ⇒ 唯一出路是让**相邻格的亮灭决策相关**：同一块共用一个门槛。
+check('引擎有 pickBlock 开关',
+      re.search(r'^\s+pickBlock:\s*0,', PARAMS_BODY, re.M) is not None)
+check('门槛按块共享（si = 块索引，而不是逐格索引）',
+      re.search(r'var pb = p\.pickBlock \| 0;', PIXELFIELD) is not None and
+      re.search(r'si = bx \* 8191 \+ by;', PIXELFIELD) is not None)
+check('pickBlock=0 时走逐格随机分支（逐位一致的保证没被破坏）',
+      re.search(r'if \(pb > 0\) \{', PIXELFIELD) is not None and
+      'rSel[i] = rnd(si, 1013904223);' in PIXELFIELD)
+check('块索引用素数行距 8191（避免 (bx,by) 撞成同一个索引）',
+      re.search(r'bx \* 8191 \+ by', PIXELFIELD) is not None)
+
+# ─────────────────────────────────────────────────────────────
+sec('PF-13 14 套变体引擎与切换器已彻底删除')
+
+for f in REMOVED_FILES:
+    check(f'{f} 文件已删除', not has_file(f), '还在 ⇒ 变体方案没砍干净')
+    # ⚠️ 用剥掉注释的 HTML 判：注释里写「已删掉 fx.js」是说明，
+    #    不等于还在引用它 —— 直接对原文做子串判断会假红。
+    check(f'门户页不再引用 {f}', f not in PORTAL_HTML_CODE)
+    check(f'白名单不再列 {f}', f not in allowed)
+check('portal.js 不再有 GhostFX 守卫（变体引擎没了，守卫是死代码）',
+      'GhostFX' not in PORTAL_JS_CODE)
+check('portal.js 用的是 moonstone-tide', "'moonstone-tide'" in PORTAL_JS_CODE)
+check('portal.js 不再用 moonstone-swirl（那一档已不是门户默认）',
+      "'moonstone-swirl'" not in PORTAL_JS_CODE)
+check('引擎里 moonstone-tide / moonstone-swing 两档都还在（可随时切回去）',
+      'moonstone-tide' in STYLES_BODY and 'moonstone-swing' in STYLES_BODY)
+check('登录页那一档 moonstone 仍然在（不能被删）',
+      bool(entry_block(STYLES_BODY, 'moonstone')))
+
+# ─────────────────────────────────────────────────────────────
+sec('PF-14 门户页的脚本加载顺序正确')
+
+i_fp = PORTAL_HTML.find('{{STATIC_BASE}}fingerprint.js')
+i_pf = PORTAL_HTML.find('{{STATIC_BASE}}pixelfield.js')
 i_pj = PORTAL_HTML.find('{{STATIC_BASE}}portal.js')
-i_sw = PORTAL_HTML.find('{{STATIC_BASE}}switcher.js')
-check('三个脚本都引用了', -1 not in (i_fx, i_pj, i_sw))
-check('fx.js 在 portal.js 之前（portal.js 要看到 window.GhostFX）',
-      0 <= i_fx < i_pj, f'fx {i_fx} / portal {i_pj}')
-check('switcher.js 在 portal.js 之后（它要接管挂载）',
-      0 <= i_pj < i_sw, f'portal {i_pj} / switcher {i_sw}')
+check('三个脚本都引用了', -1 not in (i_fp, i_pf, i_pj))
+check('pixelfield.js 在 portal.js 之前（portal.js 要用 window.GhostPixelField）',
+      0 <= i_pf < i_pj, f'pixelfield {i_pf} / portal {i_pj}')
 
 # ─────────────────────────────────────────────────────────────
 sec('PF-15 CSP 没被放宽，页面不引外部资源')
@@ -332,11 +542,12 @@ check('CSP 仍是 default-src \'none\'', "default-src 'none'" in csp)
 check('CSP 仍只允许同源脚本', "script-src 'self'" in csp)
 check('CSP 仍只允许同源样式', "style-src 'self'" in csp)
 check('门户页不引外部资源',
-      'http://' not in PORTAL_HTML and 'https://' not in PORTAL_HTML)
-for f in ('fx.js', 'switcher.js', 'switcher.css'):
-    src = read(f)
+      'http://' not in PORTAL_HTML_CODE and 'https://' not in PORTAL_HTML_CODE)
+for f, code in (('portal.js', PORTAL_JS_CODE),
+                ('pixelfield.js', PIXELFIELD_CODE),
+                ('fingerprint.js', FINGERPRINT_JS_CODE)):
     check(f'{f} 不引外部资源',
-          'http://' not in src and 'https://' not in src)
+          'http://' not in code and 'https://' not in code)
 
 # ⚠️ 上面几条只查「包含」，CSP 被**放宽**（比如加上 'unsafe-inline'）
 #    之后这三条依然成立 —— 所以下面必须**逐字比对**，
@@ -353,11 +564,11 @@ check('CSP 不含 unsafe-inline', 'unsafe-inline' not in csp_value)
 check('CSP 不含 unsafe-eval', 'unsafe-eval' not in csp_value)
 
 # ─────────────────────────────────────────────────────────────
-sec('PF-16 四个 JS 文件语法正确')
+sec('PF-16 三个 JS 文件语法正确')
 
 node = shutil.which('node') or '/tmp/node-v22.23.4-linux-x64/bin/node'
 if os.path.isfile(node) or shutil.which(node):
-    for f in ('fx.js', 'switcher.js', 'portal.js', 'pixelfield.js'):
+    for f in ('portal.js', 'pixelfield.js', 'fingerprint.js'):
         r = subprocess.run([node, '--check', os.path.join(STATIC, f)],
                            capture_output=True, text=True)
         check(f'{f} 通过 node --check', r.returncode == 0,
@@ -372,27 +583,29 @@ sec('PF-17 页面里没有内联脚本 / 内联样式 / on* 事件属性')
 # 都会被浏览器直接拦掉（表现为「按钮没反应」「样式没生效」），
 # 而且 'unsafe-inline' 一旦被加进 CSP 就是 XSS 的口子。
 check('门户页没有内联 <script> 块',
-      re.search(r'<script(?![^>]*\bsrc=)', PORTAL_HTML, re.I) is None)
+      re.search(r'<script(?![^>]*\bsrc=)', PORTAL_HTML_CODE, re.I) is None)
 check('门户页没有 style= 属性',
-      re.search(r'\sstyle\s*=', PORTAL_HTML, re.I) is None)
+      re.search(r'\sstyle\s*=', PORTAL_HTML_CODE, re.I) is None)
 check('门户页没有 on* 事件属性',
-      re.search(r'\son[a-z]+\s*=', PORTAL_HTML, re.I) is None)
-for f in ('fx.js', 'switcher.js', 'portal.js'):
-    src = read(f)
+      re.search(r'\son[a-z]+\s*=', PORTAL_HTML_CODE, re.I) is None)
+for f, code in (('portal.js', PORTAL_JS_CODE), ('pixelfield.js', PIXELFIELD_CODE)):
     check(f'{f} 不拼 innerHTML（防 XSS）',
-          not re.search(r'\.innerHTML\s*=', src) and
-          not re.search(r'\.outerHTML\s*=', src))
+          not re.search(r'\.innerHTML\s*=', code) and
+          not re.search(r'\.outerHTML\s*=', code))
     check(f'{f} 不写内联 style 属性（用 class 驱动）',
-          not re.search(r'\.style\s*\.\s*(?!setProperty)', src) and
-          not re.search(r'\.setAttribute\(\s*[\'"]style', src))
+          not re.search(r'\.style\s*\.\s*(?!setProperty)', code) and
+          not re.search(r'\.setAttribute\(\s*[\'"]style', code))
 
 # ─────────────────────────────────────────────────────────────
 sec('PF-18 门户页该引的都引了')
 
-for need in ('base.css', 'gate.css', 'switcher.css',
-             'fingerprint.js', 'pixelfield.js', 'fx.js', 'portal.js', 'switcher.js'):
+for need in ('base.css', 'gate.css', 'fingerprint.js', 'pixelfield.js', 'portal.js'):
     check(f'门户页引用了 {need}', need in refs,
           '漏引 ⇒ 那部分功能直接消失，而且页面还能正常打开（很难一眼看出）')
+
+for f in REMOVED_FILES:
+    check(f'门户页**没有**再引用 {f}', f not in refs,
+          '变体方案已砍干净，引用就是死链')
 
 print()
 if FAIL:

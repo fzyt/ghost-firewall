@@ -34,25 +34,23 @@
   (function mountField() {
     var canvas = document.getElementById('pix');
     if (!canvas || !window.GhostPixelField) return;
-    /* 装了变体引擎（fx.js）就别自己再挂一个 ——
-       两个引擎抢同一个 canvas 会互相覆盖：原生引擎每帧 fillRect 整屏，
-       把变体引擎画的东西抹掉，反之亦然 ⇒ 背景随机闪烁。
-       fx.js 在 portal.js **之前**加载，所以这里能直接看到 window.GhostFX。 */
-    if (window.GhostFX) return;
     try {
       var reduce = !!(window.matchMedia &&
         window.matchMedia('(prefers-reduced-motion: reduce)').matches);
       var opt = {
         columns: 118,
-        params: { lit: 0.12 },
+        params: { lit: 0.21 },
         static: reduce,
       };
-      /* 用 'moonstone-swirl'（门户那一档：波速 ×1.9、方块晶向杂乱），
-         而不是 'moonstone'（登录页那一档，一字未动）。
-         这条分支是 **fx.js 没加载上时的降级路径** —— 背景要用同一档，
-         否则一掉脚本背景就「变回原版」，用户会以为页面坏了。 */
+      /* 用 'moonstone-tide'（月白·乱潮）—— 随机方向波浪：
+         所有波共用一张空间局部方向场，走向随位置变、随时间漂移；
+         分片遮罩的晶向跟随局部波向 ⇒ 亮块沿波前拉成长条，
+         而不是一堆各管各的散点。
+         2026-11-02：14 套生成艺术变体（fx.js + switcher.*）已按用户
+         要求全部删除，门户背景只剩这一套。
+         'moonstone-swirl'（旧那档）仍在引擎里，改这里就能换回去。 */
       if (window.GhostPixelField.createStyle) {
-        window.GhostPixelField.createStyle(canvas, 'moonstone-swirl', opt);
+        window.GhostPixelField.createStyle(canvas, 'moonstone-tide', opt);
       } else if (window.GhostPixelField.mount) {
         window.GhostPixelField.mount(canvas, opt);
       }

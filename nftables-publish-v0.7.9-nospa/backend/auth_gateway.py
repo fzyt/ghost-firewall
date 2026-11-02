@@ -210,17 +210,16 @@ STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 STATIC_ALLOWED = frozenset({
     "base.css", "fingerprint.js", "login.html", "login.js",
     "portal.html", "portal.js", "pixelfield.js", "gate.css",
-    # 门户改版新增的三个文件（2026-11-02）：
-    #   fx.js        背景变体引擎（15 套生成艺术方案）
-    #   switcher.css 变体切换器面板样式
-    #   switcher.js  变体切换器逻辑 + 键盘 + 指针反馈层
     #
     # ⚠️ 白名单是**硬闸**：不在这里的文件，即使已经拷进 static 目录，
     #   /auth/static/<file> 也会回 404（JSON 体，37 字节）。
-    #   门户页（portal.html）引用这三个文件 ⇒ 加文件进 static 目录时
-    #   **必须同步加进这里**，否则页面白屏（背景和切换器全 404）。
+    #   门户页（portal.html）引用的文件 ⇒ 加文件进 static 目录时
+    #   **必须同步加进这里**，否则页面白屏。
     #   tests/test_portal_frontend.py 里有断言守着这条不变量。
-    "fx.js", "switcher.css", "switcher.js",
+    #
+    # 2026-11-02：原先的 fx.js / switcher.css / switcher.js
+    #   （14 套「生成艺术」背景变体 + 切换器）已按用户要求全部删除，
+    #   门户背景只剩 pixelfield.js 一个引擎、pixelfield.js 内部的几档。
 })
 
 # 两个 HTML 页面的 CSP。两者只差 form-action：登录页有表单要提交到

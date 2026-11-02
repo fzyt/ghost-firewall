@@ -144,9 +144,7 @@ nftables-publish-v0.7.9-nospa/
         ├── gate.css              # 「光之门」转场动画
         ├── login.html/.js        # 登录页
         ├── portal.html/.js       # 服务门户
-        ├── pixelfield.js         # 像素场背景引擎（光带扫过方块场）
-        ├── fx.js                 # 背景变体引擎（15 套生成艺术方案）
-        └── switcher.css/.js      # 背景变体切换器
+        └── pixelfield.js         # 像素场背景引擎（光带扫过方块场 / 随机方向波浪）
 frontend/
 ├── index.html                    # 面板前端
 ├── app.js                        # 面板逻辑
