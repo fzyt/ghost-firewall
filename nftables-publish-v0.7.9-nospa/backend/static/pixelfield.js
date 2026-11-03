@@ -65,6 +65,15 @@
          页面底色 = rgb(10, 11, 13)
        ⇒ 青绿↔白双色，点阵在深底上。 */
     mint:      { bg: [10, 11, 13],  accent: [50, 240, 140],  white: [255, 255, 255], bloom: [70, 200, 140] },
+    /* ── TRAE 原版配色（2026-11-03）──────────────────────────
+       取值来自 TRAE 首页背景的**屏幕真值**（抓线上原图做颜色直方图）：
+         背景 = rgb(0,0,0)
+         白块 = rgb(255,255,255)
+         绿块 = rgb(122,248,196)
+       ⚠ 绿**不是** rgb(50,240,140)：那是着色器写进缓冲的**编码前**值，
+         末端合成还会再做一次 linear→sRGB，屏幕上看到的是 122,248,196。
+         差这一档整个画面的绿色就暗一截，和 TRAE 完全不像。 */
+    trae:      { bg: [0, 0, 0],       accent: [122, 248, 196], white: [255, 255, 255], bloom: [70, 200, 140] },
   };
 
   /* ══════════════════════════════════════════════════════════
@@ -296,6 +305,32 @@
         speedRange: 0.55,
         dirPivot: 0,
         lit: 0.12,
+      },
+    },
+    /* ── TRAE 原版（2026-11-03）────────────────────────────────
+     *
+     * 用户原话：「这个效果还是不行，你先拔下他的代码，做一个完全一样的复刻」。
+     * ⇒ 这一档不是「像 TRAE」，而是**把 TRAE 首页背景的两段 GLSL 逐行移植**：
+     *   流体层   main()        —— simplex 噪声 + fbm + 域扭曲
+     *   像素化层 mainImage()   —— 7px 晶格 / 5px 实心方块 / 按块随机绿白二选一
+     *   computeFluidFlow()    —— 位移场（恒正单向拖曳）
+     * 参数全部用 TRAE 线上 uniform 实测值（density .5 / frequency 4 /
+     * speed .18 / threshold .87 / greenRatio .49 / pixelSize 5 / pixelGap 2）。
+     *
+     * ⚠ 这一档**不走**本引擎的波/遮罩/余晖/辉光体系，
+     *   几何与渲染整条路径都换掉了（见 traeMode 分支）。
+     * ⚠ 与 TRAE 的**不可消除**差异：TRAE 的 hash 是 GPU float32 的
+     *   fract(sin(大数)*43758.5453123)，JS 的 double 复现不出 ⇒
+     *   画面是「同一个算法、同一套统计量」，但不是同一帧的逐格复制。
+     *   （实测 noise/fbm 分布逐位吻合，时间平均亮格率也吻合。） */
+    trae: {
+      label: 'TRAE 原版',
+      note: 'TRAE 首页背景的逐行移植：7px 晶格、5px 实心方块、绿白按块随机、指针附近泛绿。',
+      palette: 'trae',
+      params: {
+        traeMode: 1,
+        traeGrid: 16,
+        traeMouse: 1,
       },
     },
     /* ── 月白·乱晶（服务门户专用，2026-11-02）──────────────────
@@ -676,6 +711,18 @@
     hyst: 0.035,
     /* lit：旧引擎语义 —— **总体**点亮比例（占全画布）。0 = 用下面默认。 */
     lit: 0.10,
+    /* ── TRAE 原版复刻（2026-11-03）────────────────────────
+     * traeMode = 1 时，几何与渲染**整个换掉**：不走本引擎的波/遮罩/
+     * 余晖体系，改走 TRAE 首页背景的**原版算法**（两段 GLSL 逐行移植）。
+     * ⚠ 默认 0 ⇒ 不传时与改版前逐位一致。 */
+    traeMode: 0,
+    /* 粗网格步长（px）：颜色场、位移场各一张。
+     * 0 = 用默认 16。TRAE 的颜色场最细特征 ~360px、位移场 ~480px，
+     * 16px 网格分别有 22 / 30 个采样点落在每个特征里 ⇒ 误差可忽略。 */
+    traeGrid: 0,
+    /* 鼠标交互（TRAE 原版：指针附近白块泛绿、绿块泛白）。
+     * 0 = 关；>0 = 开（强度用 TRAE 原版 uMouseStrength）。 */
+    traeMouse: 0,
   };
 
   /* ══════════════════════════════════════════════════════════
@@ -745,6 +792,132 @@
     h = (h ^ (h >>> 16)) >>> 0;
     return h / 4294967296;
   }
+
+  /* ══════════════════════════════════════════════════════════════════
+     TRAE 原版背景 —— 两段 GLSL 逐行移植（2026-11-03）
+     ══════════════════════════════════════════════════════════════════
+     原文出处：TRAE 生产 chunk 29016（本地副本 trae-29016-pretty.js）
+       · 流体层   main()        137~163 行
+       · 像素化层 mainImage()   363~494 行
+       · computeFluidFlow()    334~360 行
+       · hash/noise/fbm         71~132 / 266~329 行
+       · 参数默认值             590~593 行
+         speed .18 / density .5 / frequency 4
+         pixelSize 5 / pixelGap 2 / threshold .87 / greenRatio .49
+
+     ⚠ 三个坑（都是实测钉死的，改之前先看证据文件）：
+       ① 颜色空间：线上 uniform 实测 uColor1 = (0.19607843, 0.94117647,
+          0.54901961) —— 就是**原始 sRGB 值**，没被 three.js 线性化。
+          ⇒ 流体纹理里存的是 mix(sRGB绿, 白, n)
+          ⇒ brightness = mean(rgb) = 0.562 + 0.438*n
+       ② 末端编码：像素化着色器写的是 vec3(50/255,240/255,140/255)，
+          但**屏幕上是 rgb(122,248,196)** —— 末端合成做了一次
+          linear→sRGB。本引擎直接画 2D canvas（没有那次编码），
+          ⇒ 必须自己补 srgb_encode，否则绿色会暗一档。
+       ③ v 轴：WebGL 的 vUv.y 原点在**底部**，canvas 在**顶部**
+          ⇒ 噪声域用 v = 1 - y/H；blockId.y 从底往上数
+          ⇒ canvas 行 cy 对应 blockId.y = rows-1-cy。
+
+     ⚠ 已知的**不可消除**差异（不是 bug）：
+       TRAE 的 hash 是 fract(sin(大数) * 43758.5453123)，GPU 上是
+       float32 的 sin —— 参数规约误差 ×43758 后，fract 的值能差 0.4。
+       ⇒ JS（double）永远复现不出 TRAE 那一版哈希。
+       ⇒ 复刻只能做到「同一个算法 + 同一套统计量」，做不到逐格相同。
+       实测：noise/fbm 的分布逐位吻合（均值 0.4998 vs 0.4993，
+       sd 0.0890 vs 0.0903），时间平均亮格率也吻合（18.9% vs 19.6%）。
+     ══════════════════════════════════════════════════════════════════ */
+  var TRAE = (function () {
+    /* ── hash 缓存 ───────────────────────────────────────
+     * TRAE 的 hash(vec2) 只在**整数**格点上被调用（i / i+o / i+1），
+     * 而 noise() 每次要算 2 个 sin ⇒ 不缓存的话 184ns/次，30fps 必跑不动。
+     * 直接映射表 + 冲突线性探测，命中就是一次数组读。 */
+    var HC_BITS = 16, HC_SIZE = 1 << HC_BITS, HC_MASK = HC_SIZE - 1;
+    var hcUsed = new Uint8Array(HC_SIZE);
+    var hcPx = new Int32Array(HC_SIZE);
+    var hcPy = new Int32Array(HC_SIZE);
+    var hcHx = new Float64Array(HC_SIZE);
+    var hcHy = new Float64Array(HC_SIZE);
+    var _h0 = 0, _h1 = 0;
+
+    function fract(x) { return x - Math.floor(x); }
+
+    /* vec2 hash(vec2 p) {
+     *   p = vec2(dot(p,vec2(127.1,311.7)), dot(p,vec2(269.5,183.3)));
+     *   return -1.0 + 2.0 * fract(sin(p) * 43758.5453123);
+     * } */
+    function thash(px, py) {
+      var key = (px * 73856093) ^ (py * 19349663);
+      var idx = (key >>> 0) & HC_MASK;
+      if (hcUsed[idx] && hcPx[idx] === px && hcPy[idx] === py) {
+        _h0 = hcHx[idx]; _h1 = hcHy[idx]; return;
+      }
+      /* 线性探测：同一格点被不同键占用时往后找空位 */
+      var probe = idx;
+      for (var k = 0; k < 8; k++) {
+        if (!hcUsed[probe]) break;
+        if (hcPx[probe] === px && hcPy[probe] === py) {
+          _h0 = hcHx[probe]; _h1 = hcHy[probe]; return;
+        }
+        probe = (probe + 1) & HC_MASK;
+      }
+      var ax = px * 127.1 + py * 311.7;
+      var ay = px * 269.5 + py * 183.3;
+      var hx = -1 + 2 * fract(Math.sin(ax) * 43758.5453123);
+      var hy = -1 + 2 * fract(Math.sin(ay) * 43758.5453123);
+      hcUsed[probe] = 1; hcPx[probe] = px; hcPy[probe] = py;
+      hcHx[probe] = hx; hcHy[probe] = hy;
+      _h0 = hx; _h1 = hy;
+    }
+
+    /* float noise(vec2 p) —— 2D simplex（TRAE 原样） */
+    function tnoise(px, py) {
+      var K1 = 0.366025404, K2 = 0.211324865;
+      var skew = (px + py) * K1;
+      var ix = Math.floor(px + skew), iy = Math.floor(py + skew);
+      var corner = (ix + iy) * K2;
+      var ax = px - ix + corner, ay = py - iy + corner;
+      var ox = ax > ay ? 1 : 0, oy = 1 - ox;
+      var bx = ax - ox + K2, by = ay - oy + K2;
+      var cx = ax - 1 + 2 * K2, cy = ay - 1 + 2 * K2;
+      var ha = 0.5 - (ax * ax + ay * ay); if (ha < 0) ha = 0;
+      var hb = 0.5 - (bx * bx + by * by); if (hb < 0) hb = 0;
+      var hc = 0.5 - (cx * cx + cy * cy); if (hc < 0) hc = 0;
+      thash(ix, iy);          var g0x = _h0, g0y = _h1;
+      thash(ix + ox, iy + oy); var g1x = _h0, g1y = _h1;
+      thash(ix + 1, iy + 1);  var g2x = _h0, g2y = _h1;
+      var n = ha * ha * ha * ha * (ax * g0x + ay * g0y)
+            + hb * hb * hb * hb * (bx * g1x + by * g1y)
+            + hc * hc * hc * hc * (cx * g2x + cy * g2y);
+      return n * 70;
+    }
+
+    /* float fbm(vec2 p) —— 3 层，amp 0.5/0.25/0.125，return value*0.5+0.5 */
+    function tfbm(px, py) {
+      var v = 0, amp = 0.5, freq = 1, i;
+      for (i = 0; i < 3; i++) {
+        v += amp * tnoise(px * freq, py * freq);
+        freq *= 2; amp *= 0.5;
+      }
+      return v * 0.5 + 0.5;
+    }
+
+    /* linear→sRGB 查表（末端合成那一步，256 级足够） */
+    var LUT = new Uint8Array(256);
+    (function () {
+      for (var i = 0; i < 256; i++) {
+        var c = i / 255;
+        var s = c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+        LUT[i] = Math.round(255 * s);
+      }
+    })();
+    function enc(c) {
+      var i = c * 255 + 0.5;
+      if (i < 0) i = 0; else if (i > 255) i = 255;
+      return LUT[i | 0];
+    }
+
+    return { noise: tnoise, fbm: tfbm, fract: fract, enc: enc, hash: thash };
+  })();
 
   /* ══════════════════════════════════════════════════════════
      引擎
@@ -844,6 +1017,286 @@
     var frameCount = 0, geoCount = 0, fpsEma = 0;
     var lastStep = -1;
 
+    /* ══════════════════════════════════════════════════════════
+       TRAE 原版分支的状态（2026-11-03）
+       ══════════════════════════════════════════════════════════
+       TRAE 原值（实测钉死，**不得擅自改动**）：
+         pixelSize 5 + pixelGap 2 = 7px 晶格；方块 5×5，贴每格左上角
+         threshold .87 / greenRatio .49 / 阈值抖动 .08
+         流体层   uSpeed .18 / uDensity .5 / uFrequency 4
+         像素化层 speed .15 / density 1.5 / frequency 2.5 / 位移 ×35
+         uMouseRadius .3 / uMouseStrength 1.3
+         uColor1 = (50,240,140)/255 —— 原始 sRGB 值（没被线性化）
+       */
+    var TR_CELL = 7;        /* pixelSize + pixelGap */
+    var TR_DOT = 5;         /* pixelSize */
+    var TR_THR = 0.87;      /* e1Threshold */
+    var TR_GREEN = 0.49;    /* e1GreenRatio */
+    var TR_JIT = 0.08;      /* threshold - 0.08*rand */
+    var TR_SPEED = 0.18;    /* 流体层 uSpeed */
+    var TR_DENS = 0.5;      /* 流体层 uDensity */
+    var TR_FREQ = 4;        /* 流体层 uFrequency */
+    var TR_FSPEED = 0.15;   /* 像素化层 speed */
+    var TR_FDENS = 1.5;     /* 像素化层 density */
+    var TR_FFREQ = 2.5;     /* 像素化层 frequency */
+    var TR_FSCALE = 35;     /* 像素化层 *35.0 */
+    var TR_MR = 0.3;        /* uMouseRadius */
+    var TR_MS = 1.3;        /* uMouseStrength */
+    var TR_GR = 50 / 255, TR_GG = 240 / 255, TR_GB = 140 / 255;  /* uColor1 */
+
+    var tCols = 0, tRows = 0;
+    var tGrid = 16, tGx0 = 0, tGy0 = 0, tGw = 0, tGh = 0;
+    var tField = null;      /* 颜色场：n（流体层算出来的噪声值） */
+    var tFlowX = null;      /* 位移场：x（px） */
+    var tFlowY = null;      /* 位移场：y（px） */
+    var tState = null;      /* 每格：0 黑 / 1 绿 / 2 白 */
+    var tMF = null;         /* 每格 mouseFactor */
+    var tImg = null, tImgData = null;   /* 设备分辨率输出缓冲 */
+    var tDotDev = 5;        /* 方块的设备像素边长 */
+    var tPitch = 7;         /* 晶格的设备像素周期 */
+    var tPrevLit = null;    /* 上一帧亮格的格号（用来擦掉旧点） */
+    var tPrevCount = 0;
+    var tMouseX = 0.5, tMouseY = 0.5;    /* 指针位置（UV，v 向上） */
+    var tRect = null;                    /* 画布矩形（缓存，避免每次 pointermove 触发布局） */
+
+    /* 粗网格双线性采样：网格坐标 = 画布像素（y 向下） */
+    function tSample(arr, px, py) {
+      var fx = (px - tGx0) / tGrid, fy = (py - tGy0) / tGrid;
+      var ix = Math.floor(fx), iy = Math.floor(fy);
+      var tx = fx - ix, ty = fy - iy;
+      var j0 = ix < 0 ? 0 : (ix >= tGw ? tGw - 1 : ix);
+      var j1 = ix + 1 < 0 ? 0 : (ix + 1 >= tGw ? tGw - 1 : ix + 1);
+      var i0 = iy < 0 ? 0 : (iy >= tGh ? tGh - 1 : iy);
+      var i1 = iy + 1 < 0 ? 0 : (iy + 1 >= tGh ? tGh - 1 : iy + 1);
+      var a0 = i0 * tGw, a1 = i1 * tGw;
+      var f00 = arr[a0 + j0], f10 = arr[a0 + j1];
+      var f01 = arr[a1 + j0], f11 = arr[a1 + j1];
+      var top = f00 + (f10 - f00) * tx;
+      var bot = f01 + (f11 - f01) * tx;
+      return top + (bot - top) * ty;
+    }
+
+    /* 流体层：mix(uColor1, uColor2, noise) 里的 noise
+     *   float t = uTime * uSpeed;
+     *   vec2 q = vec2(fbm(st*uDensity + vec2(0.0, 0.2*t)),
+     *                 fbm(st*uDensity + vec2(1.2, -0.3*t)));
+     *   float noise = fbm(st*uDensity + q*uFrequency);
+     * ⚠ st 是 TRAE 的 vUv（v 向上）⇒ 调用方给的 v 必须是 1 - y/H。 */
+    function trField(u, v, tt) {
+      var qx = TRAE.fbm(u * TR_DENS + 0.0, v * TR_DENS + 0.2 * tt);
+      var qy = TRAE.fbm(u * TR_DENS + 1.2, v * TR_DENS - 0.3 * tt);
+      return TRAE.fbm(u * TR_DENS + qx * TR_FREQ, v * TR_DENS + qy * TR_FREQ);
+    }
+
+    /* 重建 TRAE 分支的缓冲（尺寸变了才调） */
+    function setupTrae() {
+      tCols = Math.ceil(w / TR_CELL);
+      tRows = Math.ceil(h / TR_CELL);
+      tGrid = p.traeGrid > 0 ? p.traeGrid : 16;
+      /* 颜色场要覆盖取样点：位移最大 73.5px ⇒ 上下各垫 80px、左右垫 16px */
+      tGx0 = -16; tGy0 = -80;
+      tGw = Math.ceil((w - tGx0) / tGrid) + 2;
+      tGh = Math.ceil((h - tGy0) / tGrid) + 2;
+      tField = new Float32Array(tGw * tGh);
+      tFlowX = new Float32Array(tGw * tGh);
+      tFlowY = new Float32Array(tGw * tGh);
+      tState = new Uint8Array(tCols * tRows);
+      tMF = new Float32Array(tCols * tRows);
+      tPrevLit = new Int32Array(tCols * tRows);
+      tPrevCount = 0;
+      /* 输出缓冲用设备分辨率（点阵是 CSS 像素 ⇒ 设备像素要乘 dpr） */
+      var dw = canvas.width, dh = canvas.height;
+      tImg = ctx.createImageData(dw, dh);
+      tImgData = tImg.data;
+      tRect = canvas.getBoundingClientRect();
+      var dprT = dw / Math.max(1, w);
+      tPitch = TR_CELL * dprT;
+      tDotDev = Math.max(1, Math.round(TR_DOT * dprT));
+      /* 底色先铺一遍，之后每帧只改方块那点像素 */
+      var bg = pal.bg;
+      for (var i = 0; i < tImgData.length; i += 4) {
+        tImgData[i] = bg[0]; tImgData[i + 1] = bg[1]; tImgData[i + 2] = bg[2]; tImgData[i + 3] = 255;
+      }
+      lastStep = -1;
+    }
+
+    /* TRAE 的几何：两张粗网格（颜色场 + 位移场）+ 逐格判定 */
+    function computeTrae(t) {
+      if (!tField) return;
+      /* 两条时间轴（TRAE 实测）：
+       *   流体层 uTime = 真实秒（clock.elapsedTime）
+       *   像素化层 uTime = 每 2 帧推进一次 ≈ 真实时间的一半（实测比值 0.51） */
+      var tt = t * TR_SPEED;                       /* 流体层 uTime * uSpeed */
+      var s = t * 0.5 * TR_FSPEED;                 /* 像素化层 uTime * speed */
+      var gx, gy, u, v, i;
+
+      /* ── 颜色场网格 ─────────────────────────────── */
+      for (gy = 0; gy < tGh; gy++) {
+        v = 1 - (tGy0 + gy * tGrid) / h;          /* 画布 y 向下 ⇒ v = 1 - y/H */
+        var rowBase = gy * tGw;
+        for (gx = 0; gx < tGw; gx++) {
+          u = (tGx0 + gx * tGrid) / w;
+          tField[rowBase + gx] = trField(u, v, tt);
+        }
+      }
+      /* ── 位移场网格 ───────────────────────────────
+       *   computeFluidFlow(uv, time, .15, 1.5, 2.5) * 35
+       *   ⇒ flow.x = q.x*10.5px，flow.y = q.y*73.5px（恒正，单向拖曳） */
+      for (gy = 0; gy < tGh; gy++) {
+        v = 1 - (tGy0 + gy * tGrid) / h;
+        var r2 = gy * tGw;
+        for (gx = 0; gx < tGw; gx++) {
+          u = (tGx0 + gx * tGrid) / w;
+          var qx = TRAE.fbm(u * TR_FDENS + 0.0, v * TR_FDENS + 0.2 * s);
+          var qy = TRAE.fbm(u * TR_FDENS + 1.2, v * TR_FDENS - 0.3 * s);
+          tFlowX[r2 + gx] = qx * 0.3 * 2.0 * 0.5 * TR_FSCALE;
+          tFlowY[r2 + gx] = qy * 0.7 * 2.0 * 1.5 * TR_FSCALE;
+        }
+      }
+
+      /* ── 逐格判定 ──────────────────────────────────
+       *   blockPos    = blockId * 7
+       *   blockCenter = blockPos + 2.5
+       *   samplePos   = blockCenter - flow
+       *   brightness  = mean(texel) = 0.562 + 0.438*n
+       *   rand        = fract(sin(dot(blockId,(12.9898,78.233)))*43758.5453123)
+       *   thr         = 0.87 - 0.08*rand
+       *   lit ⇔ brightness > thr；绿 ⇔ rand < 0.49
+       * ⚠ blockId.y 在 TRAE 里是**从底往上**的格号
+       *   ⇒ canvas 行 cy 对应 by = rows-1-cy。 */
+      var lit = 0, green = 0;
+      for (var cy = 0; cy < tRows; cy++) {
+        var by = tRows - 1 - cy;
+        for (var cx = 0; cx < tCols; cx++) {
+          var bu = (cx * TR_CELL + TR_DOT / 2) / w;   /* 格心（TRAE 的 vUv） */
+          var bv = (by * TR_CELL + TR_DOT / 2) / h;
+          /* 位移场在格心处采样 */
+          var cxp = bu * w, cyp = (1 - bv) * h;
+          var dx = tSample(tFlowX, cxp, cyp);
+          var dy = tSample(tFlowY, cxp, cyp);
+          /* 颜色场在「格心 − 位移」处采样 */
+          var su = bu - dx / w;
+          var sv = bv - dy / h;
+          var nAt = tSample(tField, su * w, (1 - sv) * h);
+          /* brightness = mean(mix(uColor1, uColor2, n))
+           *   uColor1 是原始 sRGB 值 ⇒ 均值 = 0.562 + 0.438*n */
+          var bright = 0.562 + 0.438 * nAt;
+          var r = TRAE.fract(Math.sin(cx * 12.9898 + by * 78.233) * 43758.5453123);
+          var thr = TR_THR - TR_JIT * r;
+          var idx = cy * tCols + cx;
+          if (bright > thr) {
+            tState[idx] = r < TR_GREEN ? 1 : 2;
+            lit++;
+            if (r < TR_GREEN) green++;
+          } else {
+            tState[idx] = 0;
+          }
+          /* 鼠标影响因子（TRAE 原文）：
+           *   mouseFactor = (1 - smoothstep(0, uMouseRadius, dist)) * uMouseStrength
+           * ⚠ mouseFactor 可以 >1（GLSL 的 mix 不夹）⇒ 这里也不夹。 */
+          var mf = 0;
+          if (p.traeMouse > 0) {
+            var mdx = bu - tMouseX, mdy = bv - tMouseY;
+            var md = Math.sqrt(mdx * mdx + mdy * mdy);
+            var stt = TR_MR > 0 ? md / TR_MR : (md >= 0 ? 1 : 0);
+            if (stt > 1) stt = 1; else if (stt < 0) stt = 0;
+            mf = (1 - stt * stt * (3 - 2 * stt)) * TR_MS;
+          }
+          tMF[idx] = mf;
+        }
+      }
+      stats.lit = lit;
+      stats.cells = tCols * tRows;
+      stats.litFrac = lit / Math.max(1, tCols * tRows);
+      stats.bandCells = tCols * tRows;
+      stats.litInBand = stats.litFrac;
+      stats.bandFrac = 1;
+      /* ⚠ 这里**不能**重建 tPrevLit（上一帧亮格清单）：
+       *   tPrevLit 的用途是「把上一帧的点擦回底色」，
+       *   必须在渲染时用**旧**清单擦完、再用**新**状态画，
+       *   最后才把清单换成新的。
+       *   在这里就换 ⇒ 擦的是当前格 ⇒ 上一帧灭掉的点永远擦不掉
+       *   ⇒ 画面会一轮轮累积（实测会糊成一片）。 */
+    }
+
+    /* TRAE 的渲染：每格左上角一个 5×5 实心方块（绿 / 白 / 黑）
+     * ⚠ 颜色要过一遍 linear→sRGB（TRAE 末端合成那一步）：
+     *   绿分支 c = mix(vec3(50,240,140)/255, uColor2, mouseFactor)
+     *   白分支 c = mix(vec3(1.0), uColor1, mouseFactor)
+     *   屏幕上看到的是 srgb_encode(c) ⇒ 绿是 rgb(122,248,196)。 */
+    function renderTrae(t) {
+      if (!tImgData) return;
+      var stepIdx = Math.floor(t / p.step);
+      if (stepIdx !== lastStep) {
+        computeTrae(stepIdx * p.step);
+        lastStep = stepIdx;
+        geoCount++;
+      }
+      var d = tImgData;
+      var bg = pal.bg;
+      var dw = canvas.width, dh = canvas.height;
+      var i, x, y, xx, yy, o, idx;
+
+      /* 先把上一帧的点擦回底色 */
+      for (i = 0; i < tPrevCount; i++) {
+        idx = tPrevLit[i];
+        var pcx = idx % tCols, pcy = (idx / tCols) | 0;
+        x = Math.floor(pcx * tPitch); y = Math.floor(pcy * tPitch);
+        for (yy = 0; yy < tDotDev; yy++) {
+          if (y + yy >= dh) break;
+          o = ((y + yy) * dw + x) * 4;
+          for (xx = 0; xx < tDotDev; xx++) {
+            if (x + xx >= dw) break;
+            d[o] = bg[0]; d[o + 1] = bg[1]; d[o + 2] = bg[2]; d[o + 3] = 255;
+            o += 4;
+          }
+        }
+      }
+
+      /* 再画这一帧的点 */
+      var litCount = 0;
+      for (var cy = 0; cy < tRows; cy++) {
+        y = Math.floor(cy * tPitch);
+        if (y >= dh) break;
+        for (var cx = 0; cx < tCols; cx++) {
+          var stt = tState[cy * tCols + cx];
+          if (!stt) continue;
+          x = Math.floor(cx * tPitch);
+          if (x >= dw) break;
+          var mf = tMF[cy * tCols + cx];
+          var cr, cg, cb;
+          if (stt === 1) {
+            /* 绿 → 越靠近指针越白 */
+            cr = TR_GR + (1 - TR_GR) * mf;
+            cg = TR_GG + (1 - TR_GG) * mf;
+            cb = TR_GB + (1 - TR_GB) * mf;
+          } else {
+            /* 白 → 越靠近指针越绿 */
+            cr = 1 + (TR_GR - 1) * mf;
+            cg = 1 + (TR_GG - 1) * mf;
+            cb = 1 + (TR_GB - 1) * mf;
+          }
+          var R = TRAE.enc(cr), G = TRAE.enc(cg), B = TRAE.enc(cb);
+          for (yy = 0; yy < tDotDev; yy++) {
+            if (y + yy >= dh) break;
+            o = ((y + yy) * dw + x) * 4;
+            for (xx = 0; xx < tDotDev; xx++) {
+              if (x + xx >= dw) break;
+              d[o] = R; d[o + 1] = G; d[o + 2] = B; d[o + 3] = 255;
+              o += 4;
+            }
+          }
+          litCount++;
+        }
+      }
+      ctx.putImageData(tImg, 0, 0);
+      stats.lit = litCount;
+      stats.litFrac = litCount / Math.max(1, tCols * tRows);
+      /* 清单换成这一帧的亮格（下一帧拿它擦旧点） */
+      tPrevCount = 0;
+      for (var k = 0; k < tState.length; k++) if (tState[k]) tPrevLit[tPrevCount++] = k;
+    }
+
     function resize() {
       var rect = canvas.getBoundingClientRect();
       w = Math.max(1, Math.floor(rect.width));
@@ -853,6 +1306,12 @@
       canvas.height = Math.floor(h * dpr);
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.imageSmoothingEnabled = false;
+
+      /* ── TRAE 原版分支：晶格固定 7px，不走本引擎的波/遮罩体系 ── */
+      if (p.traeMode > 0) {
+        setupTrae();
+        return;
+      }
 
       var newCell = SS * Math.max(2, Math.round(w / COLUMNS / SS));
       var newCols = Math.ceil(w / newCell);
@@ -1360,6 +1819,8 @@
     }
 
     function render(t, dt) {
+      /* ── TRAE 原版分支：整条渲染路径都换掉 ─────────────── */
+      if (p.traeMode > 0) { renderTrae(t); return; }
       if (!fineData || !fctx || !peak.length) return;
 
       /* ── 几何步推进 ────────────────────────────────── */
@@ -1619,6 +2080,22 @@
       ro.observe(canvas);
     }
     global.addEventListener('resize', onResize);
+
+    /* ── 指针跟踪（TRAE 原版的鼠标交互，2026-11-03）────────────
+     * TRAE 的像素化着色器里有 uMouse：指针附近白块泛绿、绿块泛白。
+     * 坐标换算成 UV（v 向上，与 TRAE 的 vUv 一致）：
+     *   u = (clientX - rect.left) / rect.width
+     *   v = 1 - (clientY - rect.top) / rect.height
+     * ⚠ 只在 traeMouse > 0 时才挂监听 ⇒ 别的档位不白跑事件。
+     * ⚠ 每次 pointermove 都读 getBoundingClientRect 会触发布局，
+     *   所以矩形缓存在 tRect 里，只在 resize 时更新。 */
+    if (p.traeMouse > 0 && global.addEventListener) {
+      global.addEventListener('pointermove', function (ev) {
+        if (!tRect || !tRect.width || !tRect.height) return;
+        tMouseX = (ev.clientX - tRect.left) / tRect.width;
+        tMouseY = 1 - (ev.clientY - tRect.top) / tRect.height;
+      }, { passive: true });
+    }
 
     var api = {
       start: function () { if (!raf) { start = 0; lastT = 0; raf = global.requestAnimationFrame(frame); } },

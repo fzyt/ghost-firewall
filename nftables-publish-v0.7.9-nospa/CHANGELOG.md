@@ -2,6 +2,125 @@
 
 所有重要更改均记录在此文件中。
 
+## [v0.14.0] - 2026-11-03
+
+**服务门户背景第九轮**：按用户要求「拔下他的代码，做一个完全一样的复刻」——
+把 TRAE 首页背景的**两段 GLSL 逐行移植**进引擎，新增 `trae` 档，门户切过去。
+
+起因是用户原话：
+
+> 「这个效果还是不行，你先拔下他的代码，做一个完全一样的复刻」
+
+之前几轮都是在**近似还原**（把 TRAE 的机制用自己的波/遮罩体系模拟出来），
+这一轮改成**直接移植**：TRAE 怎么算，引擎就怎么算。
+
+### ★ 这一版钉死的三件事（都推翻过之前的说法）
+
+| # | 之前以为 | 实测结论 | 证据 |
+|---|---|---|---|
+| ① | `uColor1` 是线性色，`brightness` 在线性空间算 | **不是**。线上 uniform 实测 `uColor1 = (0.19607843, 0.94117647, 0.54901961)` —— 原始 sRGB 值，没被 three.js 线性化 ⇒ `brightness = 0.562 + 0.438*n` | 拦截 WebGL uniform 读取 |
+| ② | 绿块是 `rgb(50,240,140)` | **不是**。末端合成还有一次 linear→sRGB ⇒ 屏幕上真实值是 **`rgb(122,248,196)`** | 抓线上原图做颜色直方图：`rgb(122,248,196)` × 12223 像素 |
+| ③ | `brightness(-0.2)` 会压暗背景 | **完全无效**。postprocessing 的 EffectPass 把所有效果合并进同一片元着色器，而像素化着色器**不用 `inputColor`**，只用自己的 `inputTexture` ⇒ 上一环结果被整体覆盖 | 恒量探针：流体写常量 `(0.5,0.25,0.75)` ⇒ 屏幕 `rgb(188,137,225)`（= sRGB 编码后） |
+
+### 线上 uniform 实测值（复刻的定档依据）
+
+```
+uTime 16.0322   e1UTime 8.4104     ← 两条时间轴，比值 0.5245（像素化层≈真实一半）
+uSpeed 0.18     uDensity 0.5       uFrequency 4
+e1Threshold 0.87   e1GreenRatio 0.49   e1PixelSize 5   e1PixelGap 2
+uColor1 (0.19607843, 0.94117647, 0.54901961)   ← 原始 sRGB
+e1Resolution 1440×796
+```
+
+### 移植的两段 GLSL
+
+```glsl
+// 流体层 main()
+float t = uTime * uSpeed;
+vec2 q = vec2(fbm(st*uDensity + vec2(0.0,  0.2*t)),
+              fbm(st*uDensity + vec2(1.2, -0.3*t)));
+float noise = fbm(st*uDensity + q*uFrequency);
+color = mix(uColor1, uColor2, noise);
+
+// 像素化层 mainImage()
+vec2 blockId = floor(uv * resolution / 7);
+vec2 flow  = computeFluidFlow(blockCenterUV, time, .15, 1.5, 2.5) * 35.0;
+vec4 color = texture2D(inputTexture, blockPos - flow + 2.5);
+float brightness = (color.r + color.g + color.b) / 3.0;
+float rand = fract(sin(dot(blockId, vec2(12.9898,78.233))) * 43758.5453123);
+if (brightness > threshold - 0.08 * rand) → rand < greenRatio ? 绿 : 白
+```
+
+`hash` / `noise`（2D simplex）/ `fbm`（3 层）也一并逐行移植。
+
+### ★ 三个必须记住的坑（改代码前先看这里）
+
+1. **v 轴要翻**：WebGL 的 `vUv.y` 原点在**底部**，canvas 在**顶部**
+   ⇒ 噪声域用 `v = 1 - y/H`；`blockId.y` 从底往上数 ⇒ canvas 行 `cy` 对应 `by = rows-1-cy`。
+2. **末端要补一次 sRGB 编码**：着色器写的是 `vec3(50/255,240/255,140/255)`，
+   但屏幕上是 `rgb(122,248,196)`。本引擎直接画 2D canvas（没有那次编码）
+   ⇒ **必须自己补**，否则整个画面的绿色暗一档，和 TRAE 完全不像。
+3. **`blockId.y` 从底往上 + 方块贴格子左上角**：亮像素落在
+   `x mod 7 ∈ {0..4}`、`y mod 7 ∈ {0..4}`（线上实拍：游程长度 5、相位分布实测）。
+
+### ★ 与 TRAE 的**不可消除**差异（不是 bug，是物理限制）
+
+TRAE 的哈希是 GPU **float32** 的 `fract(sin(大数) * 43758.5453123)`。
+float32 的 `sin` 参数规约误差约 1e-5，乘 43758 之后 `fract` 能差 **0.4**
+⇒ **JS（double）永远复现不出 TRAE 那一版哈希**。
+
+⇒ 复刻能做到「**同一个算法 + 同一套统计量**」，做不到「同一帧的逐格复制」。
+
+实测佐证（同一块 GPU 上用 TRAE 原 GLSL 建了一个真值台对拍）：
+
+| 指标 | GPU 真值台 | JS 复刻 | 结论 |
+|---|---|---|---|
+| `noise` 均值 / 标准差 | -0.0008 / 0.3097 | -0.0028 / 0.3164 | 分布吻合 |
+| `fbm` 均值 / 标准差 | 0.4998 / 0.0890 | 0.4993 / 0.0903 | 分布吻合 |
+| 时间平均亮格率（8 个时刻） | 18.9% | 19.6% | 吻合 |
+
+单帧对不上是**必然**的：TRAE 自己的亮格率就在 **8%~35%** 之间大幅波动
+（域扭曲 `q*4` 把采样点系统性地推到 fbm 偏高的区域，那块区域的均值
+取决于哈希实现），两个实现各自走各自的波动曲线。
+
+### 引擎改动
+
+- 新增 `TRAE` 模块：`hash` / `noise` / `fbm` 逐行移植 + hash 缓存
+  （直接映射 + 冲突线性探测；不缓存的话 184ns/次，30fps 必跑不动）
+  + linear→sRGB 查表。
+- 新增参数（**默认值全为 0** ⇒ 不传时与改版前逐位一致）：
+  `traeMode` / `traeGrid` / `traeMouse`。
+- 新增 `trae` 配色：`bg` 纯黑、`accent` rgb(122,248,196)、`white` 纯白。
+- 新增 `trae` 档：几何与渲染**整条路径**都换掉（不走波/遮罩/余晖/辉光体系）。
+- `trae` 档开了鼠标交互（TRAE 原文：指针附近白块泛绿、绿块泛白；
+  `uMouseRadius .3` / `uMouseStrength 1.3`）。
+- `portal.js` 从 `'moonstone-flow'` 切到 `'trae'`。
+
+### 这一版抓到的自己的一个 bug
+
+TRAE 分支的输出缓冲是「就地改同一个 ImageData」，所以每帧要先把**上一帧**
+的点擦回底色。最初把「上一帧亮格清单」在几何计算里就换成了新值
+⇒ 擦的是当前格 ⇒ **上一帧灭掉的点永远擦不掉** ⇒ 画面一轮轮累积、糊成一片。
+
+⇒ 改成：渲染时用旧清单擦完、画完新的，再把清单换成新的。
+（行为级测试 PT-1 的「实心 5×5」断言当场抓到。）
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| 静态断言 `tests/test_portal_frontend.py` | **282 / 282**（新增 PF-26 共 37 项） |
+| 行为级 `tests/test_pixelfield_trae.js`（新增） | **20 / 20** |
+| 行为级 `tests/test_pixelfield_hardedge.js` | **18 / 18** |
+| 变异脚本 `tests/mutation_check_portal_frontend.py` | **166 / 166 全捕获**（新增 M 组 20 条） |
+| 四档逐位一致（`pfidentity.js`） | `2099a4b8` / `f0454319` / `14231b1d` / `2fbb5810` —— **与 v0.13.0 完全一致** |
+| 浏览器实测 | 1440×900 下 **60fps**，亮格率 13.9% |
+
+新增行为级测试专门盯四个「只看代码看不出来」的坑：
+颜色空间（绿必须 122,248,196）、几何（7px 晶格 + 5×5 实心方块 + 贴左上角）、
+密度区间、鼠标混合。另加一条**定值锚点**（t=0.5s 那一帧的亮格掩码哈希）
+—— 因为 v 翻转、方向反了这些退化**统计上完全不可见**，只有钉死某一帧才抓得住。
+
 ## [v0.13.0] - 2026-11-03
 
 **服务门户背景第八轮**：按 TRAE 首页的**点位生成规律**重做 `pixel-flow`

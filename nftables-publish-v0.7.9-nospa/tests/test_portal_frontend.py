@@ -243,6 +243,8 @@ def entry_block(body, key):
 
 STYLES_BODY = table_body(PIXELFIELD, 'STYLES')
 PARAMS_BODY = table_body(PIXELFIELD, 'P')
+PALETTES_BODY = table_body(PIXELFIELD, 'PALETTES')
+PALETTE_TRAE = entry_block(PALETTES_BODY, 'trae')
 
 # ─────────────────────────────────────────────────────────────
 sec('PF-1  门户页引用的静态文件都在认证网关白名单里')
@@ -562,8 +564,8 @@ for f in REMOVED_FILES:
     check(f'白名单不再列 {f}', f not in allowed)
 check('portal.js 不再有 GhostFX 守卫（变体引擎没了，守卫是死代码）',
       'GhostFX' not in PORTAL_JS_CODE)
-check('portal.js 用的是 moonstone-flow（随机方向流动那一档）',
-      "'moonstone-flow'" in PORTAL_JS_CODE)
+check('portal.js 用的是 trae（TRAE 原版复刻那一档）',
+      "'trae'" in PORTAL_JS_CODE)
 check('portal.js 不再用 moonstone-swirl（那一档已不是门户默认）',
       "'moonstone-swirl'" not in PORTAL_JS_CODE)
 # 已被用户否掉的两档（月白·乱潮 / 月白·转潮）必须从引擎里删干净 ——
@@ -969,6 +971,98 @@ check('压暗层的停靠点做成了 CSS 变量（可调深浅/位置而不用�
 check('旧版压暗层保留在 body.pix-scrim-legacy 下（能切回去）',
       re.search(r'body\.pix-scrim-legacy \.pix-scrim \{', CSS) is not None and
       'radial-gradient(58% 48% at 34% 20%' in CSS)
+
+
+# ─────────────────────────────────────────────────────────────
+sec('PF-26 TRAE 原版复刻档（2026-11-03：拔下他的代码，做完全一样的复刻）')
+
+# 这一批把 TRAE 首页背景的两段 GLSL 逐行移植进引擎（traeMode 分支）。
+# 下面每一条都写成「改回原样就必然失败」的形式。
+trae = entry_block(STYLES_BODY, 'trae')
+check('引擎新增了 trae 档（TRAE 原版复刻）', bool(trae))
+check('trae 档用 trae 配色（bg 纯黑 + 末端 sRGB 编码后的绿）',
+      "palette: 'trae'" in trae)
+check('trae 档打开了 traeMode', re.search(r'traeMode:\s*1,', trae) is not None)
+check('trae 档开了鼠标交互（TRAE 原版指针附近泛绿）',
+      re.search(r'traeMouse:\s*1,', trae) is not None)
+check('trae 档的粗网格步长定档 16px',
+      re.search(r'traeGrid:\s*16,', trae) is not None)
+
+# 配色：绿必须是 122,248,196（不是 50,240,140 —— 那是末端编码前的值）
+trae_pal = entry_block(PALETTES_BODY, 'trae') if 'PALETTES_BODY' in globals() else ''
+check('trae 配色的底色是纯黑', re.search(r'bg:\s*\[0,\s*0,\s*0\]', PALETTE_TRAE) is not None)
+check('trae 配色的绿是 rgb(122,248,196)（= sRGB 编码后的 #32F08C）',
+      re.search(r'accent:\s*\[122,\s*248,\s*196\]', PALETTE_TRAE) is not None)
+check('trae 配色的白是 rgb(255,255,255)',
+      re.search(r'white:\s*\[255,\s*255,\s*255\]', PALETTE_TRAE) is not None)
+
+# 新增参数默认值全为 0（不传时与改版前逐位一致）
+check('引擎新增 traeMode 参数（默认 0 ⇒ 不传时逐位一致）',
+      re.search(r'traeMode:\s*0,', PARAMS_BODY) is not None)
+check('引擎新增 traeGrid 参数（默认 0）',
+      re.search(r'traeGrid:\s*0,', PARAMS_BODY) is not None)
+check('引擎新增 traeMouse 参数（默认 0）',
+      re.search(r'traeMouse:\s*0,', PARAMS_BODY) is not None)
+
+# TRAE 原值必须写死在引擎里（改了就跟 TRAE 不一样）
+TR_CONSTS = [
+    ('TR_CELL = 7', '晶格周期 7px（pixelSize 5 + pixelGap 2）'),
+    ('TR_DOT = 5', '方块边长 5px（pixelSize）'),
+    ('TR_THR = 0.87', '阈值 0.87（e1Threshold）'),
+    ('TR_GREEN = 0.49', '绿占比 0.49（e1GreenRatio）'),
+    ('TR_JIT = 0.08', '阈值抖动 0.08'),
+    ('TR_SPEED = 0.18', '流体层 uSpeed 0.18'),
+    ('TR_DENS = 0.5', '流体层 uDensity 0.5'),
+    ('TR_FREQ = 4', '流体层 uFrequency 4'),
+    ('TR_FSPEED = 0.15', '像素化层 speed 0.15'),
+    ('TR_FDENS = 1.5', '像素化层 density 1.5'),
+    ('TR_FFREQ = 2.5', '像素化层 frequency 2.5'),
+    ('TR_FSCALE = 35', '像素化层位移 ×35'),
+    ('TR_MR = 0.3', 'uMouseRadius 0.3'),
+    ('TR_MS = 1.3', 'uMouseStrength 1.3'),
+]
+for pat, desc in TR_CONSTS:
+    check(f'TRAE 原值 {desc} 写死在引擎里', re.search(re.escape(pat), PIXELFIELD) is not None)
+
+# 亮度公式：uColor1 是原始 sRGB 值 ⇒ brightness = 0.562 + 0.438*n
+check('亮度按 sRGB 空间算：brightness = 0.562 + 0.438*n（uColor1 没被线性化）',
+      re.search(r'0\.562\s*\+\s*0\.438\s*\*\s*nAt', PIXELFIELD) is not None)
+# 输出必须过一遍 linear→sRGB（TRAE 末端合成那一步）
+check('输出颜色过了 sRGB 编码（绿才是 122,248,196 而不是 50,240,140）',
+      re.search(r'TRAE\.enc\(cr\)', PIXELFIELD) is not None)
+# v 轴翻转 + blockId.y 从底往上
+check('噪声域的 v 是 1 - y/H（WebGL 原点在底部 ⇒ 必须翻）',
+      re.search(r'v = 1 - \(tGy0 \+ gy \* tGrid\) / h', PIXELFIELD) is not None)
+check('blockId.y 从底往上（canvas 行 cy 对应 rows-1-cy）',
+      re.search(r'var by = tRows - 1 - cy', PIXELFIELD) is not None)
+# rand 公式
+check('rand 用的是 TRAE 原公式 fract(sin(dot(blockId,(12.9898,78.233)))*43758.5453123)',
+      re.search(r'Math\.sin\(cx \* 12\.9898 \+ by \* 78\.233\) \* 43758\.5453123', PIXELFIELD)
+      is not None)
+# 两条时间轴
+check('流体层用真实时间、像素化层用一半时间（TRAE 实测比值 0.51）',
+      re.search(r'var tt = t \* TR_SPEED', PIXELFIELD) is not None and
+      re.search(r'var s = t \* 0\.5 \* TR_FSPEED', PIXELFIELD) is not None)
+# 鼠标交互按 TRAE 原文
+check('鼠标影响因子按 TRAE 原文 (1 - smoothstep(0, R, dist)) * strength',
+      re.search(r'\(1 - stt \* stt \* \(3 - 2 \* stt\)\) \* TR_MS', PIXELFIELD) is not None)
+
+# 这一批不许外溢到别的档
+# ⚠ 判据用 'traeMode:'（带冒号 = 参数赋值），不用 'traeMode'：
+#   entry_block 取到的是「到下一个同级键为止」，会把**下一档的注释**
+#   一起吃进来，而那注释里就写着「见 traeMode 分支」。
+check('moonstone-flow 档没被这一批动过（登录页/门脸页保持原样）',
+      'traeMode:' not in entry_block(STYLES_BODY, 'moonstone-flow'))
+check('pixel-flow 档没被这一批动过',
+      'traeMode:' not in entry_block(STYLES_BODY, 'pixel-flow'))
+check('moonstone 档没被这一批动过（登录页那一档）',
+      'traeMode:' not in entry_block(STYLES_BODY, 'moonstone'))
+
+# 门户已经切到新档
+check("portal.js 用的是 createStyle(canvas, 'trae', opt)",
+      "createStyle(canvas, 'trae', opt)" in PORTAL_JS_CODE)
+check('portal.js 不再自己传 columns（TRAE 档的晶格固定 7px，不吃 columns）',
+      'columns: 118' not in PORTAL_JS_CODE)
 
 
 print()

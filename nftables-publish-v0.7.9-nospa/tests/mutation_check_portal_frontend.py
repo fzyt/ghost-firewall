@@ -53,6 +53,7 @@ STATIC = os.path.join(ROOT, 'backend', 'static')
 BACKEND = os.path.join(ROOT, 'backend')
 TEST_PY = os.path.join(ROOT, 'tests', 'test_portal_frontend.py')
 TEST_JS = os.path.join(ROOT, 'tests', 'test_pixelfield_hardedge.js')
+TEST_JS2 = os.path.join(ROOT, 'tests', 'test_pixelfield_trae.js')
 
 # 本脚本会动的文件（只这些）
 REL_FILES = [
@@ -92,6 +93,8 @@ def run_tests():
     两个都要跑：
       · test_portal_frontend.py     —— 源码文本断言（静态）
       · test_pixelfield_hardedge.js —— 真跑引擎、把画布像素读出来（行为级）
+      · test_pixelfield_trae.js     —— 同上，专测 TRAE 原版复刻档的
+                                        几何 / 颜色 / 密度
 
     ⚠ 行为级那个是这一批的关键（2026-11-03）：
       硬边是**渲染行为**（alpha 到底是不是两态、颜色到底几种），
@@ -116,7 +119,12 @@ def run_tests():
     r2 = subprocess.run([node, TEST_JS],
                         capture_output=True, text=True, cwd=ROOT,
                         timeout=300, env=env)
-    return r2.returncode, out + r2.stdout + r2.stderr
+    if r2.returncode != 0:
+        return r2.returncode, out + r2.stdout + r2.stderr
+    r3 = subprocess.run([node, TEST_JS2],
+                        capture_output=True, text=True, cwd=ROOT,
+                        timeout=300, env=env)
+    return r3.returncode, out + r2.stdout + r2.stderr + r3.stdout + r3.stderr
 
 
 def mutate(rel, old, new):
@@ -519,15 +527,15 @@ MUTATIONS = [
 
     # ── G. 接线 / 加载顺序 / 安全面 / 占位符 ──
     ('N-59', '门户退回 moonstone-swirl（用户点名否掉的那一档）', PJS,
-     "createStyle(canvas, 'moonstone-flow', opt)",
+     "createStyle(canvas, 'trae', opt)",
      "createStyle(canvas, 'moonstone-swirl', opt)"),
     ('N-60', 'GhostFX 守卫被复活（变体引擎没了，守卫是死代码）', PJS,
      "  (function mountField() {\n    var canvas = document.getElementById('pix');",
      "  (function mountField() {\n    var canvas = document.getElementById('pix');\n"
      "    if (window.GhostFX) return;"),
     ('N-61', '门户自己传 lit（opt.params 会盖掉档位里的值）', PJS,
-     '      var opt = {\n        columns: 118,\n        static: reduce,\n      };',
-     '      var opt = {\n        columns: 118,\n        params: { lit: 0.21 },\n'
+     '      var opt = {\n        static: reduce,\n      };',
+     '      var opt = {\n        params: { lit: 0.21 },\n'
      '        static: reduce,\n      };'),
     ('N-62', '脚本加载顺序对调（pixelfield.js 排到 portal.js 后面）', PHT,
      '<script src="{{STATIC_BASE}}pixelfield.js"></script>\n'
@@ -569,6 +577,57 @@ MUTATIONS = [
     ('N-73', '_read_portal_html 的默认基址被改（白名单直达路径会变死链）', GW,
      "def _read_portal_html(static_base='/auth/static/'):",
      "def _read_portal_html(static_base='/static/'):"),
+
+    # ── M. TRAE 原版复刻被撤回（2026-11-03）────────────────────
+    # 这一批是「把 TRAE 首页背景的两段 GLSL 逐行移植进引擎」。
+    # 最危险的退化是**看起来还像那么回事**的：晶格差 1px、阈值差 0.01、
+    # 颜色少做一次 sRGB 编码 —— 画面照样有形状，肉眼未必立刻发现。
+    ('M-01', 'traeMode 默认值被改成 1（破坏「不传时逐位一致」）', PIX,
+     'traeMode: 0,', 'traeMode: 1,'),
+    ('M-02', '晶格周期 7 改成 6（TRAE 是 5px 点 + 2px 间隙 = 7px）', PIX,
+     'var TR_CELL = 7;', 'var TR_CELL = 6;'),
+    ('M-03', '方块边长 5 改成 4（TRAE 的 pixelSize 是 5）', PIX,
+     'var TR_DOT = 5;', 'var TR_DOT = 4;'),
+    ('M-04', '阈值 0.87 改成 0.5（密度会暴涨）', PIX,
+     'var TR_THR = 0.87;', 'var TR_THR = 0.5;'),
+    ('M-05', '绿占比 0.49 改成 0.9（几乎全绿）', PIX,
+     'var TR_GREEN = 0.49;', 'var TR_GREEN = 0.9;'),
+    ('M-06', '阈值抖动 0.08 改成 0（TRAE 用同一个 rand 两处用）', PIX,
+     'var TR_JIT = 0.08;', 'var TR_JIT = 0;'),
+    ('M-07', '亮度公式改成 0.5 + 0.5*n（颜色空间错了 ⇒ 密度与颜色都偏）', PIX,
+     'var bright = 0.562 + 0.438 * nAt;', 'var bright = 0.5 + 0.5 * nAt;'),
+    ('M-08', '输出不做过 sRGB 编码（绿会变成 50,240,140 ⇒ 整体暗一档）', PIX,
+     'var R = TRAE.enc(cr), G = TRAE.enc(cg), B = TRAE.enc(cb);',
+     'var R = (cr * 255) | 0, G = (cg * 255) | 0, B = (cb * 255) | 0;'),
+    ('M-09', 'v 轴翻转被去掉（画面上下颠倒）', PIX,
+     'v = 1 - (tGy0 + gy * tGrid) / h;', 'v = (tGy0 + gy * tGrid) / h;'),
+    ('M-10', 'blockId.y 方向反了（点阵上下颠倒）', PIX,
+     'var by = tRows - 1 - cy;', 'var by = cy;'),
+    ('M-11', 'rand 公式被改（绿白分布不再是 TRAE 那套）', PIX,
+     'var r = TRAE.fract(Math.sin(cx * 12.9898 + by * 78.233) * 43758.5453123);',
+     'var r = TRAE.fract(Math.sin(cx * 7.1 + by * 3.3) * 43758.5453123);'),
+    ('M-12', '两条时间轴被合成一条（像素化层速度翻倍）', PIX,
+     'var s = t * 0.5 * TR_FSPEED;', 'var s = t * TR_FSPEED;'),
+    ('M-13', '位移场 ×35 改成 ×1（取样位置不对 ⇒ 形状完全变了）', PIX,
+     'var TR_FSCALE = 35;', 'var TR_FSCALE = 1;'),
+    ('M-14', 'traeMouse 默认值被改成 1（老档也会挂指针监听）', PIX,
+     'traeMouse: 0,', 'traeMouse: 1,'),
+    ('M-15', 'trae 档的 traeMode 被关掉（门户背景退回旧算法）', PIX,
+     '        traeMode: 1,\n        traeGrid: 16,',
+     '        traeMode: 0,\n        traeGrid: 16,'),
+    ('M-16', 'trae 配色的绿被改成 50,240,140（编码前的值 ⇒ 整体暗一档）', PIX,
+     'trae:      { bg: [0, 0, 0],       accent: [122, 248, 196], white: [255, 255, 255], bloom: [70, 200, 140] },',
+     'trae:      { bg: [0, 0, 0],       accent: [50, 240, 140], white: [255, 255, 255], bloom: [70, 200, 140] },'),
+    ('M-17', '门户不用 trae 档（背景不是 TRAE 复刻）', PJS,
+     "createStyle(canvas, 'trae', opt)", "createStyle(canvas, 'moonstone-flow', opt)"),
+    ('M-18', 'TRAE 分支的渲染被绕过（门户背景变成一片空白）', PIX,
+     'if (p.traeMode > 0) { renderTrae(t); return; }',
+     'if (false) { renderTrae(t); return; }'),
+    ('M-19', 'TRAE 分支的几何被绕过（退回老路径 ⇒ 不是 TRAE 的画面）', PIX,
+     'if (p.traeMode > 0) { renderTrae(t); return; }',
+     'if (p.traeMode > 0) { computeTrae(stepIdx * p.step); return; }'),
+    ('M-20', '鼠标影响因子被拆掉（指针附近不再泛绿）', PIX,
+     'mf = (1 - stt * stt * (3 - 2 * stt)) * TR_MS;', 'mf = 0;'),
 ]
 
 

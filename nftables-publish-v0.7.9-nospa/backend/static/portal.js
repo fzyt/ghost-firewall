@@ -26,9 +26,14 @@
 
   /* ── 像素场背景 ───────────────────────────────────────────
    * 和门脸页同一个引擎（pixelfield.js），纯装饰。
-   * 用月白（moonstone-flow）那套配色 —— 跟门脸页、登录页对齐，
-   * 整站是同一种银白语言，不是三页三种色。
-   * createStyle 会连配色带波形参数一起套上；引擎不存在或接口对不上
+   *
+   * 2026-11-03：用户原话「这个效果还是不行，你先拔下他的代码，
+   * 做一个完全一样的复刻」⇒ 换成 'trae' 档 —— 那一档不是「像 TRAE」，
+   * 而是把 TRAE 首页背景的两段 GLSL **逐行移植**进引擎：
+   * 流体层（simplex 噪声 + fbm + 域扭曲）+ 像素化层（7px 晶格、
+   * 5px 实心方块、按块随机绿白二选一、指针附近泛绿）。
+   *
+   * createStyle 会连配色带参数一起套上；引擎不存在或接口对不上
    * 就退回 mount()，再不行就什么都不画 —— 背景画不出来无所谓，
    * 页面照常用。 */
   (function mountField() {
@@ -37,25 +42,15 @@
     try {
       var reduce = !!(window.matchMedia &&
         window.matchMedia('(prefers-reduced-motion: reduce)').matches);
-      /* ⚠ 不在这里覆盖 lit：点亮比例由样式自己定（moonstone-flow = 0.12，
-         与改版前的 moonstone 一致）。opt.params 会**盖掉**样式里的同名参数，
-         这里一旦写死 lit，以后调样式就会对不上。 */
+      /* ⚠ 不在这里覆盖 lit / columns：
+         点亮比例与晶格密度都由样式自己定（'trae' 那一档的晶格
+         固定 7px，不吃 columns），opt.params 会**盖掉**样式里的同名参数，
+         这里一旦写死，以后调样式就会对不上。 */
       var opt = {
-        columns: 118,
         static: reduce,
       };
-      /* 用 'moonstone-flow'（月白·流）—— 原版几何 + 随机方向流动：
-         波速、遮罩、余晖、像素尺寸、点亮比例全部照抄改版前的 moonstone，
-         **只把「固定方向」换成「方向缓慢随机游走」**：
-         方向挂在全屏共享的方向场上，绕画布中心缓慢换向。
-         实测：60 秒内方向偏 34°、120 秒内偏 111°；
-         平均角速度 0.032 rad/s，比原版 dirSwing 的 0.037 **还慢**
-         ⇒ 不是「抖得快」，是「拐得慢、拐得远」。
-         2026-11-02 的 'moonstone-tide'（月白·乱潮）已被用户否掉 ——
-         空间局部方向场让运动场分片，眼睛追踪不到统一运动。
-         'moonstone-swirl'（更早那档）仍在引擎里，改这里就能换回去。 */
       if (window.GhostPixelField.createStyle) {
-        window.GhostPixelField.createStyle(canvas, 'moonstone-flow', opt);
+        window.GhostPixelField.createStyle(canvas, 'trae', opt);
       } else if (window.GhostPixelField.mount) {
         window.GhostPixelField.mount(canvas, opt);
       }
