@@ -171,6 +171,8 @@ PIXELFIELD = read('pixelfield.js')
 PORTAL_JS = read('portal.js')
 FINGERPRINT_JS = read('fingerprint.js')
 GATEWAY_PY = read('auth_gateway.py', base=BACKEND)
+# 回归入口脚本（断言计数公式在它里面）
+RUN_ALL = read('run_all.sh', base=os.path.join(ROOT, 'tests'))
 
 # 「这东西不该出现」类断言一律用剥掉注释的版本（见上面 strip_js_comments 的说明）
 PORTAL_HTML_CODE = strip_html_comments(PORTAL_HTML)
@@ -564,8 +566,11 @@ for f in REMOVED_FILES:
     check(f'白名单不再列 {f}', f not in allowed)
 check('portal.js 不再有 GhostFX 守卫（变体引擎没了，守卫是死代码）',
       'GhostFX' not in PORTAL_JS_CODE)
-check('portal.js 用的是 trae（TRAE 原版复刻那一档）',
-      "'trae'" in PORTAL_JS_CODE)
+# 2026-11-03 第十轮：门户切到「月白·TRAE」合档（方块用原方案、流动用 TRAE）。
+# ⚠ 判据用 "'moonstone-trae'"：TRAE 原版那一档仍在引擎里，
+#   但**门户不再用它**（合档才是当前要的那个画面）。
+check('portal.js 用的是 moonstone-trae（合档：方块用原方案、流动用 TRAE）',
+      "'moonstone-trae'" in PORTAL_JS_CODE)
 check('portal.js 不再用 moonstone-swirl（那一档已不是门户默认）',
       "'moonstone-swirl'" not in PORTAL_JS_CODE)
 # 已被用户否掉的两档（月白·乱潮 / 月白·转潮）必须从引擎里删干净 ——
@@ -811,12 +816,15 @@ check('量化模式关掉每格抖动偏移（off = 0，否则点阵还是随机
 
 # 域扭曲流场：TRAE 的观感真正来源。
 # 不用它 ⇒ 值噪声的轴对齐晶格 ⇒ 亮点连成方块簇（2026-11-03 实测）。
+# ⚠ 2026-11-03 第十轮：流场计算被抽成共用函数 flowValAt（量化档与合档共用），
+#   所以这里的锚点跟着改；「q 两条通道先采样再掰坐标」三行原样保留。
 check('流场走 TRAE 同款的域扭曲（q 两条通道先采样再掰坐标）',
       'var qxq = sample(tex, NOISE_N, uf, vf + 0.05 * ftq);' in PIXELFIELD and
       'var qyq = sample(tex, NOISE_N, uf + 0.30, vf - 0.0375 * ftq);' in PIXELFIELD and
-      'qf = sample(tex, NOISE_N, uf + qxq * p.flowWarp, vf + qyq * p.flowWarp);' in PIXELFIELD)
+      'return sample(tex, NOISE_N, uf + qxq * p.flowWarp, vf + qyq * p.flowWarp);' in PIXELFIELD)
 check('流场开关提到逐格循环外（每步只取决于参数）',
-      re.search(r'var useFlow = p\.pixelQuant > 0 && p\.flowDensity > 0;', PIXELFIELD) is not None)
+      re.search(r'var useFlow = p\.flowDensity > 0 && \(p\.pixelQuant > 0 \|\| p\.flowMask > 0\);',
+                PIXELFIELD) is not None)
 
 # ─────────────────────────────────────────────────────────────
 sec('PF-22 pixel-flow 新档（借鉴 TRAE，独立于现有各档）')
@@ -1059,10 +1067,95 @@ check('moonstone 档没被这一批动过（登录页那一档）',
       'traeMode:' not in entry_block(STYLES_BODY, 'moonstone'))
 
 # 门户已经切到新档
-check("portal.js 用的是 createStyle(canvas, 'trae', opt)",
-      "createStyle(canvas, 'trae', opt)" in PORTAL_JS_CODE)
-check('portal.js 不再自己传 columns（TRAE 档的晶格固定 7px，不吃 columns）',
+# ⚠ 2026-11-03 第十轮：门户切到「月白·TRAE」合档 ⇒ 这两条改成合档。
+#   TRAE 原版那一档**保留在引擎里**，只是门户不再用它。
+check("portal.js 用的是 createStyle(canvas, 'moonstone-trae', opt)",
+      "createStyle(canvas, 'moonstone-trae', opt)" in PORTAL_JS_CODE)
+check('portal.js 不再自己传 columns（合档吃引擎默认列数）',
       'columns: 118' not in PORTAL_JS_CODE)
+
+
+# ─────────────────────────────────────────────────────────────
+sec('PF-27 「月白·TRAE」合档（2026-11-03：很好，就这样，然后和我的原方案综合一下）')
+
+# 用户原话：「方块使用我们现在网关用的方案（原方案），然后流动保留trae的流动方案」
+# ⇒ 方块 ← 原方案（随机疏密 / 明暗参差 / 余晖渐隐），流动 ← TRAE（域扭曲 + 单向拖曳）
+mst = entry_block(STYLES_BODY, 'moonstone-trae')
+check('引擎新增了 moonstone-trae 档（合档）', bool(mst))
+check('合档用 moonstone 配色（月白银白，不是 TRAE 的绿）',
+      "palette: 'moonstone'" in mst)
+check('合档打开了 flowMask（遮罩源换成 TRAE 流体场）',
+      re.search(r'flowMask:\s*1,', mst) is not None)
+check('合档的流场切点是实测校准值 0.68',
+      re.search(r'flowThresh:\s*0\.68,', mst) is not None)
+check('合档的流场软边是实测校准值 0.30',
+      re.search(r'flowSoft:\s*0\.30,', mst) is not None)
+check('合档默认 flowSolo = 0（保留原方案的波带构图）',
+      re.search(r'flowSolo:\s*0,', mst) is not None)
+
+# TRAE 的两层流场参数必须照抄（单位是贴图单位，不是 TRAE 的 uniform 名义值）
+for key, val, desc in [
+    ('flowDensity', '0.375', '位移场尺度'),
+    ('fieldDensity', '0.125', '颜色场尺度'),
+    ('flowWarp', '0.50', '域扭曲强度'),
+    ('flowSpeed', '0.020', '漂移速度'),
+    ('flowDispX', '10', '取样横向位移（px）'),
+    ('flowDispY', '70', '取样纵向位移（px）'),
+]:
+    check('合档的 TRAE 流场参数 ' + key + ' = ' + val + '（' + desc + '）',
+          re.search(re.escape(key) + r':\s*' + re.escape(val) + r',', mst) is not None)
+
+# 几何照抄原版 moonstone（三道波一个都不能改）
+moon_block = entry_block(STYLES_BODY, 'moonstone')
+moon_waves = re.findall(r'\{ k: [\d.]+, om: [\d.]+, off: [\d.]+, dir: -?[\d.]+, w: [\d.]+ \}', moon_block)
+mst_waves = re.findall(r'\{ k: [\d.]+, om: [\d.]+, off: [\d.]+, dir: -?[\d.]+, w: [\d.]+ \}', mst)
+check('合档的三道波与原版 moonstone 一字不差',
+      len(moon_waves) == 3 and moon_waves == mst_waves,
+      'moonstone=%s / 合档=%s' % (moon_waves, mst_waves))
+
+# 用户说「转向/变速都按照 TRAE 的方案」⇒ 不许出现随机转向/随机变速
+# ⚠ 判据用 'dirField:'（带冒号 = 参数赋值）：entry_block 取到的段落里
+#   含注释，注释里会提到「不开 dirField」⇒ 不能用裸词判。
+check('合档不开随机转向（没有 dirField 参数赋值）', 'dirField:' not in mst)
+check('合档不开随机换向周期（没有 dirTurnPeriod）', 'dirTurnPeriod' not in mst)
+check('合档不开随机变速（没有 speedTurnPeriod）', 'speedTurnPeriod' not in mst)
+
+# 新增参数默认值必须全为 0（不传时与改版前逐位一致）
+for pname in ['flowMask', 'flowThresh', 'flowSoft', 'flowSolo']:
+    check('引擎新增 ' + pname + ' 参数（默认 0 ⇒ 不传时逐位一致）',
+          re.search(re.escape(pname) + r':\s*0,', PARAMS_BODY) is not None)
+
+# 流场必须从硬边量化档里解耦出来（否则合档拿不到流体场）
+check('流场开关已放宽：flowDensity>0 且（量化模式 或 flowMask 模式）',
+      re.search(r'flowDensity > 0 && \(p\.pixelQuant > 0 \|\| p\.flowMask > 0\)', PIXELFIELD)
+      is not None)
+check('流体场被抽成共用函数 flowValAt（两档一处算）',
+      'function flowValAt(' in PIXELFIELD)
+check('合档把遮罩源换成流体场（mask = sstep(...)）',
+      re.search(r'mask = sstep\(fmTh - fmSf, fmTh \+ fmSf, fv\)', PIXELFIELD) is not None)
+check('flowSolo=1 时波带不参与（band = 1）',
+      re.search(r'if \(solo\) band = 1;', PIXELFIELD) is not None)
+check('独当模式下流体场对全屏计算（solo || band > 0）',
+      'useFlow && (solo || band > 0)' in PIXELFIELD)
+
+# 这一批不许外溢到别的档
+for k in ['moonstone', 'moonstone-flow', 'pixel-flow', 'trae']:
+    check(k + ' 档没被这一批动过（没有开 flowMask）',
+          'flowMask:' not in entry_block(STYLES_BODY, k))
+check('trae 档（TRAE 原版）仍然保留', bool(entry_block(STYLES_BODY, 'trae')))
+
+# 门户已经切到合档
+check("portal.js 用的是 createStyle(canvas, 'moonstone-trae', opt)",
+      "createStyle(canvas, 'moonstone-trae', opt)" in PORTAL_JS_CODE)
+check('portal.js 不再自己传 columns（合档吃引擎默认列数）',
+      'columns: 118' not in PORTAL_JS_CODE)
+
+# 回归计数公式必须认 [PASS]/[FAIL]（否则这几百项静态断言在计数里全是 0）
+check('回归脚本的计数公式同时认 ✅ 与 [PASS]',
+      re.search(r"count_pass\(\)", RUN_ALL) is not None and
+      r'\[PASS\]' in RUN_ALL)
+check('回归脚本的失败计数同时认 ❌ 与 [FAIL]',
+      r'\[FAIL\]' in RUN_ALL)
 
 
 print()

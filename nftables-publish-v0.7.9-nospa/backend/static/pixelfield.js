@@ -333,6 +333,82 @@
         traeMouse: 1,
       },
     },
+    /* ── 月白·TRAE（2026-11-03）────────────────────────────────
+     *
+     * 用户原话：「方块使用我们现在网关用的方案（原方案），然后流动保留
+     *   trae的流动方案」
+     *
+     * ⇒ 这一档是**两个方案的综合**，各取一半：
+     *   · 方块 ← 原方案：每格随机门槛（块内随机疏密）、每格随机亮度
+     *     （明暗参差）、余晖 trail（尾部逐渐消失）、迟滞 hyst、
+     *     抖动溶解 statJit、密度伺服 —— 一件都没换
+     *   · 流动 ← TRAE：域扭曲 FBM（有机等值线）+ 单向取样位移（拖曳）
+     *   · 配色 ← 月白（银白单色；TRAE 那套绿白留在 trae 档里）
+     *
+     * 实现上只加了一个开关：**flowMask = 1**
+     * ⇒ 常规路径的**遮罩源**从「两层旋转值噪声」换成 TRAE 的流体场；
+     *   下面「选点」那段（rSel / rAmp / 余晖）一个字没改。
+     *
+     * 几何照抄原版 moonstone（三道波的 k/om/off/w 一字未改）。
+     * ⚠ 不加随机转向 / 随机变速（用户：「按照trae的方案」）
+     *   —— TRAE 的流动本身就是恒定方向 + 恒定速度。
+     *
+     * 为什么不复用 pixel-flow 那一档：
+     *   pixel-flow 是「TRAE 点阵 + mint 配色 + 原方案几何」，
+     *   走的是**硬边量化**路径（pixelQuant=1）⇒ 方块不是原方案那种
+     *   随机疏密的点群，而是规整点阵。
+     *   用户要的是「方块用原方案」⇒ 必须留在常规路径上。 */
+    'moonstone-trae': {
+      label: '月白·TRAE',
+      note: '原方案的方块（随机疏密/明暗参差/尾部渐隐）+ TRAE 的域扭曲流动。月白银白。',
+      palette: 'moonstone',
+      params: {
+        /* 原版 moonstone 的三道波，一字未改（dir 用绝对角，不开 dirField）。 */
+        waves: [
+          { k: 0.00580, om: 0.504, off: 0.00, dir: -0.30, w: 1.00 },
+          { k: 0.00625, om: 0.563, off: 2.10, dir: -0.25, w: 0.90 },
+          { k: 0.00545, om: 0.454, off: 4.20, dir: -0.35, w: 0.78 },
+        ],
+        distortAmp: 0.85,
+        /* ── TRAE 的两层流场（数值照抄 pixel-flow 档）──────────────
+           ⚠ 单位是**贴图单位**，不是 TRAE 的 uniform 名义值：
+             TRAE 噪声 p 空间基频周期 = 1，本引擎贴图基频周期 = 0.25
+             ⇒ 1 个 TRAE p 单位 = 0.25 贴图单位
+               · 位移场 TRAE density=1.5 ⇒ flowDensity = 0.375
+               · 颜色场 TRAE density=0.5 ⇒ fieldDensity = 0.125
+           flowWarp = 0.50：域扭曲强度（TRAE 名义 frequency=4 的一半）
+           flowSpeed = 0.020：漂移速度（贴图单位/秒）
+           flowDispX/Y = 10 / 70 px：TRAE 实测横向 0.6~9.9、纵向 4.4~69，
+                            纵向是横向的 7 倍 ⇒ 观感上图案整体单向拖曳。 */
+        flowDensity: 0.375,
+        fieldDensity: 0.125,
+        flowWarp: 0.50,
+        flowSpeed: 0.020,
+        flowDispX: 10,
+        flowDispY: 70,
+        /* ★ 合档开关：常规路径的遮罩源改用 TRAE 流体场。
+           flowThresh / flowSoft = 流场切点与软边（0~1 域），实测校准。 */
+        flowMask: 1,
+        /* flowSolo = 0：波带仍在（原方案的构图：斜向的一条光带），
+           流体场只换「亮区的形状与内容」。
+           ⚠ 实测（2026-11-03，1200×800，跑满 12 秒让密度伺服收敛）：
+             flowSolo=0 / th=0.68 / sf=0.30
+               lit% 3.75   团块数 33   平均团块 14 格（4px 口径）
+             原版 moonstone
+               lit% 3.68   团块数 40   ⇒ 密度与团块分布都对得上，
+               但团块形状是 TRAE 的有机边界（域扭曲掰出来的），
+               内部是原方案的随机疏密点群 ⇒ 这就是「方块用原方案、
+               流动用 TRAE」想要的那个画面。
+             flowSolo=1（波带不参与，亮区全归流体场）：
+               lit% 1.5~2.6、团块数 0~21 ⇒ 流体场的亮区太大，
+               密度伺服只能把 pickGain 压到底 ⇒ 反而变稀了。
+               ⇒ 门户用 flowSolo=0；想看「纯 TRAE 构图」改成 1 即可。 */
+        flowSolo: 0,
+        flowThresh: 0.68,
+        flowSoft: 0.30,
+        lit: 0.12,
+      },
+    },
     /* ── 月白·乱晶（服务门户专用，2026-11-02）──────────────────
      *
      * 为什么不直接改 moonstone 那一档：
@@ -665,6 +741,41 @@
     fieldDensity: 0,        /* 颜色场空间尺度（贴图单位 / 屏宽） */
     flowDispX: 0,           /* 取样横向位移（px） */
     flowDispY: 0,           /* 取样纵向位移（px） */
+    /* ── 「原方案方块 + TRAE 流动」合档开关（2026-11-03）──────────
+     *
+     * 用户原话：「方块使用我们现在网关用的方案（原方案），然后流动保留
+     *   trae 的流动方案」。
+     *
+     * ⇒ 这一组参数把 TRAE 的流体场从「硬边量化档」里**解耦**出来，
+     *   让它能给**常规路径**当遮罩源用：
+     *
+     *   flowMask = 1 时，常规路径（非 pixelQuant）的遮罩源从
+     *   「两层旋转值噪声 n1×n2」换成 TRAE 的流体场
+     *   （域扭曲 FBM + 取样位移）：
+     *     · 亮区形状 ← TRAE 的有机等值线（域扭曲掰出来的）
+     *     · 流动     ← TRAE 的单向拖曳（flowDispX/Y）+ 恒定漂移（flowSpeed）
+     *
+     * 而**方块本身仍然是原方案**，一件都没换：
+     *   每格随机门槛 rSel（块内随机疏密）、每格随机亮度 rAmp（明暗参差）、
+     *   余晖 trail（尾部逐渐消失）、迟滞 hyst、抖动溶解 statJit、密度伺服。
+     *
+     * flowThresh：流场切点（0~1 域）。0 = 用引擎默认 0.62。
+     * flowSoft  ：切点软边宽度（0~1 域）。0 = 用引擎默认 0.30。
+     *   ⚠ 软边要**宽**：TRAE 的流场是连续场，硬切会得到一坨实心块；
+     *     留一段渐变区，mask 才有中间值 ⇒ 块内「随机疏密」才出得来。
+     *
+     * ⚠ 默认全为 0 ⇒ 不传时行为与改版前**逐位一致**。 */
+    flowMask: 0,
+    flowThresh: 0,
+    flowSoft: 0,
+    /* flowSolo：合档「独当」模式。
+     *   0 = 波带仍然门控（亮区 = 波带 ∩ 流体场）
+     *   1 = **波带不参与**，亮区位置与形状完全由 TRAE 流体场决定
+     *       ⇒ 画面是 TRAE 那种自由漂浮的团块，而不是一条斜带；
+     *         而「方块」那一层（rSel 随机疏密 / rAmp 明暗随机 /
+     *         余晖渐隐 / 迟滞）仍然是原方案。
+     * ⚠ 默认 0 ⇒ 不传时与改版前逐位一致。 */
+    flowSolo: 0,
     /* 档位自定网格密度：0 = 用 opt.columns；>0 = 自己说了算。
      * 为什么要它：TRAE 的点阵周期是 5px 点 + 2px 间隙 = 7px，
      * 而本引擎默认 118 列 ⇒ cell 12px ⇒ 点阵偏稀。
@@ -1561,9 +1672,64 @@
         }
       }
 
-      /* 流场开关：量化模式 + flowDensity > 0 才启用。
-         提到逐格循环外算 —— 它每步只取决于参数，不取决于格子。 */
-      var useFlow = p.pixelQuant > 0 && p.flowDensity > 0;
+      /* 流场开关：flowDensity > 0 且（量化模式 或 合档模式）才启用。
+         提到逐格循环外算 —— 它每步只取决于参数，不取决于格子。
+         ⚠ 2026-11-03：原来锁死在 p.pixelQuant > 0（只有硬边量化档能用）。
+           「原方案方块 + TRAE 流动」合档要在**常规路径**里用同一个流体场
+           ⇒ 条件放宽成「两档任一」。
+           ⚠ 默认全 0 ⇒ 不传时逐位一致。 */
+      var useFlow = p.flowDensity > 0 && (p.pixelQuant > 0 || p.flowMask > 0);
+      /* ── TRAE 流体场（域扭曲 FBM + 取样位移）────────────────────
+         抽成函数：一处算、两个模式共用 ——
+           · 量化档（pixelQuant=1）拿它当**阈值源**
+           · 合档（flowMask=1）拿它当**遮罩源**
+         ⚠ 三个采样都在**屏幕归一化坐标**里算 ⇒ 场与波无关，
+           只跟时间漂移 ⇒ 形状连续稳定（TRAE 的流体场也是这样）。 */
+      function flowValAt(fpx, fpy, ftq0) {
+        var sxq = fpx / w, syq = fpy / h;
+        var ftq = ftq0 * p.flowSpeed;
+        /* 颜色场的空间尺度：fieldDensity 优先，0 = 沿用 flowDensity。
+           ⚠ TRAE 的颜色场(density=0.5)与位移场(density=1.5)**尺度不同**，
+             两层必须解耦，否则位移场和扭曲场采到同一片噪声、互相抵消。 */
+        var Df = p.fieldDensity > 0 ? p.fieldDensity : p.flowDensity;
+
+        /* ── 位移场（TRAE 的 Layer B）：独立的 fbm，单向位移 ──
+           TRAE 的像素化层给**每一格**算一个独立的取样位移：
+             flow.x = q.x * 0.3 * 2.0 * 0.5 * 35 = q.x * 10.5 px
+             flow.y = q.y * 0.7 * 2.0 * 1.5 * 35 = q.y * 73.5 px
+           ⇒ 横向 0.6~9.9px、纵向 4.4~69px，**恒正**（单向拖曳），
+             纵向是横向的 7 倍。
+           ⚠ 我们的噪声值域是 [-1,1]，TRAE 的 q 是 [0.06,0.94]
+           ⇒ +1 再 /2 才拿得到 TRAE 那种「恒正」的位移；
+             直接用原值会得到双向抖动 ≠ TRAE 的单向拖曳。 */
+        var du = 0, dv = 0;
+        var useDisp = (p.flowDispX > 0 || p.flowDispY > 0);
+        if (useDisp) {
+          var ub = sxq * p.flowDensity, vb = syq * p.flowDensity;
+          var dbx = sample(tex, NOISE_N, ub, vb + 0.05 * ftq);
+          var dby = sample(tex, NOISE_N, ub + 0.30, vb - 0.0375 * ftq);
+          du = (dbx + 1) * 0.5 * p.flowDispX / w;
+          dv = (dby + 1) * 0.5 * p.flowDispY / h;
+        }
+
+        /* 颜色场（TRAE 的 Layer A）：在**位移后**的位置做域扭曲采样。
+           ⚠ TRAE 是先渲一张颜色纹理、再按位移后的 UV 去采样它；
+             这里直接在被位移的位置上求值 ⇒ 等价，但更锐（无双线性）。 */
+        var uf = (sxq - du) * Df, vf = (syq - dv) * Df;
+        /* q 的两条通道：各自偏移 + 反向漂移 ⇒ 两两不相关 */
+        var qxq = sample(tex, NOISE_N, uf, vf + 0.05 * ftq);
+        var qyq = sample(tex, NOISE_N, uf + 0.30, vf - 0.0375 * ftq);
+        /* 域扭曲：坐标先被 q 掰一下再采样 ⇒ 等值线成有机曲线。
+         *
+         * ⚠ 试过把扭曲改成 TRAE 的**单向**（q 恒正）—— 实测有害，已撤：
+         *   单向只是给采样加了个**常数**偏移（q+1 再乘 w），
+         *   等于把图案整体平移 ⇒ **形态完全不变**，白折腾；
+         *   反而因为噪声贴图每 1 个贴图单位平铺一次，
+         *   常数偏移落点不同 ⇒ 输出对 flowWarp **极度敏感**
+         *   （实测 warp 0.5→0.07% 亮、0.9→7.35%、1.4→1.17%，全靠掷骰子）。
+         * ⇒ 保持对称扭曲（qxq ∈ [-1,1]）。 */
+      return sample(tex, NOISE_N, uf + qxq * p.flowWarp, vf + qyq * p.flowWarp);
+      }
 
       for (var cy = 0; cy < rows; cy++) {
         var py = cy * cell + cell * 0.5;
@@ -1615,6 +1781,24 @@
           }
 
           /* ── 分片遮罩：把带碎成一块块 ─────────────────── */
+
+            /* ── 合档「独当」模式：波带不参与，亮区全交给流体场 ──
+               flowSolo = 1 时，波只用来算位移的参考系，
+               亮区位置与形状**完全**由 TRAE 的流体场决定
+               ⇒ 画面是 TRAE 那种自由漂浮的团块（不是一条斜带）；
+               而「方块」那一层（rSel 随机疏密 / rAmp 明暗随机 /
+               余晖渐隐 / 迟滞）仍然是原方案。 */
+            var solo = p.flowSolo > 0;
+            if (solo) band = 1;
+
+            /* ── 流体场取值 ──────────────────────────────
+               ⚠ 只在「波带内」算（solo 模式恒算）
+               ⇒ 像素流那档（pixelQuant=1）的性能与改版前一致。 */
+            var qf = 0, haveFlow = false;
+            if (useFlow && (solo || band > 0)) {
+              qf = flowValAt(px, py, tq);
+              haveFlow = true;
+            }
           if (band > 0) {
             bandCells++;
             /* 两层遮罩各带一个旋转角：采样坐标**先按各自角度转过去**，
@@ -1653,6 +1837,25 @@
             var m1 = sstep(p.patchA1, p.patchA1 + (p.patchB1 - p.patchA1) / p.patchSoft, n1);
             var m2 = sstep(p.patchA2, p.patchA2 + (p.patchB2 - p.patchA2) / p.patchSoft, n2);
             var mask = m1 * m2;
+
+            /* ── 合档：遮罩源换成 TRAE 流体场（flowMask = 1）────
+               用户原话：「方块使用我们现在网关用的方案（原方案），
+               然后流动保留trae的流动方案」
+               ⇒ 原方案的两层旋转值噪声让位给 TRAE 的域扭曲场：
+                 亮区形状与流动都变成 TRAE 那一套；
+                 而下面「选点」那段（rSel 随机疏密 / rAmp 明暗随机 /
+                 余晖渐隐 / 迟滞）**一字不改** ⇒ 方块仍是原方案。
+               ⚠ 软边要**宽**：TRAE 的流场是连续场，硬切会得到一坨
+                 实心块；留一段渐变区，mask 才有中间值 ⇒
+                 块内「随机疏密」才出得来。
+               ⚠ flowSolo = 1 时 band 恒为 1（波带不参与），
+                 亮区完全由这个斜坡决定 ⇒ 自由漂浮的团块。 */
+            if (p.flowMask > 0 && haveFlow) {
+              var fv = (qf + 1) * 0.5;                 /* [-1,1] → [0,1] */
+              var fmTh = p.flowThresh > 0 ? p.flowThresh : 0.62;
+              var fmSf = p.flowSoft > 0 ? p.flowSoft : 0.30;
+              mask = sstep(fmTh - fmSf, fmTh + fmSf, fv);
+            }
             /* ── 规整量化（pixelQuant = 1，借鉴 TRAE 首页）──────
                TRAE 的做法是「**连续噪声场 → 阈值硬切 → 规整点阵**」，
                点的位置与亮度**完全由场决定**，没有任何每格随机量。
@@ -1661,58 +1864,12 @@
                  ② 不用 rSel 每格随机门槛 ⇒ 用 n1 > 阈值硬切
                  ③ 不乘 rAmp 每格随机亮度因子
                ⚠ pixelQuant = 0（默认）⇒ 整段老路不走 ⇒ 逐位一致。 */
+
             var quant = p.pixelQuant > 0;
             if (quant) {
               /* ── 阈值源：TRAE 同款流场（域扭曲 FBM）──────────
-                 flowDensity > 0 才启用；否则沿用遮罩噪声 n1。
-                 ⚠ 三个采样都在**屏幕归一化坐标**里算 ⇒ 场与波无关，
-                   只跟时间漂移 ⇒ 形状连续稳定（TRAE 的流体场也是这样）。 */
-              var qf = n1;
-              if (useFlow) {
-                var sxq = px / w, syq = py / h;
-                var ftq = tq * p.flowSpeed;
-                /* 颜色场的空间尺度：fieldDensity 优先，0 = 沿用 flowDensity。
-                   ⚠ TRAE 的颜色场(density=0.5)与位移场(density=1.5)**尺度不同**，
-                     两层必须解耦，否则位移场和扭曲场采到同一片噪声、互相抵消。 */
-                var Df = p.fieldDensity > 0 ? p.fieldDensity : p.flowDensity;
-
-                /* ── 位移场（TRAE 的 Layer B）：独立的 fbm，单向位移 ──
-                   TRAE 的像素化层给**每一格**算一个独立的取样位移：
-                     flow.x = q.x * 0.3 * 2.0 * 0.5 * 35 = q.x * 10.5 px
-                     flow.y = q.y * 0.7 * 2.0 * 1.5 * 35 = q.y * 73.5 px
-                   ⇒ 横向 0.6~9.9px、纵向 4.4~69px，**恒正**（单向拖曳），
-                     纵向是横向的 7 倍。
-                   ⚠ 我们的噪声值域是 [-1,1]，TRAE 的 q 是 [0.06,0.94]
-                     ⇒ +1 再 /2 才拿得到 TRAE 那种「恒正」的位移；
-                     直接用原值会得到双向抖动 ≠ TRAE 的单向拖曳。 */
-                var du = 0, dv = 0;
-                var useDisp = (p.flowDispX > 0 || p.flowDispY > 0);
-                if (useDisp) {
-                  var ub = sxq * p.flowDensity, vb = syq * p.flowDensity;
-                  var dbx = sample(tex, NOISE_N, ub, vb + 0.05 * ftq);
-                  var dby = sample(tex, NOISE_N, ub + 0.30, vb - 0.0375 * ftq);
-                  du = (dbx + 1) * 0.5 * p.flowDispX / w;
-                  dv = (dby + 1) * 0.5 * p.flowDispY / h;
-                }
-
-                /* 颜色场（TRAE 的 Layer A）：在**位移后**的位置做域扭曲采样。
-                   ⚠ TRAE 是先渲一张颜色纹理、再按位移后的 UV 去采样它；
-                     这里直接在被位移的位置上求值 ⇒ 等价，但更锐（无双线性）。 */
-                var uf = (sxq - du) * Df, vf = (syq - dv) * Df;
-                /* q 的两条通道：各自偏移 + 反向漂移 ⇒ 两两不相关 */
-                var qxq = sample(tex, NOISE_N, uf, vf + 0.05 * ftq);
-                var qyq = sample(tex, NOISE_N, uf + 0.30, vf - 0.0375 * ftq);
-                /* 域扭曲：坐标先被 q 掰一下再采样 ⇒ 等值线成有机曲线。
-                 *
-                 * ⚠ 试过把扭曲改成 TRAE 的**单向**（q 恒正）—— 实测有害，已撤：
-                 *   单向只是给采样加了个**常数**偏移（q+1 再乘 w），
-                 *   等于把图案整体平移 ⇒ **形态完全不变**，白折腾；
-                 *   反而因为噪声贴图每 1 个贴图单位平铺一次，
-                 *   常数偏移落点不同 ⇒ 输出对 flowWarp **极度敏感**
-                 *   （实测 warp 0.5→0.07% 亮、0.9→7.35%、1.4→1.17%，全靠掷骰子）。
-                 *   ⇒ 保持对称扭曲（qxq ∈ [-1,1]）。 */
-                qf = sample(tex, NOISE_N, uf + qxq * p.flowWarp, vf + qyq * p.flowWarp);
-              }
+                 流场在上面已经算好了（useFlow）；没启用时沿用遮罩噪声 n1。 */
+              if (!haveFlow) qf = n1;
               /* ⚠ 噪声值域是 **[-1, 1]**（makeNoise 末尾做了归一化），
                  而 pixelThresh 用 [0, 1] 表述（跟 TRAE 的 0.87 同尺度）
                  ⇒ 这里做一次域转换，别让人填 0.87 结果一个点都没有。 */

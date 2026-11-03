@@ -144,7 +144,7 @@ nftables-publish-v0.7.9-nospa/
         ├── gate.css              # 「光之门」转场动画
         ├── login.html/.js        # 登录页
         ├── portal.html/.js       # 服务门户
-        └── pixelfield.js         # 像素场背景引擎（光带扫过方块场 / 方向随机换向 + 速度随机起伏 / 规整量化点阵 + 硬边二值 / TRAE 原版复刻：7px 晶格 + 5px 实心方块 + 按块随机绿白）
+        └── pixelfield.js         # 像素场背景引擎（光带扫过方块场 / 方向随机换向 + 速度随机起伏 / 规整量化点阵 + 硬边二值 / TRAE 原版复刻：7px 晶格 + 5px 实心方块 + 按块随机绿白 / 月白·TRAE 合档：方块用原方案 + 流动用 TRAE 域扭曲）
 frontend/
 ├── index.html                    # 面板前端
 ├── app.js                        # 面板逻辑

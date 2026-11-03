@@ -27,12 +27,17 @@
   /* ── 像素场背景 ───────────────────────────────────────────
    * 和门脸页同一个引擎（pixelfield.js），纯装饰。
    *
-   * 2026-11-03：用户原话「这个效果还是不行，你先拔下他的代码，
-   * 做一个完全一样的复刻」⇒ 换成 'trae' 档 —— 那一档不是「像 TRAE」，
-   * 而是把 TRAE 首页背景的两段 GLSL **逐行移植**进引擎：
-   * 流体层（simplex 噪声 + fbm + 域扭曲）+ 像素化层（7px 晶格、
-   * 5px 实心方块、按块随机绿白二选一、指针附近泛绿）。
+   * 2026-11-03 第十轮：用户原话「很好，就这样，然后和我的原方案综合一下」
+   * ⇒ 换成 'moonstone-trae' 档 —— 把两个方案各取一半：
+   *   · 方块 ← **原方案**：每格随机门槛（块内随机疏密）、每格随机亮度
+   *     （明暗参差）、余晖（尾部逐渐消失）、迟滞、抖动溶解、密度伺服
+   *   · 流动 ← **TRAE**：域扭曲 FBM（有机等值线）+ 单向取样位移（拖曳）
+   *   · 配色 ← 月白（银白单色）
    *
+   * 实现上只动了一个开关（引擎侧 flowMask=1）：常规路径的**遮罩源**
+   * 从「两层旋转值噪声」换成 TRAE 的流体场；「选点」那一段一个字没改。
+   *
+   * 'trae' 档（TRAE 原版逐行移植）**保留**，随时能切回去。
    * createStyle 会连配色带参数一起套上；引擎不存在或接口对不上
    * 就退回 mount()，再不行就什么都不画 —— 背景画不出来无所谓，
    * 页面照常用。 */
@@ -43,14 +48,14 @@
       var reduce = !!(window.matchMedia &&
         window.matchMedia('(prefers-reduced-motion: reduce)').matches);
       /* ⚠ 不在这里覆盖 lit / columns：
-         点亮比例与晶格密度都由样式自己定（'trae' 那一档的晶格
-         固定 7px，不吃 columns），opt.params 会**盖掉**样式里的同名参数，
-         这里一旦写死，以后调样式就会对不上。 */
+         点亮比例与晶格密度都由样式自己定（'moonstone-trae' 那一档
+         吃引擎默认的 118 列，不吃 columns），opt.params 会**盖掉**
+         样式里的同名参数，这里一旦写死，以后调样式就会对不上。 */
       var opt = {
         static: reduce,
       };
       if (window.GhostPixelField.createStyle) {
-        window.GhostPixelField.createStyle(canvas, 'trae', opt);
+        window.GhostPixelField.createStyle(canvas, 'moonstone-trae', opt);
       } else if (window.GhostPixelField.mount) {
         window.GhostPixelField.mount(canvas, opt);
       }

@@ -59,11 +59,19 @@ hr() { printf '%s\n' "═══════════════════�
 #   · 「全部通过」→ 没有标记 → 不计
 #   · 「[INFO] ✅ ...」→ 行首是"[INFO]" → 不计（那不是断言）
 #   · 断言详情里带 IP/CIDR/临时路径 → 照计，不再被误伤
+# ★ 2026-11-03 补：两种断言标记都认
+#   老测试文件用「✅ / ❌」，而 AGENTS.md 明确要求**终端输出禁用 emoji**
+#   （纯文本 [OK] / [FAIL]）⇒ 后写的测试文件用了「[PASS] / [FAIL]」。
+#   原来只认前者 ⇒ test_portal_frontend.py（282 项）与
+#   test_pixelfield_trae.js（20 项）**在计数里全是 0**，
+#   「断言合计」这个硬指标少了 300 多项却不报警 ⇒ 指标失真。
+#   ⇒ 现在两种标记一起数（行首锚定，不会误伤日志行）。
+#   ⚠ 「[跳过]」不匹配 ⇒ 跳过的断言既不算通过也不算失败。
 count_pass() {
-    printf '%s\n' "$1" | grep -cE '^[[:space:]]*✅' || true
+    printf '%s\n' "$1" | grep -cE '^[[:space:]]*(✅|\[PASS\])' || true
 }
 count_fail() {
-    printf '%s\n' "$1" | grep -cE '^[[:space:]]*❌' || true
+    printf '%s\n' "$1" | grep -cE '^[[:space:]]*(❌|\[FAIL\])' || true
 }
 
 hr

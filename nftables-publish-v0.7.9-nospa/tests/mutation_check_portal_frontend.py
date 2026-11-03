@@ -54,6 +54,7 @@ BACKEND = os.path.join(ROOT, 'backend')
 TEST_PY = os.path.join(ROOT, 'tests', 'test_portal_frontend.py')
 TEST_JS = os.path.join(ROOT, 'tests', 'test_pixelfield_hardedge.js')
 TEST_JS2 = os.path.join(ROOT, 'tests', 'test_pixelfield_trae.js')
+TEST_JS3 = os.path.join(ROOT, 'tests', 'test_pixelfield_moonstone_trae.js')
 
 # 本脚本会动的文件（只这些）
 REL_FILES = [
@@ -124,7 +125,13 @@ def run_tests():
     r3 = subprocess.run([node, TEST_JS2],
                         capture_output=True, text=True, cwd=ROOT,
                         timeout=300, env=env)
-    return r3.returncode, out + r2.stdout + r2.stderr + r3.stdout + r3.stderr
+    if r3.returncode != 0:
+        return r3.returncode, out + r2.stdout + r2.stderr + r3.stdout + r3.stderr
+    r4 = subprocess.run([node, TEST_JS3],
+                        capture_output=True, text=True, cwd=ROOT,
+                        timeout=300, env=env)
+    return r4.returncode, (out + r2.stdout + r2.stderr
+                           + r3.stdout + r3.stderr + r4.stdout + r4.stderr)
 
 
 def mutate(rel, old, new):
@@ -413,11 +420,14 @@ MUTATIONS = [
      'var off = quant ? 0\n'
      '            : (Math.sin(t * dRate + dphase[idx]) * dth + rJit[idx] * jitAmp);',
      'var off = (Math.sin(t * dRate + dphase[idx]) * dth + rJit[idx] * jitAmp);'),
+    # ⚠ 2026-11-03 第十轮：流场计算被抽成共用函数 flowValAt（量化档与合档共用），
+    #   锚点跟着改。
     ('N-118', '域扭曲被拆掉（流场退化成轴对齐的方块簇）', PIX,
-     'qf = sample(tex, NOISE_N, uf + qxq * p.flowWarp, vf + qyq * p.flowWarp);',
-     'qf = sample(tex, NOISE_N, uf, vf);'),
+     'return sample(tex, NOISE_N, uf + qxq * p.flowWarp, vf + qyq * p.flowWarp);',
+     'return sample(tex, NOISE_N, uf, vf);'),
     ('N-119', '流场开关恒为假（流场代码成了死代码）', PIX,
-     'var useFlow = p.pixelQuant > 0 && p.flowDensity > 0;', 'var useFlow = false;'),
+     'var useFlow = p.flowDensity > 0 && (p.pixelQuant > 0 || p.flowMask > 0);',
+     'var useFlow = false;'),
     ('N-120', 'pixel-flow 档被改掉名字（整档找不到了）', PIX,
      "    'pixel-flow': {", "    'pixel-flowX': {"),
     ('N-121', 'pixel-flow 用了 gate 色板（青绿↔白双色没了）', PIX,
@@ -526,8 +536,9 @@ MUTATIONS = [
      '        distortAmp: 0.85,\n        patchRot1: 0.22,\n      },'),
 
     # ── G. 接线 / 加载顺序 / 安全面 / 占位符 ──
+    # ⚠ 2026-11-03 第十轮：门户切到「月白·TRAE」合档，锚点跟着改。
     ('N-59', '门户退回 moonstone-swirl（用户点名否掉的那一档）', PJS,
-     "createStyle(canvas, 'trae', opt)",
+     "createStyle(canvas, 'moonstone-trae', opt)",
      "createStyle(canvas, 'moonstone-swirl', opt)"),
     ('N-60', 'GhostFX 守卫被复活（变体引擎没了，守卫是死代码）', PJS,
      "  (function mountField() {\n    var canvas = document.getElementById('pix');",
@@ -618,8 +629,11 @@ MUTATIONS = [
     ('M-16', 'trae 配色的绿被改成 50,240,140（编码前的值 ⇒ 整体暗一档）', PIX,
      'trae:      { bg: [0, 0, 0],       accent: [122, 248, 196], white: [255, 255, 255], bloom: [70, 200, 140] },',
      'trae:      { bg: [0, 0, 0],       accent: [50, 240, 140], white: [255, 255, 255], bloom: [70, 200, 140] },'),
-    ('M-17', '门户不用 trae 档（背景不是 TRAE 复刻）', PJS,
-     "createStyle(canvas, 'trae', opt)", "createStyle(canvas, 'moonstone-flow', opt)"),
+        # ⚠ 2026-11-03 第十轮：门户已切到「月白·TRAE」合档 ⇒
+    #   「门户不用 trae 档」这条的前提没了（M-27 覆盖「门户不用合档」）。
+    #   这条改成守另一种综合方式：独当构图（波带不参与）。
+    ('M-17', '合档改成独当构图（flowSolo 0 → 1，波带不参与）', PIX,
+     '        flowSolo: 0,', '        flowSolo: 1,'),
     ('M-18', 'TRAE 分支的渲染被绕过（门户背景变成一片空白）', PIX,
      'if (p.traeMode > 0) { renderTrae(t); return; }',
      'if (false) { renderTrae(t); return; }'),
@@ -628,6 +642,33 @@ MUTATIONS = [
      'if (p.traeMode > 0) { computeTrae(stepIdx * p.step); return; }'),
     ('M-20', '鼠标影响因子被拆掉（指针附近不再泛绿）', PIX,
      'mf = (1 - stt * stt * (3 - 2 * stt)) * TR_MS;', 'mf = 0;'),
+    # ── S. 月白·TRAE 合档（2026-11-03 第十轮）────────────────────
+    # 用户原话：「方块使用我们现在网关用的方案（原方案），
+    #   然后流动保留trae的流动方案」
+    ('M-21', '合档的 flowMask 被关掉（遮罩源退回原方案两层噪声 ⇒ 没有 TRAE 的流动）',
+     PIX, '        flowMask: 1,', '        flowMask: 0,'),
+    ('M-22', '合档的流场切点被改（0.68 → 0.30 ⇒ 亮区糊成一大片）',
+     PIX, '        flowThresh: 0.68,', '        flowThresh: 0.30,'),
+    ('M-23', '合档的流场软边被改（0.30 → 0.02 ⇒ 硬切 ⇒ 方块变成实心团）',
+     PIX, '        flowSoft: 0.30,', '        flowSoft: 0.02,'),
+    ('M-24', '流场开关又被锁回量化档（合档拿不到流体场）',
+     PIX,
+     'var useFlow = p.flowDensity > 0 && (p.pixelQuant > 0 || p.flowMask > 0);',
+     'var useFlow = p.pixelQuant > 0 && p.flowDensity > 0;'),
+    ('M-25', '合档的遮罩切换整段被删（退回两层旋转值噪声）',
+     PIX,
+     'mask = sstep(fmTh - fmSf, fmTh + fmSf, fv);',
+     'mask = m1 * m2;'),
+    ('M-26', '独当模式的 band = 1 被删（flowSolo 不起作用）',
+     PIX, '            if (solo) band = 1;', '            if (false) band = 1;'),
+    ('M-27', '门户不用合档（背景退回 TRAE 原版）', PJS,
+     "createStyle(canvas, 'moonstone-trae', opt)",
+     "createStyle(canvas, 'trae', opt)"),
+    # ⚠ 锚点必须**唯一**：裸 'palette: \'moonstone\'' 在 moonstone-flow 里也有，
+    #   而 mutate() 替换的是**第一个**匹配 ⇒ 会改错档。带上 label 才唯一。
+    ('M-28', '合档被改成 TRAE 的绿白配色（不是月白了）', PIX,
+     "      label: '月白·TRAE',\n      note: '原方案的方块（随机疏密/明暗参差/尾部渐隐）+ TRAE 的域扭曲流动。月白银白。',\n      palette: 'moonstone',",
+     "      label: '月白·TRAE',\n      note: '原方案的方块（随机疏密/明暗参差/尾部渐隐）+ TRAE 的域扭曲流动。月白银白。',\n      palette: 'trae',"),
 ]
 
 
@@ -643,7 +684,7 @@ def main():
         print(out[-3000:])
         return 2
     print('原始状态：测试通过（静态 %d 项 + 行为级 %d 项）'
-          % (out.count('[PASS]'), out.count('✅')))
+          % (out.count('[PASS]'), out.count('✅') + out.count('[PASS]')))
 
     caught, missed = 0, []
     for mid, desc, rel, old, new in MUTATIONS:
@@ -659,7 +700,11 @@ def main():
             caught += 1
             first = ''
             for line in out.splitlines():
-                if '[FAIL]' in line:
+                # ⚠ 必须**行首**匹配：原来用「行内包含」⇒ 断言名里带
+                #   ❌ / [FAIL] 的 [PASS] 行会被当成失败行（实测 M-18/M-19
+                #   报出来的失败原因行是「[PASS] …认 ❌ 与 [FAIL]…」）。
+                st = line.strip()
+                if st.startswith('[FAIL]') or st.startswith('❌'):
                     first = line.strip()
                     break
             print(f'[捕获] {mid} {desc}  →  {first[:110]}')
