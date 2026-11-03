@@ -13,7 +13,8 @@
   B  网格改造撤回
   C  新参数默认值被改 —— 破坏「不传时与改版前逐位一致」这条保证
   D  随机方向波浪的结构 —— 共享方向场 / 遮罩跟随波向 / 像素块
-  E  新档（moonstone-tide / moonstone-swing）参数被改
+  E  新档（moonstone-flow）参数被改 —— 几何必须与原版逐条一致
+  E2 两个新引擎参数（dirWalkSmooth / dirPivot）被改
   F  改版外溢到登录页
   G  安全面 / 加载顺序 / 占位符
 
@@ -221,73 +222,116 @@ MUTATIONS = [
      'var b2s = p.pxCrest > 0 ? Math.min(SS, p.pxCrest | 0) : 3;',
      'var b2s = 3;'),
 
-    # ── E. 新档参数被改（观感直接变）───────────────────────────
-    ('N-43', 'moonstone-tide 的 dirField 改成 0（方向场被关掉）', PIX,
-     '        dirField: 2,', '        dirField: 0,'),
-    ('N-44', 'moonstone-tide 的 dirFieldBase 改成 0.00', PIX,
-     '        dirFieldBase: -0.30,', '        dirFieldBase: 0.00,'),
-    ('N-45', 'moonstone-tide 的 dirFieldRange 改成 1.00（方向偏离太小）', PIX,
-     '        dirFieldRange: 1.35,', '        dirFieldRange: 1.00,'),
-    ('N-46', 'moonstone-tide 的 dirFieldDrift 改成 0.000（不漂移了）', PIX,
-     '        dirFieldDrift: 0.012,', '        dirFieldDrift: 0.000,'),
-    ('N-47', 'moonstone-tide 的 dirFieldStep 改成 24', PIX,
-     '        dirFieldStep: 40,', '        dirFieldStep: 24,'),
-    ('N-48', 'moonstone-tide 的 patchFollow 改成 0（遮罩不跟随波向）', PIX,
-     '        patchFollow: 1,', '        patchFollow: 0,'),
-    ('N-49', 'moonstone-tide 的 patchTangent 改成 1.00（不再沿波前拉长）', PIX,
-     '        patchTangent: 0.13,', '        patchTangent: 1.00,'),
-    ('N-50', 'moonstone-tide 的 patchNormal 改成 1.00', PIX,
-     '        patchNormal: 0.85,', '        patchNormal: 1.00,'),
-    ('N-51', 'moonstone-tide 的 pxBody 改成 0（退回 2px 噪点）', PIX,
-     '        pxBody: 3,', '        pxBody: 0,'),
-    ('N-52', 'moonstone-tide 的 pxCrest 改成 0', PIX,
-     '        pxCrest: 3,', '        pxCrest: 0,'),
-    ('N-53', 'moonstone-tide 的 lit 改成 0.15（亮度退回旧档）', PIX,
-     '        lit: 0.21,', '        lit: 0.15,'),
-    ('N-54', 'moonstone-tide 少一道波（4 道 → 3 道）', PIX,
-     '          { k: 0.00760, om: 0.74, off: 1.30, dir:  0.33, w: 0.60 },\n',
-     ''),
-    ('N-55', 'moonstone-tide 的 dir 写成绝对角（0.33 → 0.93）', PIX,
-     'dir:  0.33,', 'dir:  0.93,'),
-    ('N-56', 'moonstone-swing 档被删（备选档没了）', PIX,
-     "    'moonstone-swing': {", "    'moonstone-sw1ng': {"),
-    # ↓ 这三条守的是「本轮实测才定下来的参数」，不是随手填的默认值。
+    # ↓ 下面三条守的是「本轮实测才定下来的参数」，不是随手填的默认值。
     #   它们对应的退化最阴险：代码照样跑、fps 照样正常，
-    #   只是画面悄悄从「弯曲的波浪」退回「一堆随机斑点」。
-    ('N-74', '方向场变化变快（dirFieldScale 调大 ⇒ 采样坐标跳变 ⇒ 遮罩被打散）', PIX,
-     '        dirFieldScale: 0.0011,', '        dirFieldScale: 0.0026,'),
-    ('N-75', '法向噪声波长与波带同尺度（patchNormal2 调大 ⇒ 波带被切碎）', PIX,
-     '        patchNormal2: 0.80,', '        patchNormal2: 1.20,'),
-    ('N-76', '切向频率调大（patchTangent2 ⇒ 沿波前拉不开 ⇒ 亮块又变孤点）', PIX,
-     '        patchTangent2: 0.42,', '        patchTangent2: 0.90,'),
-    # ↓ 块状选取这三条：守的是「亮区是实心方块而不是雪花点」这条不变量。
-    #   对应的退化最阴险：fps、亮格占比全都正常，
-    #   只是画面从「一条条弯曲的浪」退回「等密度雪花点」。
-    ('N-77', 'pickBlock 默认值从 0 改成 3（原版逐格随机被破坏 ⇒ 不传时行为变了）', PIX,
-     '    pickBlock: 0,', '    pickBlock: 3,'),
-    ('N-78', '块共享门槛被拆掉（si 恒等于逐格索引 ⇒ 退回雪花点）', PIX,
+    #   只是画面悄悄从「一条条流动的浪」退回「一堆随机斑点」。
+    ('N-74', '像素块边长被写死（pxBody 参数失效）', PIX,
+     'var b1s = p.pxBody > 0 ? Math.min(SS, p.pxBody | 0) : 2;',
+     'var b1s = 2;'),
+    ('N-75', '块共享门槛被拆掉（si 恒等于逐格索引 ⇒ 退回雪花点）', PIX,
      'si = bx * 8191 + by;', 'si = i;'),
-    ('N-79', 'moonstone-tide 的 pickBlock 改成 0（退回逐格随机 ⇒ 亮区成点阵）', PIX,
-     '        pickBlock: 3,', '        pickBlock: 0,'),
+    ('N-76', '遮罩采样坐标不再转进波帧（亮块不沿波前拉长）', PIX,
+     'var tanX = px * fc - py * fs;', 'var tanX = px;'),
+
+    # ── E. 新档（moonstone-flow）参数被改（观感直接变）────────────────
+    ('N-43', 'moonstone-flow 的 dirField 改成 0（方向场被关掉 ⇒ 退回固定方向）', PIX,
+     '        dirField: 1,', '        dirField: 0,'),
+    ('N-44', 'moonstone-flow 的 dirFieldBase 改成 0.00', PIX,
+     '        dirFieldBase: -0.30,', '        dirFieldBase: 0.00,'),
+    ('N-45', 'moonstone-flow 的 dirFieldRange 改成 0.00（方向不偏离 ⇒ 等于没随机）', PIX,
+     '        dirFieldRange: 1.50,', '        dirFieldRange: 0.00,'),
+    ('N-46', 'moonstone-flow 的 dirWalkFreq 改成 0.15（游走太快 ⇒ 画面在抖不是在流）', PIX,
+     '        dirWalkFreq: 0.010,', '        dirWalkFreq: 0.15,'),
+    ('N-91', '摆幅 × 频率超限（摆幅 1.50 配频率 0.03 ⇒ 转速飙到原版的 3 倍）', PIX,
+     '        dirWalkFreq: 0.010,', '        dirWalkFreq: 0.030,'),
+    ('N-47', 'moonstone-flow 的 dirWalkSmooth 改成 0（退回噪声切片 ⇒ 高频抖动）', PIX,
+     '        dirWalkSmooth: 1,', '        dirWalkSmooth: 0,'),
+    ('N-48', 'moonstone-flow 的 dirPivot 改成 0（绕左上角转 ⇒ 整屏流速不均匀）', PIX,
+     '        dirPivot: 1,', '        dirPivot: 0,'),
+    ('N-49', 'moonstone-flow 的 lit 改成 0.21（密度翻倍 ⇒ 又变回一块块的纹理）', PIX,
+     '        lit: 0.12,', '        lit: 0.21,'),
+    ('N-50', 'moonstone-flow 少一道波（3 道 → 2 道）', PIX,
+     '          { k: 0.00545, om: 0.454, off: 4.20, dir: -0.05, w: 0.78 },\n',
+     ''),
+    ('N-51', 'moonstone-flow 的 dir 写成绝对角（0.05 → 0.95）', PIX,
+     'dir:  0.05,', 'dir:  0.95,'),
+    ('N-52', 'moonstone-flow 档被删（门户背景没了）', PIX,
+     "    'moonstone-flow': {", "    'moonstone-fl0w': {"),
+    ('N-53', 'moonstone-flow 的 distortAmp 改成 1.25（扭曲变了 ⇒ 几何不再是原版）', PIX,
+     '        distortAmp: 0.85,\n        dirField: 1,',
+     '        distortAmp: 1.25,\n        dirField: 1,'),
+    ('N-54', 'moonstone-flow 的波速改成 swirl 那一档（0.504 → 0.958）', PIX,
+     '{ k: 0.00580, om: 0.504, off: 0.00, dir:  0.00, w: 1.00 }',
+     '{ k: 0.00580, om: 0.958, off: 0.00, dir:  0.00, w: 1.00 }'),
+    # ↓ 下面三条最关键：它们把「原版几何逐条照抄」这条保证从三个方向各打一次。
+    ('N-55', 'moonstone-flow 被塞进 pxBody: 3（把「一块一块生成」的成因带回来）', PIX,
+     '        dirPivot: 1,', '        dirPivot: 1,\n        pxBody: 3,'),
+    ('N-56', 'moonstone-flow 被塞进 pickBlock: 3（亮区变实心方块 ⇒ 纹理感）', PIX,
+     '        dirPivot: 1,', '        dirPivot: 1,\n        pickBlock: 3,'),
+    ('N-79', 'moonstone-flow 被塞进 patchFollow: 1（遮罩跟波向 ⇒ 不再是原版观感）', PIX,
+     '        dirPivot: 1,', '        dirPivot: 1,\n        patchFollow: 1,'),
+
+    # ── E2. 两个新引擎参数（2026-11-03）────────────────────────────
+    ('N-80', '方向游走的三组频率改成可公度（0.55/1.10/2.20 ⇒ 合成波形 10 秒一循环 ⇒ 像钟摆）',
+     PIX,
+     'return 0.55 * Math.sin(a * 0.55 * t + 0.7)\n'
+     '         + 0.30 * Math.sin(a * 1.15 * t + 2.3)\n'
+     '         + 0.15 * Math.sin(a * 2.35 * t + 4.1);',
+     'return 0.55 * Math.sin(a * 0.55 * t + 0.7)\n'
+     '         + 0.30 * Math.sin(a * 1.10 * t + 2.3)\n'
+     '         + 0.15 * Math.sin(a * 2.20 * t + 4.1);'),
+    ('N-81', '方向游走的权重和改成 1.6（值域超出 [-1,1] ⇒ 方向会超调）', PIX,
+     'return 0.55 * Math.sin(a * 0.55 * t + 0.7)\n'
+     '         + 0.30 * Math.sin(a * 1.15 * t + 2.3)\n'
+     '         + 0.15 * Math.sin(a * 2.35 * t + 4.1);',
+     'return 0.88 * Math.sin(a * 0.55 * t + 0.7)\n'
+     '         + 0.48 * Math.sin(a * 1.15 * t + 2.3)\n'
+     '         + 0.24 * Math.sin(a * 2.35 * t + 4.1);'),
+    ('N-82', 'dirWalkSignal 函数被删（平滑解析式路径直接崩）', PIX,
+     'function dirWalkSignal(t, base) {', 'function dirWalkSignalX(t, base) {'),
+    ('N-83', '方向场二选一退化成只剩噪声切片（平滑解析式失效）', PIX,
+     'dn = p.dirWalkSmooth > 0\n'
+     '                ? dirWalkSignal(tq, dwf)\n'
+     '                : sample(tex, NOISE_N, tq * dwf, 0.37);',
+     'dn = sample(tex, NOISE_N, tq * dwf, 0.37);'),
+    ('N-84', '旋转中心从画布中心挪到四分之一处（转心不对 ⇒ 流速不均）', PIX,
+     'pivX = w * 0.5; pivY = h * 0.5;', 'pivX = w * 0.25; pivY = h * 0.25;'),
+    ('N-85', '旋转中心不再受 useField 约束（dirField=0 的档也被改 ⇒ 破坏逐位一致）', PIX,
+     'if (useField && p.dirPivot > 0) { pivX = w * 0.5; pivY = h * 0.5; }',
+     'if (p.dirPivot > 0) { pivX = w * 0.5; pivY = h * 0.5; }'),
+    ('N-86', '法线坐标里的旋转中心被丢掉（dirPivot 参数失效）', PIX,
+     'var uy = (px - pivX) * wsn + (py - pivY) * wcn;',
+     'var uy = px * wsn + py * wcn;'),
+    ('N-87', 'dirWalkSmooth 默认值从 0 改成 1（不传时行为变了 ⇒ 破坏逐位一致）', PIX,
+     '    dirWalkSmooth: 0,', '    dirWalkSmooth: 1,'),
+    ('N-88', 'dirPivot 默认值从 0 改成 1（不传时行为变了 ⇒ 破坏逐位一致）', PIX,
+     '    dirPivot: 0,', '    dirPivot: 1,'),
+    ('N-89', 'debug() 不再报引擎真值方向角（证据图只能另算公式 ⇒ 会与实际不符）', PIX,
+     'dirAngle: dirAngleNow, dirAngleDeg: dirAngleNow * 180 / Math.PI,',
+     'dirAngle: 0, dirAngleDeg: 0,'),
+    ('N-90', '当前方向角不再每个几何步更新（一直停在初始值）', PIX,
+     'dirAngleNow = dang;', '/* dirAngleNow 不更新 */'),
 
     # ── F. 改版外溢到登录页 ──
     ('N-57', '登录页那一档的波速被改成门户参数（改版外溢）', PIX,
      '{ k: 0.00580, om: 0.504, off: 0.00, dir: -0.30, w: 1.00 }',
      '{ k: 0.00580, om: 0.958, off: 0.00, dir: -0.30, w: 1.00 }'),
     ('N-58', '登录页那一档被塞进晶向随机化参数', PIX,
-     '        distortAmp: 0.85,\n',
-     '        distortAmp: 0.85,\n        patchRot1: 0.22,\n'),
+     '        distortAmp: 0.85,\n      },',
+     '        distortAmp: 0.85,\n        patchRot1: 0.22,\n      },'),
 
     # ── G. 接线 / 加载顺序 / 安全面 / 占位符 ──
     ('N-59', '门户退回 moonstone-swirl（用户点名否掉的那一档）', PJS,
-     "createStyle(canvas, 'moonstone-tide', opt)",
+     "createStyle(canvas, 'moonstone-flow', opt)",
      "createStyle(canvas, 'moonstone-swirl', opt)"),
     ('N-60', 'GhostFX 守卫被复活（变体引擎没了，守卫是死代码）', PJS,
      "  (function mountField() {\n    var canvas = document.getElementById('pix');",
      "  (function mountField() {\n    var canvas = document.getElementById('pix');\n"
      "    if (window.GhostFX) return;"),
-    ('N-61', '门户传的亮度覆盖值与档位不一致', PJS,
-     'params: { lit: 0.21 },', 'params: { lit: 0.15 },'),
+    ('N-61', '门户自己传 lit（opt.params 会盖掉档位里的值）', PJS,
+     '      var opt = {\n        columns: 118,\n        static: reduce,\n      };',
+     '      var opt = {\n        columns: 118,\n        params: { lit: 0.21 },\n'
+     '        static: reduce,\n      };'),
     ('N-62', '脚本加载顺序对调（pixelfield.js 排到 portal.js 后面）', PHT,
      '<script src="{{STATIC_BASE}}pixelfield.js"></script>\n'
      '<script src="{{STATIC_BASE}}portal.js"></script>',

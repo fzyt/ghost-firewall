@@ -97,6 +97,67 @@
         distortAmp: 0.85,
       },
     },
+    /* ── 月白·流（服务门户用，2026-11-03）────────────────────
+     *
+     * 用户原话：「现在的原版有固定方向流动的感觉，新版设计一下随机方向流动的试试」。
+     * ⇒ 这一档的做法是：**原版 moonstone 一个字不改，只把「固定方向」换成
+     *   「方向随机游走」**。别的什么都不动。
+     *
+     * 为什么基线是 moonstone 而不是 moonstone-swirl（踩过的坑）：
+     *   改版前（6596764）门户用的就是 moonstone + dirSwing=0，
+     *   那才是用户说的「原版」「固定方向流动」；
+     *   moonstone-swirl 带着 dirSwing（正弦来回扫）+ 遮罩双层旋转 +
+     *   整片自转，是改版过程中的产物，拿它当基线等于连换了三样东西。
+     *
+     * 与 moonstone 的**唯一**差别（其余参数逐条照抄）：
+     *   ① waves[].dir 由绝对角变成**相对基准角的偏角**：
+     *      原版 -0.30 / -0.25 / -0.35 ⇒ 基准 -0.30 + 偏角 0 / +0.05 / -0.05。
+     *      三道波之间的夹角一字未改 ⇒ 光带的相对排布与原版完全一致。
+     *   ② dirField=1：方向挂在**一张全屏共享**的方向场上（空间上统一）。
+     *      必须共享：每波各一张方向场 ⇒ 遮罩采样帧跟着「每格胜出的波」
+     *      跳变 ⇒ 亮块拉长效果互相抵消 ⇒ 画面退回一堆散点（2026-11-02 踩过）。
+     *   ③ dirWalkSmooth=1 + dirWalkFreq：方向沿**平滑解析游走**缓慢换向。
+     *      不用噪声切片（高频抖动，实测角速度是原版的 3~12 倍）。
+     *   ④ dirPivot=1：换向时绕**画布中心**转，而不是绕左上角 ——
+     *      绕角转会「左上角不动、右下角狂甩」，整屏流速不均匀。
+     *
+     * ⚠ 密度、像素尺寸、遮罩、余晖全部照抄原版：
+     *   pxBody/pxCrest 不传（= 2/3 原版小点）、pickBlock 不传（= 逐格随机）、
+     *   patchDrift 0.011 / trail 0.80 / hyst 0.035 / distortAmp 0.85
+     *   ⇒ 「一块一块各自生成」的成因一个都没被带进来。 */
+    'moonstone-flow': {
+      label: '月白·流',
+      note: '原版几何，只把固定方向换成缓慢随机游走 ⇒ 仍是同一条浪在流，只是流的方向在变。',
+      palette: 'moonstone',
+      params: {
+        waves: [
+          /* ⚠ dirField>0 时 dir 是**相对共享方向的偏角**（不是绝对角）。
+             偏角 0 / +0.05 / -0.05 ⇒ 与原版的 -0.30 / -0.25 / -0.35 完全等价。 */
+          { k: 0.00580, om: 0.504, off: 0.00, dir:  0.00, w: 1.00 },
+          { k: 0.00625, om: 0.563, off: 2.10, dir:  0.05, w: 0.90 },
+          { k: 0.00545, om: 0.454, off: 4.20, dir: -0.05, w: 0.78 },
+        ],
+        distortAmp: 0.85,
+        dirField: 1,
+        dirFieldBase: -0.30,
+        /* 方向偏离基准角的幅度（rad）。1.50。
+           实测摆幅（240 秒窗口、base=0.010）：
+             60 秒内偏 34°、120 秒内偏 111° ⇒ 明显是「在换方向」，
+             而原版 dirSwing 一共才 ±7.4°（往复）。
+           ⚠ 摆幅与转速是一对：ω 峰值 ≈ 摆幅 × 2π × 频率，
+             摆幅翻倍会把转速也带上，所以频率必须同步压低。 */
+        dirFieldRange: 1.50,
+        /* 游走基准频率（Hz）。0.010。
+           实测：60 秒内平均转速 0.024 rad/s、120 秒 0.032 rad/s，
+           而原版 dirSwing 的平均转速是 0.037 rad/s
+           ⇒ **平均比原版还慢**，但方向偏得比原版远得多。
+           这正是要的效果：不是「抖得快」，是「拐得慢、拐得远」。 */
+        dirWalkFreq: 0.010,
+        dirWalkSmooth: 1,
+        dirPivot: 1,
+        lit: 0.12,
+      },
+    },
     /* ── 月白·乱晶（服务门户专用，2026-11-02）──────────────────
      *
      * 为什么不直接改 moonstone 那一档：
@@ -141,126 +202,6 @@
         trail: 0.72,
         hyst: 0.05,
         lit: 0.15,
-      },
-    },
-    /* ── 月白·乱潮（服务门户用，2026-11-02）──────────────────
-     *
-     * 解决的正是用户说的「像是一块一块生成的」：
-     *   moonstone-swirl 的几道波 dir 是 -0.30 / -0.25 / -0.35，
-     *   三个值几乎一样 ⇒ 几道波前**平行** ⇒ 亮块只能沿同一批方向
-     *   排成规则珠串，一眼看过去就是「一块一块各自出现」。
-     *
-     * 这一档改成「**随机方向波浪**」：
-     *   ① 四道波挂同一张**空间局部方向场**：方向随位置变化、随时间漂移
-     *      ⇒ 同一条波在不同位置朝不同方向走 ⇒ 屏幕上没有统一走向可循
-     *   ② 分片遮罩的晶向**跟随局部波向** ⇒ 亮块沿波前拉成长条
-     *   ③ 像素块从 2px 放大到 9×9 ⇒ 有像素网格，不再是噪点
-     *
-     * 波浪的本体（正弦波前 + 噪声遮罩 + 随机选取）一个字没改 ——
-     * 改的只是「波往哪个方向走」。
-     *
-     * ⚠️⚠️ 下面 dirFieldScale / dirFieldRange / patchNormal 三个值
-     * 是**反复实测**调出来的，不是随手填的 —— 改任何一个都会把
-     * 「弯曲的波浪」退回「一堆随机斑点」。原因见下：
-     *
-     *   遮罩的采样坐标是转进波帧算的（tanX / norX），
-     *   而波帧由方向场决定 ⇒ 方向场在空间上有梯度 ⇒
-     *   **采样坐标系在旋转**。坐标跳变幅度 ≈ 角度变化率 × 距离²，
-     *   角度变化率 ≈ 1.2 × dirFieldScale × dirFieldRange (rad/px)。
-     *
-     *   初版 dirFieldScale=0.0026、dirFieldRange=1.05
-     *   ⇒ 变化率 0.0033 rad/px ⇒ 法向坐标跳变可达 130~400px，
-     *   而法向噪声波长只有 1/(0.0027×1.50) ≈ 247px
-     *   ⇒ 跳变跨过 1~2 个噪声周期 ⇒ **遮罩被打散成随机斑点**
-     *   ⇒ 画面还是「一块一块各自生成」，什么波浪都看不出来。
-     *
-     *   现在 dirFieldScale=0.0011（周期 909px）、dirFieldRange=1.35
-     *   ⇒ 变化率 0.0018 rad/px ⇒ 跳变压到 ~90px
-     *   ⇒ 遮罩在波帧里连续 ⇒ 亮块连成沿波前走的**弯曲长带**。
-     *   实测：带内亮度占比 0.32 → 0.37，画面从碎点变成涡卷纹。
-     *
-     *   patchNormal 同理：1.50 时法向噪声波长 247px，恰好与波带宽度
-     *   （edge0=0.80 ⇒ 约占周期 20% ≈ 247px）同量级 ⇒ 遮罩正好
-     *   把波带切成「一块一块」。降到 0.85（波长 435px）⇒ 带被切成
-     *   2~3 段而不是切碎 ⇒ 整体仍读得出是一条浪。
-     */
-    'moonstone-tide': {
-      label: '月白·乱潮',
-      note: '四道波互不平行，各挂一张空间局部方向场（方向随位置变、随时间漂移）⇒ 没有统一走向的规则珠串。',
-      palette: 'moonstone',
-      params: {
-        waves: [
-          /* ⚠️ dirField>0 时 dir 是**相对共享方向的偏角**（不是绝对角）。
-             偏角都取小值 ⇒ 几道波在局部仍然平行，但整体走向随位置变。 */
-          { k: 0.00520, om: 0.66, off: 0.00, dir:  0.00, w: 1.00 },
-          { k: 0.00690, om: 0.88, off: 2.10, dir:  0.17, w: 0.88 },
-          { k: 0.00440, om: 0.52, off: 4.20, dir: -0.14, w: 0.74 },
-          { k: 0.00760, om: 0.74, off: 1.30, dir:  0.33, w: 0.60 },
-        ],
-        distortAmp: 1.00,
-        dirField: 2,
-        dirFieldBase: -0.30,
-        /* 方向场的空间频率 —— 必须**慢**（见上面的坐标跳变推导）。
-           0.0011 ⇒ 周期 909px，方向在屏幕上大尺度地转。 */
-        dirFieldScale: 0.0011,
-        /* 方向偏离基准角的幅度。配合上面的慢频率，
-           屏幕上不同区域走向明显不同，但都不会「急转」。 */
-        dirFieldRange: 1.35,
-        dirFieldDrift: 0.012,
-        /* 方向场粗网格步长：40px ⇒ 插值更平滑，少一层高频抖动 */
-        dirFieldStep: 40,
-        /* 遮罩晶向跟随局部波向 ⇒ 亮块沿波前拉成长条 */
-        patchFollow: 1,
-        patchTangent: 0.13,
-        /* 法向频率（0.85 ⇒ 噪声波长 435px）：不能太高，
-           否则遮罩把波带切成碎块（见上面的说明） */
-        patchNormal: 0.85,
-        patchTangent2: 0.42,
-        patchNormal2: 0.80,
-        /* 像素块从 2px 改成 9×9 ⇒ 有像素网格，不再是噪点 */
-        pxBody: 3,
-        pxCrest: 3,
-        /* 块状选取：每 3×3 格共用一个门槛 ⇒ 亮区是**实心小方块**，
-           不再是等密度的雪花点（这是「一块一块各自生成」的最后一块拼图，
-           详见 P 表里 pickBlock 的注释）。 */
-        pickBlock: 3,
-        patchDrift: 0.030,
-        trail: 0.72,
-        hyst: 0.05,
-        lit: 0.21,
-      },
-    },
-    /* ── 月白·转潮（2026-11-02）────────────────────────────
-     * 同一个「随机方向波浪」的另一个档：**方向只随时间变**，
-     * 空间上整片统一 ⇒ 波浪整体缓慢换朝向，但不会出现统一走向。
-     * 适合想要「大范围流动」而不是「多区域湍流」的场景。 */
-    'moonstone-swing': {
-      label: '月白·转潮',
-      note: '方向只随时间随机变（空间上整片统一）⇒ 波浪整体缓慢换朝向，没有固定走向。',
-      palette: 'moonstone',
-      params: {
-        waves: [
-          { k: 0.00560, om: 0.72, off: 0.00, dir:  0.00, w: 1.00 },
-          { k: 0.00700, om: 0.92, off: 2.10, dir:  0.18, w: 0.85 },
-          { k: 0.00450, om: 0.55, off: 4.20, dir: -0.12, w: 0.70 },
-        ],
-        distortAmp: 1.05,
-        dirField: 1,
-        dirFieldBase: -0.30,
-        dirWalkFreq: 0.085,
-        dirFieldRange: 0.90,
-        patchFollow: 1,
-        patchTangent: 0.15,
-        patchNormal: 1.45,
-        patchTangent2: 0.42,
-        patchNormal2: 0.95,
-        pxBody: 3,
-        pxCrest: 3,
-        pickBlock: 3,
-        patchDrift: 0.030,
-        trail: 0.72,
-        hyst: 0.05,
-        lit: 0.21,
       },
     },
     dusk: {
@@ -372,6 +313,37 @@
     dirFieldDrift: 0.0,    /* 方向场自身的时间漂移（噪声坐标 / 秒） */
     dirFieldStep: 24,      /* 方向场粗网格步长（px） */
     dirWalkFreq: 0.0,      /* dirField=1 时的时间随机游走频率（Hz） */
+    /* ── 方向游走：平滑解析式（2026-11-03）─────────────────────
+     * 原来 dirField=1 的方向取自「噪声图上的一条 1D 切片」：
+     *   dn = sample(tex, NOISE_N, t*dirWalkFreq, 0.37)
+     * 而噪声是三个倍频（4/9/21）叠加 ⇒ 沿时间轴走一刀必然带进高频抖动。
+     * 实测（2026-11-03，dirFieldRange=0.9，240 秒窗口）：
+     *   dirWalkFreq=0.03 ⇒ 角速度峰值 0.43 rad/s、角加速度 5.3 rad/s²
+     *   dirWalkFreq=0.05 ⇒ 角速度峰值 0.62 rad/s、角加速度 4.9 rad/s²
+     *   dirWalkFreq=0.01 ⇒ 角速度峰值 0.15 rad/s、角加速度 1.2 rad/s²
+     * 而原版 dirSwing（幅 0.13rad × 0.065Hz）的角速度峰值只有 0.053 rad/s
+     * ⇒ 就算把频率压到最低，噪声切片也比原版快 2~3 倍 ⇒ 那不是「洋流拐弯」，
+     * 是**抖**。噪声的高频倍频没法靠调频率消掉，只能换信号源。
+     *
+     * dirWalkSmooth = 1 时改用三组**不可公度**的正弦叠加：
+     *   频率互不成整数倍 ⇒ 合成波形几分钟内不重复 ⇒ 看着像随机游走；
+     *   正弦天生平滑 ⇒ 角加速度有界，没有折角顿挫。
+     * dirWalkFreq 在这条路径上的单位变成 **Hz**（基准频率），
+     * 角速度峰值 = dirFieldRange × 2π × dirWalkFreq（rad/s）。
+     *
+     * ⚠ 默认 0（走原噪声切片）⇒ 不传时行为与改版前逐位一致。 */
+    dirWalkSmooth: 0,
+    /* ── 方向场的旋转中心（2026-11-03）───────────────────────
+     * 波前的法线坐标 uy = px·sin(d) + py·cos(d) ⇒ 亮带是**一组过原点
+     * 的平行线**（原版 dir 固定时就是这样）。方向 d 一旦随时间变，
+     * 这组线就绕原点转 ⇒ 离原点越远转得越快、离原点越近越慢
+     * ⇒ 左上角几乎不动、右下角飞快扫 ⇒ 整屏「流速」严重不均匀。
+     *
+     * dirPivot = 1 时把旋转中心挪到画布中心 ⇒ 四周等距、转速均匀，
+     * 看起来像「整片洋流在拐弯」，而不是「一角在甩」。
+     *
+     * ⚠ 默认 0（原点）⇒ 不传时行为与改版前逐位一致。 */
+    dirPivot: 0,
     /* ── 遮罩跟随波向（2026-11-02）────────────────────────
      * 原来分片遮罩是**屏幕空间**的各向异性噪声：晶向由全局常量
      * patchRot1/patchRot2 决定 ⇒ 所有地方的方块是同一个朝向，
@@ -503,6 +475,25 @@
     return top + (bot - top) * sy;
   }
 
+  /* ── 方向游走信号（平滑解析式）────────────────────────────
+   * 三组不可公度的正弦叠加，权重和为 1 ⇒ 值域 [-1, 1]。
+   *
+   * 频率取 base 的 0.55 / 1.15 / 2.35 倍 —— 三个比例互相不可通约，
+   * 合成波形的公倍周期极长 ⇒ 短时间内看着像随机游走，而不是钟摆来回摆。
+   * 角速度峰值 = 2π·base·(Σ wᵢfᵢ)；因 Σ wᵢfᵢ = base·Σ wᵢ·ratioᵢ = base，
+   * 系数正好是 1 ⇒ 角速度峰值 = 2π·base（rad/s）。
+   *
+   * base=0.012 ⇒ 角速度峰值 0.075 rad/s、角加速度峰值约 1.7 rad/s²
+   * （原版 dirSwing 的角速度峰值 0.053 rad/s）⇒ 略快于原版，仍是「慢」。
+   *
+   * 相位常数 0.7 / 2.3 / 4.1 只决定「起始姿态」，不改变速度特性。 */
+  function dirWalkSignal(t, base) {
+    var a = 6.2831853 * base;
+    return 0.55 * Math.sin(a * 0.55 * t + 0.7)
+         + 0.30 * Math.sin(a * 1.15 * t + 2.3)
+         + 0.15 * Math.sin(a * 2.35 * t + 4.1);
+  }
+
   function sstep(a, b, x) {
     if (b === a) return x < a ? 0 : 1;
     var t = (x - a) / (b - a);
@@ -570,6 +561,11 @@
        存分量而不是角度，是为了让逐格插值时不会在 ±π 处翻折。
        只在 dirField>0 时分配，其余情况保持 null（零开销）。 */
     var dirSin = null, dirCos = null, dirFW = 0, dirFH = 0, dirStep = 24;
+    /* 当前共享方向场的基准角（rad）。dirField=1 时这是**全屏统一**的方向；
+       dirField=2 时方向随位置变，这里报的是基准角（整体取向）。
+       debug() 把它吐出去，是为了让「方向条对比图」的箭头直接读引擎的真值，
+       而不是外部脚本另算一份公式（实测踩过：另算 ⇒ 图上的角与实际不符）。 */
+    var dirAngleNow = 0;
     /* 每道波在**共享方向**上的偏角（dirField>0 时 waves[].dir 是偏角，不是绝对角） */
     var wOffS = new Float64Array(8);
     var wOffC = new Float64Array(8);
@@ -729,6 +725,11 @@
        * dirField>0 时 waves[].dir 的语义从「绝对法线角」变成
        * 「相对共享方向的偏角」；dirField=0 时语义不变（逐位一致）。 */
       var useField = ensureDirField();
+      /* 方向场的旋转中心：默认原点（= 原版行为），dirPivot=1 时挪到画布中心。
+         只有 useField 时才有意义（方向不变时旋转中心不产生任何差别），
+         且偏移为 0 时 (px-0) 与 px 逐位相等 ⇒ 原路径不受影响。 */
+      var pivX = 0, pivY = 0;
+      if (useField && p.dirPivot > 0) { pivX = w * 0.5; pivY = h * 0.5; }
       if (useField) {
         var dsc = p.dirFieldScale || 0.003;
         var drg = p.dirFieldRange || 0;
@@ -741,14 +742,20 @@
           for (fi = 0; fi < dirFW; fi++) {
             ddx = fi * dstep;
             if (p.dirField === 1) {
-              /* 方向只随时间变（空间上统一）⇒ 整片波浪换个朝向 */
-              dn = sample(tex, NOISE_N, tq * dwf, 0.37);
+              /* 方向只随时间变（空间上统一）⇒ 整片波浪换个朝向。
+                 两条取值路径：
+                   · 噪声切片（默认）= 原始实现，带高频抖动
+                   · 平滑解析式      = 三组不可公度正弦叠加，慢而连续 */
+              dn = p.dirWalkSmooth > 0
+                ? dirWalkSignal(tq, dwf)
+                : sample(tex, NOISE_N, tq * dwf, 0.37);
             } else {
               /* 方向随位置变 + 随时间漂移 ⇒ 湍流状 */
               dn = sample(tex, NOISE_N, ddx * dsc + tq * ddr,
                                       ddy * dsc + tq * ddr * 0.7);
             }
             dang = dbase + dn * drg;
+            dirAngleNow = dang;
             do2 = fj * dirFW + fi;
             dirSin[do2] = Math.sin(dang);
             dirCos[do2] = Math.cos(dang);
@@ -801,7 +808,7 @@
               wsn = fs * wOffC[wi2] + fc * wOffS[wi2];
               wcn = fc * wOffC[wi2] - fs * wOffS[wi2];
             }
-            var uy = px * wsn + py * wcn;
+            var uy = (px - pivX) * wsn + (py - pivY) * wcn;
             var ph = wv.k * uy - wv.om * tq + wv.off + dz * p.distortAmp;
             var s = Math.sin(ph);
             if (s <= p.edge0) continue;
@@ -1170,6 +1177,7 @@
           pickGain: p.pickGain, bandFracEma: bandFracEma, errFilt: errFilt,
           waves: p.waves.map(function (x) { return { k: x.k, om: x.om, off: x.off, dir: x.dir, w: x.w }; }),
           fieldMean: n ? sum / n : 0, fieldMax: mx,
+          dirAngle: dirAngleNow, dirAngleDeg: dirAngleNow * 180 / Math.PI,
           resizeCount: resizeCount, roCount: roCount, frameCount: frameCount, geoCount: geoCount,
           p: {
             edge0: p.edge0, edge1: p.edge1, distortAmp: p.distortAmp,
