@@ -116,10 +116,13 @@
      *   ② dirField=1：方向挂在**一张全屏共享**的方向场上（空间上统一）。
      *      必须共享：每波各一张方向场 ⇒ 遮罩采样帧跟着「每格胜出的波」
      *      跳变 ⇒ 亮块拉长效果互相抵消 ⇒ 画面退回一堆散点（2026-11-02 踩过）。
-     *   ③ dirWalkSmooth=1 + dirWalkFreq：方向沿**平滑解析游走**缓慢换向。
-     *      不用噪声切片（高频抖动，实测角速度是原版的 3~12 倍）。
-     *   ④ dirPivot=1：换向时绕**画布中心**转，而不是绕左上角 ——
-     *      绕角转会「左上角不动、右下角狂甩」，整屏流速不均匀。
+     *   ③ dirTurnPeriod + dirTurnRate：方向走「随机目标角 + 限速逼近」，
+     *      每 8 秒抽一个**整圈均匀**的随机目标角 ⇒ 上下左右都会出现。
+     *      不用噪声切片 / 三正弦叠加（都试过：前者角速度是原版的 3~12 倍，
+     *      后者值域只有 ±0.45，要摆满 360° 得把角速度拉到原版的 8 倍 ⇒ 在甩）。
+     *   ④ speedTurnPeriod + speedTurnRate + speedRange：速度随机起伏
+     *      （0.45~1.55 倍），用**累计相位**兑现 ⇒ 变速时波前不跳变。
+     *   ⑤ dirPivot=0：旋转中心留在原点 ⇒ 几何与原版逐位一致。
      *
      * ⚠ 密度、像素尺寸、遮罩、余晖全部照抄原版：
      *   pxBody/pxCrest 不传（= 2/3 原版小点）、pickBlock 不传（= 逐格随机）、
@@ -140,21 +143,28 @@
         distortAmp: 0.85,
         dirField: 1,
         dirFieldBase: -0.30,
-        /* 方向偏离基准角的幅度（rad）。1.50。
-           实测摆幅（240 秒窗口、base=0.010）：
-             60 秒内偏 34°、120 秒内偏 111° ⇒ 明显是「在换方向」，
-             而原版 dirSwing 一共才 ±7.4°（往复）。
-           ⚠ 摆幅与转速是一对：ω 峰值 ≈ 摆幅 × 2π × 频率，
-             摆幅翻倍会把转速也带上，所以频率必须同步压低。 */
-        dirFieldRange: 1.50,
-        /* 游走基准频率（Hz）。0.010。
-           实测：60 秒内平均转速 0.024 rad/s、120 秒 0.032 rad/s，
-           而原版 dirSwing 的平均转速是 0.037 rad/s
-           ⇒ **平均比原版还慢**，但方向偏得比原版远得多。
-           这正是要的效果：不是「抖得快」，是「拐得慢、拐得远」。 */
-        dirWalkFreq: 0.010,
-        dirWalkSmooth: 1,
-        dirPivot: 1,
+        /* 方向换向周期（秒）：每 8 秒抽一个**整圈均匀**的随机目标方向。
+           ⇒ 方向会走遍上下左右，不再挤在「偏下」那一小段。
+           ⚠ 上一版（dirFieldRange + 噪声/正弦游走）实测 48 秒里方向角
+             只在 +23.7° ~ -10.3° 之间晃，运动方向 cos d 恒为 0.90~0.98
+             ⇒ **永远朝下、从不向上、从不横向** ⇒ 用户的投诉客观成立。 */
+        dirTurnPeriod: 8,
+        /* 转向角速度上限（rad/s）：0.16 ⇒ 每秒最多转 9.2°，
+           一个 8 秒周期最多转 73° ⇒ 转向上下左右要 2~4 个周期，
+           看得见「在拐」，又不是「甩」。
+           原版 dirSwing 的角速度峰值是 0.053 rad/s ⇒ 这一档快约 3 倍。 */
+        dirTurnRate: 0.16,
+        /* 速度换挡周期（秒）：每 6 秒抽一个目标倍率。 */
+        speedTurnPeriod: 6,
+        /* 速度变化率上限（倍率/秒）：0.18 ⇒ 从 1.00 走到 0.45 要 3 秒
+           ⇒ 是「慢慢提速降速」。改成 0 就是「瞬间换挡」。 */
+        speedTurnRate: 0.18,
+        /* 速度倍率幅度（±）：0.55 ⇒ 速度在 0.45 ~ 1.55 倍之间随机起伏
+           （原版恒为 1.00 倍）。 */
+        speedRange: 0.55,
+        /* 旋转中心：0 = 原点（与原版逐位一致）、1 = 画布中心（四周流速均匀）。
+           默认取 0 ⇒ 保持「只换方向与速度、几何一字不改」的承诺。 */
+        dirPivot: 0,
         lit: 0.12,
       },
     },
@@ -313,26 +323,45 @@
     dirFieldDrift: 0.0,    /* 方向场自身的时间漂移（噪声坐标 / 秒） */
     dirFieldStep: 24,      /* 方向场粗网格步长（px） */
     dirWalkFreq: 0.0,      /* dirField=1 时的时间随机游走频率（Hz） */
-    /* ── 方向游走：平滑解析式（2026-11-03）─────────────────────
-     * 原来 dirField=1 的方向取自「噪声图上的一条 1D 切片」：
-     *   dn = sample(tex, NOISE_N, t*dirWalkFreq, 0.37)
-     * 而噪声是三个倍频（4/9/21）叠加 ⇒ 沿时间轴走一刀必然带进高频抖动。
-     * 实测（2026-11-03，dirFieldRange=0.9，240 秒窗口）：
-     *   dirWalkFreq=0.03 ⇒ 角速度峰值 0.43 rad/s、角加速度 5.3 rad/s²
-     *   dirWalkFreq=0.05 ⇒ 角速度峰值 0.62 rad/s、角加速度 4.9 rad/s²
-     *   dirWalkFreq=0.01 ⇒ 角速度峰值 0.15 rad/s、角加速度 1.2 rad/s²
-     * 而原版 dirSwing（幅 0.13rad × 0.065Hz）的角速度峰值只有 0.053 rad/s
-     * ⇒ 就算把频率压到最低，噪声切片也比原版快 2~3 倍 ⇒ 那不是「洋流拐弯」，
-     * 是**抖**。噪声的高频倍频没法靠调频率消掉，只能换信号源。
+    /* ── 随机换向（2026-11-03）────────────────────────────────
+     * 用户原话：「没有上下或者更多其他方向的随机流动了」。
      *
-     * dirWalkSmooth = 1 时改用三组**不可公度**的正弦叠加：
-     *   频率互不成整数倍 ⇒ 合成波形几分钟内不重复 ⇒ 看着像随机游走；
-     *   正弦天生平滑 ⇒ 角加速度有界，没有折角顿挫。
-     * dirWalkFreq 在这条路径上的单位变成 **Hz**（基准频率），
-     * 角速度峰值 = dirFieldRange × 2π × dirWalkFreq（rad/s）。
+     * 为什么不用「噪声切片」或「三正弦叠加」来随机化方向（都试过，否决）：
+     *   · 噪声切片：角速度是原版的 3~12 倍 ⇒ 那是在抖不是在流；
+     *   · 三正弦叠加：合成信号的实际值域只有 ±0.45，
+     *     要摆满 360° 就得把角速度拉到 0.4 rad/s（原版的 8 倍）⇒ 在甩不是流。
+     * 而且两者的方向区间都挤在「偏下」那一小段：
+     *   实测 48 秒里方向角只在 +23.7° ~ -10.3° 之间晃，
+     *   运动方向 cos d 恒为 0.90~0.98 ⇒ **永远朝下，从不向上、从不横向**。
      *
-     * ⚠ 默认 0（走原噪声切片）⇒ 不传时行为与改版前逐位一致。 */
-    dirWalkSmooth: 0,
+     * 现在改成「**随机目标角 + 限速逼近**」：
+     *   ① 每 dirTurnPeriod 秒抽一个**整圈均匀**的随机目标角；
+     *   ② 当前角以不超过 dirTurnRate 的角速度朝它靠（取短弧，
+     *      免得为了 350° 绕远路）；
+     *   ③ 换向速度与换向周期**分开可调** ⇒「突然拐一下」（dirTurnRate=0）
+     *      和「慢慢飘过去」（dirTurnRate>0）都是参数的事。
+     *
+     * ⚠ dirTurnPeriod = 0（默认）⇒ 走老路（噪声切片），
+     *   不传时行为与改版前逐位一致。 */
+    dirTurnPeriod: 0,      /* 方向换向周期（秒）；0 = 关闭 */
+    dirTurnRate: 0.0,      /* 转向角速度上限（rad/s）；0 = 不限速（一步到位） */
+    /* ── 随机变速（2026-11-03）────────────────────────────────
+     * 用户原话：「速度快慢也可以加入随机，目前看好像是始终一个速度的，
+     * 也就是流动可能突然提速降速，也可能慢慢提速降速」。
+     *
+     * 每 speedTurnPeriod 秒抽一个目标倍率（1 ± speedRange），
+     * 当前倍率以不超过 speedTurnRate 的速率靠拢，
+     * 再用它推进**每道波的累计相位**（见 computeGeometry 里的 wPh）。
+     *
+     * ⚠ 为什么必须用累计相位：原来的相位是闭式的 om*t，
+     *   速度一变，波前位置会**跳变**（画面会「闪一下」）。
+     *   改成 wPh += om·倍率·dt 之后，速度变化是连续的，
+     *   即使 speedTurnRate=0（瞬间换挡）波前也不会跳。
+     *
+     * ⚠ 默认 0 ⇒ 不传时仍走 om*t，与改版前逐位一致。 */
+    speedTurnPeriod: 0,    /* 速度换挡周期（秒）；0 = 关闭 */
+    speedTurnRate: 0.0,    /* 速度变化率上限（倍率/秒）；0 = 不限速（瞬间换挡） */
+    speedRange: 0.0,       /* 速度倍率幅度（±）；0.5 ⇒ 速度在 0.5~1.5 倍之间 */
     /* ── 方向场的旋转中心（2026-11-03）───────────────────────
      * 波前的法线坐标 uy = px·sin(d) + py·cos(d) ⇒ 亮带是**一组过原点
      * 的平行线**（原版 dir 固定时就是这样）。方向 d 一旦随时间变，
@@ -475,25 +504,6 @@
     return top + (bot - top) * sy;
   }
 
-  /* ── 方向游走信号（平滑解析式）────────────────────────────
-   * 三组不可公度的正弦叠加，权重和为 1 ⇒ 值域 [-1, 1]。
-   *
-   * 频率取 base 的 0.55 / 1.15 / 2.35 倍 —— 三个比例互相不可通约，
-   * 合成波形的公倍周期极长 ⇒ 短时间内看着像随机游走，而不是钟摆来回摆。
-   * 角速度峰值 = 2π·base·(Σ wᵢfᵢ)；因 Σ wᵢfᵢ = base·Σ wᵢ·ratioᵢ = base，
-   * 系数正好是 1 ⇒ 角速度峰值 = 2π·base（rad/s）。
-   *
-   * base=0.012 ⇒ 角速度峰值 0.075 rad/s、角加速度峰值约 1.7 rad/s²
-   * （原版 dirSwing 的角速度峰值 0.053 rad/s）⇒ 略快于原版，仍是「慢」。
-   *
-   * 相位常数 0.7 / 2.3 / 4.1 只决定「起始姿态」，不改变速度特性。 */
-  function dirWalkSignal(t, base) {
-    var a = 6.2831853 * base;
-    return 0.55 * Math.sin(a * 0.55 * t + 0.7)
-         + 0.30 * Math.sin(a * 1.15 * t + 2.3)
-         + 0.15 * Math.sin(a * 2.35 * t + 4.1);
-  }
-
   function sstep(a, b, x) {
     if (b === a) return x < a ? 0 : 1;
     var t = (x - a) / (b - a);
@@ -566,6 +576,21 @@
        debug() 把它吐出去，是为了让「方向条对比图」的箭头直接读引擎的真值，
        而不是外部脚本另算一份公式（实测踩过：另算 ⇒ 图上的角与实际不符）。 */
     var dirAngleNow = 0;
+    /* ── 随机换向 / 随机变速的状态（2026-11-03）──────────────
+     * dirAng     当前方向角（rad）
+     * dirTarget  本轮的目标方向角（整圈均匀抽样）
+     * dirTurnIdx 换向计数（决定抽第几个目标角）
+     * turnInit   是否已把 dirAng 对齐到原版基准角
+     * spdF       当前速度倍率（1 = 与原版同速）
+     * spdTarget  本轮的目标倍率
+     * spdTurnIdx 换挡计数
+     * spdInit    累计相位是否已初始化
+     * lastGeomT  上一次几何计算的绝对时间（算 dt 用）
+     * wPh        每道波的**累计相位**（有随机变速时用它，否则沿用 om*t） */
+    var dirAng = 0, dirTarget = 0, dirTurnIdx = -1, turnInit = false;
+    var spdF = 1, spdTarget = 1, spdTurnIdx = -1, spdInit = false;
+    var lastGeomT = 0;
+    var wPh = new Float64Array(8);
     /* 每道波在**共享方向**上的偏角（dirField>0 时 waves[].dir 是偏角，不是绝对角） */
     var wOffS = new Float64Array(8);
     var wOffC = new Float64Array(8);
@@ -730,6 +755,76 @@
          且偏移为 0 时 (px-0) 与 px 逐位相等 ⇒ 原路径不受影响。 */
       var pivX = 0, pivY = 0;
       if (useField && p.dirPivot > 0) { pivX = w * 0.5; pivY = h * 0.5; }
+
+      /* ── 本几何步的实际时间间隔 dt ──────────────────────────
+         用它（而不是 p.step）来推进方向与相位：
+         引擎在标签页隐藏时 rAF 会停 ⇒ 几何步会被**跳过**，
+         若按 p.step 累加，方向与相位就会比真实时间慢一大截。 */
+      var geoDt = tq - lastGeomT;
+      if (!(geoDt > 0)) geoDt = 0;
+      lastGeomT = tq;
+
+      /* ── 随机变速（2026-11-03）─────────────────────────────
+         每 speedTurnPeriod 秒抽一个目标倍率，按 speedTurnRate 逼近。
+         倍率用**累计相位**兑现（见下面 wPh），否则速度一变波前会跳变。 */
+      var useSpeedWalk = p.speedTurnPeriod > 0 && p.speedRange > 0;
+      if (useSpeedWalk) {
+        var sid = Math.floor(tq / p.speedTurnPeriod);
+        if (sid !== spdTurnIdx) {
+          spdTurnIdx = sid;
+          /* 索引乘一个质数步长再哈希 ⇒ 相邻两档的目标不会相关 */
+          spdTarget = 1 + (rnd(sid * 104729 + 13, 22695477) * 2 - 1) * p.speedRange;
+        }
+        var sdiff = spdTarget - spdF;
+        /* speedTurnRate = 0 ⇒ 不限速 ⇒ 瞬间换挡（「啪」地一下）
+           限速时是「慢慢提速降速」。两种都由这一个参数控制。 */
+        var smax = p.speedTurnRate > 0 ? p.speedTurnRate * geoDt : 1e9;
+        if (sdiff > smax) sdiff = smax; else if (sdiff < -smax) sdiff = -smax;
+        spdF += sdiff;
+        if (!spdInit) {
+          /* 第一次启用：对齐到闭式 om*t ⇒ 启用瞬间波前不跳变 */
+          spdInit = true;
+          for (var sgi = 0; sgi < nw; sgi++) wPh[sgi] = waves[sgi].om * tq;
+        } else {
+          /* 累计相位：速度是它的推进速率。
+             ⚠ 必须累计，不能用闭式 om*t —— 否则速度一变波前位置会跳。 */
+          for (var spi = 0; spi < nw; spi++) {
+            wPh[spi] += waves[spi].om * spdF * geoDt;
+          }
+        }
+      }
+
+      /* ── 随机换向（2026-11-03）─────────────────────────────
+         dirTurnPeriod > 0 ⇒ 每周期抽一个整圈均匀的随机目标角，
+         当前角按不超过 dirTurnRate 的角速度朝它靠（取短弧）。 */
+      var useTurnWalk = p.dirTurnPeriod > 0;
+      if (useTurnWalk) {
+        if (!turnInit) {
+          /* 起始朝向对齐原版基准角 ⇒ 第一帧与原版一致，
+             之后才慢慢被随机目标带走（否则一上来就跳到随机角）。 */
+          turnInit = true;
+          dirAng = p.dirFieldBase || 0;
+          dirTarget = dirAng;
+        }
+        var did = Math.floor(tq / p.dirTurnPeriod);
+        if (did !== dirTurnIdx) {
+          dirTurnIdx = did;
+          /* 目标角在整圈上均匀抽样 ⇒ 上下左右都会抽到 */
+          dirTarget = rnd(did * 7919 + 13, 1013904223) * 6.2831853;
+        }
+        var tdiff = dirTarget - dirAng;
+        /* 取短弧：否则为了 350° 的差别会绕远路 */
+        while (tdiff > Math.PI) tdiff -= 6.2831853;
+        while (tdiff < -Math.PI) tdiff += 6.2831853;
+        /* dirTurnRate = 0 ⇒ 不限速 ⇒ 一步到位（「突然拐一下」）
+           dirTurnRate > 0 ⇒ 限速 ⇒「慢慢飘过去」。 */
+        var tmax = p.dirTurnRate > 0 ? p.dirTurnRate * geoDt : 1e9;
+        if (tdiff > tmax) tdiff = tmax; else if (tdiff < -tmax) tdiff = -tmax;
+        dirAng += tdiff;
+        while (dirAng > Math.PI) dirAng -= 6.2831853;
+        while (dirAng < -Math.PI) dirAng += 6.2831853;
+      }
+
       if (useField) {
         var dsc = p.dirFieldScale || 0.003;
         var drg = p.dirFieldRange || 0;
@@ -744,17 +839,21 @@
             if (p.dirField === 1) {
               /* 方向只随时间变（空间上统一）⇒ 整片波浪换个朝向。
                  两条取值路径：
-                   · 噪声切片（默认）= 原始实现，带高频抖动
-                   · 平滑解析式      = 三组不可公度正弦叠加，慢而连续 */
-              dn = p.dirWalkSmooth > 0
-                ? dirWalkSignal(tq, dwf)
-                : sample(tex, NOISE_N, tq * dwf, 0.37);
+                   · 随机目标角（dirTurnPeriod > 0）= 主路，能摆满整圈
+                   · 噪声切片（默认）                = 原始实现，带高频抖动 */
+              if (useTurnWalk) {
+                /* 保留 dirSwing 的微摆（该档若设了的话） */
+                dang = dirAng + p.dirSwing * Math.sin(swingT);
+              } else {
+                dn = sample(tex, NOISE_N, tq * dwf, 0.37);
+                dang = dbase + dn * drg;
+              }
             } else {
               /* 方向随位置变 + 随时间漂移 ⇒ 湍流状 */
               dn = sample(tex, NOISE_N, ddx * dsc + tq * ddr,
                                       ddy * dsc + tq * ddr * 0.7);
+              dang = dbase + dn * drg;
             }
-            dang = dbase + dn * drg;
             dirAngleNow = dang;
             do2 = fj * dirFW + fi;
             dirSin[do2] = Math.sin(dang);
@@ -809,7 +908,8 @@
               wcn = fc * wOffC[wi2] - fs * wOffS[wi2];
             }
             var uy = (px - pivX) * wsn + (py - pivY) * wcn;
-            var ph = wv.k * uy - wv.om * tq + wv.off + dz * p.distortAmp;
+            var ph = wv.k * uy - (useSpeedWalk ? wPh[wi2] : wv.om * tq)
+                   + wv.off + dz * p.distortAmp;
             var s = Math.sin(ph);
             if (s <= p.edge0) continue;
             var b = sstep(p.edge0, p.edge1, s) * wv.w;
@@ -1178,6 +1278,7 @@
           waves: p.waves.map(function (x) { return { k: x.k, om: x.om, off: x.off, dir: x.dir, w: x.w }; }),
           fieldMean: n ? sum / n : 0, fieldMax: mx,
           dirAngle: dirAngleNow, dirAngleDeg: dirAngleNow * 180 / Math.PI,
+          speedFactor: spdF, dirTarget: dirTarget,
           resizeCount: resizeCount, roCount: roCount, frameCount: frameCount, geoCount: geoCount,
           p: {
             edge0: p.edge0, edge1: p.edge1, distortAmp: p.distortAmp,

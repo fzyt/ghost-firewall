@@ -358,42 +358,62 @@ sec('PF-8  门户那一档（moonstone-flow）背景参数齐')
 flow = entry_block(STYLES_BODY, 'moonstone-flow')
 check('moonstone-flow 档存在', bool(flow))
 for name, val in (('dirField', '1'), ('dirFieldBase', '-0.30'),
-                  ('dirFieldRange', '1.50'), ('dirWalkFreq', '0.010'),
-                  ('dirWalkSmooth', '1'), ('dirPivot', '1'),
+                  ('dirTurnPeriod', '8'), ('dirTurnRate', '0.16'),
+                  ('speedTurnPeriod', '6'), ('speedTurnRate', '0.18'),
+                  ('speedRange', '0.55'), ('dirPivot', '0'),
                   ('distortAmp', '0.85'), ('lit', '0.12')):
     check(f'moonstone-flow 的 {name} = {val}',
           re.search(re.escape(name) + r':\s*' + re.escape(val), flow) is not None)
 
-# ⚠️ 该守的不是单个值，是**乘积**。
-#   ω 峰值 ≈ 摆幅 × 2π × 频率（rad/s）——
-#   摆幅翻倍会把转速也带上，只看其中一个数就会被骗：
-#     · 只看摆幅上限 ⇒ 允许「摆幅大 + 频率高」⇒ 画面在抖不是在流；
-#     · 只看频率上限 ⇒ 允许「摆幅巨大 + 频率低」⇒ 方向半天转一下，像卡顿。
-#   原版 dirSwing 的 ω 峰值 = 0.053 rad/s、平均 0.037 rad/s，
-#   实测本档 120 秒平均 0.032 rad/s ⇒ **比原版还慢**，但方向偏得远得多
-#   （60 秒偏 34°、120 秒偏 111°；原版 dirSwing 一共才 ±7.4° 往复）。
-dwf = re.search(r'dirWalkFreq:\s*([0-9.]+)', flow)
-dfr = re.search(r'dirFieldRange:\s*([0-9.]+)', flow)
-check('moonstone-flow 写了 dirWalkFreq 与 dirFieldRange',
-      dwf is not None and dfr is not None,
-      f'实测 freq={dwf.group(1) if dwf else "没找到"} / range={dfr.group(1) if dfr else "没找到"}')
-if dwf and dfr:
-    prod = float(dfr.group(1)) * float(dwf.group(1))
-    check('moonstone-flow 的 摆幅 × 频率 ≤ 0.016（角速度不能超过原版的 ~1.8 倍）',
-          prod <= 0.016, f'实测乘积 {prod:.5f} ⇒ ω 峰值 {prod * 6.2831853:.4f} rad/s')
-    check('moonstone-flow 的 dirFieldRange ≥ 1.2（方向必须真的在换，才不是原版）',
-          float(dfr.group(1)) >= 1.2, f'实测 {dfr.group(1)}')
+# ⚠️ 这一批改动的三个硬指标（2026-11-03 实测，不是猜的）：
+#
+#   ① 方向必须能覆盖**整圈**。
+#      上一版（dirFieldRange + 噪声切片/三正弦游走）实测 48 秒里方向角只在
+#      +23.7° ~ -10.3° 之间晃，运动方向 cos d 恒为 0.90~0.98
+#      ⇒ **永远朝下、从不向上、从不横向** ⇒ 用户的投诉客观成立。
+#      现在改成「随机目标角 + 限速逼近」，目标角在整圈上均匀抽样。
+#
+#   ② 转向角速度不能快到变成「甩」。dirTurnRate 是**上限**，
+#      一个换向周期最多转 dirTurnRate × dirTurnPeriod 弧度。
+#
+#   ③ 变速率与幅度都要有界：幅度太小看不出在变速，太大像抽搐；
+#      变速率太大 ⇒ 一秒内从极慢跳到极快。
+dtp = re.search(r'dirTurnPeriod:\s*([0-9.]+)', flow)
+dtr = re.search(r'dirTurnRate:\s*([0-9.]+)', flow)
+stp = re.search(r'speedTurnPeriod:\s*([0-9.]+)', flow)
+strate = re.search(r'speedTurnRate:\s*([0-9.]+)', flow)
+srg = re.search(r'speedRange:\s*([0-9.]+)', flow)
+check('moonstone-flow 写了 dirTurnPeriod / dirTurnRate / speed* 四个参数',
+      all(x is not None for x in (dtp, dtr, stp, strate, srg)),
+      '实测 period=%s rate=%s spdPeriod=%s spdRate=%s spdRange=%s' % (
+          dtp.group(1) if dtp else '没找到', dtr.group(1) if dtr else '没找到',
+          stp.group(1) if stp else '没找到', strate.group(1) if strate else '没找到',
+          srg.group(1) if srg else '没找到'))
+if dtp and dtr and stp and strate and srg:
+    per = float(dtp.group(1))
+    rate = float(dtr.group(1))
+    check('moonstone-flow 一个换向周期最多转 ≤ 90°（再快就是「甩」不是「流」）',
+          rate * per <= 6.2831853 * 0.25,
+          f'实测 {rate}×{per} = {rate * per * 180 / 3.14159265:.1f}°/周期')
+    check('moonstone-flow 换向角速度 ≤ 0.30 rad/s（原版 dirSwing 峰值 0.053）',
+          rate <= 0.30, f'实测 {rate}')
+    check('moonstone-flow 速度倍率幅度在 0.30~0.80 之间（太小看不出、大了像抽搐）',
+          0.30 <= float(srg.group(1)) <= 0.80, f'实测 {srg.group(1)}')
+    check('moonstone-flow 变速率 ≤ 0.50 倍/秒（一秒内从极慢跳到极快就是抽搐）',
+          float(strate.group(1)) <= 0.50, f'实测 {strate.group(1)}')
 else:
-    check('moonstone-flow 的 摆幅 × 频率 ≤ 0.016（角速度不能超过原版的 ~1.8 倍）', False)
-    check('moonstone-flow 的 dirFieldRange ≥ 1.2（方向必须真的在换，才不是原版）', False)
+    check('moonstone-flow 一个换向周期最多转 ≤ 90°（再快就是「甩」不是「流」）', False)
+    check('moonstone-flow 换向角速度 ≤ 0.30 rad/s（原版 dirSwing 峰值 0.053）', False)
+    check('moonstone-flow 速度倍率幅度在 0.30~0.80 之间（太小看不出、大了像抽搐）', False)
+    check('moonstone-flow 变速率 ≤ 0.50 倍/秒（一秒内从极慢跳到极快就是抽搐）', False)
 
 # ─────────────────────────────────────────────────────────────
-sec('PF-8b moonstone-flow 与原版 moonstone 的差别**只有方向**')
+sec('PF-8b moonstone-flow 与原版 moonstone 的差别**只有方向与速度**')
 
 # 这一批改动的全部意义就在这一条上：
 #   用户要的是「原版那种固定方向流动的**随机版**」——
 #   所以几何（波速、波长、相位、扭曲、遮罩、余晖、像素尺寸、密度）
-#   必须与原版 moonstone **逐条一致**，只有「方向」这一项变了。
+#   必须与原版 moonstone **逐条一致**，只有「方向」和「速度」这两项变了。
 # 任何一项被顺手改掉，观感就会滑回「被否掉的那一版」。
 WAVE_RE = re.compile(r'\{\s*k:\s*([0-9.]+),\s*om:\s*([0-9.]+),\s*off:\s*([0-9.]+),'
                       r'\s*dir:\s*(-?[0-9.]+),\s*w:\s*([0-9.]+)\s*\}')
@@ -436,7 +456,9 @@ sec('PF-9  新增的方向参数默认值全为 0（不传时逐位一致）')
 
 for name in ('patchRot1', 'patchRot2', 'patchSpin', 'dirSwing', 'dirSwingFreq',
              'dirField', 'dirFieldBase', 'dirFieldScale', 'dirFieldRange',
-             'dirFieldDrift', 'dirWalkFreq', 'dirWalkSmooth', 'dirPivot',
+             'dirFieldDrift', 'dirWalkFreq', 'dirPivot',
+             'dirTurnPeriod', 'dirTurnRate',
+             'speedTurnPeriod', 'speedTurnRate', 'speedRange',
              'patchFollow', 'pxBody', 'pxCrest', 'pickBlock'):
     m2 = re.search(r'^\s+' + name + r':\s*([0-9.]+),', PARAMS_BODY, re.M)
     check(f'引擎默认参数 {name} = 0', m2 is not None and float(m2.group(1)) == 0.0,
@@ -638,36 +660,37 @@ for f in REMOVED_FILES:
           '变体方案已砍干净，引用就是死链')
 
 # ─────────────────────────────────────────────────────────────
-sec('PF-19 方向游走走「平滑解析式」（不是噪声切片）')
+sec('PF-19 方向走「随机目标角 + 限速逼近」（能覆盖整圈）')
 
-# 为什么不用噪声切片（2026-11-03 实测，不是猜的）：
-#   噪声是三个倍频（4/9/21）叠加，沿时间轴走一刀必然带进高频抖动。
-#   实测（240 秒窗口，dirFieldRange=0.9）：
-#     dirWalkFreq=0.03 ⇒ 角速度峰值 0.43 rad/s、角加速度 5.3 rad/s²
-#     dirWalkFreq=0.05 ⇒ 角速度峰值 0.62 rad/s、角加速度 4.9 rad/s²
-#     dirWalkFreq=0.01 ⇒ 角速度峰值 0.15 rad/s、角加速度 1.2 rad/s²
-#   而原版 dirSwing（幅 0.13rad × 0.065Hz）的角速度峰值只有 0.053 rad/s
-#   ⇒ 就算把频率压到最低，噪声切片也比原版快 2~3 倍
-#   ⇒ 那不是「洋流拐弯」，是**抖**。噪声的高频倍频没法靠调频率消掉，
-#     只能换信号源。
-check('引擎有 dirWalkSignal（平滑解析式方向游走）',
-      'function dirWalkSignal(' in PIXELFIELD)
-check('方向场取值按 dirWalkSmooth 二选一（平滑解析式 / 噪声切片）',
-      re.search(r'dn = p\.dirWalkSmooth > 0\s*\?\s*dirWalkSignal\(tq, dwf\)',
+# 为什么不用噪声切片、也不用三正弦叠加（2026-11-03 实测，不是猜的）：
+#   噪声切片：角速度是原版的 3~12 倍 ⇒ 那是在抖不是在流；
+#   三正弦叠加：合成信号的实际值域只有 ±0.45，
+#     要摆满 360° 就得把角速度拉到 0.4 rad/s（原版的 8 倍）⇒ 在甩不是流。
+#   而且两者的方向区间都挤在「偏下」那一小段：
+#     实测 48 秒里方向角只在 +23.7° ~ -10.3° 之间晃，
+#     运动方向 cos d 恒为 0.90~0.98 ⇒ **永远朝下、从不向上、从不横向**。
+check('引擎有 dirTurnPeriod / dirTurnRate 两个参数（默认 0 ⇒ 走老路）',
+      re.search(r'^\s+dirTurnPeriod:\s*0,', PARAMS_BODY, re.M) is not None and
+      re.search(r'^\s+dirTurnRate:\s*0\.0,', PARAMS_BODY, re.M) is not None)
+check('目标角在**整圈**上均匀抽样（不是挤在一小段弧里）',
+      re.search(r'dirTarget = rnd\([^)]*\) \* 6\.2831853;', PIXELFIELD) is not None)
+check('转向走短弧（否则为了 350° 的差别会绕远路）',
+      'while (tdiff > Math.PI) tdiff -= 6.2831853;' in PIXELFIELD and
+      'while (tdiff < -Math.PI) tdiff += 6.2831853;' in PIXELFIELD)
+check('转向角速度有上限，0 = 不限速（一步到位 = 「突然拐一下」）',
+      re.search(r'var tmax = p\.dirTurnRate > 0 \? p\.dirTurnRate \* geoDt : 1e9;',
                 PIXELFIELD) is not None)
-check('噪声切片那条老路径还在（不传 dirWalkSmooth 时走它 ⇒ 逐位一致）',
+check('方向起始角对齐原版基准角（第一帧与原版一致，不一上来就跳到随机角）',
+      re.search(r'dirAng = p\.dirFieldBase \|\| 0;', PIXELFIELD) is not None)
+# 噪声切片那条老路径还在（不传 dirTurnPeriod 时走它 ⇒ 逐位一致）
+check('噪声切片那条老路径还在（不传 dirTurnPeriod 时走它 ⇒ 逐位一致）',
       'sample(tex, NOISE_N, tq * dwf, 0.37)' in PIXELFIELD)
-# 三组频率必须**不可公度**，否则合成波形会看出周期（像钟摆，不像随机游走）。
-check('方向游走用三组不可公度的频率（合成波形几分钟内不重复）',
-      re.search(r'0\.55 \* Math\.sin\(a \* 0\.55 \* t \+ 0\.7\)', PIXELFIELD) is not None and
-      re.search(r'0\.30 \* Math\.sin\(a \* 1\.15 \* t \+ 2\.3\)', PIXELFIELD) is not None and
-      re.search(r'0\.15 \* Math\.sin\(a \* 2\.35 \* t \+ 4\.1\)', PIXELFIELD) is not None)
-check('方向游走三组权重之和为 1（值域 [-1,1]，不超范围）',
-      re.search(r'0\.55 \* Math\.sin', PIXELFIELD) is not None and
-      re.search(r'0\.30 \* Math\.sin', PIXELFIELD) is not None and
-      re.search(r'0\.15 \* Math\.sin', PIXELFIELD) is not None)
-check('引擎默认参数 dirWalkSmooth = 0（默认走老路径 ⇒ 逐位一致）',
-      re.search(r'^\s+dirWalkSmooth:\s*0,', PARAMS_BODY, re.M) is not None)
+check('两条路径二选一：随机换向 vs 噪声切片老路径',
+      'dang = dirAng + p.dirSwing * Math.sin(swingT);' in PIXELFIELD)
+check('已否决的「三正弦叠加」方向游走函数已删除（不该留在引擎里）',
+      'dirWalkSignal' not in PIXELFIELD)
+check('已否决的 dirWalkSmooth 参数已删除（默认参数表里不该再有）',
+      'dirWalkSmooth' not in PIXELFIELD)
 
 # debug() 必须报出**引擎自己算出来的**当前方向角。
 # 为什么：方向对比图的箭头如果由外部脚本另算一份公式，
@@ -677,6 +700,40 @@ check('debug() 报出引擎自己算出的当前方向角（证据图的箭头�
       'dirAngle: dirAngleNow' in PIXELFIELD and 'dirAngleDeg' in PIXELFIELD)
 check('当前方向角在每个几何步更新（不是初始值）',
       re.search(r'dirAngleNow = dang;', PIXELFIELD) is not None)
+
+# ─────────────────────────────────────────────────────────────
+sec('PF-19b 随机变速走「累计相位」（变速时波前不跳变）')
+
+# 用户原话：「速度快慢也可以加入随机，目前看好像是始终一个速度的，
+#           也就是流动可能突然提速降速，也可能慢慢提速降速」。
+check('引擎有 speedTurnPeriod / speedTurnRate / speedRange 三个参数（默认 0）',
+      re.search(r'^\s+speedTurnPeriod:\s*0,', PARAMS_BODY, re.M) is not None and
+      re.search(r'^\s+speedTurnRate:\s*0\.0,', PARAMS_BODY, re.M) is not None and
+      re.search(r'^\s+speedRange:\s*0\.0,', PARAMS_BODY, re.M) is not None)
+check('速度倍率有上下限（speedRange 是 ± 幅度，基准是 1.0）',
+      re.search(r'spdTarget = 1 \+ \(rnd\([^)]*\) \* 2 - 1\) \* p\.speedRange;',
+                PIXELFIELD) is not None)
+check('变速率有上限，0 = 不限速（瞬间换挡 = 「突然提速降速」）',
+      re.search(r'var smax = p\.speedTurnRate > 0 \? p\.speedTurnRate \* geoDt : 1e9;',
+                PIXELFIELD) is not None)
+# ★ 关键：相位必须用**累计量**，不能是闭式的 om*t。
+#   闭式的话速度一变，波前位置会跳一下（画面「闪」一下）。
+check('波相位走累计量 wPh（不是闭式 om*t）⇒ 变速时波前不跳变',
+      re.search(r'var ph = wv\.k \* uy - \(useSpeedWalk \? wPh\[wi2\] : wv\.om \* tq\)',
+                PIXELFIELD) is not None)
+check('累计相位按「速度倍率 × 实际 dt」推进',
+      re.search(r'wPh\[spi\] \+= waves\[spi\]\.om \* spdF \* geoDt;', PIXELFIELD) is not None)
+check('累计相位初始化对齐闭式 om*t（启用瞬间不跳变）',
+      re.search(r'wPh\[sgi\] = waves\[sgi\]\.om \* tq;', PIXELFIELD) is not None)
+# dt 必须用**实际几何步间隔**，不能用 p.step：
+#   标签页隐藏时 rAF 会停、几何步被跳过 ⇒ 按 p.step 累加会慢一大截。
+check('推进用实际几何步间隔 geoDt（不是 p.step）',
+      re.search(r'var geoDt = tq - lastGeomT;', PIXELFIELD) is not None and
+      'lastGeomT = tq;' in PIXELFIELD)
+check('debug() 报出当前速度倍率（证据图不另算公式）',
+      'speedFactor: spdF' in PIXELFIELD)
+check('累计相位用双精度存（Float32 会丢末位 ⇒ 破坏「逐位一致」）',
+      re.search(r'var wPh = new Float64Array\(8\);', PIXELFIELD) is not None)
 
 # ─────────────────────────────────────────────────────────────
 sec('PF-20 方向场绕画布中心转（不是绕左上角）')

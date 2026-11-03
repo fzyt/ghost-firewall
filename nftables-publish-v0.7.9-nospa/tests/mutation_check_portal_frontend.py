@@ -14,7 +14,8 @@
   C  新参数默认值被改 —— 破坏「不传时与改版前逐位一致」这条保证
   D  随机方向波浪的结构 —— 共享方向场 / 遮罩跟随波向 / 像素块
   E  新档（moonstone-flow）参数被改 —— 几何必须与原版逐条一致
-  E2 两个新引擎参数（dirWalkSmooth / dirPivot）被改
+  E2 随机换向的机制（整圈目标角 / 短弧 / 限速）被拆掉
+  E3 随机变速的机制（累计相位 / 变速率上限）被拆掉
   F  改版外溢到登录页
   G  安全面 / 加载顺序 / 占位符
 
@@ -238,16 +239,18 @@ MUTATIONS = [
      '        dirField: 1,', '        dirField: 0,'),
     ('N-44', 'moonstone-flow 的 dirFieldBase 改成 0.00', PIX,
      '        dirFieldBase: -0.30,', '        dirFieldBase: 0.00,'),
-    ('N-45', 'moonstone-flow 的 dirFieldRange 改成 0.00（方向不偏离 ⇒ 等于没随机）', PIX,
-     '        dirFieldRange: 1.50,', '        dirFieldRange: 0.00,'),
-    ('N-46', 'moonstone-flow 的 dirWalkFreq 改成 0.15（游走太快 ⇒ 画面在抖不是在流）', PIX,
-     '        dirWalkFreq: 0.010,', '        dirWalkFreq: 0.15,'),
-    ('N-91', '摆幅 × 频率超限（摆幅 1.50 配频率 0.03 ⇒ 转速飙到原版的 3 倍）', PIX,
-     '        dirWalkFreq: 0.010,', '        dirWalkFreq: 0.030,'),
-    ('N-47', 'moonstone-flow 的 dirWalkSmooth 改成 0（退回噪声切片 ⇒ 高频抖动）', PIX,
-     '        dirWalkSmooth: 1,', '        dirWalkSmooth: 0,'),
-    ('N-48', 'moonstone-flow 的 dirPivot 改成 0（绕左上角转 ⇒ 整屏流速不均匀）', PIX,
-     '        dirPivot: 1,', '        dirPivot: 0,'),
+    ('N-45', 'moonstone-flow 的 dirTurnPeriod 改成 0（关掉换向 ⇒ 退回固定方向）', PIX,
+     '        dirTurnPeriod: 8,', '        dirTurnPeriod: 0,'),
+    ('N-46', 'moonstone-flow 的 dirTurnRate 改成 0.60（转向太快 ⇒ 在甩不是在流）', PIX,
+     '        dirTurnRate: 0.16,', '        dirTurnRate: 0.60,'),
+    ('N-91', '换向周期拉长到 60 秒（换向太慢 ⇒ 等于没有随机方向）', PIX,
+     '        dirTurnPeriod: 8,', '        dirTurnPeriod: 60,'),
+    ('N-47', 'moonstone-flow 的 speedTurnPeriod 改成 0（关掉变速 ⇒ 恒定速度）', PIX,
+     '        speedTurnPeriod: 6,', '        speedTurnPeriod: 0,'),
+    ('N-48', 'moonstone-flow 的 speedRange 改成 0.00（幅度为 0 ⇒ 等于没随机速度）', PIX,
+     '        speedRange: 0.55,', '        speedRange: 0.00,'),
+    ('N-92', '变速率飙到 1.20 倍/秒（一秒内从极慢跳到极快 ⇒ 抽搐）', PIX,
+     '        speedTurnRate: 0.18,', '        speedTurnRate: 1.20,'),
     ('N-49', 'moonstone-flow 的 lit 改成 0.21（密度翻倍 ⇒ 又变回一块块的纹理）', PIX,
      '        lit: 0.12,', '        lit: 0.21,'),
     ('N-50', 'moonstone-flow 少一道波（3 道 → 2 道）', PIX,
@@ -265,35 +268,26 @@ MUTATIONS = [
      '{ k: 0.00580, om: 0.958, off: 0.00, dir:  0.00, w: 1.00 }'),
     # ↓ 下面三条最关键：它们把「原版几何逐条照抄」这条保证从三个方向各打一次。
     ('N-55', 'moonstone-flow 被塞进 pxBody: 3（把「一块一块生成」的成因带回来）', PIX,
-     '        dirPivot: 1,', '        dirPivot: 1,\n        pxBody: 3,'),
+     '        dirPivot: 0,', '        dirPivot: 0,\n        pxBody: 3,'),
     ('N-56', 'moonstone-flow 被塞进 pickBlock: 3（亮区变实心方块 ⇒ 纹理感）', PIX,
-     '        dirPivot: 1,', '        dirPivot: 1,\n        pickBlock: 3,'),
+     '        dirPivot: 0,', '        dirPivot: 0,\n        pickBlock: 3,'),
     ('N-79', 'moonstone-flow 被塞进 patchFollow: 1（遮罩跟波向 ⇒ 不再是原版观感）', PIX,
-     '        dirPivot: 1,', '        dirPivot: 1,\n        patchFollow: 1,'),
+     '        dirPivot: 0,', '        dirPivot: 0,\n        patchFollow: 1,'),
 
-    # ── E2. 两个新引擎参数（2026-11-03）────────────────────────────
-    ('N-80', '方向游走的三组频率改成可公度（0.55/1.10/2.20 ⇒ 合成波形 10 秒一循环 ⇒ 像钟摆）',
+    # ── E2. 随机换向 / 随机变速的机制（2026-11-03）─────────────────
+    ('N-80', '目标角不再在整圈上均匀抽样（缩到一小段弧 ⇒ 又变回只朝一个方向）',
      PIX,
-     'return 0.55 * Math.sin(a * 0.55 * t + 0.7)\n'
-     '         + 0.30 * Math.sin(a * 1.15 * t + 2.3)\n'
-     '         + 0.15 * Math.sin(a * 2.35 * t + 4.1);',
-     'return 0.55 * Math.sin(a * 0.55 * t + 0.7)\n'
-     '         + 0.30 * Math.sin(a * 1.10 * t + 2.3)\n'
-     '         + 0.15 * Math.sin(a * 2.20 * t + 4.1);'),
-    ('N-81', '方向游走的权重和改成 1.6（值域超出 [-1,1] ⇒ 方向会超调）', PIX,
-     'return 0.55 * Math.sin(a * 0.55 * t + 0.7)\n'
-     '         + 0.30 * Math.sin(a * 1.15 * t + 2.3)\n'
-     '         + 0.15 * Math.sin(a * 2.35 * t + 4.1);',
-     'return 0.88 * Math.sin(a * 0.55 * t + 0.7)\n'
-     '         + 0.48 * Math.sin(a * 1.15 * t + 2.3)\n'
-     '         + 0.24 * Math.sin(a * 2.35 * t + 4.1);'),
-    ('N-82', 'dirWalkSignal 函数被删（平滑解析式路径直接崩）', PIX,
-     'function dirWalkSignal(t, base) {', 'function dirWalkSignalX(t, base) {'),
-    ('N-83', '方向场二选一退化成只剩噪声切片（平滑解析式失效）', PIX,
-     'dn = p.dirWalkSmooth > 0\n'
-     '                ? dirWalkSignal(tq, dwf)\n'
-     '                : sample(tex, NOISE_N, tq * dwf, 0.37);',
-     'dn = sample(tex, NOISE_N, tq * dwf, 0.37);'),
+     'dirTarget = rnd(did * 7919 + 13, 1013904223) * 6.2831853;',
+     'dirTarget = rnd(did * 7919 + 13, 1013904223) * 0.9 - 0.45;'),
+    ('N-81', '转向不再走短弧（为了 350° 的差别会绕远路 ⇒ 转得又慢又别扭）', PIX,
+     'while (tdiff > Math.PI) tdiff -= 6.2831853;',
+     'while (tdiff > Math.PI * 3) tdiff -= 6.2831853;'),
+    ('N-82', '转向限速失效（dirTurnRate 不再是上限 ⇒ 一步到位 ⇒ 画面硬拐）', PIX,
+     'var tmax = p.dirTurnRate > 0 ? p.dirTurnRate * geoDt : 1e9;',
+     'var tmax = 1e9;'),
+    ('N-83', '随机换向路径被删（只剩噪声切片老路径 ⇒ 方向又挤在一小段）', PIX,
+     'dang = dirAng + p.dirSwing * Math.sin(swingT);',
+     'dang = dbase + dn * drg;'),
     ('N-84', '旋转中心从画布中心挪到四分之一处（转心不对 ⇒ 流速不均）', PIX,
      'pivX = w * 0.5; pivY = h * 0.5;', 'pivX = w * 0.25; pivY = h * 0.25;'),
     ('N-85', '旋转中心不再受 useField 约束（dirField=0 的档也被改 ⇒ 破坏逐位一致）', PIX,
@@ -302,8 +296,10 @@ MUTATIONS = [
     ('N-86', '法线坐标里的旋转中心被丢掉（dirPivot 参数失效）', PIX,
      'var uy = (px - pivX) * wsn + (py - pivY) * wcn;',
      'var uy = px * wsn + py * wcn;'),
-    ('N-87', 'dirWalkSmooth 默认值从 0 改成 1（不传时行为变了 ⇒ 破坏逐位一致）', PIX,
-     '    dirWalkSmooth: 0,', '    dirWalkSmooth: 1,'),
+    ('N-87', 'dirTurnPeriod 默认值从 0 改成 8（不传时行为变了 ⇒ 破坏逐位一致）', PIX,
+     '    dirTurnPeriod: 0,', '    dirTurnPeriod: 8,'),
+    ('N-93', 'speedTurnPeriod 默认值从 0 改成 6（不传时行为变了 ⇒ 破坏逐位一致）', PIX,
+     '    speedTurnPeriod: 0,', '    speedTurnPeriod: 6,'),
     ('N-88', 'dirPivot 默认值从 0 改成 1（不传时行为变了 ⇒ 破坏逐位一致）', PIX,
      '    dirPivot: 0,', '    dirPivot: 1,'),
     ('N-89', 'debug() 不再报引擎真值方向角（证据图只能另算公式 ⇒ 会与实际不符）', PIX,
@@ -311,6 +307,29 @@ MUTATIONS = [
      'dirAngle: 0, dirAngleDeg: 0,'),
     ('N-90', '当前方向角不再每个几何步更新（一直停在初始值）', PIX,
      'dirAngleNow = dang;', '/* dirAngleNow 不更新 */'),
+
+    # ── E3. 随机变速的机制（累计相位）────────────────────────────
+    ('N-94', '累计相位退化成闭式 om*t（速度一变波前就跳 ⇒ 画面闪一下）', PIX,
+     'var ph = wv.k * uy - (useSpeedWalk ? wPh[wi2] : wv.om * tq)',
+     'var ph = wv.k * uy - wv.om * tq'),
+    ('N-95', '累计相位推进时丢掉了速度倍率（变速完全不起作用）', PIX,
+     'wPh[spi] += waves[spi].om * spdF * geoDt;',
+     'wPh[spi] += waves[spi].om * geoDt;'),
+    ('N-96', '累计相位初始化不对齐闭式 om*t（启用瞬间波前跳一下）', PIX,
+     'wPh[sgi] = waves[sgi].om * tq;', 'wPh[sgi] = 0;'),
+    ('N-97', '推进间隔改用 p.step（标签页隐藏后相位会慢一大截）', PIX,
+     'var geoDt = tq - lastGeomT;', 'var geoDt = p.step;'),
+    ('N-98', '变速限速失效（speedTurnRate 不再是上限 ⇒ 一秒内极慢↔极快）', PIX,
+     'var smax = p.speedTurnRate > 0 ? p.speedTurnRate * geoDt : 1e9;',
+     'var smax = 1e9;'),
+    ('N-99', '速度目标幅度被忽略（speedRange 失效 ⇒ 速度恒为 1.0）', PIX,
+     'spdTarget = 1 + (rnd(sid * 104729 + 13, 22695477) * 2 - 1) * p.speedRange;',
+     'spdTarget = 1;'),
+    ('N-100', 'debug() 不再报速度倍率（证据图只能另算公式）', PIX,
+     'speedFactor: spdF, dirTarget: dirTarget,',
+     'speedFactor: 1, dirTarget: dirTarget,'),
+    ('N-101', '累计相位用单精度存（Float32 丢末位 ⇒ 破坏「逐位一致」）', PIX,
+     'var wPh = new Float64Array(8);', 'var wPh = new Float32Array(8);'),
 
     # ── F. 改版外溢到登录页 ──
     ('N-57', '登录页那一档的波速被改成门户参数（改版外溢）', PIX,
