@@ -136,6 +136,7 @@ function run(styleKey, extraParams) {
     frames.push({
       alpha: img.data,
       lit: countLit(img.data),
+      w: img.width, h: img.height,
     });
   }
   return { api: api, frames: frames };
@@ -313,6 +314,63 @@ function hasGray(frames) {
 ok('moonstone 仍是软边（没有被改成硬边）', hasGray(moonstone.frames));
 ok('gate 仍是软边（没有被改成硬边）', hasGray(gate.frames));
 ok('moonstone-swirl 仍是软边（没有被改成硬边）', hasGray(swirl.frames));
+
+/* ─────────────────────────────────────────────────────────────
+ * 8. TRAE 式显式取样位移：点不动、内容错位
+ * ─────────────────────────────────────────────────────────────
+sec('PH-8 取样位移：晶格不变，但「哪些格亮着」会变');
+
+/* 我们的点阵：columns=190 ⇒ cell = SS × max(2, round(w/190/SS)) = 4 × 2 = 8 设备px。
+ * ⚠ 但读到的缓冲是 **fine 画布**（亚像素分辨率）：宽 = cols × SS = 150 × 4 = 600。
+ *   pxBody=3 ⇒ 3 个亚像素、inset=0（(4-3)/2|0）⇒ 贴在格子左上角。
+ * ⇒ 在 fine 坐标里，任何亮像素都必须满足 (x mod 4) < 3 且 (y mod 4) < 3。
+ * 这一条锁住「点钉在固定晶格上」——TRAE 实测同理（7px 晶格、5px 点、100% 合规）。 */
+const SS = 4, DOT = 3;
+function latticeViolations(frames) {
+  let bad = 0, total = 0;
+  for (const f of frames) {
+    const d = f.alpha, W = f.w, H = f.h;
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        if (d[(y * W + x) * 4 + 3] > 0) {
+          total++;
+          if (x % SS >= DOT || y % SS >= DOT) bad++;
+        }
+      }
+    }
+  }
+  return { bad: bad, total: total };
+}
+
+const pfDisp = run('pixel-flow');
+const pfNoDisp = run('pixel-flow', { flowDispX: 0, flowDispY: 0 });
+
+const vDisp = latticeViolations(pfDisp.frames);
+const vNo = latticeViolations(pfNoDisp.frames);
+ok('开位移时：所有亮像素都落在 8px 晶格的点实体内（点不动）',
+   vDisp.bad === 0, '越界 ' + vDisp.bad + ' / ' + vDisp.total + ' 个亮像素');
+ok('关位移时：同样落在晶格的点实体内（老路径也守规矩）',
+   vNo.bad === 0, '越界 ' + vNo.bad + ' / ' + vNo.total + ' 个亮像素');
+ok('确实量到了亮像素（不是「没东西所以零越界」）',
+   vDisp.total > 1000 && vNo.total > 1000,
+   '亮像素 ' + vDisp.total + ' / ' + vNo.total);
+
+/* 内容错位：开/关位移 ⇒ 亮格集合必须不同（否则位移分支是死代码） */
+function maskHash(frames) {
+  let h = 2166136261 >>> 0;
+  for (const f of frames) {
+    const d = f.alpha;
+    for (let i = 0; i < d.length; i += 4) {
+      h ^= d[i + 3] > 0 ? 1 : 0;
+      h = Math.imul(h, 16777619) >>> 0;
+    }
+  }
+  return h;
+}
+const hDisp = maskHash(pfDisp.frames);
+const hNo = maskHash(pfNoDisp.frames);
+ok('开/关位移：亮格集合不同（位移真的把内容挪走了）',
+   hDisp !== hNo, '两个哈希一样 ⇒ 位移分支空转');
 
 console.log();
 if (F) {

@@ -197,7 +197,7 @@
      * ⚠ 鼠标交互**不做**（用户明确不要）。 */
     'pixel-flow': {
       label: '像素流 Pixel',
-      note: '借鉴 TRAE 首页：规整点阵（连续场硬阈值）+ 青绿↔白双色插值。',
+      note: '借鉴 TRAE 首页：规整点阵（连续场硬阈值）+ 青绿/白二选一 + 逐格取样位移。',
       palette: 'mint',
       params: {
         waves: [
@@ -224,8 +224,14 @@
              brightness = 0.562 + 0.438 * noise  （noise ∈ [0,1]）
              ⇒ noise > (0.87 - 0.562) / 0.438 = 0.703
            换算到本引擎的 [-1,1] 域：0.703 ⇒ pixelThresh = (0.703+1)/2 = 0.70。
-           实测本引擎的域分布与 TRAE 略有差异，最终取 0.76（实测密度对得上）。 */
-        pixelThresh: 0.76,
+           ⚠ 2026-11-03 改成 0.88：换算只是「同尺度」，两边的**分布形状**不同
+             （TRAE 是 simplex 噪声 ours 是值噪声），同一阈值切出来的
+             亮区密度不一样。
+             ⇒ 最终按**实测同口径指标**定：亮度直方图 + 与 TRAE 逐项对齐
+               （工具 /tmp/portal-preview/pfmetrics.js）。
+             TRAE 实测：像素 lit=5.4~7.2%、绿占比 27~31.5%
+             本引擎 0.88 实测：像素 lit=5.5%、绿占比 29%  ⇒ 对上 */
+        pixelThresh: 0.88,
         /* ── TRAE 像素化着色器的另两条 ──────────────────────────
            ① 阈值按块随机抖动：dynamicThreshold = e1Threshold - 0.08 * rand
               换算：TRAE 的 0.08 在亮度域（跨度 0.438）⇒ 本引擎 [-1,1] 域
@@ -233,22 +239,43 @@
               ⚠ 这个值**不是可有可无的**：TRAE 的绿白是**同一个 rand** 定的，
                 rand 小 ⇒ 阈值高 ⇒ 绿块更容易被淘汰 ⇒ 白块占绝对多数。
                 实测：抖动 0.12 ⇒ 绿占 39%；抖动 0.36 ⇒ 绿占 19%（TRAE 是 17%）。
-           ② 颜色按块随机二选一（绿 / 白），绿占 49%（TRAE e1GreenRatio=0.49）
+           ② 颜色按块随机二选一（绿 / 白）
            ⚠ **不是**按场值连续插值 —— TRAE 着色器里唯一的连续 mix
-             出现在鼠标交互那两处，而用户明确说不要鼠标交互。 */
+             出现在鼠标交互那两处，而用户明确说不要鼠标交互。
+           ⚠ pixelGreen 从 TRAE 的 0.49 调到 0.56：实测绿占比对不上
+             （本引擎 0.49 ⇒ 绿 24%，TRAE 实测 27~31.5%），
+             调高之后 ⇒ 绿 ~29%，与 TRAE 对上。 */
         pixelJitter: 0.36,
-        pixelGreen: 0.49,
-        /* ── TRAE 同款流场（域扭曲 FBM）─────────────────────
+        pixelGreen: 0.56,
+        /* ── TRAE 同款流场：颜色场 + 位移场，两层解耦 ────────────
            域扭曲是 TRAE 那个观感的**真正来源**：
            不用它 ⇒ 亮点是轴对齐的方块簇（值噪声的晶格形状）；
            用了它 ⇒ 等值线被掰成有机曲线，跟 TRAE 一个路子。
-           flowDensity = 0.25：屏幕宽 = 0.25 贴图单位
-           flowWarp = 0.5：域扭曲强度（TRAE 名义值 4，换算到贴图单位是 1.0，
-                            这里取一半，等值线不至于扭成一团）
-           flowSpeed = 0.02：漂移速度（贴图单位/秒） */
-        flowDensity: 0.25,
+
+           ⚠ 2026-11-03 更正（实测 trae-lattice.js 之后）：
+             TRAE 的**点从来不移动**（实测亮像素 100% 落在 7px 晶格的
+             5×5 格实体内、6 帧相位恒为 (1,3)）。动的是「每格去哪儿取色」。
+             所以这里要拆成**两层**：
+               ① 颜色场（决定亮区形状）：fieldDensity 尺度 + flowWarp 扭曲
+               ② 位移场（决定每格读哪一块）：flowDensity 尺度 + flowDispX/Y 幅度
+
+           单位换算（别照抄 TRAE 的 uniform 名义值）：
+             TRAE 噪声 p 空间基频周期 = 1，本引擎贴图基频周期 = 0.25 贴图单位
+             ⇒ 1 个 TRAE p 单位 = 0.25 贴图单位
+             ⇒ TRAE density=d  ↔  我们的 D = 0.25 × d
+             · 位移场 TRAE density=1.5 ⇒ flowDensity = 0.375
+             · 颜色场 TRAE density=0.5 ⇒ fieldDensity = 0.125
+           flowWarp = 0.5：域扭曲强度（TRAE 名义 frequency=4，换算到贴图单位
+                            是 1.0，这里取一半，等值线不至于扭成一团）
+           flowSpeed = 0.02：漂移速度（贴图单位/秒）
+           flowDispX/Y = 10 / 70 px：TRAE 实测横向 0.6~9.9、纵向 4.4~69，
+                            纵向是横向的 7 倍 ⇒ 观感上图案整体单向拖曳。 */
+        flowDensity: 0.375,
+        fieldDensity: 0.125,
         flowWarp: 0.50,
         flowSpeed: 0.020,
+        flowDispX: 10,
+        flowDispY: 70,
         /* ── 亮度切点：硬边模式下调的是「亮/不亮」的分界 ──────────
            量化模式下 alpha 是**两态**的（满亮 / 全黑），没有斜坡 ⇒
            accentT 不再管「亮度」，只管「从哪儿开始算亮」。
@@ -578,6 +605,31 @@
     flowDensity: 0,         /* 流场基础尺度（贴图单位 / 屏宽） */
     flowWarp: 0,            /* 域扭曲强度（贴图单位 / 单位 q） */
     flowSpeed: 0,           /* 流场漂移速度（贴图单位 / 秒） */
+    /* ── TRAE 式「显式取样位移」（2026-11-03）──────────────────
+     *
+     * ★ 先纠正一个容易搞错的地方：TRAE 的点**从来不动**。
+     *   实测（trae-lattice.js，1440×796，6 帧）：亮像素按 (x mod 7)
+     *   分桶后残差 0 与 6 **恒为 0**、残差 1..5 计数几乎完全相等
+     *   ⇒ 100% 的亮像素落在 7px 晶格的 5×5 格实体内；
+     *   6 帧的最优相位**恒为 (1,3)** ⇒ 晶格相位从未变过。
+     *
+     *   TRAE 的点阵是「位置固定、内容错位」：
+     *     · 点画在 blockId * 7（固定晶格，永不移动）
+     *     · 但每一格去**哪儿取色**由一个独立的位移场决定
+     *       blockUv = (blockPos - flow + 2.5) / resolution
+     *
+     *   flowDispX / flowDispY 就是这个位移的**像素**幅度。
+     *   TRAE 实测值：横向 0.6~9.9px、纵向 4.4~69px（**恒正**、单向、
+     *   纵向是横向的 7 倍）—— 所以是「拖曳」而不是「抖动」。
+     *
+     *   ⚠ 默认全为 0 ⇒ 不传时逐位一致（位移分支整段跳过）。
+     *   ⚠ fieldDensity：颜色场自己的空间尺度。TRAE 的颜色场
+     *     (density=0.5) 与位移场 (density=1.5) **尺度不同**，
+     *     两层必须解耦 —— 否则位移和扭曲采到同一片噪声、互相抵消。
+     *     0 = 沿用 flowDensity（老行为）。 */
+    fieldDensity: 0,        /* 颜色场空间尺度（贴图单位 / 屏宽） */
+    flowDispX: 0,           /* 取样横向位移（px） */
+    flowDispY: 0,           /* 取样纵向位移（px） */
     /* 档位自定网格密度：0 = 用 opt.columns；>0 = 自己说了算。
      * 为什么要它：TRAE 的点阵周期是 5px 点 + 2px 间隙 = 7px，
      * 而本引擎默认 118 列 ⇒ cell 12px ⇒ 点阵偏稀。
@@ -1159,13 +1211,48 @@
               var qf = n1;
               if (useFlow) {
                 var sxq = px / w, syq = py / h;
-                var ubq = sxq * p.flowDensity, vbq = syq * p.flowDensity;
                 var ftq = tq * p.flowSpeed;
+                /* 颜色场的空间尺度：fieldDensity 优先，0 = 沿用 flowDensity。
+                   ⚠ TRAE 的颜色场(density=0.5)与位移场(density=1.5)**尺度不同**，
+                     两层必须解耦，否则位移场和扭曲场采到同一片噪声、互相抵消。 */
+                var Df = p.fieldDensity > 0 ? p.fieldDensity : p.flowDensity;
+
+                /* ── 位移场（TRAE 的 Layer B）：独立的 fbm，单向位移 ──
+                   TRAE 的像素化层给**每一格**算一个独立的取样位移：
+                     flow.x = q.x * 0.3 * 2.0 * 0.5 * 35 = q.x * 10.5 px
+                     flow.y = q.y * 0.7 * 2.0 * 1.5 * 35 = q.y * 73.5 px
+                   ⇒ 横向 0.6~9.9px、纵向 4.4~69px，**恒正**（单向拖曳），
+                     纵向是横向的 7 倍。
+                   ⚠ 我们的噪声值域是 [-1,1]，TRAE 的 q 是 [0.06,0.94]
+                     ⇒ +1 再 /2 才拿得到 TRAE 那种「恒正」的位移；
+                     直接用原值会得到双向抖动 ≠ TRAE 的单向拖曳。 */
+                var du = 0, dv = 0;
+                var useDisp = (p.flowDispX > 0 || p.flowDispY > 0);
+                if (useDisp) {
+                  var ub = sxq * p.flowDensity, vb = syq * p.flowDensity;
+                  var dbx = sample(tex, NOISE_N, ub, vb + 0.05 * ftq);
+                  var dby = sample(tex, NOISE_N, ub + 0.30, vb - 0.0375 * ftq);
+                  du = (dbx + 1) * 0.5 * p.flowDispX / w;
+                  dv = (dby + 1) * 0.5 * p.flowDispY / h;
+                }
+
+                /* 颜色场（TRAE 的 Layer A）：在**位移后**的位置做域扭曲采样。
+                   ⚠ TRAE 是先渲一张颜色纹理、再按位移后的 UV 去采样它；
+                     这里直接在被位移的位置上求值 ⇒ 等价，但更锐（无双线性）。 */
+                var uf = (sxq - du) * Df, vf = (syq - dv) * Df;
                 /* q 的两条通道：各自偏移 + 反向漂移 ⇒ 两两不相关 */
-                var qxq = sample(tex, NOISE_N, ubq, vbq + 0.05 * ftq);
-                var qyq = sample(tex, NOISE_N, ubq + 0.30, vbq - 0.0375 * ftq);
-                /* 域扭曲：坐标先被 q 掰一下再采样 ⇒ 等值线成有机曲线 */
-                qf = sample(tex, NOISE_N, ubq + qxq * p.flowWarp, vbq + qyq * p.flowWarp);
+                var qxq = sample(tex, NOISE_N, uf, vf + 0.05 * ftq);
+                var qyq = sample(tex, NOISE_N, uf + 0.30, vf - 0.0375 * ftq);
+                /* 域扭曲：坐标先被 q 掰一下再采样 ⇒ 等值线成有机曲线。
+                 *
+                 * ⚠ 试过把扭曲改成 TRAE 的**单向**（q 恒正）—— 实测有害，已撤：
+                 *   单向只是给采样加了个**常数**偏移（q+1 再乘 w），
+                 *   等于把图案整体平移 ⇒ **形态完全不变**，白折腾；
+                 *   反而因为噪声贴图每 1 个贴图单位平铺一次，
+                 *   常数偏移落点不同 ⇒ 输出对 flowWarp **极度敏感**
+                 *   （实测 warp 0.5→0.07% 亮、0.9→7.35%、1.4→1.17%，全靠掷骰子）。
+                 *   ⇒ 保持对称扭曲（qxq ∈ [-1,1]）。 */
+                qf = sample(tex, NOISE_N, uf + qxq * p.flowWarp, vf + qyq * p.flowWarp);
               }
               /* ⚠ 噪声值域是 **[-1, 1]**（makeNoise 末尾做了归一化），
                  而 pixelThresh 用 [0, 1] 表述（跟 TRAE 的 0.87 同尺度）

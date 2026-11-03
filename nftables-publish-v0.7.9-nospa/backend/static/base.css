@@ -121,12 +121,39 @@ html, body {
 }
 
 /* 压暗层：像素场是背景，内容必须压得住它。
-   内容是顶部对齐的，所以左上角压得最狠，底部保留更多场。 */
+ *
+ * ★ 2026-11-03 改成 TRAE 首页那种**纯纵向渐变**（用户要求做，保留开关）。
+ *   TRAE 那边是从浏览器里读出来的计算样式，原文：
+ *     linear-gradient(rgb(12,12,12) 0%,
+ *                     rgba(12,12,12,.6) 30%,
+ *                     rgba(12,12,12,.6) 60%,
+ *                     rgb(12,12,12) 100%)
+ *   ⇒ 上下**全封**、中间 30%~60% 段只压 60% ⇒ 场在中间那段透出来。
+ *
+ * ⚠ 旧版是「radial（暗角偏左上）+ linear」两层叠加，
+ *   保留在 body.pix-scrim-legacy 下 —— 要切回去给 <body> 加那个 class。
+ *   （门户正文落在中间那段 ⇒ 切到 TRAE 版后卡片后面的场会明显变亮。）
+ *
+ * 渐变的四个停靠点做成了 CSS 变量：要调深浅/位置只改变量，不用改规则。 */
 .pix-scrim {
+  --scrim-c: rgb(12, 12, 12);
+  --scrim-m: rgba(12, 12, 12, .6);
+  --scrim-a: 0%;
+  --scrim-b: 30%;
+  --scrim-d: 60%;
   position: fixed;
   inset: 0;
   z-index: 0;
   pointer-events: none;
+  background: linear-gradient(
+    var(--scrim-c) var(--scrim-a),
+    var(--scrim-m) var(--scrim-b),
+    var(--scrim-m) var(--scrim-d),
+    var(--scrim-c) 100%);
+}
+
+/* 旧版压暗层（radial 暗角 + linear 两层叠加），开关用 */
+body.pix-scrim-legacy .pix-scrim {
   background:
     radial-gradient(58% 48% at 34% 20%,
       rgba(10, 10, 11, .94) 0%, rgba(10, 10, 11, .74) 48%, rgba(10, 10, 11, .22) 100%),

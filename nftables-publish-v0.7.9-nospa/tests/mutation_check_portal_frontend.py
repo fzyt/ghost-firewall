@@ -19,6 +19,8 @@
   H  规整量化点阵被撤回（默认值被改 / 连续场判据 / 阈值抖动 / 绿白二选一 / 域扭曲）
   I  pixel-flow 新档被改或外溢到现有各档
   J  硬边改造被撤回（alpha 斜坡 / 余晖 / 迟滞 —— 必须三处同时改才有效）
+  K  TRAE 式显式取样位移被撤回（默认值被改 / 位移拆掉 / 两层同尺度）
+  L  压暗层被撤回（TRAE 纵向渐变 / 旧版开关 / 中间段不透明度）
   F  改版外溢到登录页
   G  安全面 / 加载顺序 / 占位符
 
@@ -135,6 +137,7 @@ PIX = os.path.join('backend', 'static', 'pixelfield.js')
 PJS = os.path.join('backend', 'static', 'portal.js')
 PHT = os.path.join('backend', 'static', 'portal.html')
 GW = os.path.join('backend', 'auth_gateway.py')
+CSSF = os.path.join('backend', 'static', 'base.css')
 
 # 白名单那一行（auth_gateway.py:211-212）
 WL = ('    "base.css", "fingerprint.js", "login.html", "login.js",\n'
@@ -403,8 +406,8 @@ MUTATIONS = [
      '            : (Math.sin(t * dRate + dphase[idx]) * dth + rJit[idx] * jitAmp);',
      'var off = (Math.sin(t * dRate + dphase[idx]) * dth + rJit[idx] * jitAmp);'),
     ('N-118', '域扭曲被拆掉（流场退化成轴对齐的方块簇）', PIX,
-     'qf = sample(tex, NOISE_N, ubq + qxq * p.flowWarp, vbq + qyq * p.flowWarp);',
-     'qf = sample(tex, NOISE_N, ubq, vbq);'),
+     'qf = sample(tex, NOISE_N, uf + qxq * p.flowWarp, vf + qyq * p.flowWarp);',
+     'qf = sample(tex, NOISE_N, uf, vf);'),
     ('N-119', '流场开关恒为假（流场代码成了死代码）', PIX,
      'var useFlow = p.pixelQuant > 0 && p.flowDensity > 0;', 'var useFlow = false;'),
     ('N-120', 'pixel-flow 档被改掉名字（整档找不到了）', PIX,
@@ -414,7 +417,7 @@ MUTATIONS = [
     ('N-122', 'mint 色板的强调色被改（不再是 TRAE 的 #32F08C）', PIX,
      'accent: [50, 240, 140]', 'accent: [50, 200, 140]'),
     ('N-123', 'pixel-flow 的阈值被改（密度对不上 TRAE）', PIX,
-     'pixelThresh: 0.76,', 'pixelThresh: 0.87,'),
+     'pixelThresh: 0.88,', 'pixelThresh: 0.87,'),
     ('N-124', 'pixel-flow 的域扭曲强度被改（形状退回方块簇）', PIX,
      'flowWarp: 0.50,', 'flowWarp: 0.10,'),
     ('N-125', 'pixel-flow 的阈值抖动被改（绿白比完全对不上 TRAE）', PIX,
@@ -457,6 +460,54 @@ MUTATIONS = [
      '            if (a1 < 0) a1 = 0; else if (a1 > 1) a1 = 1;'),
     ('N-134', '量化模式又用回迟滞（1→0 被压成 1→0.965 ⇒ 又变灰度）', PIX,
      'if (!quant) {', 'if (true) {'),
+
+    # ── K. TRAE 式显式取样位移被撤回（2026-11-03 点位规律逆向）──────
+    # 起因：实测证明 TRAE 的点**从来不移动**（trae-lattice.js：亮像素 100%
+    # 落在 7px 晶格的 5×5 格实体内、6 帧相位恒为 (1,3)）。
+    # 动的是「每格去哪儿取色」⇒ 引擎必须拆成「颜色场 + 位移场」两层。
+    #
+    # 危险退化同型：把新参数默认值改成非 0 ⇒ 破坏「不传时逐位一致」；
+    # 把位移拆掉 ⇒ 画面悄悄退回「一层场」，代码照样跑、单测容易全绿。
+    ('N-135', 'fieldDensity 默认值从 0 改成 0.125（不传就改颜色场尺度）', PIX,
+     '    fieldDensity: 0,', '    fieldDensity: 0.125,'),
+    ('N-136', 'flowDispX 默认值从 0 改成 10（不传就有横向位移）', PIX,
+     '    flowDispX: 0,', '    flowDispX: 10,'),
+    ('N-137', 'flowDispY 默认值从 0 改成 70（不传就有纵向位移）', PIX,
+     '    flowDispY: 0,', '    flowDispY: 70,'),
+    ('N-138', '位移改成双向抖动（去掉 +1 再 /2 ⇒ 抖动，不是 TRAE 的单向拖曳）', PIX,
+     'du = (dbx + 1) * 0.5 * p.flowDispX / w;',
+     'du = dbx * p.flowDispX / w;'),
+    ('N-139', '位移场改用颜色场的尺度（两层同尺度 ⇒ 采到同一片噪声、互相抵消）', PIX,
+     'var ub = sxq * p.flowDensity, vb = syq * p.flowDensity;',
+     'var ub = sxq * Df, vb = syq * Df;'),
+    ('N-140', '颜色场不在位移后的位置求值（点就跟着内容一起动了 ⇒ 不是 TRAE）', PIX,
+     'var uf = (sxq - du) * Df, vf = (syq - dv) * Df;',
+     'var uf = sxq * Df, vf = syq * Df;'),
+    ('N-141', '位移分支整个跳过（位移成了死代码）', PIX,
+     'var useDisp = (p.flowDispX > 0 || p.flowDispY > 0);',
+     'var useDisp = false;'),
+    ('N-142', 'pixel-flow 的 flowDensity 被改（0.375 是 TRAE density 1.5 的换算值）', PIX,
+     'flowDensity: 0.375,', 'flowDensity: 0.25,'),
+    ('N-143', 'pixel-flow 的 fieldDensity 被改（两层尺度必须不同）', PIX,
+     'fieldDensity: 0.125,', 'fieldDensity: 0.375,'),
+    ('N-144', 'pixel-flow 的横向位移被关掉', PIX,
+     'flowDispX: 10,', 'flowDispX: 0,'),
+    ('N-145', 'pixel-flow 的纵向位移被关掉', PIX,
+     'flowDispY: 70,', 'flowDispY: 0,'),
+
+    # ── L. 压暗层被撤回（TRAE 纵向渐变 + 开关）───────────────────
+    ('N-146', '压暗层退回旧版的 radial 叠加（TRAE 的纵向渐变被换掉）', CSSF,
+     '  background: linear-gradient(\n'
+     '    var(--scrim-c) var(--scrim-a),\n'
+     '    var(--scrim-m) var(--scrim-b),\n'
+     '    var(--scrim-m) var(--scrim-d),\n'
+     '    var(--scrim-c) 100%);',
+     '  background: radial-gradient(58% 48% at 34% 20%,\n'
+     '    rgba(10, 10, 11, .94) 0%, rgba(10, 10, 11, .22) 100%);'),
+    ('N-147', '压暗层的旧版开关被删（切不回去了）', CSSF,
+     'body.pix-scrim-legacy .pix-scrim {', 'body.pix-scrim-legacy2 .pix-scrim {'),
+    ('N-148', '压暗层中间段的不透明度被改（不再是 TRAE 的 60%）', CSSF,
+     '  --scrim-m: rgba(12, 12, 12, .6);', '  --scrim-m: rgba(12, 12, 12, .9);'),
 
     # ── F. 改版外溢到登录页 ──
     ('N-57', '登录页那一档的波速被改成门户参数（改版外溢）', PIX,

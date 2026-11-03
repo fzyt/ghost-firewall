@@ -28,6 +28,8 @@
   PF-21 规整量化点阵（借鉴 TRAE 首页：连续场硬阈值 + 按块随机绿白二选一）
   PF-22 pixel-flow 新档独立存在，现有各档一字未动
   PF-23 硬边改造（要么亮要么不亮：alpha 斜坡 / 余晖 / 迟滞三处同改）
+  PF-24 TRAE 式显式取样位移（点位规律逆向：点不动、内容错位）
+  PF-25 压暗层改 TRAE 纯纵向渐变 + 保留开关
 
 不碰网络、不碰真实配置：全部是源码文本解析 + node --check 语法校验。
 """
@@ -808,9 +810,9 @@ check('量化模式关掉每格抖动偏移（off = 0，否则点阵还是随机
 # 域扭曲流场：TRAE 的观感真正来源。
 # 不用它 ⇒ 值噪声的轴对齐晶格 ⇒ 亮点连成方块簇（2026-11-03 实测）。
 check('流场走 TRAE 同款的域扭曲（q 两条通道先采样再掰坐标）',
-      'var qxq = sample(tex, NOISE_N, ubq, vbq + 0.05 * ftq);' in PIXELFIELD and
-      'var qyq = sample(tex, NOISE_N, ubq + 0.30, vbq - 0.0375 * ftq);' in PIXELFIELD and
-      'qf = sample(tex, NOISE_N, ubq + qxq * p.flowWarp, vbq + qyq * p.flowWarp);' in PIXELFIELD)
+      'var qxq = sample(tex, NOISE_N, uf, vf + 0.05 * ftq);' in PIXELFIELD and
+      'var qyq = sample(tex, NOISE_N, uf + 0.30, vf - 0.0375 * ftq);' in PIXELFIELD and
+      'qf = sample(tex, NOISE_N, uf + qxq * p.flowWarp, vf + qyq * p.flowWarp);' in PIXELFIELD)
 check('流场开关提到逐格循环外（每步只取决于参数）',
       re.search(r'var useFlow = p\.pixelQuant > 0 && p\.flowDensity > 0;', PIXELFIELD) is not None)
 
@@ -825,8 +827,8 @@ check('pixel-flow 用的是新调的色板 mint（不是复用 gate / moonstone�
 check('mint 色板的取色直接来自 TRAE 的 uniform 真值（青绿 #32F08C）',
       re.search(r'accent:\s*\[50,\s*240,\s*140\]', PIXELFIELD) is not None)
 check('pixel-flow 开了规整量化', re.search(r'pixelQuant:\s*1,', pix) is not None)
-check('pixel-flow 开了 TRAE 同款绿白二选一（绿占 49%）',
-      re.search(r'pixelGreen:\s*0\.49,', pix) is not None)
+check('pixel-flow 开了 TRAE 同款绿白二选一（绿占 56%）',
+      re.search(r'pixelGreen:\s*0\.56,', pix) is not None)
 # ⚠ 这条是踩过坑才补的：变异脚本按「第一个匹配」替换，
 #   而 pixelBlend: 0, 在**档位**和**默认参数表**里各有一处（档位在前）
 #   ⇒ 之前那条变异改到的是档位，而档位级没有断言 ⇒ 漏网。
@@ -836,12 +838,13 @@ check('pixel-flow 默认用「按块随机二选一」而不是连续插值（pi
       re.search(r'pixelBlend:\s*0,', pix) is not None)
 check('pixel-flow 开了阈值按块抖动（0.36 = TRAE 0.08 在亮度域的等价幅度）',
       re.search(r'pixelJitter:\s*0\.36,', pix) is not None)
-check('pixel-flow 开了域扭曲流场', re.search(r'flowDensity:\s*0\.25,', pix) is not None)
+check('pixel-flow 开了域扭曲流场', re.search(r'flowDensity:\s*0\.375,', pix) is not None)
 check('pixel-flow 的域扭曲强度与漂移速度定档',
       re.search(r'flowWarp:\s*0\.50,', pix) is not None and
       re.search(r'flowSpeed:\s*0\.020,', pix) is not None)
-check('pixel-flow 的阈值定档 0.76（TRAE 0.87 在亮度域换算过来是 0.70，实测调到 0.76）',
-      re.search(r'pixelThresh:\s*0\.76,', pix) is not None)
+check('pixel-flow 的阈值定档 0.88（TRAE 0.87 在亮度域换算过来是 0.70，'
+      '实测按同口径指标调到 0.88）',
+      re.search(r'pixelThresh:\s*0\.88,', pix) is not None)
 check('pixel-flow 把点提前到满亮度（TRAE 的像素块是满亮度的）',
       re.search(r'accentT:\s*0\.08,', pix) is not None)
 check('pixel-flow 加密了网格（columns=190 ⇒ 1440 宽下 cell = 8px）',
@@ -896,6 +899,76 @@ check('硬边改造只挂在 quant 分支上（老档走的 else 分支一字未
 check('硬边模式的切点取 tLo1（accentT - fade/2，落在原斜坡刚满亮处）',
       re.search(r'var tLo1 = p\.accentT - half, tLo2 = p\.whiteT - half;',
                 PIXELFIELD) is not None)
+
+# ─────────────────────────────────────────────────────────────
+sec('PF-24 TRAE 式显式取样位移（2026-11-03 点位规律逆向）')
+
+# ★ 这一批的起因：实测证明 TRAE 的点**从来不移动**。
+#   探针 /tmp/portal-preview/trae-lattice.js：把 TRAE 首页背景裁一块，
+#   按 (x mod 7) / (y mod 7) 给亮像素分桶 ⇒
+#     残差 0 与 6 **恒为 0**、残差 1..5 计数几乎完全相等
+#     ⇒ 100% 的亮像素落在 7px 晶格的 5×5 格实体内
+#     6 帧的最优相位**恒为 (1,3)** ⇒ 晶格相位从未变过
+#   ⇒ 动的是「每格去哪儿取色」，不是点的位置。
+check('引擎新增 fieldDensity 参数（颜色场尺度，默认 0 ⇒ 沿用 flowDensity）',
+      re.search(r'^\s+fieldDensity:\s*0,', PARAMS_BODY, re.M) is not None)
+check('引擎新增 flowDispX / flowDispY 参数（取样位移 px，默认全 0）',
+      re.search(r'^\s+flowDispX:\s*0,', PARAMS_BODY, re.M) is not None and
+      re.search(r'^\s+flowDispY:\s*0,', PARAMS_BODY, re.M) is not None)
+# 位移是**单向**的：TRAE 的 q ∈ [0.06,0.94] 恒正 ⇒ 位移恒正（拖曳，不是抖动）。
+check('取样位移把噪声从 [-1,1] 映射到 [0,1]（+1 再 /2 ⇒ 恒正，像 TRAE）',
+      re.search(r'du = \(dbx \+ 1\) \* 0\.5 \* p\.flowDispX / w;', PIXELFIELD) is not None and
+      re.search(r'dv = \(dby \+ 1\) \* 0\.5 \* p\.flowDispY / h;', PIXELFIELD) is not None)
+# 位移场与颜色场必须**尺度不同**（TRAE: density 1.5 vs 0.5），
+# 否则两层采到同一片噪声、互相抵消。
+check('颜色场尺度与位移场尺度解耦（fieldDensity 独立于 flowDensity）',
+      re.search(r'var Df = p\.fieldDensity > 0 \? p\.fieldDensity : p\.flowDensity;',
+                PIXELFIELD) is not None)
+check('位移场用自己的 flowDensity 采样（不是拿颜色场的尺度）',
+      re.search(r'var ub = sxq \* p\.flowDensity, vb = syq \* p\.flowDensity;',
+                PIXELFIELD) is not None)
+# 位移后的位置再求颜色场 —— 这就是 TRAE「点不动、内容错位」的核心。
+check('颜色场在**位移后**的位置求值（点不动、内容错位）',
+      re.search(r'var uf = \(sxq - du\) \* Df, vf = \(syq - dv\) \* Df;',
+                PIXELFIELD) is not None)
+# ⚠ 位移没开时必须整段跳过 ⇒ 逐位一致。
+check('位移默认关闭（flowDispX/Y 全 0 ⇒ 整段跳过 ⇒ 逐位一致）',
+      re.search(r'if \(useDisp\) \{', PIXELFIELD) is not None and
+      re.search(r'var useDisp = \(p\.flowDispX > 0 \|\| p\.flowDispY > 0\);',
+                PIXELFIELD) is not None)
+# 单位换算：TRAE density=d ↔ 本引擎 D = 0.25×d（噪声贴图基频周期 0.25 贴图单位）
+check('pixel-flow 的 flowDensity 定档 0.375（TRAE density 1.5 ⇒ 0.25×1.5）',
+      re.search(r'flowDensity:\s*0\.375,', pix) is not None)
+check('pixel-flow 的 fieldDensity 定档 0.125（TRAE density 0.5 ⇒ 0.25×0.5）',
+      re.search(r'fieldDensity:\s*0\.125,', pix) is not None)
+check('pixel-flow 开了 TRAE 式取样位移（横向 10px / 纵向 70px）',
+      re.search(r'flowDispX:\s*10,', pix) is not None and
+      re.search(r'flowDispY:\s*70,', pix) is not None)
+# 阈值与绿占比：2026-11-03 按实测同口径指标重新定档
+# （TRAE 实测 lit 5.4~7.2% / 绿 27~31.5%）。
+check('pixel-flow 的阈值定档 0.88（实测与 TRAE 的亮区密度对上）',
+      re.search(r'pixelThresh:\s*0\.88,', pix) is not None)
+check('pixel-flow 的绿占比定档 0.56（实测绿占比与 TRAE 的 27~31.5% 对上）',
+      re.search(r'pixelGreen:\s*0\.56,', pix) is not None)
+
+# ─────────────────────────────────────────────────────────────
+sec('PF-25 压暗层改 TRAE 纯纵向渐变 + 保留开关')
+
+# TRAE 的压暗层是从浏览器计算样式里读出来的原文：
+#   linear-gradient(rgb(12,12,12) 0%, rgba(12,12,12,.6) 30%,
+#                   rgba(12,12,12,.6) 60%, rgb(12,12,12) 100%)
+CSS = read('base.css')
+check('压暗层用的是 TRAE 的纵向渐变（上下全封、中间 30%~60% 段 60% 不透明）',
+      re.search(r'linear-gradient\(\s*var\(--scrim-c\) var\(--scrim-a\),\s*'
+                r'var\(--scrim-m\) var\(--scrim-b\),\s*'
+                r'var\(--scrim-m\) var\(--scrim-d\),\s*'
+                r'var\(--scrim-c\) 100%\)', CSS) is not None)
+check('压暗层的停靠点做成了 CSS 变量（可调深浅/位置而不用改规则）',
+      re.search(r'--scrim-c:\s*rgb\(12, 12, 12\);', CSS) is not None and
+      re.search(r'--scrim-m:\s*rgba\(12, 12, 12, \.6\);', CSS) is not None)
+check('旧版压暗层保留在 body.pix-scrim-legacy 下（能切回去）',
+      re.search(r'body\.pix-scrim-legacy \.pix-scrim \{', CSS) is not None and
+      'radial-gradient(58% 48% at 34% 20%' in CSS)
 
 
 print()
