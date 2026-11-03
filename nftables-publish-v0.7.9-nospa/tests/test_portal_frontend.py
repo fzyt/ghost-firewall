@@ -25,6 +25,9 @@
   PF-18 门户页该引的都引了
   PF-19 方向游走走「平滑解析式」（不是噪声切片）
   PF-20 方向场绕画布中心转（不是绕左上角）
+  PF-21 规整量化点阵（借鉴 TRAE 首页：连续场硬阈值 + 按块随机绿白二选一）
+  PF-22 pixel-flow 新档独立存在，现有各档一字未动
+  PF-23 硬边改造（要么亮要么不亮：alpha 斜坡 / 余晖 / 迟滞三处同改）
 
 不碰网络、不碰真实配置：全部是源码文本解析 + node --check 语法校验。
 """
@@ -751,6 +754,149 @@ check('旋转中心只在方向场生效时才偏移（否则原路径被改 ⇒
       re.search(r'if \(useField && p\.dirPivot > 0\)', PIXELFIELD) is not None)
 check('法线坐标带上了旋转中心',
       re.search(r'var uy = \(px - pivX\) \* wsn \+ \(py - pivY\) \* wcn;', PIXELFIELD) is not None)
+
+# ─────────────────────────────────────────────────────────────
+sec('PF-21 规整量化点阵（借鉴 TRAE 首页，2026-11-03）')
+
+# 这一批做的是「**独立一档**」：moonstone / gate / moonstone-swirl / moonstone-flow
+# 一个字节都没动，新增的参数默认值全为 0 ⇒ 不传时逐位一致。
+check('引擎新增 pixelQuant 参数（默认 0 ⇒ 走老路，逐位一致）',
+      re.search(r'^\s+pixelQuant:\s*0,', PARAMS_BODY, re.M) is not None)
+check('引擎新增 pixelThresh 参数（默认 0）',
+      re.search(r'^\s+pixelThresh:\s*0\.0,', PARAMS_BODY, re.M) is not None)
+check('引擎新增 pixelBlend 参数（默认 0）',
+      re.search(r'^\s+pixelBlend:\s*0,', PARAMS_BODY, re.M) is not None)
+check('引擎新增 pixelGreen 参数（默认 0）',
+      re.search(r'^\s+pixelGreen:\s*0,', PARAMS_BODY, re.M) is not None)
+check('引擎新增 pixelJitter 参数（默认 0）',
+      re.search(r'^\s+pixelJitter:\s*0,', PARAMS_BODY, re.M) is not None)
+check('引擎新增 columns 参数（默认 0 ⇒ 用 opt.columns）',
+      re.search(r'^\s+columns:\s*0,', PARAMS_BODY, re.M) is not None)
+check('引擎新增 flowDensity / flowWarp / flowSpeed 三个流场参数（默认全 0）',
+      re.search(r'^\s+flowDensity:\s*0,', PARAMS_BODY, re.M) is not None and
+      re.search(r'^\s+flowWarp:\s*0,', PARAMS_BODY, re.M) is not None and
+      re.search(r'^\s+flowSpeed:\s*0,', PARAMS_BODY, re.M) is not None)
+
+# 网格密度：p.columns 优先于 opt.columns。
+# ⚠ 这条踩过坑：cell = SS * max(2, round(w / COLUMNS / SS))，
+#   在 800px 画布上 COLUMNS=118 与 190 都 round 到 cell=8 ⇒ 网格一模一样。
+#   探针曾据此报出「columns 没生效」的假结论 ⇒ 用例必须在 1440 宽上验。
+check('网格密度由 p.columns 决定（档位可以覆盖 opt.columns）',
+      re.search(r'var COLUMNS = p\.columns > 0 \? \(p\.columns \| 0\) : \(opt\.columns \|\| 112\);',
+                PIXELFIELD) is not None)
+
+# 量化模式的三条机制（照 TRAE 的 e1MainImage 着色器真值）：
+#   ① 不用每格随机门槛 ⇒ 点的存在由连续场 > 阈值决定
+#   ② 阈值按块随机抖动（dynamicThreshold = e1Threshold - 0.08 * rand）
+#   ③ 颜色按块随机二选一（绿/白），不是按场值连续插值
+check('量化模式下点由「连续场 > 阈值」决定（不是每格随机门槛 rSel）',
+      re.search(r'var qth = \(p\.pixelThresh > 0 \? p\.pixelThresh : 0\.5\) \* 2 - 1;',
+                PIXELFIELD) is not None and
+      'if (qf > qth) {' in PIXELFIELD)
+check('阈值按块随机抖动（TRAE 的 dynamicThreshold = e1Threshold - 0.08 * rand）',
+      re.search(r'if \(p\.pixelJitter > 0\) qth -= p\.pixelJitter \* rSel\[idx\];',
+                PIXELFIELD) is not None)
+check('颜色按块随机二选一（绿/白），用每格稳定的 rSel 当 rand',
+      re.search(r'if \(rSel\[idx\] < p\.pixelGreen\) \{', PIXELFIELD) is not None)
+check('量化模式只画一层（两档叠加会把插值/二选一冲掉）',
+      re.search(r'if \(!blend && !greenBin && a2 > 0\.002\) \{', PIXELFIELD) is not None)
+check('量化模式下伺服不参与（选点不吃 pickGain，伺服是空转）',
+      re.search(r'if \(p\.pixelQuant > 0\) return 0;', PIXELFIELD) is not None)
+check('量化模式关掉每格抖动偏移（off = 0，否则点阵还是随机疏密）',
+      re.search(r'var off = quant \? 0', PIXELFIELD) is not None)
+
+# 域扭曲流场：TRAE 的观感真正来源。
+# 不用它 ⇒ 值噪声的轴对齐晶格 ⇒ 亮点连成方块簇（2026-11-03 实测）。
+check('流场走 TRAE 同款的域扭曲（q 两条通道先采样再掰坐标）',
+      'var qxq = sample(tex, NOISE_N, ubq, vbq + 0.05 * ftq);' in PIXELFIELD and
+      'var qyq = sample(tex, NOISE_N, ubq + 0.30, vbq - 0.0375 * ftq);' in PIXELFIELD and
+      'qf = sample(tex, NOISE_N, ubq + qxq * p.flowWarp, vbq + qyq * p.flowWarp);' in PIXELFIELD)
+check('流场开关提到逐格循环外（每步只取决于参数）',
+      re.search(r'var useFlow = p\.pixelQuant > 0 && p\.flowDensity > 0;', PIXELFIELD) is not None)
+
+# ─────────────────────────────────────────────────────────────
+sec('PF-22 pixel-flow 新档（借鉴 TRAE，独立于现有各档）')
+
+pix = entry_block(STYLES_BODY, 'pixel-flow')
+check('pixel-flow 档存在', bool(pix))
+check('pixel-flow 用的是新调的色板 mint（不是复用 gate / moonstone）',
+      re.search(r"palette:\s*'mint'", pix) is not None and
+      "mint:" in PIXELFIELD)
+check('mint 色板的取色直接来自 TRAE 的 uniform 真值（青绿 #32F08C）',
+      re.search(r'accent:\s*\[50,\s*240,\s*140\]', PIXELFIELD) is not None)
+check('pixel-flow 开了规整量化', re.search(r'pixelQuant:\s*1,', pix) is not None)
+check('pixel-flow 开了 TRAE 同款绿白二选一（绿占 49%）',
+      re.search(r'pixelGreen:\s*0\.49,', pix) is not None)
+# ⚠ 这条是踩过坑才补的：变异脚本按「第一个匹配」替换，
+#   而 pixelBlend: 0, 在**档位**和**默认参数表**里各有一处（档位在前）
+#   ⇒ 之前那条变异改到的是档位，而档位级没有断言 ⇒ 漏网。
+#   语义上也要钉死：TRAE 的颜色是「按块随机二选一」，
+#   连续插值只是保留的备选开关（pixelBlend=1），不是这一档的默认。
+check('pixel-flow 默认用「按块随机二选一」而不是连续插值（pixelBlend = 0）',
+      re.search(r'pixelBlend:\s*0,', pix) is not None)
+check('pixel-flow 开了阈值按块抖动（0.36 = TRAE 0.08 在亮度域的等价幅度）',
+      re.search(r'pixelJitter:\s*0\.36,', pix) is not None)
+check('pixel-flow 开了域扭曲流场', re.search(r'flowDensity:\s*0\.25,', pix) is not None)
+check('pixel-flow 的域扭曲强度与漂移速度定档',
+      re.search(r'flowWarp:\s*0\.50,', pix) is not None and
+      re.search(r'flowSpeed:\s*0\.020,', pix) is not None)
+check('pixel-flow 的阈值定档 0.76（TRAE 0.87 在亮度域换算过来是 0.70，实测调到 0.76）',
+      re.search(r'pixelThresh:\s*0\.76,', pix) is not None)
+check('pixel-flow 把点提前到满亮度（TRAE 的像素块是满亮度的）',
+      re.search(r'accentT:\s*0\.08,', pix) is not None)
+check('pixel-flow 加密了网格（columns=190 ⇒ 1440 宽下 cell = 8px）',
+      re.search(r'columns:\s*190,', pix) is not None)
+check('pixel-flow 沿用 moonstone-flow 的随机换向与随机变速',
+      re.search(r'dirTurnPeriod:\s*8,', pix) is not None and
+      re.search(r'speedTurnPeriod:\s*6,', pix) is not None)
+# 现有各档必须一字不动 —— 新档是「另外一份」，不是把老档改了。
+check('moonstone 档没被这一批动过（登录页视觉零变化）',
+      entry_block(STYLES_BODY, 'moonstone') != '' and
+      'pixelQuant' not in entry_block(STYLES_BODY, 'moonstone'))
+check('moonstone-flow 档没被这一批动过（现有门户档保持原样）',
+      'pixelQuant' not in entry_block(STYLES_BODY, 'moonstone-flow'))
+check('moonstone-swirl 档没被这一批动过（回退档保持原样）',
+      'pixelQuant' not in entry_block(STYLES_BODY, 'moonstone-swirl'))
+check('gate 档没被这一批动过',
+      'pixelQuant' not in entry_block(STYLES_BODY, 'gate'))
+
+# ─────────────────────────────────────────────────────────────
+sec('PF-23 硬边改造：要么亮，要么不亮（2026-11-03 用户要求）')
+
+# 用户原话：「我看目前有一些灰度和亮的交接，类似于水打上去的印记一样，
+#           我想要么亮，要么不亮，分界明显一点」。
+#
+# 柔边是三件套叠出来的，量化模式下必须**三件全关**，缺一件就露馅：
+#   ① alpha 斜坡：a1 = (vv - tLo1) / fade ⇒ 值域 0..1 ⇒ 中间灰
+#   ② 余晖衰减  ：peak 留着旧值慢慢衰减 ⇒ 刚熄灭的点还亮着 ⇒ 拖尾是渐变
+#   ③ 迟滞限速  ：alpha 下降按帧限速 ⇒ 1 → 0.965 → … ⇒ 又变灰度
+#
+# ⚠ 只关 ① 不够：余晖会把已经熄灭的格继续顶在阈值之上，硬边做不出来。
+#   这三条断言一起钉住「三处同改」这个事实。
+# ⚠ 这层是**静态**断言（代码写了什么）；真正的「画面有没有中间灰」
+#   由 tests/test_pixelfield_hardedge.js 真跑引擎读像素来验。
+check('量化模式下 alpha 是硬开关（不是连续斜坡）',
+      re.search(r'a1 = vv > tLo1 \? 1 : 0;', PIXELFIELD) is not None)
+check('量化模式下不出辉光层（TRAE 那边同样没有辉光）',
+      re.search(r'a2 = 0;\n\s+\} else \{', PIXELFIELD) is not None)
+check('量化模式不留余晖（peak 直接取 band，不做衰减）',
+      re.search(r'var e = quant \? band : \(band > prev \? band : prev \* p\.trail\);',
+                PIXELFIELD) is not None)
+check('量化模式整段跳过迟滞（迟滞会把 1→0 压成渐变）',
+      re.search(r'if \(!quant\) \{\n\s+if \(a1 < aPrev\[idx\]\) \{', PIXELFIELD) is not None)
+# 硬边模式没有「半亮」这一态 ⇒ 迟滞的载体 aPrev/wPrev 在量化模式下
+# 只会拿到 0 或 1，两处赋值必须都还在（否则迟滞块被误删成空壳）。
+check('迟滞被跳过时 aPrev / wPrev 仍照常落值（不是死代码）',
+      re.search(r'aPrev\[idx\] = a1;\n\s+wPrev\[idx\] = a2;', PIXELFIELD) is not None)
+# 硬边改造**不能**外溢到现有各档：那几个档没开 pixelQuant，
+# 走的是 else 分支 ⇒ 行为逐位不变。
+check('硬边改造只挂在 quant 分支上（老档走的 else 分支一字未动）',
+      re.search(r'if \(quant\) \{\n\s+/\* ⚠ 量化模式是\*\*硬开关\*\*', PIXELFIELD) is not None)
+# 切点语义变了：硬边下 accentT 不再管「亮度」，只管「从哪儿开始算亮」。
+check('硬边模式的切点取 tLo1（accentT - fade/2，落在原斜坡刚满亮处）',
+      re.search(r'var tLo1 = p\.accentT - half, tLo2 = p\.whiteT - half;',
+                PIXELFIELD) is not None)
+
 
 print()
 if FAIL:

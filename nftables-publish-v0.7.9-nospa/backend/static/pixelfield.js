@@ -59,6 +59,12 @@
     dusk:      { bg: [8, 8, 16],    accent: [106, 104, 176], white: [232, 230, 250], bloom: [130, 128, 214] },
     ember:     { bg: [12, 9, 8],    accent: [162, 122, 76],  white: [247, 232, 210], bloom: [214, 158, 92] },
     violet:    { bg: [9, 7, 15],    accent: [130, 104, 196], white: [240, 236, 252], bloom: [152, 124, 224] },
+    /* ── 薄荷（借鉴 TRAE 首页，2026-11-03）────────────────────
+       取值直接来自 TRAE 运行时截获的着色器 uniform 真值：
+         uColor1 = rgb(50, 240, 140)  uColor2 = rgb(255, 255, 255)
+         页面底色 = rgb(10, 11, 13)
+       ⇒ 青绿↔白双色，点阵在深底上。 */
+    mint:      { bg: [10, 11, 13],  accent: [50, 240, 140],  white: [255, 255, 255], bloom: [70, 200, 140] },
   };
 
   /* ══════════════════════════════════════════════════════════
@@ -164,6 +170,103 @@
         speedRange: 0.55,
         /* 旋转中心：0 = 原点（与原版逐位一致）、1 = 画布中心（四周流速均匀）。
            默认取 0 ⇒ 保持「只换方向与速度、几何一字不改」的承诺。 */
+        dirPivot: 0,
+        lit: 0.12,
+      },
+    },
+    /* ── 像素流（借鉴 TRAE 首页，2026-11-03）──────────────────
+     *
+     * 这是**独立的一档**，moonstone / moonstone-flow 一字未动 ——
+     * 用户要求「复制当前方案，单独做一份借鉴方案」。
+     *
+     * TRAE 首页那套是怎么做的（hook WebGL2 截获的着色器真值，
+     * 不是看图猜的）：
+     *   ① 连续噪声场（simplex + 3 层 FBM + domain warping）
+     *      uDensity=0.5  uSpeed=0.18  uFrequency=4
+     *   ② 像素化后处理：**硬阈值**切成规整点阵
+     *      e1PixelSize=5  e1PixelGap=2  e1Threshold=0.87
+     *   ③ 颜色按同一个场连续插值 uColor1=rgb(50,240,140) → 白
+     *
+     * 与本引擎原来做法的**核心差别**：
+     *   原来 = 每格一个固定随机门槛（rSel）⇒ 点是**随机散点**
+     *          ⇒ 看着像「一块一块各自生成」，不像「设计过的像素艺术」
+     *   这一档 = 连续场 > 阈值 ⇒ 点是**规整网格**上的硬切结果
+     *
+     * 几何仍照抄原版 moonstone（三道波的 k/om/off/w 一字未改），
+     * 方向与速度沿用 moonstone-flow 的随机换向 + 随机变速。
+     * ⚠ 鼠标交互**不做**（用户明确不要）。 */
+    'pixel-flow': {
+      label: '像素流 Pixel',
+      note: '借鉴 TRAE 首页：规整点阵（连续场硬阈值）+ 青绿↔白双色插值。',
+      palette: 'mint',
+      params: {
+        waves: [
+          /* ⚠ dirField>0 时 dir 是**相对共享方向的偏角**（不是绝对角），
+             偏角 0 / +0.05 / -0.05 ⇒ 与原版的 -0.30 / -0.25 / -0.35 等价。 */
+          { k: 0.00580, om: 0.504, off: 0.00, dir:  0.00, w: 1.00 },
+          { k: 0.00625, om: 0.563, off: 2.10, dir:  0.05, w: 0.90 },
+          { k: 0.00545, om: 0.454, off: 4.20, dir: -0.05, w: 0.78 },
+        ],
+        distortAmp: 0.85,
+        /* ── 网格加密 ──────────────────────────────────────
+           1440 / 190 ⇒ cell = 8px（默认 118 列 ⇒ 12px）。
+           TRAE 的点阵周期是 5px 点 + 2px 间隙 = 7px，
+           我们 8px 周期 + 2px 间隙 ⇒ 密度接近。 */
+        columns: 190,
+        /* 点占 cell 的 3/4（3 亚像素 / 4）= 75%，
+           TRAE 是 5/7 = 71% ⇒ 接近。 */
+        pxBody: 3,
+        pxCrest: 3,
+        /* 规整量化：去掉每格随机门槛 / 随机亮度因子 / 抖动。 */
+        pixelQuant: 1,
+        /* 阈值（0~1 表述，引擎内部换算到噪声域 -1..1）。
+           TRAE 的 e1Threshold = 0.87，它作用在**亮度域**：
+             brightness = 0.562 + 0.438 * noise  （noise ∈ [0,1]）
+             ⇒ noise > (0.87 - 0.562) / 0.438 = 0.703
+           换算到本引擎的 [-1,1] 域：0.703 ⇒ pixelThresh = (0.703+1)/2 = 0.70。
+           实测本引擎的域分布与 TRAE 略有差异，最终取 0.76（实测密度对得上）。 */
+        pixelThresh: 0.76,
+        /* ── TRAE 像素化着色器的另两条 ──────────────────────────
+           ① 阈值按块随机抖动：dynamicThreshold = e1Threshold - 0.08 * rand
+              换算：TRAE 的 0.08 在亮度域（跨度 0.438）⇒ 本引擎 [-1,1] 域
+              里的等价幅度 = 0.08 × (2 / 0.438) ≈ 0.365。
+              ⚠ 这个值**不是可有可无的**：TRAE 的绿白是**同一个 rand** 定的，
+                rand 小 ⇒ 阈值高 ⇒ 绿块更容易被淘汰 ⇒ 白块占绝对多数。
+                实测：抖动 0.12 ⇒ 绿占 39%；抖动 0.36 ⇒ 绿占 19%（TRAE 是 17%）。
+           ② 颜色按块随机二选一（绿 / 白），绿占 49%（TRAE e1GreenRatio=0.49）
+           ⚠ **不是**按场值连续插值 —— TRAE 着色器里唯一的连续 mix
+             出现在鼠标交互那两处，而用户明确说不要鼠标交互。 */
+        pixelJitter: 0.36,
+        pixelGreen: 0.49,
+        /* ── TRAE 同款流场（域扭曲 FBM）─────────────────────
+           域扭曲是 TRAE 那个观感的**真正来源**：
+           不用它 ⇒ 亮点是轴对齐的方块簇（值噪声的晶格形状）；
+           用了它 ⇒ 等值线被掰成有机曲线，跟 TRAE 一个路子。
+           flowDensity = 0.25：屏幕宽 = 0.25 贴图单位
+           flowWarp = 0.5：域扭曲强度（TRAE 名义值 4，换算到贴图单位是 1.0，
+                            这里取一半，等值线不至于扭成一团）
+           flowSpeed = 0.02：漂移速度（贴图单位/秒） */
+        flowDensity: 0.25,
+        flowWarp: 0.50,
+        flowSpeed: 0.020,
+        /* ── 亮度切点：硬边模式下调的是「亮/不亮」的分界 ──────────
+           量化模式下 alpha 是**两态**的（满亮 / 全黑），没有斜坡 ⇒
+           accentT 不再管「亮度」，只管「从哪儿开始算亮」。
+           tLo1 = accentT - fade/2，取 0.08 ⇒ 切点落在原斜坡刚到满亮处
+           ⇒ **亮区大小基本不变**，只是边界从渐变变成硬边。
+           ⚠ 别把它调大：accentT 越大 ⇒ 切点越高 ⇒ 亮区越小。 */
+        accentT: 0.08,
+        /* 连续双色插值（单层绘制，颜色与点的存在同源）。
+           保留成开关：想看「按场值连续渐变」时把它开成 1。 */
+        pixelBlend: 0,
+        /* ── 随机换向 + 随机变速（沿用 moonstone-flow）───────── */
+        dirField: 1,
+        dirFieldBase: -0.30,
+        dirTurnPeriod: 8,
+        dirTurnRate: 0.16,
+        speedTurnPeriod: 6,
+        speedTurnRate: 0.18,
+        speedRange: 0.55,
         dirPivot: 0,
         lit: 0.12,
       },
@@ -411,6 +514,75 @@
      * 而 pickGain 是自适应的（按 lit 目标自动增减），
      * 调 pickSoft 或遮罩阈值都改不了这一点。 */
     pickBlock: 0,
+    /* ── 规整量化点阵（2026-11-03，借鉴 TRAE 首页）────────────
+     * 背景：TRAE 首页的像素场是「**连续噪声场 → 像素化后处理**」，
+     *   实测参数（hook WebGL2 截获的着色器真值）：
+     *     e1PixelSize=5  e1PixelGap=2  e1Threshold=0.87
+     *     uDensity=0.5   uSpeed=0.18   uFrequency=4
+     *     uColor1=rgb(50,240,140)  uColor2=白
+     *   ⇒ 它的点是**规整网格**上的硬阈值结果，颜色按场值连续插值。
+     *
+     * 本引擎原来的做法是「**每格一个固定随机门槛**」（rSel）
+     *   ⇒ 点是随机散点，看起来像「一块一块各自生成」而不是
+     *     「设计过的像素艺术」。这是两者的核心差别。
+     *
+     * pixelQuant = 1 时：
+     *   ① 不再用 rSel 随机门槛 ⇒ 亮灭只由**连续场**决定；
+     *   ② 不再用 rAmp 每格随机亮度因子、不用 jitter 抖动
+     *      ⇒ 点的亮度与颜色**完全由场**决定 ⇒ 规整、有形态；
+     *   ③ 点的存在由「遮罩噪声 n1 > pixelThresh」硬切（TRAE 同款），
+     *      颜色按波前强度在 accent↔white 之间**连续插值**（pixelBlend=1）。
+     *
+     * ⚠ 默认全为 0 ⇒ 不传时行为与改版前**逐位一致**。 */
+    pixelQuant: 0,          /* 0 = 关（走老的随机选点）；1 = 规整量化 */
+    pixelThresh: 0.0,       /* 量化阈值（0~1，作用在遮罩噪声上） */
+    pixelBlend: 0,          /* 0 = 两档色叠加；1 = 连续双色插值（单层） */
+    /* ── TRAE 像素化着色器的另外两条（2026-11-03 补）────────────
+     * 读了 TRAE 的像素化着色器真值（e1MainImage）之后补的：
+     *
+     *   float dynamicThreshold = e1Threshold - 0.08 * rand;
+     *   if (brightness > dynamicThreshold) {
+     *     if (rand < e1GreenRatio) { 绿 #32F08C } else { 白 }
+     *   }
+     *
+     * ⇒ 阈值带**按块随机抖动**（不是一刀切的硬边）；
+     * ⇒ 颜色是**按块随机二选一**（绿/白），**不是**按场值连续插值
+     *   （着色器里唯一的连续 mix 是鼠标交互那两处，用户明确不要）。
+     *
+     * ⚠ pixelGreen = 0 ⇒ 不做绿白二选一（点全是 accent 色）；
+     *   pixelJitter = 0 ⇒ 阈值不抖动（一刀切）。
+     * ⚠ 默认全为 0 ⇒ 不传时行为与改版前**逐位一致**。 */
+    pixelGreen: 0,          /* >0 = 按块随机，绿的占比（TRAE 0.49） */
+    pixelJitter: 0,         /* 阈值按块随机抖动幅度（场域 -1..1） */
+    /* ── TRAE 同款「流场」（2026-11-03）──────────────────────
+     * 为什么需要它（实测出来的）：
+     *   遮罩噪声 n1 是**值噪声**（方格晶格上的插值）⇒ 它的等值线
+     *   天然**轴对齐** ⇒ 直接拿它当阈值源，亮点连出来是**方形小块**
+     *   （实测：thr=0.65 时是一堆 5~7 格的方簇，像「一堆小方块」）。
+     *   TRAE 的流体场是 **simplex + 3 层 FBM + 域扭曲**，
+     *   域扭曲（domain warping）把坐标先扭一下再采样噪声，
+     *   等值线就被掰成**有机曲线** ⇒ 这才是 TRAE 那个观感的来源。
+     *
+     *   实现（零依赖，照抄 TRAE 的 fbm/fbm 公式）：
+     *     q.x = fbm(st*density + (0, 0.2t))
+     *     q.y = fbm(st*density + (1.2, -0.3t))
+     *     f   = fbm(st*density + q*warp)
+     *
+     *   ⚠ 单位换算（别照抄数字）：TRAE 的 simplex 噪声在 p 空间周期为 1，
+     *     本引擎的噪声贴图**基频周期是 0.25 个贴图单位**（256 贴图 / 4 倍频）
+     *     ⇒ 1 个 p 单位 = 0.25 个贴图单位。下面 flowDensity / flowWarp
+     *     都直接用**贴图单位**，不要跟 TRAE 的 uniform 名义值混着填。
+     *
+     * ⚠ flowDensity = 0 ⇒ 不启用流场，沿用遮罩噪声 n1 当阈值源。
+     * ⚠ 默认全为 0 ⇒ 不传时行为与改版前**逐位一致**。 */
+    flowDensity: 0,         /* 流场基础尺度（贴图单位 / 屏宽） */
+    flowWarp: 0,            /* 域扭曲强度（贴图单位 / 单位 q） */
+    flowSpeed: 0,           /* 流场漂移速度（贴图单位 / 秒） */
+    /* 档位自定网格密度：0 = 用 opt.columns；>0 = 自己说了算。
+     * 为什么要它：TRAE 的点阵周期是 5px 点 + 2px 间隙 = 7px，
+     * 而本引擎默认 118 列 ⇒ cell 12px ⇒ 点阵偏稀。
+     * ⚠ 默认 0 ⇒ 不传时与改版前逐位一致。 */
+    columns: 0,
     /* 亮度总增益 */
     gain: 1.0,
     /* 色阶切分：band 值 ≥ accentT 给浪身，≥ whiteT 给浪尖 */
@@ -527,7 +699,6 @@
      ══════════════════════════════════════════════════════════ */
   function create(canvas, opt) {
     opt = opt || {};
-    var COLUMNS = opt.columns || 112;
     var USE_BLOOM = opt.bloom !== false;
     var PAL_KEY = opt.palette || 'gate';
 
@@ -540,6 +711,12 @@
       }
     }
     if (opt.waves) p.waves = opt.waves;
+
+    /* ── 网格密度：档位可以自己定 ──────────────────────────
+     * p.columns > 0 ⇒ 档位说了算（TRAE 式规整点阵需要更密的网格）；
+     * 否则沿用 opt.columns。
+     * ⚠ p.columns 默认 0 ⇒ 不传时与改版前**逐位一致**。 */
+    var COLUMNS = p.columns > 0 ? (p.columns | 0) : (opt.columns || 112);
 
     var ctx = canvas.getContext('2d');
     if (!ctx) return null;
@@ -557,6 +734,11 @@
     var rAmp = new Float32Array(0);        /* 每格固定亮度因子 */
     var rJit = new Float32Array(0);        /* 每格固定值域偏移 */
     var dphase = new Float32Array(0);      /* 每格抖动相位 */
+    /* 量化模式下的**颜色系数**（=-1..1 的遮罩噪声 n1）。
+       TRAE 的颜色是 mix(color1, color2, noise) —— 位置与颜色**同源**，
+       所以这里必须把 n1 从几何步传到渲染步。
+       ⚠ 只在 pixelQuant > 0 时写，其余情况保持 0（不传 ⇒ 逐位一致）。 */
+    var qNorm = new Float32Array(0);
     /* 每道波当前的方向（sin/cos 各存一份）：方向摆动只跟时间有关，
        每步算一次就够，不必每格重复算三角函数。
        ⚠️ 用 Float64Array 而不是 Float32Array：Float32 只有 24 位有效位，
@@ -642,6 +824,7 @@
         rAmp = new Float32Array(n);
         rJit = new Float32Array(n);
         dphase = new Float32Array(n);
+        qNorm = new Float32Array(n);
         /* ⚠️ pickBlock > 0 时，**同一块里的格子共享同一个随机门槛**，
          *   亮区于是变成**实心小方块**，而不是逐格随机的点阵。
          *
@@ -867,6 +1050,10 @@
         }
       }
 
+      /* 流场开关：量化模式 + flowDensity > 0 才启用。
+         提到逐格循环外算 —— 它每步只取决于参数，不取决于格子。 */
+      var useFlow = p.pixelQuant > 0 && p.flowDensity > 0;
+
       for (var cy = 0; cy < rows; cy++) {
         var py = cy * cell + cell * 0.5;
         for (var cx = 0; cx < cols; cx++) {
@@ -955,7 +1142,51 @@
             var m1 = sstep(p.patchA1, p.patchA1 + (p.patchB1 - p.patchA1) / p.patchSoft, n1);
             var m2 = sstep(p.patchA2, p.patchA2 + (p.patchB2 - p.patchA2) / p.patchSoft, n2);
             var mask = m1 * m2;
-            if (mask < 0.08) {
+            /* ── 规整量化（pixelQuant = 1，借鉴 TRAE 首页）──────
+               TRAE 的做法是「**连续噪声场 → 阈值硬切 → 规整点阵**」，
+               点的位置与亮度**完全由场决定**，没有任何每格随机量。
+               这里照搬那三件事：
+                 ① 不乘遮罩 ⇒ 去掉「一块一块」的块状明暗
+                 ② 不用 rSel 每格随机门槛 ⇒ 用 n1 > 阈值硬切
+                 ③ 不乘 rAmp 每格随机亮度因子
+               ⚠ pixelQuant = 0（默认）⇒ 整段老路不走 ⇒ 逐位一致。 */
+            var quant = p.pixelQuant > 0;
+            if (quant) {
+              /* ── 阈值源：TRAE 同款流场（域扭曲 FBM）──────────
+                 flowDensity > 0 才启用；否则沿用遮罩噪声 n1。
+                 ⚠ 三个采样都在**屏幕归一化坐标**里算 ⇒ 场与波无关，
+                   只跟时间漂移 ⇒ 形状连续稳定（TRAE 的流体场也是这样）。 */
+              var qf = n1;
+              if (useFlow) {
+                var sxq = px / w, syq = py / h;
+                var ubq = sxq * p.flowDensity, vbq = syq * p.flowDensity;
+                var ftq = tq * p.flowSpeed;
+                /* q 的两条通道：各自偏移 + 反向漂移 ⇒ 两两不相关 */
+                var qxq = sample(tex, NOISE_N, ubq, vbq + 0.05 * ftq);
+                var qyq = sample(tex, NOISE_N, ubq + 0.30, vbq - 0.0375 * ftq);
+                /* 域扭曲：坐标先被 q 掰一下再采样 ⇒ 等值线成有机曲线 */
+                qf = sample(tex, NOISE_N, ubq + qxq * p.flowWarp, vbq + qyq * p.flowWarp);
+              }
+              /* ⚠ 噪声值域是 **[-1, 1]**（makeNoise 末尾做了归一化），
+                 而 pixelThresh 用 [0, 1] 表述（跟 TRAE 的 0.87 同尺度）
+                 ⇒ 这里做一次域转换，别让人填 0.87 结果一个点都没有。 */
+              var qth = (p.pixelThresh > 0 ? p.pixelThresh : 0.5) * 2 - 1;
+              /* ── 阈值按块随机抖动（TRAE 同款）──────────────
+                 TRAE 像素化着色器：`dynamicThreshold = e1Threshold - 0.08 * rand`
+                 其中 rand 是**按 blockId 稳定**的伪随机。
+                 作用：硬边被随机削掉一点 ⇒ 亮区边界是参差的，
+                       而不是一刀切出来的光滑轮廓。
+                 ⚠ 用的是 rSel[idx]（每格固定的伪随机，resize 后不变）
+                   —— 正好当 TRAE 的 rand(blockId)。 */
+              if (p.pixelJitter > 0) qth -= p.pixelJitter * rSel[idx];
+              /* 颜色系数：跟点的存在**同源**（TRAE 的 mix(c1, c2, noise) 同款）*/
+              qNorm[idx] = qf;
+              if (qf > qth) {
+                band *= p.patchGain;
+              } else {
+                band = 0;
+              }
+            } else if (mask < 0.08) {
               band = 0;
             } else {
               band *= mask * p.patchGain;
@@ -988,7 +1219,14 @@
 
           /* ── 磷光余晖：保留峰值再衰减 ─────────────────── */
           var prev = peak[idx];
-          var e = band > prev ? band : prev * p.trail;
+          /* ⚠ 量化模式（pixelQuant = 1）下**不留余晖**。
+             余晖的作用是让刚熄灭的点按 trail 慢慢衰减 ⇒ 渲出来是一条
+             alpha 渐变带 ⇒ 边缘看着像「水打上去的印记」。
+             TRAE 的像素块是**硬开关**（亮 / 不亮两态，中间灰没有）
+             ⇒ 这里 peak 直接取 band，不做衰减。
+             ⚠ 只改渲染的 alpha 斜坡是不够的 —— 余晖会把已经熄灭的格
+               继续顶在阈值之上，硬边做不出来。 */
+          var e = quant ? band : (band > prev ? band : prev * p.trail);
           peak[idx] = e;
           idx++;
         }
@@ -1012,6 +1250,11 @@
     var errFilt = 0;
 
     function servoStep(litInBand, fast) {
+      /* ⚠ 量化模式（pixelQuant > 0）下选点不再吃 pickGain ——
+         点的亮灭由「连续场 > 阈值」决定 ⇒ 伺服是空转，
+         继续调只会把 pickGain 顶到上限、还会污染 debug() 的读数。
+         ⇒ 直接跳过，密度由 pixelThresh 自己说了算。 */
+      if (p.pixelQuant > 0) return 0;
       var target = p.lit > 0 ? p.lit : 0.10;
       var tf = bandFracEma > 0.02 ? bandFracEma : 0.5;
       var targetInBand = clamp(target / tf, 0.02, 0.98);
@@ -1060,33 +1303,65 @@
          填 3 则是 9×9 的方块，留 1.5px 间隙 ⇒ 有像素网格。 */
       var b1s = p.pxBody > 0 ? Math.min(SS, p.pxBody | 0) : 2;
       var b2s = p.pxCrest > 0 ? Math.min(SS, p.pxCrest | 0) : 3;
+      /* ── 规整量化 / 连续双色插值（借鉴 TRAE，2026-11-03）────────
+         quant：点阵去掉所有每格随机量（门槛、亮度因子、抖动），
+                亮灭与颜色完全由连续场决定 ⇒ 规整、有形态。
+         blend：颜色按场的值在 accent↔white 之间**连续插值**，
+                且只画**一层**（TRAE 的 mix(c1, c2, noise) 同款，
+                原来这里是「accent 层 + white 层」两档叠加）。
+         ⚠ 两者默认都是 0 ⇒ 走的还是原路径 ⇒ 逐位一致。 */
+      var quant = p.pixelQuant > 0;
+      var blend = p.pixelBlend > 0;
+      /* TRAE 同款的「按块随机绿白二选一」：pixelGreen > 0 才开。
+         ⚠ 必须在 quant 模式里才有意义（老路径的绿白分层是另一回事）。 */
+      var greenBin = quant && p.pixelGreen > 0;
 
       for (var cy = 0; cy < rows; cy++) {
         var by0 = cy * SS;
         for (var cx = 0; cx < cols; cx++) {
           /* ── 连续插值：几何按 1/30 秒采样，渲染在步间线性过渡 */
           var v = prevPeak[idx] + (peak[idx] - prevPeak[idx]) * lerp;
-          /* ── 抖动：每格固定相位的时间平滑摆动 + 每格固定的空间偏移 */
-          var off = Math.sin(t * dRate + dphase[idx]) * dth + rJit[idx] * jitAmp;
+          /* ── 抖动：每格固定相位的时间平滑摆动 + 每格固定的空间偏移
+             ⚠ 量化模式下必须关掉 —— 它是「每格随机量」之一，
+               留着点阵就还是随机疏密，而不是规整网格。 */
+          var off = quant ? 0
+            : (Math.sin(t * dRate + dphase[idx]) * dth + rJit[idx] * jitAmp);
           var vv = v + off;
 
           /* ── 色阶的 alpha 斜坡（对称，边界是渐变不是硬切）── */
-          var a1 = (vv - tLo1) / fade;
-          if (a1 < 0) a1 = 0; else if (a1 > 1) a1 = 1;
-          var a2 = (vv - tLo2) / fade;
-          if (a2 < 0) a2 = 0; else if (a2 > 1) a2 = 1;
+          var a1, a2;
+          if (quant) {
+            /* ⚠ 量化模式是**硬开关**：要么满亮、要么全黑，没有中间态。
+               TRAE 的像素化层只有两态（vec4(color,1.0) / vec4(bg,1.0)），
+               中间灰是没有的 ⇒ 边缘不会出现「水印记」式的灰度过渡。
+               切点取 tLo1（= accentT - fade/2）：正好落在原来斜坡
+               刚到满亮的位置上 ⇒ **亮区大小基本不变**，只是边界由
+               渐变变成硬边。 */
+            a1 = vv > tLo1 ? 1 : 0;
+            /* 没有「浪尖」层 ⇒ 也不出辉光（TRAE 那边同样没有辉光） */
+            a2 = 0;
+          } else {
+            a1 = (vv - tLo1) / fade;
+            if (a1 < 0) a1 = 0; else if (a1 > 1) a1 = 1;
+            a2 = (vv - tLo2) / fade;
+            if (a2 < 0) a2 = 0; else if (a2 > 1) a2 = 1;
+          }
 
           /* ── 迟滞：alpha 下降按帧限速，卡在阈值上的格子
                 不会一帧掉到 0 ⇒ 消掉闪烁。 ─────────────── */
-          if (a1 < aPrev[idx]) {
-            var lo = aPrev[idx] - hyst;
-            if (lo < 0) lo = 0;
-            if (a1 < lo) a1 = lo;
-          }
-          if (a2 < wPrev[idx]) {
-            var lo2 = wPrev[idx] - hyst;
-            if (lo2 < 0) lo2 = 0;
-            if (a2 < lo2) a2 = lo2;
+          /* ⚠ 量化模式下**不能**用迟滞：迟滞把「1 → 0」压成
+             「1 → 0.965 → …」⇒ 又变回灰度过渡，跟硬边相悖。 */
+          if (!quant) {
+            if (a1 < aPrev[idx]) {
+              var lo = aPrev[idx] - hyst;
+              if (lo < 0) lo = 0;
+              if (a1 < lo) a1 = lo;
+            }
+            if (a2 < wPrev[idx]) {
+              var lo2 = wPrev[idx] - hyst;
+              if (lo2 < 0) lo2 = 0;
+              if (a2 < lo2) a2 = lo2;
+            }
           }
           aPrev[idx] = a1;
           wPrev[idx] = a2;
@@ -1103,16 +1378,45 @@
           if (bx1 + b1 <= sw && by1 + b1 <= rows * SS) {
             var a255 = (a1 * 255) | 0;
             var o;
+            /* 颜色：blend 模式按场的值连续插值 accent↔white，
+               非 blend 模式沿用常量 accent 色（逐位一致）。
+               插值系数用**遮罩噪声 n1**（qNorm，值域 -1..1 归一到 0..1）——
+               跟点的存在同源，和 TRAE 的 mix(c1, c2, noise) 一个路子。
+               ⚠ 但 TRAE 的像素化着色器里**颜色不是连续插值**，
+                 是 `if (rand < e1GreenRatio) 绿 else 白` 的**按块随机二选一**
+                 —— 唯一的连续 mix 出现在鼠标交互里（用户明确不要）。
+                 ⇒ pixelGreen > 0 时走「按块随机二选一」，pixelBlend = 1 时走连续插值。 */
+            var cr = acc[0], cg = acc[1], cb = acc[2];
+            if (blend) {
+              var kk = (qNorm[idx] + 1) * 0.5;
+              if (kk < 0) kk = 0; else if (kk > 1) kk = 1;
+              cr = (acc[0] + (wht[0] - acc[0]) * kk) | 0;
+              cg = (acc[1] + (wht[1] - acc[1]) * kk) | 0;
+              cb = (acc[2] + (wht[2] - acc[2]) * kk) | 0;
+            } else if (greenBin) {
+              /* TRAE 同款：按块随机二选一。rand 用 rSel[idx]（每格固定）。
+                 ⚠ 同一个 rand 也参与阈值抖动（见 computeGeometry），
+                   所以「绿块」的阈值略高一点、白块略低一点 ——
+                   这正是 TRAE 原着色器的行为（同一个 rand 两处用）。 */
+              if (rSel[idx] < p.pixelGreen) {
+                cr = acc[0]; cg = acc[1]; cb = acc[2];
+              } else {
+                cr = wht[0]; cg = wht[1]; cb = wht[2];
+              }
+            }
             for (var yy = 0; yy < b1; yy++) {
               o = ((by1 + yy) * sw + bx1) * 4;
               for (var xx = 0; xx < b1; xx++) {
-                fineData[o] = acc[0]; fineData[o + 1] = acc[1]; fineData[o + 2] = acc[2]; fineData[o + 3] = a255;
+                fineData[o] = cr; fineData[o + 1] = cg; fineData[o + 2] = cb; fineData[o + 3] = a255;
                 o += 4;
               }
             }
           }
 
-          if (a2 > 0.002) {
+          /* ⚠ blend / greenBin 模式只画**一层**（颜色已经在上面定好了），
+             再叠一层 white 会把插值/二选一冲掉。
+             非量化模式仍是原来的「浪身铺底 + 浪尖叠上」两档。 */
+          if (!blend && !greenBin && a2 > 0.002) {
             var b2 = b2s;
             var inset2 = ((SS - b2) / 2) | 0;
             var bx2 = cx * SS + inset2;

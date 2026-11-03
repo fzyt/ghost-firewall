@@ -16,6 +16,9 @@
   E  新档（moonstone-flow）参数被改 —— 几何必须与原版逐条一致
   E2 随机换向的机制（整圈目标角 / 短弧 / 限速）被拆掉
   E3 随机变速的机制（累计相位 / 变速率上限）被拆掉
+  H  规整量化点阵被撤回（默认值被改 / 连续场判据 / 阈值抖动 / 绿白二选一 / 域扭曲）
+  I  pixel-flow 新档被改或外溢到现有各档
+  J  硬边改造被撤回（alpha 斜坡 / 余晖 / 迟滞 —— 必须三处同时改才有效）
   F  改版外溢到登录页
   G  安全面 / 加载顺序 / 占位符
 
@@ -36,6 +39,7 @@ Python 只按 mtime+size 判过期，两条大小相近的变异会复用上一�
 """
 import atexit
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -46,6 +50,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC = os.path.join(ROOT, 'backend', 'static')
 BACKEND = os.path.join(ROOT, 'backend')
 TEST_PY = os.path.join(ROOT, 'tests', 'test_portal_frontend.py')
+TEST_JS = os.path.join(ROOT, 'tests', 'test_pixelfield_hardedge.js')
 
 # 本脚本会动的文件（只这些）
 REL_FILES = [
@@ -80,12 +85,36 @@ for _sig in (signal.SIGINT, signal.SIGTERM):
 
 
 def run_tests():
-    """跑本批次的测试文件。返回 (rc, 输出)。"""
+    """跑本批次的测试文件（静态断言 + 行为级渲染断言）。
+
+    两个都要跑：
+      · test_portal_frontend.py     —— 源码文本断言（静态）
+      · test_pixelfield_hardedge.js —— 真跑引擎、把画布像素读出来（行为级）
+
+    ⚠ 行为级那个是这一批的关键（2026-11-03）：
+      硬边是**渲染行为**（alpha 到底是不是两态、颜色到底几种），
+      源码文本断言钉不住「画面有没有中间灰」——
+      哪怕把斜坡改回另一个分支，文本断言照样全绿。
+      ⇒ 变异必须能被**行为级**测试抓住才算数。
+
+    返回 (rc, 输出)。
+    """
     env = {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'}
+    node = shutil.which('node')
+    if not node:
+        print('!! 找不到 node —— 行为级测试跑不了，变异无法验证')
+        return 2, 'node not found in PATH'
     r = subprocess.run([sys.executable, TEST_PY],
                        capture_output=True, text=True, cwd=ROOT,
                        timeout=300, env=env)
-    return r.returncode, r.stdout + r.stderr
+    rc = r.returncode
+    out = r.stdout + r.stderr
+    if rc != 0:
+        return rc, out
+    r2 = subprocess.run([node, TEST_JS],
+                        capture_output=True, text=True, cwd=ROOT,
+                        timeout=300, env=env)
+    return r2.returncode, out + r2.stdout + r2.stderr
 
 
 def mutate(rel, old, new):
@@ -301,7 +330,8 @@ MUTATIONS = [
     ('N-93', 'speedTurnPeriod 默认值从 0 改成 6（不传时行为变了 ⇒ 破坏逐位一致）', PIX,
      '    speedTurnPeriod: 0,', '    speedTurnPeriod: 6,'),
     ('N-88', 'dirPivot 默认值从 0 改成 1（不传时行为变了 ⇒ 破坏逐位一致）', PIX,
-     '    dirPivot: 0,', '    dirPivot: 1,'),
+     '    dirPivot: 0,\n    /* ── 遮罩跟随波向',
+     '    dirPivot: 1,\n    /* ── 遮罩跟随波向'),
     ('N-89', 'debug() 不再报引擎真值方向角（证据图只能另算公式 ⇒ 会与实际不符）', PIX,
      'dirAngle: dirAngleNow, dirAngleDeg: dirAngleNow * 180 / Math.PI,',
      'dirAngle: 0, dirAngleDeg: 0,'),
@@ -330,6 +360,103 @@ MUTATIONS = [
      'speedFactor: 1, dirTarget: dirTarget,'),
     ('N-101', '累计相位用单精度存（Float32 丢末位 ⇒ 破坏「逐位一致」）', PIX,
      'var wPh = new Float64Array(8);', 'var wPh = new Float32Array(8);'),
+
+    # ── H. 规整量化点阵被撤回（借鉴 TRAE 那一批，2026-11-03）──────
+    # 这一批做的是「独立一档 + 若干新参数」，危险退化跟上一批同型：
+    # 把新参数默认值改成非 0 ⇒ 破坏「不传时逐位一致」；
+    # 把新机制拆掉 ⇒ 画面悄悄退回「一堆随机散点」，代码照样跑、单测容易全绿。
+    ('N-102', 'pixelQuant 默认值从 0 改成 1（不传也走量化 ⇒ 破坏逐位一致）', PIX,
+     '    pixelQuant: 0,', '    pixelQuant: 1,'),
+    ('N-103', 'pixelThresh 默认值从 0 改成 0.76（不传也套 TRAE 的阈值）', PIX,
+     '    pixelThresh: 0.0,', '    pixelThresh: 0.76,'),
+    ('N-104', 'pixelBlend 默认值从 0 改成 1（不传也走连续插值）', PIX,
+     '    pixelBlend: 0,          /* 0 = 两档色叠加',
+     '    pixelBlend: 1,          /* 0 = 两档色叠加'),
+    ('N-105', 'pixelGreen 默认值从 0 改成 0.49（不传也做绿白二选一）', PIX,
+     '    pixelGreen: 0,', '    pixelGreen: 0.49,'),
+    ('N-106', 'pixelJitter 默认值从 0 改成 0.36（不传也抖阈值）', PIX,
+     '    pixelJitter: 0,', '    pixelJitter: 0.36,'),
+    ('N-107', 'columns 默认值从 0 改成 190（不传就加密网格 ⇒ 破坏逐位一致）', PIX,
+     '    columns: 0,', '    columns: 190,'),
+    ('N-108', 'flowDensity 默认值从 0 改成 0.25（不传也启用流场）', PIX,
+     '    flowDensity: 0,', '    flowDensity: 0.25,'),
+    ('N-109', 'flowWarp 默认值从 0 改成 0.50（不传就域扭曲）', PIX,
+     '    flowWarp: 0,', '    flowWarp: 0.50,'),
+    ('N-110', 'flowSpeed 默认值从 0 改成 0.020（不传就漂移）', PIX,
+     '    flowSpeed: 0,', '    flowSpeed: 0.020,'),
+    ('N-111', '网格密度忽略 p.columns（档位定不动密度了）', PIX,
+     'var COLUMNS = p.columns > 0 ? (p.columns | 0) : (opt.columns || 112);',
+     'var COLUMNS = opt.columns || 112;'),
+    ('N-112', '量化判据退回每格随机门槛（亮点变回随机散点）', PIX,
+     'if (qf > qth) {', 'if (mask > qth) {'),
+    ('N-113', '阈值的按块随机抖动被删（边缘变成一刀切的光滑轮廓）', PIX,
+     'if (p.pixelJitter > 0) qth -= p.pixelJitter * rSel[idx];',
+     '/* 抖动被删 */'),
+    ('N-114', '绿白二选一改成永远绿（白块消失，绿占比 100%）', PIX,
+     'if (rSel[idx] < p.pixelGreen) {', 'if (true) {'),
+    ('N-115', '量化模式又画两层（把二选一的颜色冲成白色）', PIX,
+     'if (!blend && !greenBin && a2 > 0.002) {', 'if (!blend && a2 > 0.002) {'),
+    ('N-116', '量化模式下伺服不再跳过（伺服空转，把 pickGain 顶到上限）', PIX,
+     'if (p.pixelQuant > 0) return 0;', '/* 不再跳过 */'),
+    ('N-117', '量化模式下仍保留每格抖动偏移（点阵又变回随机疏密）', PIX,
+     'var off = quant ? 0\n'
+     '            : (Math.sin(t * dRate + dphase[idx]) * dth + rJit[idx] * jitAmp);',
+     'var off = (Math.sin(t * dRate + dphase[idx]) * dth + rJit[idx] * jitAmp);'),
+    ('N-118', '域扭曲被拆掉（流场退化成轴对齐的方块簇）', PIX,
+     'qf = sample(tex, NOISE_N, ubq + qxq * p.flowWarp, vbq + qyq * p.flowWarp);',
+     'qf = sample(tex, NOISE_N, ubq, vbq);'),
+    ('N-119', '流场开关恒为假（流场代码成了死代码）', PIX,
+     'var useFlow = p.pixelQuant > 0 && p.flowDensity > 0;', 'var useFlow = false;'),
+    ('N-120', 'pixel-flow 档被改掉名字（整档找不到了）', PIX,
+     "    'pixel-flow': {", "    'pixel-flowX': {"),
+    ('N-121', 'pixel-flow 用了 gate 色板（青绿↔白双色没了）', PIX,
+     "      palette: 'mint',", "      palette: 'gate',"),
+    ('N-122', 'mint 色板的强调色被改（不再是 TRAE 的 #32F08C）', PIX,
+     'accent: [50, 240, 140]', 'accent: [50, 200, 140]'),
+    ('N-123', 'pixel-flow 的阈值被改（密度对不上 TRAE）', PIX,
+     'pixelThresh: 0.76,', 'pixelThresh: 0.87,'),
+    ('N-124', 'pixel-flow 的域扭曲强度被改（形状退回方块簇）', PIX,
+     'flowWarp: 0.50,', 'flowWarp: 0.10,'),
+    ('N-125', 'pixel-flow 的阈值抖动被改（绿白比完全对不上 TRAE）', PIX,
+     'pixelJitter: 0.36,', 'pixelJitter: 0.12,'),
+    ('N-126', 'pixel-flow 的 accentT 被改（点又变暗）', PIX,
+     'accentT: 0.08,', 'accentT: 0.30,'),
+    ('N-127', '量化外溢到 moonstone 档（登录页背景被顺带改了）', PIX,
+     '        distortAmp: 0.85,\n      },',
+     '        distortAmp: 0.85,\n        pixelQuant: 1,\n      },'),
+    ('N-128', '量化外溢到 moonstone-flow 档（现有门户档被顺带改了）', PIX,
+     '        lit: 0.12,\n      },', '        lit: 0.12,\n        pixelQuant: 1,\n      },'),
+    ('N-129', '量化外溢到 moonstone-swirl 档（回退档被顺带改了）', PIX,
+     '        patchRot1: 0.22,', '        patchRot1: 0.22,\n        pixelQuant: 1,'),
+    ('N-130', '量化外溢到 gate 档（产品默认档被顺带改了）', PIX,
+     "      palette: 'gate',\n      params: {},",
+     "      palette: 'gate',\n      params: { pixelQuant: 1 },"),
+    ('N-131', 'pixel-flow 档默认改用连续插值（TRAE 的按块二选一被换掉）', PIX,
+     '        pixelBlend: 0,\n', '        pixelBlend: 1,\n'),
+
+    # ── J. 硬边改造被撤回（2026-11-03，用户要求「要么亮，要么不亮」）──
+    # 用户原话：「我看目前有一些灰度和亮的交接，类似于水打上去的印记一样，
+    #           我想要么亮，要么不亮，分界明显一点」。
+    #
+    # 这一批把柔边三件套在**量化模式**下全部关掉：
+    #   ① alpha 斜坡 → 硬开关 a1 = vv > tLo1 ? 1 : 0
+    #   ② 余晖衰减   → 不留痕  e = quant ? band : ...
+    #   ③ 迟滞限速   → 整段跳过 if (!quant)
+    #
+    # ⚠ 这三处**必须同时改**：只改 ① 的话余晖会把刚熄灭的点继续顶在
+    #   阈值之上 ⇒ 硬边做不出来。所以每一条单独撤回都要能被抓到。
+    #   ①③ 靠行为级测试抓（alpha 集合里冒出中间灰）；
+    #   ② 不改 alpha 的取值域，只改「哪一格亮着」⇒ 靠不变性抓
+    #      （量化模式下改 trail 后画面必须一字节不差）。
+    ('N-132', '量化模式又留起余晖（熄灭的点被顶在阈值之上 ⇒ 硬边做不出来）', PIX,
+     'var e = quant ? band : (band > prev ? band : prev * p.trail);',
+     'var e = (band > prev ? band : prev * p.trail);'),
+    ('N-133', '量化模式又用回 alpha 斜坡（灰度过渡回来 ⇒ 水印记重现）', PIX,
+     'a1 = vv > tLo1 ? 1 : 0;',
+     'a1 = (vv - tLo1) / fade;\n'
+     '            if (a1 < 0) a1 = 0; else if (a1 > 1) a1 = 1;'),
+    ('N-134', '量化模式又用回迟滞（1→0 被压成 1→0.965 ⇒ 又变灰度）', PIX,
+     'if (!quant) {', 'if (true) {'),
 
     # ── F. 改版外溢到登录页 ──
     ('N-57', '登录页那一档的波速被改成门户参数（改版外溢）', PIX,
@@ -405,7 +532,8 @@ def main():
         print('!! 原始状态下测试就是红的，先修测试再跑变异：')
         print(out[-3000:])
         return 2
-    print('原始状态：测试通过（%d 项）' % out.count('[PASS]'))
+    print('原始状态：测试通过（静态 %d 项 + 行为级 %d 项）'
+          % (out.count('[PASS]'), out.count('✅')))
 
     caught, missed = 0, []
     for mid, desc, rel, old, new in MUTATIONS:
