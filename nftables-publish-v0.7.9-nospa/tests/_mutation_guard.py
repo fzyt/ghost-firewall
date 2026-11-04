@@ -48,6 +48,8 @@ import subprocess
 import tempfile
 
 MARKER = '.mutation-guard-snapshot'
+# 快照里额外记一个「属主 PID」文件，用来判断这份快照是不是**正在被人用**。
+PIDFILE = '.mutation-guard-owner-pid'
 
 
 class MutationGuard:
@@ -104,6 +106,13 @@ class MutationGuard:
             shutil.copy2(src, dst)
         with open(os.path.join(self.snap, MARKER), 'w') as f:
             f.write('snapshot\n')
+        # 记下属主 PID：这份快照在「属主进程还活着」期间**不是残留**，
+        # 谁都不许去还原它（见 _restore_stale）。
+        try:
+            with open(os.path.join(self.snap, PIDFILE), 'w') as f:
+                f.write(str(os.getpid()))
+        except OSError:
+            pass
         self._install_handlers()
         atexit.register(self.restore)
         return self.snap
@@ -187,6 +196,43 @@ class MutationGuard:
                 print(f'       {rel}')
 
     # ── 上次被硬杀的残留 ──────────────────────────────────────
+    def _snapshot_owner_alive(self, d):
+        """这份快照的属主进程还活着吗？
+
+        ⚠️ 2026-11-04 修的真问题（并行跑变异时踩到）：
+        多份仓库副本**并行**跑变异脚本时，每个进程都会建自己的快照；
+        而 `_restore_stale()` 扫的是**全局** `/tmp/mutguard-*`
+        （tempfile.gettempdir()）⇒ A 进程会把 B 进程**正在用**的
+        活快照当成「上次硬杀的残留」来还原。
+
+        后果实测（两处）：
+          · functional.py 直接 FileNotFoundError 崩掉
+            （报 `/tmp/mutguard-xxx.pre-restore.pre-restore.../backend/app.py`
+              不存在 —— 那条路径是别人的快照路径）
+          · test_mutation_guard_concurrent_edit.py 的断言全乱
+            （它自己也被别人的活快照干扰）
+
+        ⇒ 判据：快照里记了属主 PID；**PID 还活着 ⇒ 这不是残留，跳过**。
+        （PID 不存在 ⇒ 属主确实死了 ⇒ 这才是真残留。）
+        """
+        try:
+            with open(os.path.join(d, PIDFILE), 'r') as f:
+                pid = int(f.read().strip())
+        except (OSError, ValueError):
+            # 没有 PID 文件 ⇒ 老版本留下的快照 ⇒ 按老逻辑当残留处理
+            return False
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)          # 信号 0 = 只检查存在性
+        except ProcessLookupError:
+            return False             # 属主死了 ⇒ 真残留
+        except PermissionError:
+            return True              # 存在但不是我们的用户 ⇒ 活着
+        except OSError:
+            return True
+        return True
+
     def _restore_stale(self):
         """启动时发现上次的快照还在 ⇒ 上次没走到还原（被硬杀）。
         先把当前状态另存一份，再还原 —— 不丢用户后续的改动。"""
@@ -196,6 +242,9 @@ class MutationGuard:
         for d in stale:
             # 只取最新的一份（其它可能是更早的残留）
             if not os.path.isfile(os.path.join(d, MARKER)):
+                continue
+            # ⚠️ 属主还活着 ⇒ 这是**别人正在用**的快照，不是残留
+            if self._snapshot_owner_alive(d):
                 continue
             backup = d + '.pre-restore'
             if not os.path.exists(backup):
