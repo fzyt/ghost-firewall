@@ -1301,8 +1301,37 @@ check('URL 覆盖参数名是 pfstyle',
 check('URL 里写了不存在的档名会回退随机（不能传空档给引擎）',
       re.search(r"if \(BG_STYLES\[i\] === want\) return want;",
                 PORTAL_JS_CODE) is not None)
-check('登录页不受影响（仍是原版 moonstone）',
-      "createStyle(canvas, 'moonstone', opt)" in LOGIN_JS_CODE)
+check('登录页也不写死某一档（第十五轮起登录页也随机两档）',
+      re.search(r"createStyle\(canvas, '[^']+', opt\)", LOGIN_JS_CODE) is None)
+
+# ─────────────────────────────────────────────────────────────
+sec('PF-30 网关登录页也随机两档（2026-11-04 第十五轮）')
+
+# 用户拍板：「遮罩调淡 + 两边登录页都随机」
+#   · 面板（5443）登录页：v0.18.0 起就是随机两档（frontend/pixelbg.js）
+#   · 网关登录页：这一轮之前写死 'moonstone' ⇒ 现在也改成随机两档
+#
+# ⚠ 静态断言只能钉住「结构」；「随机到底有没有生效」由行为级测试
+#   tests/test_login_bgstyle.js 钉（源码文本钉不住随机 ——
+#   把 Math.floor(Math.random() * n) 写成 0，静态断言照样全绿）。
+
+check('登录页候选表正好是两档原版',
+      re.search(r"var BG_STYLES = \['moonstone', 'trae'\];",
+                LOGIN_JS_CODE) is not None)
+check('登录页真的用了随机（Math.random 在挑档位）',
+      re.search(r"Math\.floor\(Math\.random\(\) \* BG_STYLES\.length\)",
+                LOGIN_JS_CODE) is not None)
+check('登录页随机结果被真正传给引擎',
+      'createStyle(canvas, pickBgStyle(), opt)' in LOGIN_JS_CODE)
+check('登录页也支持 ?pfstyle= 钉死某一档',
+      "queryParam('pfstyle')" in LOGIN_JS_CODE)
+check('登录页档名写错也回退随机（不给引擎传不存在的档）',
+      re.search(r"if \(BG_STYLES\[i\] === want\) return want;",
+                LOGIN_JS_CODE) is not None)
+check('登录页的随机不记存储（每次打开都重新抽）',
+      'localStorage' not in LOGIN_JS_CODE and 'sessionStorage' not in LOGIN_JS_CODE)
+check('登录页的引擎加载失败/抛异常仍不影响表单',
+      'catch (e)' in LOGIN_JS_CODE)
 
 _pick = re.search(r"function pickBgStyle\(\) \{(.*?)\n  \}", PORTAL_JS_CODE, re.S)
 check('挑档位的函数存在', _pick is not None)

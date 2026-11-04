@@ -172,7 +172,10 @@ MUTATIONS = [
        '    if false; then')]),
 
     ('M21 apk_install_via_local_file 不用 apk fetch（退回会坏的 wget 通道）',
-     [('    if ! ( cd "$work" && apk fetch "$pkg" >/dev/null 2>&1 ); then',
+     # ⚠️ 2026-11-04：这一行本轮改成了带 ${fetch_opts}（apk 2.x 不能写死 --timeout），
+     #   锚点必须跟着更新 —— 否则变异静默不生效，
+     #   而「未生效」极容易被当成「通过」（脚本会报「锚点没匹配上」并跳过）。
+     [('    if ! ( cd "$work" && apk fetch ${fetch_opts} "$pkg" >/dev/null 2>&1 ); then',
        '    if ! ( cd "$work" && apk add --no-cache "$pkg" >/dev/null 2>&1 ); then')]),
 
     ('M22 pkg_install_apk 重试时刷索引用回裸 apk update（重试白等 12 分钟）',

@@ -115,7 +115,20 @@ pkg_install_apk() {
         # --no-cache：apk 的下载缓存在 /var/cache/apk，那是在 **overlay** 上
         # （不是 tmpfs）。不清理的话下载的包会再存一份 —— OpenWrt 的
         # overlay 常常只有 80~90MB，一份 50MB 的缓存直接把它撑满。
-        if apk add --no-cache "$pkg"; then
+        #
+        # ⚠️ --timeout（2026-11-04 修的三个 apk 缺陷之一）：
+        #   apk-tools 3.x 的全局选项，语义是「连接**没有进展**就超时」
+        #   （--timeout TIME  Timeout network connections if no progress is made）。
+        #   原来这里是**裸调 apk add**，没有任何超时保护 ⇒ 卡住就是死等：
+        #   .238 全新部署实测「4 分钟零字节」，apk update 有 run_with_timeout
+        #   而 install 没有 —— 同类问题只修了一半。
+        #   两层保险：apk 自己的 --timeout（连接无进展即中止，不会留下锁）
+        #   + 外层 run_with_timeout（万一 apk 自己卡死，兜底把它收掉）。
+        #   ⚠️ apk 2.x（老 OpenWrt）没有这个选项，写死会直接报 unknown option
+        #   ⇒ 先探测再拼参数。
+        local apk_opts="--no-cache"
+        apk_supports_timeout && apk_opts="${apk_opts} --timeout ${APK_NET_TIMEOUT}"
+        if run_with_timeout "${APK_INSTALL_TIMEOUT:-600}" apk add ${apk_opts} "$pkg"; then
             return 0
         fi
         attempt=$((attempt + 1))
@@ -125,6 +138,14 @@ pkg_install_apk() {
             # ⚠️ 这一步会带上超时和国内镜像切换 —— 原来的裸 `apk update`
             #   在坏源上要卡 4 分钟，重试 3 次 = 白等 12 分钟还必然失败。
             apk_update_with_failover || true
+            # ⚠️ 索引刷新成功**不代表**当前源的包体下得到。
+            #   实测有镜像「索引全、包体缺」（nginx-full / wget-ssl /
+            #   python3-pip / acme-acmesh 在 ustc 上都是 404），
+            #   而那种源 `apk update` 是**成功**的 ⇒ 只靠上面的 failover
+            #   永远不会换源 ⇒ 同一个包反复失败，最后报一个
+            #   "ADB integrity error"（镜像问题被伪装成签名问题，排查方向全偏）。
+            #   ⇒ 失败后**强制轮换**到下一个镜像。
+            apk_rotate_mirror || true
             sleep $((attempt * 2))
         fi
     done
@@ -159,12 +180,24 @@ pkg_install_apk() {
 #   openwrt-25.12.pem，仓库索引里的签名并不进本地信任库）。
 #   正常路径（apk add <包名>，从仓库装）仍然**完整校验签名**，
 #   这里只在正常路径已经失败之后才用，且包的来源就是当前配置的镜像。
+#
+# ⚠️ 2026-11-04 更正一条**与事实不符**的注释（三个 apk 缺陷之一）：
+#   原来这里写着「apk fetch 用的是 apk 自带的下载器（不走外部 wget），
+#   实测同一个包下载得干干净净」—— **在 25.12 上不成立**：
+#   apk-tools 3.0.5 的包体下载同样外调 wget（设备的 /usr/bin/wget 是
+#   busybox 的 uclient-fetch 软链），大包照样中途断流。
+#   ⇒ 这条兜底路径在 25.12 上**并不比正常路径更可靠**，
+#     它真正的价值是「拿到一个可以单独校验、单独重试的文件」。
+#   ⇒ 所以下面加了 apk_file_looks_valid 校验：镜像缺包体时 wget 拿到的是
+#     一张 HTML 错误页，直接装会报 "ADB integrity error"（伪装成签名问题）。
 apk_install_via_local_file() {
     local pkg="$1"
     local work="/tmp/apk-local.$$"
     mkdir -p "$work" 2>/dev/null || return 1
 
-    if ! ( cd "$work" && apk fetch "$pkg" >/dev/null 2>&1 ); then
+    local fetch_opts=""
+    apk_supports_timeout && fetch_opts="--timeout ${APK_NET_TIMEOUT}"
+    if ! ( cd "$work" && apk fetch ${fetch_opts} "$pkg" >/dev/null 2>&1 ); then
         rm -rf "$work"
         return 1
     fi
@@ -172,6 +205,16 @@ apk_install_via_local_file() {
     local f
     f="$(ls "$work"/*.apk 2>/dev/null | head -1)"
     if [ -z "$f" ]; then
+        rm -rf "$work"
+        return 1
+    fi
+
+    # ⚠️ 2026-11-04：下载到的可能**根本不是包**。
+    #   镜像的索引里有这个名字、但包体 404 ⇒ wget 拿到一张 HTML 错误页。
+    #   直接装的话 apk 报 "ADB integrity error" —— 一个镜像问题
+    #   被伪装成签名问题，排查方向完全被带偏。
+    if ! apk_file_looks_valid "$f"; then
+        warn "  下载到的不是有效的 apk 包（当前镜像缺包体：$(basename "$f")，$(wc -c < "$f" 2>/dev/null | tr -d ' ') 字节）"
         rm -rf "$work"
         return 1
     fi
@@ -508,6 +551,71 @@ switch_apk_mirror() {
     fi
     mv "$tmp" "$repo" || { rm -f "$tmp"; return 1; }
     return 0
+}
+
+# apk 的网络超时（秒）。apk-tools 3.x 的全局选项，语义是
+# 「连接**没有进展**就超时」（--timeout TIME  Timeout network connections
+# if no progress is made）——正好治「4 分钟零字节」那种卡死。
+# ⚠️ apk 2.x 没有这个选项 ⇒ 用之前先 apk_supports_timeout 探测。
+APK_NET_TIMEOUT="${APK_NET_TIMEOUT:-30}"
+
+# 这个 apk 支持 --timeout 吗？（apk-tools 3.x 支持，2.x 不支持）
+# 探测一次就缓存结果 —— 每次装包都跑一次 `apk add --help` 太浪费。
+APK_HAS_TIMEOUT=""
+apk_supports_timeout() {
+    if [ -z "$APK_HAS_TIMEOUT" ]; then
+        if apk add --help 2>&1 | grep -q -- '--timeout'; then
+            APK_HAS_TIMEOUT=1
+        else
+            APK_HAS_TIMEOUT=0
+        fi
+    fi
+    [ "$APK_HAS_TIMEOUT" = "1" ]
+}
+
+# 判断下载到的文件是不是**真的 apk 包**。
+#
+# 为什么需要（2026-11-04 在 .238 全新部署时踩到）：
+#   某个镜像的**索引里有这个包名，包体却是 404** ⇒ wget 把一张 HTML
+#   错误页存成了 .apk。直接 apk add 会报：
+#       ADB integrity error
+#   —— 一个「镜像缺包体」的网络问题，被伪装成了「签名校验失败」，
+#   排查方向整个偏掉（人会去查密钥、去关签名校验）。
+#
+# 判据：apk 包是 gzip 流，头两字节必须是 1f 8b；HTML/文本错误页一定不是。
+# 顺带挡掉「截断成 0 字节 / 几十字节」的半截文件。
+apk_file_looks_valid() {
+    local f="$1"
+    [ -s "$f" ] || return 1
+    local magic sz
+    magic="$(od -An -tx1 -N2 "$f" 2>/dev/null | tr -d ' \n')"
+    [ "$magic" = "1f8b" ] || return 1
+    sz="$(wc -c < "$f" 2>/dev/null | tr -d ' ')"
+    [ -n "$sz" ] && [ "$sz" -ge 64 ]
+}
+
+# 强制轮换到**下一个**镜像（不跟当前的重复）。
+#
+# 为什么需要（三个 apk 缺陷之二）：
+#   实测有镜像「索引全、包体缺」——`apk update` 在这种源上是**成功**的，
+#   所以只靠 apk_update_with_failover 永远不会换源 ⇒ 同一个包反复失败，
+#   最后报一个毫无线索的 "ADB integrity error"。
+#   ⇒ 装包失败时，除了刷索引，还要**主动换一个源**再试。
+apk_rotate_mirror() {
+    local repo cur host
+    repo="$(apk_repo_file)" || return 1
+    # 当前源的主机名（仓库清单里第一行的 ://host/）
+    cur="$(sed -n 's#.*://\([^/]*\)/.*#\1#p' "$repo" 2>/dev/null | head -1)"
+    for host in ${APK_MIRROR_CANDIDATES}; do
+        [ "$host" = "$cur" ] && continue
+        if switch_apk_mirror "$host"; then
+            info "已轮换 apk 源 → ${host}（当前源的包体可能缺失）"
+            # 换源后要把索引也拉一遍（索引与包体必须来自同一个源）
+            apk_update_once "${APK_UPDATE_TIMEOUT:-180}" || true
+            return 0
+        fi
+    done
+    return 1
 }
 
 # 跑一次 apk update 并判断**结果**，不是只看退出码。

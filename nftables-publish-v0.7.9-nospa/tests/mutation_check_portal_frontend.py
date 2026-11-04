@@ -62,6 +62,7 @@ TEST_JS5 = os.path.join(ROOT, 'tests', 'test_portal_bgstyle.js')
 TEST_JS6 = os.path.join(ROOT, 'tests', 'test_panel_pixelbg.js')
 TEST_PY2 = os.path.join(ROOT, 'tests', 'test_panel_frontend.py')
 TEST_PY3 = os.path.join(ROOT, 'tests', 'test_fw_console.py')
+TEST_JS7 = os.path.join(ROOT, 'tests', 'test_login_bgstyle.js')
 
 # 本脚本会动的文件（只这些）
 REL_FILES = [
@@ -69,6 +70,10 @@ REL_FILES = [
     os.path.join('backend', 'static', 'pixelfield.js'),
     os.path.join('backend', 'static', 'portal.js'),
     os.path.join('backend', 'static', 'portal.html'),
+    # ⚠️ 2026-11-04 第十五轮：网关登录页也开始随机选档了，
+    #    S 组要改 login.js ⇒ 它必须在还原清单里，
+    #    否则脚本退出时会把变异留在源码里（这文件是**跟踪文件**）。
+    os.path.join('backend', 'static', 'login.js'),
     os.path.join('backend', 'auth_gateway.py'),
     # 面板侧（2026-11-04 第十三轮：面板也做一套像素场）
     os.path.join('backend', 'app.py'),
@@ -195,11 +200,20 @@ def run_tests():
     r9 = subprocess.run([sys.executable, TEST_PY3],
                         capture_output=True, text=True, cwd=ROOT,
                         timeout=600, env=env)
-    return r9.returncode, (out + r2.stdout + r2.stderr
-                           + r3.stdout + r3.stderr + r4.stdout + r4.stderr
-                           + r5.stdout + r5.stderr + r6.stdout + r6.stderr
-                           + r7.stdout + r7.stderr + r8.stdout + r8.stderr
-                           + r9.stdout + r9.stderr)
+    out9 = out + r2.stdout + r2.stderr
+    out9 += r3.stdout + r3.stderr + r4.stdout + r4.stderr
+    out9 += r5.stdout + r5.stderr + r6.stdout + r6.stderr
+    out9 += r7.stdout + r7.stderr + r8.stdout + r8.stderr
+    out9 += r9.stdout + r9.stderr
+    if r9.returncode != 0:
+        return r9.returncode, out9
+    # 网关登录页的背景选档（2026-11-04 第十五轮 S 组）——
+    #   「随机」只能靠行为级测试钉：把 Math.floor(Math.random() * n)
+    #   写成 0，页面永远显示同一档，静态断言照样全绿。
+    r10 = subprocess.run([node, TEST_JS7],
+                         capture_output=True, text=True, cwd=ROOT,
+                         timeout=300, env=env)
+    return r10.returncode, (out9 + r10.stdout + r10.stderr)
 
 
 def mutate(rel, old, new):
@@ -219,6 +233,7 @@ CSS = os.path.join('backend', 'static', 'base.css')
 PIX = os.path.join('backend', 'static', 'pixelfield.js')
 PJS = os.path.join('backend', 'static', 'portal.js')
 PHT = os.path.join('backend', 'static', 'portal.html')
+LJS = os.path.join('backend', 'static', 'login.js')
 GW = os.path.join('backend', 'auth_gateway.py')
 # 面板侧（2026-11-04 第十三轮）
 APP = os.path.join('backend', 'app.py')
@@ -921,6 +936,43 @@ MUTATIONS = [
      'return CANDIDATES[0];'),
     ('Q-10', '面板引导脚本不再支持 ?pfstyle= 钉死某一档', FPIX,
      "    var want = queryParam('pfstyle');", "    var want = '';"),
+
+    # ── S. 登录页也要看得见背景（2026-11-04 第十五轮）────────────
+    # 用户拍板：「遮罩调淡 + 两边登录页都随机」
+    #   · 网关登录页：写死 'moonstone' ⇒ 改成两档随机
+    #   · 面板登录页：遮罩 .88 ⇒ .58，并把遮罩下面的侧栏/主内容藏起来
+    #
+    # 这批最危险的退化：
+    #   · 「随机」被写死 ⇒ 页面**看不出任何异常**，静态断言也照样全绿
+    #     ⇒ 只有行为级测试（tests/test_login_bgstyle.js）能抓
+    #   · 遮罩调回 .88 ⇒ 背景被遮死，等于这轮白做（用户一眼看出来）
+    #   · 侧栏/主内容不藏 ⇒ 58% 的遮罩把「半个面板」透出来，像渲染坏了
+    ('S-01', '网关登录页又写死成一档（不再随机）', LJS,
+     'createStyle(canvas, pickBgStyle(), opt)',
+     "createStyle(canvas, 'moonstone', opt)"),
+    ('S-02', '网关登录页候选表少一档（只剩原版月白）', LJS,
+     "var BG_STYLES = ['moonstone', 'trae'];",
+     "var BG_STYLES = ['moonstone'];"),
+    ('S-03', '网关登录页的随机被写死成第一个', LJS,
+     'return BG_STYLES[Math.floor(Math.random() * BG_STYLES.length)];',
+     'return BG_STYLES[0];'),
+    ('S-04', '网关登录页不再支持 ?pfstyle= 钉死某一档', LJS,
+     "    var want = queryParam('pfstyle');", "    var want = '';"),
+    ('S-05', '网关登录页档名写错也照传（引擎整片空掉）', LJS,
+     '      if (BG_STYLES[i] === want) return want;',
+     '      if (want) return want;'),
+    ('S-06', '面板登录遮罩调回 88%（背景被遮死，等于这轮白做）', FCSS,
+     'background: rgba(7, 9, 16, .58);',
+     'background: rgba(7, 9, 16, .88);'),
+    ('S-07', '面板登录遮罩改成全透明（卡片与背景叠在一起）', FCSS,
+     'background: rgba(7, 9, 16, .58);',
+     'background: rgba(7, 9, 16, 0);'),
+    ('S-08', '侧边栏不再隐藏（半个面板从遮罩里透出来）', FINX,
+     '<aside x-show="auth.authenticated" class="nf-sidebar">',
+     '<aside class="nf-sidebar">'),
+    ('S-09', '主内容不再隐藏（半个面板从遮罩里透出来）', FINX,
+     '<main x-show="auth.authenticated" class="nf-main">',
+     '<main class="nf-main">'),
 ]
 
 

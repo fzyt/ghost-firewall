@@ -303,21 +303,58 @@ def _harden_response(resp):
 # 密钥派生
 # ══════════════════════════════════════════════════════════════════════
 
+# 令牌密钥的进程内缓存（P1-9，2026-11-04）。
+#
+# 为什么必须缓存：_load_secret() **每次调用都重新读盘**，读不到就返回一把
+# **随机**密钥 ⇒
+#   · 进程内：每次拿到的密钥都不同 ⇒ 刚签出来的令牌下一次请求就验不过
+#     （表现是「登录成功了，但一刷新就 401」，极难定位）；
+#   · 重启后：密钥又变 ⇒ 所有已发令牌作废。
+# ⇒ 只读一次，进程内复用。
+_SECRET_CACHE = {"key": None}
+
+
 def _load_secret() -> bytes:
     """读取持久化密钥。
 
     与 app.py 的 _init_app_secret 同源文件，但这里派生独立子密钥，
     使 token 签名密钥与 Flask session 密钥互不相关。
+
+    ⚠️ 2026-11-04（P1-9）修掉的三个问题：
+      1. 每次调用都重新读盘（I/O 白扔）→ 现在**进程内缓存**；
+      2. 读不到就返回一把**新的随机**密钥 → 现在进程内只用同一把；
+      3. 读不到时**一声不吭** → 现在明确告警。
+
+    ⚠️ 「读不到」有两种，处理方式不同：
+      · 文件不存在 ⇒ init 脚本没播种（正常不会发生）⇒ 生成一把临时密钥，
+        告警说清「重启后令牌会失效」，但**不自己写文件** ——
+        这个文件的属主/权限由 init 脚本以 root 播种（640 root:nftweb），
+        网关进程（uid=nftweb）去写会把权限语义弄乱。
+      · 文件在但读不到（权限坏了）⇒ **绝不覆盖**它（覆写会把唯一那份
+        密钥毁掉），同样用临时密钥 + 告警。
     """
+    if _SECRET_CACHE["key"] is not None:
+        return _SECRET_CACHE["key"]
+
     if os.path.exists(SECRET_FILE):
         try:
             with open(SECRET_FILE, "r") as f:
                 raw = f.read().strip()
             if raw:
-                return raw.encode()
-        except OSError:
-            pass
-    return secrets.token_hex(32).encode()
+                _SECRET_CACHE["key"] = raw.encode()
+                return _SECRET_CACHE["key"]
+        except OSError as e:
+            print(f"[WARNING] 读取网关令牌密钥 {SECRET_FILE} 失败: {e}"
+                  "（本次进程使用临时密钥；已签发的令牌将无法验证，"
+                  "修复文件权限后重启即可恢复）", flush=True)
+            _SECRET_CACHE["key"] = secrets.token_hex(32).encode()
+            return _SECRET_CACHE["key"]
+
+    print(f"[WARNING] 网关令牌密钥文件 {SECRET_FILE} 不存在"
+          "（init 脚本本应播种它）—— 本次进程使用临时密钥，"
+          "重启后所有已签发的令牌都会失效", flush=True)
+    _SECRET_CACHE["key"] = secrets.token_hex(32).encode()
+    return _SECRET_CACHE["key"]
 
 
 def _token_key() -> bytes:

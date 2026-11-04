@@ -162,6 +162,67 @@ check('尊重 prefers-reduced-motion（引擎静态模式）',
 check('引擎不存在/抛异常时不外溢（自己 try 住）',
       'catch (e)' in PIXELBG_CODE)
 
+# ─────────────────────────────────────────────────────────────
+sec('PP-6 登录页要看得见背景（遮罩调淡 + 遮罩下面的面板藏起来）')
+
+# ⚠️ 2026-11-04 第十五轮，用户要求「登录页也要看得见背景」。
+#   这件事有**两半**，缺一半等于没做：
+#     ① 遮罩别那么黑（.88 → .58）
+#     ② 遮罩下面的侧栏与主内容**藏起来**
+#   只做①不做② ⇒ 58% 的遮罩会把「半个面板」透出来：实拍里能看清
+#   「底层内容」四个字和底部模糊的表格块，看着像渲染坏了（用户会当成 bug）。
+m_login = re.search(r'\.nf-login\s*\{([^}]*)\}', STYLES)
+check('styles.css 里有 .nf-login 规则', m_login is not None)
+_alpha = None
+if m_login:
+    blk = m_login.group(1)
+    # ⚠️ rgba() 有四个分量，别用 [^)]+ 直接抓尾巴 ——
+    #   那会把 "16, .58" 整段抓成 alpha，float() 直接抛异常。
+    #   正确做法：先把 rgba(...) 整段抠出来，再按逗号切，取**最后一段**。
+    m_a = re.search(r'background:\s*rgba\(([^)]*)\)', blk)
+    if m_a:
+        parts = m_a.group(1).split(',')
+        try:
+            _alpha = float(parts[-1].strip())
+        except ValueError:
+            _alpha = None
+    check('登录遮罩的不透明度不高于 0.65（再黑背景就等于被遮死了）',
+          _alpha is not None and _alpha <= 0.65,
+          '实测 alpha=%s' % _alpha)
+    check('遮罩仍然有底（不能全透明：背景与卡片会叠在一起）',
+          _alpha is not None and _alpha > 0,
+          '实测 alpha=%s' % _alpha)
+    check('遮罩仍然带 backdrop-filter（背景要糊开，不能是硬边色块）',
+          'backdrop-filter' in blk)
+
+# 遮罩下面的面板内容必须藏起来（否则调淡遮罩就会把半个面板透出来）
+#
+# ⚠️ nf-sidebar / nf-main 是**类名**不是标签名 ——
+#   <aside x-show="auth.authenticated" class="nf-sidebar">
+#   ⇒ 不能拿 <nf-sidebar ...> 去匹配。
+# 而且属性顺序不固定（x-show 可能在 class 前也可能在后），
+# 所以按「整条标签」扫一遍再分别判属性。
+_ALL_TAGS = re.findall(r'<[a-zA-Z][^>]*>', INDEX_CODE)
+
+
+def _auth_show_with_class(cls):
+    """有没有一个标签，同时带 x-show="auth.authenticated" 和这个类。"""
+    for t in _ALL_TAGS:
+        if 'x-show="auth.authenticated"' not in t:
+            continue
+        if re.search(r'class="[^"]*\b' + re.escape(cls) + r'\b', t):
+            return True
+    return False
+
+
+for sel in ('nf-sidebar', 'nf-main'):
+    check('%s 未认证时隐藏（x-show="auth.authenticated"）' % sel,
+          _auth_show_with_class(sel))
+check('登录遮罩仍然是「未认证且不在检查中才显示」',
+      '!auth.authenticated && !auth.checking' in INDEX_CODE)
+check('登录卡片在遮罩之内（不是被藏起来了）',
+      re.search(r'class="nf-login__card[^"]*"', INDEX_CODE) is not None)
+
 print()
 if FAIL:
     print(f'失败 {len(FAIL)} 项：')

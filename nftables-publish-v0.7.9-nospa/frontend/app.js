@@ -27,6 +27,9 @@ function app() {
       loginMode: 'login',     // 'login' | 'setup'
       loginLoading: false,
       loginError: '',
+      // P1-26：访问边界降级时的说明（配置读不出来 ⇒ 面板不限制来源）。
+      // 非空就要在界面上明确告诉用户「此刻谁都能访问你的面板」。
+      accessWarning: '',
     },
     // 默认打开的页面。
     //
@@ -339,6 +342,10 @@ function app() {
         this.auth.authenticated = !!d.authenticated;
         this.auth.passwordSet = !!d.password_set;
         this.auth.loginMode = d.password_set ? 'login' : 'setup';
+        // P1-26：访问边界降级说明（配置读不出来 ⇒ 不限制来源）。
+        // 必须在 catch 之外赋值 —— 出错时也要显示上一次拿到的告警，
+        // 否则「接口挂了」反而把「面板此刻不设防」这条信息藏掉了。
+        this.auth.accessWarning = d.access_boundary_warning || '';
       } catch (e) {
         // 401 说明未登录（虽然 status 端点本身放行，但保险起见）
         this.auth.authenticated = false;

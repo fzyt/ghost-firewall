@@ -80,16 +80,16 @@ MUTATIONS = [
      lambda s: s.replace(
          """    deploy_ok, deploy_msg = _deploy_all_rules(config)
     if not deploy_ok:
-        return jsonify({"success": False,
-                        "message": f"网关配置未生效，规则已丢弃: {deploy_msg}"}), 500
+        rp["rules"].pop()
+        return None, f"网关配置未生效，规则已丢弃: {deploy_msg}", 500
 
     _save_rp_config(config)""",
          """    _save_rp_config(config)
 
     deploy_ok, deploy_msg = _deploy_all_rules(config)
     if not deploy_ok:
-        return jsonify({"success": False,
-                        "message": f"服务已保存但网关配置未生效: {deploy_msg}"}), 500"""),
+        rp["rules"].pop()
+        return None, f"服务已保存但网关配置未生效: {deploy_msg}", 500"""),
      '毒规则重新持久化到配置里'),
 
     ('SEC-3 登录时不吊销旧令牌',

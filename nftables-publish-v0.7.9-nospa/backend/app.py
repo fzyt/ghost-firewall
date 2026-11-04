@@ -519,6 +519,24 @@ _STATIC_EXTENSIONS = ('js', 'css', 'png', 'jpg', 'jpeg', 'gif', 'svg', 'ico', 'w
 
 _NETS_CACHE = {'mtime': None, 'nets': None}
 
+# 访问边界**降级**状态（P1-26，2026-11-04）。
+#
+# 这里记的是「面板当前不限制访问来源」这件事 + 为什么。
+# 它必须能被界面看到：原来只有服务端日志一行 [WARN]，
+# 界面上完全看不出来 ⇒ 管理员不知道自己的面板此刻谁都能访问。
+_ACCESS_DEGRADED = {'reason': ''}
+
+
+def _set_access_boundary_degraded(reason):
+    """记录/清除「访问边界降级」状态。"""
+    _ACCESS_DEGRADED['reason'] = reason or ''
+    return _ACCESS_DEGRADED['reason']
+
+
+def access_boundary_warning():
+    """当前访问边界的降级说明（空串 = 正常）。"""
+    return _ACCESS_DEGRADED.get('reason', '')
+
 
 def _parse_net_list(v):
     """把 panel_allowed_nets 归一化成网络对象列表。
@@ -575,10 +593,24 @@ def _panel_allowed_networks():
     （172.x.0.1），不在里面 → 面板会回 IP_NOT_ALLOWED 把人锁在门外。
     注意：配置里本来就不限制（nets 为空）时保持不限制 ——
     环境变量是「额外放行」，不是「收紧」。
+
+    ⚠️ 2026-11-04（P1-26）：第 3 种情况是**fail-open** ——
+    配置读不出来时**不限制来源**（不是「拒绝所有人」）。
+    为什么不是 fail-closed：fail-closed 会把管理员自己锁在门外，
+    而配置坏了的时候恰恰最需要面板能打开（哪怕只是看状态）。
+    面板本来还有两道网络侧的防线（只绑 LAN IP + 防火墙只放行 LAN 网段），
+    所以 fail-open 的实际暴露面限于「能到达面板端口的人」。
+    ⇒ 代价是这个降级状态**必须让人看得见**：
+    原来只有服务端日志里一行 [WARN]，界面上完全看不出来 ——
+    现在把它挂到 /api/auth/status 的 access_boundary_warning 上，
+    前端在登录页与主界面都显示一条醒目告警（P1-26 要求的「至少暴露到 UI」）。
     """
     try:
         stamp = os.stat(CONFIG_PATH).st_mtime_ns
     except OSError:
+        _set_access_boundary_degraded(
+            f'配置文件 {CONFIG_PATH} 不存在 —— 面板当前**不限制访问来源**，'
+            '任何能连到面板端口的人都能访问（含管理接口）')
         return []                       # 配置不存在 → 不限制
     if _NETS_CACHE['mtime'] == stamp:
         return _NETS_CACHE['nets']
@@ -587,6 +619,9 @@ def _panel_allowed_networks():
         bad, err = _config_corrupted()
         if bad:
             print(f'[WARN] 配置损坏（{err}），面板访问边界本次不限制', flush=True)
+            _set_access_boundary_degraded(
+                f'配置文件已损坏（{err}）—— 面板当前**不限制访问来源**，'
+                '任何能连到面板端口的人都能访问（含管理接口）')
             nets = []
         else:
             nets = _parse_net_list(cfg.get('panel_allowed_nets'))
@@ -594,8 +629,12 @@ def _panel_allowed_networks():
                 nets = _parse_net_list(cfg.get('lan_subnet4'))
     except Exception as e:              # noqa: BLE001
         print(f'[WARN] 面板访问边界读取失败（{type(e).__name__}: {e}），本次不限制', flush=True)
+        _set_access_boundary_degraded(
+            f'访问边界配置读取失败（{type(e).__name__}: {e}）—— 面板当前**不限制访问来源**，'
+            '任何能连到面板端口的人都能访问（含管理接口）')
         nets = []
     if nets:
+        _set_access_boundary_degraded('')
         extra = _parse_net_list(PANEL_ALLOWED_NETS_ENV)
         if extra:
             for n in extra:
@@ -636,6 +675,49 @@ def _lan_bind_address(lan_if, retries=6, wait=2.0):
             time.sleep(wait)
     print(f'[WARN] {lan_if} 上探测不到 IPv4 地址（{last or "无输出"}），已尝试 {retries} 次', flush=True)
     return ''
+
+
+def _sync_router_ip4(detected):
+    """把配置里的 router_ip4 同步成**探测到的**本机 LAN 地址。
+
+    为什么要它（2026-11-04，.238 换 IP 后 router_ip4 还停在 .146）：
+      这个字段不是只写着好看 —— 它是**自签证书的 CN/SAN**
+      （见 _ensure_https_cert 的取名逻辑）⇒ 机器换了 IP 而配置没跟着改时，
+      浏览器在新地址上照样报「证书与域名不匹配」，
+      用户看到的现象是「面板打不开 / 一直有证书警告」，
+      而真正的原因（配置里的地址过期了）没人会想到。
+
+      「保存网络配置」那条路径本来就会同步（见 save_network_config），
+      但那要人手动点一次；机器换 IP 这种事没人会想到去点。
+
+    同步条件（都满足才动）：
+      · 探测到了地址（调用方保证非空）
+      · 是合法的 IPv4
+      · 与配置里的现值不同
+      · **只写配置，不触发防火墙重下发** —— 启动阶段重下发风险太大
+
+    返回一条给日志看的说明；没同步则返回 ''。
+    """
+    if not detected:
+        return ''
+    try:
+        ipaddress.ip_address(str(detected).strip())
+    except ValueError:
+        return ''
+    try:
+        cfg = load_config()
+    except Exception:
+        return ''
+    old = str(cfg.get('router_ip4') or '').strip()
+    if old == str(detected).strip():
+        return ''
+    cfg['router_ip4'] = str(detected).strip()
+    try:
+        save_config(cfg)
+    except Exception as e:          # noqa: BLE001
+        return (f'router_ip4 同步失败（不影响启动）: {type(e).__name__}: {e}')
+    return (f'路由器 LAN 地址已从 {old or "(空)"} 同步为 {str(detected).strip()}'
+            '（机器换过 IP；该值用于自签证书 CN 与网关上游地址）')
 
 
 @app.before_request
@@ -12167,6 +12249,10 @@ def auth_status():
         'data': {
             'authenticated': _is_authenticated() and _session_epoch_ok(),
             'password_set': _password_set(),
+            # P1-26：访问边界降级（配置读不出来 ⇒ 面板**不限制来源**）。
+            # 原来这个状态只有服务端日志一行 [WARN]，界面上完全看不出来 ——
+            # 管理员不知道此刻谁都能访问自己的面板。
+            'access_boundary_warning': access_boundary_warning(),
         }
     })
 
@@ -13209,18 +13295,16 @@ def _start_servers():
     import sys as _sys
     from werkzeug.serving import make_server
 
-    cert_files = _ensure_https_cert()
-    ssl_ctx = _build_ssl_context(cert_files)
-
-    if not ssl_ctx:
-        print("[FATAL] HTTPS 证书不可用，拒绝启动（避免密码明文传输）。", flush=True)
-        print("        请检查：", flush=True)
-        print("        1. /etc/nginx/ssl/<domain>/ 下是否有有效反代证书（≥30 天有效期）", flush=True)
-        print("        2. 或确认 openssl 可用，以便生成自签证书", flush=True)
-        _sys.exit(1)
-
-    debug = os.environ.get('FLASK_DEBUG', '0') == '1'
-
+    # ========== 先探测本机 LAN 地址（两处要用）==========
+    #
+    # ① 绑定 HTTPS 服务（面板只绑 LAN IP，0.0.0.0 是公网开放的降级）
+    # ② 同步配置里的 router_ip4
+    #
+    # ⚠️ 顺序很重要：router_ip4 是**自签证书的 CN/SAN**。
+    #    机器换过 IP（.146 → .238）而配置没跟着改时，
+    #    证书里还是旧 IP ⇒ 浏览器在新地址上照样报「证书与域名不匹配」。
+    #    ⇒ 同步必须发生在 _ensure_https_cert() **之前**。
+    #
     # 单端口模式：面板本体 HTTPS。
     #
     # 绑定到 LAN 地址而不是 0.0.0.0。原来的做法把「面板只在 LAN 可达」
@@ -13233,8 +13317,8 @@ def _start_servers():
     # 逃生口是显式的：NFTABLES_WEB_BIND=0.0.0.0，且会打日志。
     _bind = os.environ.get('NFTABLES_WEB_BIND', '').strip()
     _bind_source = '环境变量 NFTABLES_WEB_BIND'
+    _cfg = load_config()
     if not _bind:
-        _cfg = load_config()
         _lan_if = str(_cfg.get('lan_if') or 'br-lan').strip() or 'br-lan'
         _bind = _lan_bind_address(_lan_if)
         _bind_source = f'探测 {_lan_if} 得到'
@@ -13250,6 +13334,28 @@ def _start_servers():
     # （面板只绑 LAN IP，127.0.0.1 连不上）。
     global PANEL_BIND_ADDR
     PANEL_BIND_ADDR = _bind
+
+    # router_ip4 自愈（2026-11-04）：机器换过 IP 就把配置里的旧地址纠正过来。
+    # 只写配置，不触发防火墙重下发（启动阶段重下发风险太大）。
+    try:
+        _sync_msg = _sync_router_ip4(_bind)
+        if _sync_msg:
+            print(f'[INFO] {_sync_msg}', flush=True)
+    except Exception as e:
+        print(f'[WARN] 同步 router_ip4 失败（不影响启动）: '
+              f'{type(e).__name__}: {e}', flush=True)
+
+    cert_files = _ensure_https_cert()
+    ssl_ctx = _build_ssl_context(cert_files)
+
+    if not ssl_ctx:
+        print("[FATAL] HTTPS 证书不可用，拒绝启动（避免密码明文传输）。", flush=True)
+        print("        请检查：", flush=True)
+        print("        1. /etc/nginx/ssl/<domain>/ 下是否有有效反代证书（≥30 天有效期）", flush=True)
+        print("        2. 或确认 openssl 可用，以便生成自签证书", flush=True)
+        _sys.exit(1)
+
+    debug = os.environ.get('FLASK_DEBUG', '0') == '1'
 
     https_server = make_server(_bind, HTTPS_PORT, app, ssl_context=ssl_ctx, threaded=True)
 

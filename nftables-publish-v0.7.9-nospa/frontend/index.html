@@ -101,6 +101,19 @@
       </div>
     </div>
   </div>
+  <!-- 访问边界降级告警（P1-26，2026-11-04）
+       配置读不出来时面板**不限制访问来源**（fail-open：fail-closed 会把
+       管理员自己也锁在门外，而配置坏了的时候恰恰最需要面板能打开）。
+       这个状态原来只有服务端日志里一行 [WARN]，界面上完全看不出来 ——
+       管理员不知道此刻谁都能访问自己的面板。
+       ⇒ 挂到 /api/auth/status 的 access_boundary_warning 上，
+         登录页与主界面都显示（z-index 高于登录遮罩，否则登录页看不见）。 -->
+  <div x-show="auth.accessWarning" x-cloak
+       class="nf-alert nf-alert--warn nf-access-warn">
+    <strong class="block mb-1">访问边界降级：面板当前不限制访问来源</strong>
+    <span x-text="auth.accessWarning"></span>
+  </div>
+
     <!-- 侧边导航 -->
     <!-- ⚠️ 2026-11-04 第十五轮：未认证时**整个藏起来**。
          登录遮罩从 88% 调到 58% 之后，遮罩下面那半个面板
