@@ -49,6 +49,20 @@ def load_app():
     return m
 
 
+def save_cfg(client, payload):
+    """POST /api/config —— 自动带上当前的 config_rev。
+
+    ⚠️ 2026-11-05（P1-24）：后端现在**强制要求** config_rev，
+    不带的一律 409 拒收 ⇒ 测试里凡是「正常保存」语义的调用
+    都得带上版本号。
+    """
+    body = dict(payload)
+    if 'config_rev' not in body:
+        snap = client.get('/api/config').get_json() or {}
+        body['config_rev'] = snap.get('config_rev')
+    return client.post('/api/config', json=body)
+
+
 mod = load_app()
 
 UCI_SAMPLE = """config main global
@@ -283,13 +297,16 @@ try:
         sess['login_time'] = 9e9
 
     # 5a. 改别的字段 → 不该碰 LuCI
-    r = client.post('/api/config', json={'whitelist_timeout': 12345})
+    #
+    # ⚠️ 2026-11-05（P1-24）：POST /api/config 现在**强制要求** config_rev
+    #   （不带的一律 409 拒收）⇒ 这里统一走 save_cfg()，它自动带上版本号。
+    r = save_cfg(client, {'whitelist_timeout': 12345})
     check('保存无关字段返回 200', r.status_code == 200, f'status={r.status_code}')
     check('开关没变 → 不调 _apply_luci_toggle', toggle_calls == [],
           f'calls={toggle_calls}')
 
     # 5b. 真的翻开关 → 调，且参数是新值
-    r = client.post('/api/config', json={'luci_enabled': True})
+    r = save_cfg(client, {'luci_enabled': True})
     check('翻开关返回 200', r.status_code == 200,
           f'status={r.status_code} body={r.get_json()}')
     check('翻开关 → 调了一次 _apply_luci_toggle(True)',
@@ -298,7 +315,7 @@ try:
 
     # 5c. 再翻回 False，同样要调
     toggle_calls.clear()
-    r = client.post('/api/config', json={'luci_enabled': False})
+    r = save_cfg(client, {'luci_enabled': False})
     check('翻回也调用一次',
           r.status_code == 200 and toggle_calls == [False],
           f'status={r.status_code} calls={toggle_calls}')
@@ -307,11 +324,11 @@ try:
     # 5c 的 toggle 失败了，实际状态没跟上；先把它拨回一致，
     # 再翻成 True、然后往 False 翻，制造一次真正的不一致
     actual['v'] = False
-    client.post('/api/config', json={'luci_enabled': True})
+    save_cfg(client, {'luci_enabled': True})
     check('翻成 True 后实际状态跟上', actual['v'] is True, f"actual={actual['v']}")
     toggle_calls.clear()
     gw_ok['v'] = False
-    r = client.post('/api/config', json={'luci_enabled': False})
+    r = save_cfg(client, {'luci_enabled': False})
     body = r.get_json()
     # 关一次(False) + 检测到网关不在后自动还原一次(True) —— 两次都要在
     check('关了之后又自动还原，toggle 共调两次',
@@ -329,7 +346,7 @@ try:
     gw_ok['v'] = True
     toggle_result['r'] = (False, 'nginx -t 失败')
     # 5d 结束时配置已回滚为 True，所以这里要往 False 翻才会真正触发 toggle
-    r = client.post('/api/config', json={'luci_enabled': False})
+    r = save_cfg(client, {'luci_enabled': False})
     body = r.get_json()
     check('切换失败返回 500', r.status_code == 500, f'status={r.status_code}')
     check('错误码是 LUCI_TOGGLE_FAILED', body.get('code') == 'LUCI_TOGGLE_FAILED',
@@ -379,7 +396,7 @@ try:
     with client.session_transaction() as sess:
         sess['authenticated'] = True
         sess['login_time'] = 9e9
-    r = client.post('/api/config', json={'whitelist_timeout': 999})
+    r = save_cfg(client, {'whitelist_timeout': 999})
     check('保存无关字段也触发对齐',
           r.status_code == 200 and t3 == [False],
           f'status={r.status_code} calls={t3}')
@@ -475,7 +492,7 @@ try:
     client = mod.app.test_client()
     with client.session_transaction() as sess:
         sess['authenticated'] = True
-    r = client.post('/api/config', json={
+    r = save_cfg(client, {
         'trusted_ip4': '192.168.100.1', 'luci_enabled': False})
     check('网关未启用时关 LuCI 返回 200', r.status_code == 200,
           f'HTTP {r.status_code} {(r.get_json() or {}).get("message")}')
@@ -496,7 +513,7 @@ try:
     cfg['gateway_enabled'] = True
     cfg['luci_enabled'] = True
     mod.save_config(cfg)
-    r = client.post('/api/config', json={
+    r = save_cfg(client, {
         'trusted_ip4': '192.168.100.1', 'luci_enabled': False})
     check('网关启用且在听时，关 LuCI 同样返回 200', r.status_code == 200,
           f'HTTP {r.status_code} {(r.get_json() or {}).get("message")}')

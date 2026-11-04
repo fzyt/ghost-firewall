@@ -940,8 +940,21 @@ DEFAULT_CONFIG = {
     #
     # 不要暴露成可由用户直接编辑的配置项：它是安全状态，不是设置项。
     "auth_token_epoch": 0,
-    # LAN 来源是否免认证。True = 认证只保护公网这一面（默认，符合「内网可信」）。
-    "auth_lan_bypass": True,
+    # LAN 来源是否免认证。
+    #
+    # ⚠️ 2026-11-05（用户拍板 P2-5）：默认值从 True 改成 **False**。
+    # 原因：**面板与网关的缺省值必须一致**。
+    #   面板原来默认 True（开），网关在配置缺这个键时按 False（关）
+    #   ⇒ 同一台机器上「面板显示的是开的、网关实际按关的处理」，
+    #     界面上看到的和实际生效的不是一回事。
+    #   而且默认「开」这个方向本身就是**安全默认的反面**：
+    #   「LAN 内免登录」意味着同一个局域网里的任何设备
+    #   （访客 Wi-Fi、客人的手机）访问公网入口都不用登录。
+    #   ⇒ 改成 False：默认要求登录，要放行由管理员显式打开。
+    #
+    # ⚠️ 只改**缺省值**；配置里已经写了这个键的机器行为不变
+    #   （存量配置里存的是 True 就还是 True —— 那是管理员自己选过的）。
+    "auth_lan_bypass": False,
     # ── v0.8.1 新增：LuCI 80/443 开关 ─────────────────────────────────
     # 80/443 属于 OpenWrt 自带的 LuCI（nginx._lan / nginx._redirect2ssl），
     # 不是本项目的反代（本项目在 8443）。个人宽带用不上 LuCI，默认关掉，
@@ -2818,20 +2831,39 @@ def post_config():
     # 这次保存会把那些改动静默覆盖掉 —— 2026-10-21 .1 事故就是这么发生的。
     # 前端把 GET /api/config 拿到的 config_rev 带回来，对不上就拒收。
     #
-    # 没带 config_rev 的调用**不拦**（第三方脚本、curl、旧版前端）：
-    # 主防线是下面「无条件剔除 reverse_proxy」，版本闸只是纵深防御。
+    # ⚠️ 2026-11-05（用户拍板 P1-24）：**强制要求**带 config_rev。
+    #   原来这里对「没带 config_rev」的调用是放行的（为了兼容
+    #   第三方脚本 / curl / 旧版前端），理由是「主防线是下面
+    #   无条件剔除 reverse_proxy，版本闸只是纵深防御」。
+    #   ⇒ 但那恰恰是危险的方向：**不带版本号的调用正是最可能
+    #     用旧快照覆盖新配置的那一类**（脚本往往拿一份手抄的配置）。
+    #     纵深防御在这里就是主防线 —— 不带版本号 = 说不清自己基于
+    #     哪一份快照 ⇒ 拒收，让调用方先去 GET 一次。
+    #
+    # 拒收用 **409**（与 CONFIG_STALE 同码）：
+    #   语义是「你这份快照对不上 / 缺版本号，重新拉一份再来」。
+    #   409 而不是 400 —— 因为这不是「请求格式错了」，
+    #   而是「内容过期了」，重试就能解决。
     sent_rev = str(data.get('config_rev') or '').strip()
     incoming.pop('config_rev', None)     # 版本号不是配置字段，绝不能落盘
-    if sent_rev:
-        cur_rev = _config_rev(old_cfg)
-        if sent_rev != cur_rev:
-            return jsonify({
-                'success': False,
-                'code': 'CONFIG_STALE',
-                'message': ('配置在你打开页面之后被改过，本次保存会覆盖掉那些改动，'
-                            '已拒绝。请刷新页面后重新编辑。'),
-                'data': {'config_rev': cur_rev},
-            }), 409
+    cur_rev = _config_rev(old_cfg)
+    if not sent_rev:
+        return jsonify({
+            'success': False,
+            'code': 'CONFIG_REV_REQUIRED',
+            'message': ('本次保存缺少配置版本号（config_rev），已拒绝。'
+                        '请先 GET /api/config 取一份最新快照，'
+                        '带上 config_rev 再提交。'),
+            'data': {'config_rev': cur_rev},
+        }), 409
+    if sent_rev != cur_rev:
+        return jsonify({
+            'success': False,
+            'code': 'CONFIG_STALE',
+            'message': ('配置在你打开页面之后被改过，本次保存会覆盖掉那些改动，'
+                        '已拒绝。请刷新页面后重新编辑。'),
+            'data': {'config_rev': cur_rev},
+        }), 409
 
     # 只读键：GET 为了让前端能显示「实际状态」会多给几个字段，而前端是把
     # 整个 config 对象原样回传的。这些键不是配置，绝不能落盘。
@@ -8996,9 +9028,11 @@ def _config_rev(config):
     写路径的子树不参与计算。否则反代页改一条规则就会让配置页的快照失效，
     保存时莫名 409 —— 而那份数据本来就不会被 /api/config 写。
 
-    没带 config_rev 的调用（第三方脚本、curl、旧版前端）**不拦**：
-    主防线是「无条件剔除 reverse_proxy」，版本闸只是纵深防御，
-    不该变成一个让老调用方直接 409 的破坏性变更。
+    ⚠️ 2026-11-05（用户拍板 P1-24）：**没带 config_rev 的调用现在也会被拒**
+    （409 CONFIG_REV_REQUIRED）。原来是为了兼容第三方脚本 / curl / 旧版前端
+    而放行的，理由是「主防线是反向代理字段的无条件剔除，版本闸只是纵深防御」
+    —— 但不带版本号的调用恰恰是最可能用**旧快照**覆盖新配置的那一类
+    （脚本往往拿一份手抄的配置）⇒ 这里从纵深防御升为主防线。
     """
     payload = {k: v for k, v in (config or {}).items()
                if k not in RP_OWNED_CONFIG_KEYS}
@@ -11043,7 +11077,10 @@ def gateway_status():
             # 面板会向用户显示「绝对上限 0（不启用）」而实际生效的是 43200。
             "absolute_timeout": _int_or(config.get("auth_absolute_timeout"),
                                         DEFAULT_CONFIG["auth_absolute_timeout"]),
-            "lan_bypass": bool(config.get("auth_lan_bypass", True)),
+            # 兜底值必须和 DEFAULT_CONFIG 一致（2026-11-05 用户拍板 P2-5：
+            # 原来这里是 True、DEFAULT_CONFIG 里也是 True，但网关那边
+            # 的缺省是 False ⇒ 三处不一致 ⇒ 界面显示与实际生效对不上）。
+            "lan_bypass": bool(config.get("auth_lan_bypass", False)),
             "services": [
                 {
                     "name": str(r.get("name") or p.lstrip("/"))[:64],
@@ -11133,8 +11170,11 @@ def gateway_set_config():
     # 「网关开着 + LAN 内免登录」这个组合本身不是错误，但它意味着
     # **同一个局域网里的任何设备**（访客 Wi-Fi、客人的手机）访问公网入口
     # 都不用登录，直接用上所有已开放的服务。2026-10-16 fresh install 实测：
-    # DEFAULT_CONFIG 的 auth_lan_bypass 默认为 True，且 setup.sh 不写这个键，
+    # 当时 DEFAULT_CONFIG 的 auth_lan_bypass 默认为 True，且 setup.sh 不写这个键，
     # 于是全新安装出来的机器天然落在这个组合上，而面板当时一个字都不提。
+    # ⚠️ 2026-11-05（P2-5）：缺省值已改成 False ⇒ 全新安装不再天然落进来；
+    #   但**存量配置里存着 True 的机器**仍然会命中下面这条提醒 ——
+    #   那是管理员自己选过的，不该被静默改掉，只该提醒。
     #
     # 判据取**结果配置**而不是「本次请求改了什么」：在已开的网关上单独打开
     # bypass，比一开始就两个都开着更危险 —— 那是在拿掉一层已经生效的保护，

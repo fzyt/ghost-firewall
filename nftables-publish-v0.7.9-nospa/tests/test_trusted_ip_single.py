@@ -160,8 +160,14 @@ try:
     with client.session_transaction() as sess:
         sess['authenticated'] = True
         sess['login_time'] = 9e9
+    # ⚠️ 2026-11-05（P1-24）：POST /api/config 现在**强制要求** config_rev
+    #   （不带版本号的调用 = 说不清自己基于哪份快照 ⇒ 409 拒收）。
+    #   ⇒ 先 GET 一份最新快照，带上它的 config_rev 再提交。
+    _snapshot = client.get('/api/config').get_json() or {}
+    _rev = _snapshot.get('config_rev')
     r = client.post('/api/config', json={
-        'trusted_ip4': ['192.168.100.224', '192.168.100.1', '192.168.100.249']})
+        'trusted_ip4': ['192.168.100.224', '192.168.100.1', '192.168.100.249'],
+        'config_rev': _rev, 'confirm': True})
     body = r.get_json()
     saved = json.load(open(CFG))
     check('保存返回 200', r.status_code == 200, f'status={r.status_code} body={body}')

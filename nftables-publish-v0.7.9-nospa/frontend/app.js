@@ -648,6 +648,23 @@ function app() {
           }
         }
       } catch (e) {
+        // 后端 409 CONFIG_REV_REQUIRED（2026-11-05 P1-24 起强制要求版本号）：
+        // 请求里没带 config_rev —— 通常意味着这次保存用的不是从
+        // GET /api/config 拉来的那份快照（配置加载失败后的残留、
+        // 或者别的脚本手搓的请求）。
+        // 语义与 CONFIG_STALE 不同：不是「配置被别人改了」，
+        // 而是「你这份请求说不清自己基于哪份快照」⇒ 让用户重新加载。
+        if (e.code === 'CONFIG_REV_REQUIRED') {
+          this.diffModal.show = false;
+          this.diffModal.pendingConfig = null;
+          this.showToast('本次保存缺少配置版本号，已被拒绝', 'error');
+          if (confirm('本次保存缺少配置版本号（config_rev），后端已经拒绝。\n' +
+                      '通常是因为配置没能正常加载，或这份请求不是基于最新快照。\n\n' +
+                      '是否重新加载最新配置？\n（当前页面上未保存的修改会丢失）')) {
+            await this.loadConfig();
+          }
+          return;
+        }
         // 后端 409 CONFIG_STALE：页面打开之后配置被别人改过
         //（反代页操作、另一台设备、另一个标签页），这次保存会把那些改动
         // 覆盖掉 —— 后端直接拒收，前端负责说清楚并让用户重新加载。

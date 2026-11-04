@@ -140,6 +140,21 @@ mod.app.before_request_funcs[None] = []
 try:
     # ── 1. 主防线：/api/config 绝不收 reverse_proxy ───────────────────────
     sec('1. POST /api/config 不收 reverse_proxy（.1 事故原样复现）')
+
+    def post_config(client, payload, with_rev=True):
+        """POST /api/config —— 默认自动带上当前的 config_rev。
+
+        ⚠️ 2026-11-05（P1-24）：后端现在**强制要求** config_rev，
+        不带的一律 409 拒收 ⇒ 测试里凡是「正常保存」语义的调用
+        都得带上版本号。
+        （专门测「不带会怎样」的那条用例走 with_rev=False。）
+        """
+        body = dict(payload)
+        if with_rev and 'config_rev' not in body:
+            snap = client.get('/api/config').get_json() or {}
+            body['config_rev'] = snap.get('config_rev')
+        return client.post('/api/config', json=body)
+
     write_config(base_config(reverse_proxy={
         'rules': [], 'certificates': [], 'settings': {}}))
     client = make_client()
@@ -194,7 +209,7 @@ try:
           f"实际={(after.get('settings') or {}).get('default_cert_id')!r} 期望={cert_id!r}")
 
     # ④ 显式传一个空 reverse_proxy 也一样不能覆盖
-    r = client.post('/api/config', json={
+    r = post_config(client, {
         'reverse_proxy': {'rules': [], 'certificates': [], 'settings': {}},
         'confirm': True})
     after = read_config()['reverse_proxy']
@@ -205,7 +220,7 @@ try:
           f"certs={len(after.get('certificates') or [])}")
 
     # ⑤ 响应里要说明「反代字段被忽略了」
-    body = client.post('/api/config', json={
+    body = post_config(client, {
         'reverse_proxy': {'rules': []}, 'confirm': True}).get_json()
     check('响应里报告了被忽略的反代字段',
           (body.get('data') or {}).get('ignored_rp_fields') == ['reverse_proxy'],
@@ -253,10 +268,24 @@ try:
     check('用新版本号再存一次：200', r2.status_code == 200,
           f'status={r2.status_code} body={r2.get_json()}')
 
-    # 不带 config_rev 的调用（curl / 第三方脚本）不拦
+    # ⚠️ 2026-11-05（用户拍板 P1-24）：**强制要求** config_rev。
+    #   原来这里是「不带 config_rev 仍然放行（向后兼容）」——
+    #   理由是「主防线是反向代理字段的无条件剔除，版本闸只是纵深防御」。
+    #   但不带版本号的调用恰恰是最可能用**旧快照**覆盖新配置的那一类
+    #   （脚本往往拿一份手抄的配置）⇒ 版本闸从纵深防御升为主防线。
     r = client.post('/api/config', json={'log_size': 512, 'confirm': True})
-    check('不带 config_rev 仍然放行（向后兼容）', r.status_code == 200,
+    check('不带 config_rev 的调用被拒（409 CONFIG_REV_REQUIRED）',
+          r.status_code == 409
+          and (r.get_json() or {}).get('code') == 'CONFIG_REV_REQUIRED',
           f'status={r.status_code} body={r.get_json()}')
+    check('拒收时把当前版本号回给调用方（它可以拿去重试）',
+          bool(((r.get_json() or {}).get('data') or {}).get('config_rev')),
+          f'body={r.get_json()}')
+    # 拒收后**配置不能被改**（这是这道闸的全部意义）
+    _after_reject = client.get('/api/config').get_json()
+    check('拒收后配置没被写入（log_size 没变成 512）',
+          _after_reject.get('log_size') != 512,
+          f"log_size={_after_reject.get('log_size')}")
 
     # 反代页的写操作**不能**让配置页的快照失效
     # （reverse_proxy 不参与版本号计算 —— 否则改一条规则就莫名 409）

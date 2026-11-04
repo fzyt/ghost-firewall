@@ -158,6 +158,8 @@ try:
     with client.session_transaction() as sess:
         sess['authenticated'] = True
 
+    # ⚠️ 2026-11-05（P1-24）：POST /api/config 强制要求 config_rev
+    _rev = (client.get('/api/config').get_json() or {}).get('config_rev')
     r = client.post('/api/config', json={
         'trusted_ip4': '192.168.100.224',
         # 模拟前端把整个 config 对象原样回传，夹带网关字段
@@ -174,6 +176,7 @@ try:
         'gateway_actual': {'enabled': True},
         # 以及「安全状态」类只读键（Shannon P0-4）：通用路径必须写不进去
         'auth_token_epoch': 999,
+        'config_rev': _rev,
     })
     check('接口仍然返回 200（不能因为剔字段就失败）', r.status_code == 200,
           f'HTTP {r.status_code} {r.get_data(as_text=True)[:160]}')
@@ -332,18 +335,27 @@ finally:
 
 
 # ── 4e. 「网关开着 + LAN 内免登录」必须在响应里明确警告 ─────────────────
-# .224 fresh install 实测（2026-10-16）：DEFAULT_CONFIG 的 auth_lan_bypass
-# 默认为 True，setup.sh 又不写这个键，于是全新安装出来的机器天然落在这个
-# 组合上 —— 直打 127.0.0.1:8444/auth/portal 无凭据返回 200 并吐出完整门户
-# 数据，而面板一个字都不提。
+# .224 fresh install 实测（2026-10-16）：当时 DEFAULT_CONFIG 的
+# auth_lan_bypass 默认为 True，setup.sh 又不写这个键，于是全新安装出来的
+# 机器天然落在这个组合上 —— 直打 127.0.0.1:8444/auth/portal 无凭据返回 200
+# 并吐出完整门户数据，而面板一个字都不提。
 #
-# 用户拍板：默认值不改（家用场景要的是免登录），但启用时必须明确警告。
+# ⚠️ 2026-11-05（用户拍板 P2-5）：**缺省值已改成 False**。
+#   理由：面板的缺省（True）与网关的缺省（False）不一致，
+#   且「默认免登录」本身是安全默认的反面。
+#   ⇒ 全新安装不再天然落进这个组合；
+#     但**存量配置里存着 True 的机器**仍然会命中下面这条警告 ——
+#     那是管理员自己选过的，不该被静默改掉，只该提醒。
+#
 # 这一节钉住后端那一半（前端 confirm 只挡走面板的人，API 客户端看不到）。
 TD4E = tempfile.mkdtemp()
 CFG4E = os.path.join(TD4E, 'config.json')
 with open(CFG4E, 'w') as f:
+    # ⚠️ 显式写 auth_lan_bypass=True —— 模拟「存量机器上管理员自己开过」。
+    #   （DEFAULT_CONFIG 现在是 False，不能再靠缺省拿到 True。）
     json.dump({**mod.DEFAULT_CONFIG, 'trusted_ip4': '192.168.100.224',
                'gateway_enabled': False, 'gateway_port': 8443,
+               'auth_lan_bypass': True,
                'lan_subnet4': '192.168.100.0/24'}, f)
 
 _orig_cfg = mod.CONFIG_PATH
@@ -363,11 +375,22 @@ try:
     with client.session_transaction() as sess:
         sess['authenticated'] = True
 
-    # 4e1. 默认配置里 auth_lan_bypass 就是 True → 启用网关必须带警告
-    check('DEFAULT_CONFIG 里 auth_lan_bypass 确实是 True（这是本节的前提）',
-          mod.DEFAULT_CONFIG.get('auth_lan_bypass') is True,
+    # 4e1. P2-5（2026-11-05）：缺省值现在是 False，且与网关一致
+    check('★ DEFAULT_CONFIG 里 auth_lan_bypass 的缺省是 False（P2-5）',
+          mod.DEFAULT_CONFIG.get('auth_lan_bypass') is False,
           f'实际={mod.DEFAULT_CONFIG.get("auth_lan_bypass")!r}')
+    # 面板与网关的缺省必须一样 ——
+    # 网关那边没有 DEFAULT_CONFIG 字典，缺省是硬编码在
+    # `cfg.get("auth_lan_bypass", False)` 里的 ⇒ 直接查源码字面量。
+    _gw_src = open(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        '..', 'backend', 'auth_gateway.py'), encoding='utf-8').read()
+    check('★ 面板与网关的缺省一致（网关那边也是 False）',
+          'cfg.get("auth_lan_bypass", False)' in _gw_src
+          and 'cfg.get("auth_lan_bypass", True)' not in _gw_src,
+          '网关侧应一律按 False 兜底')
 
+    # 4e1b. 存量机器（配置里存着 True）+ 启用网关 → 必须带警告
     r = client.post('/api/gateway/config', json={'gateway_enabled': True})
     b = (r.get_json() or {}).get('data') or {}
     w = b.get('warning')

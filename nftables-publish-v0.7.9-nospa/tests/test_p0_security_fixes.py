@@ -182,8 +182,12 @@ try:
     _pc2 = app2.app.test_client()
     with _pc2.session_transaction() as sess:
         sess['authenticated'] = True
+    # ⚠️ 2026-11-05（P1-24）：POST /api/config 强制要求 config_rev
+    #   ⇒ 先 GET 一份最新快照，带上它的 config_rev 再提交。
+    _rev2 = (_pc2.get('/api/config').get_json() or {}).get('config_rev')
     _post2 = _pc2.post('/api/config', json={'auth_token_epoch': 999,
-                                           'trusted_ip4': '192.168.100.224'})
+                                           'trusted_ip4': '192.168.100.224',
+                                           'config_rev': _rev2})
     check('管理员会话 POST /api/config 仍然 200（剔除字段不能把接口搞失败）',
           _post2.status_code == 200,
           f'HTTP {_post2.status_code} {_post2.get_data(as_text=True)[:160]}')
