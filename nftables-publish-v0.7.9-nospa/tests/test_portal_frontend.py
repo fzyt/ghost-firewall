@@ -244,6 +244,11 @@ def entry_block(body, key):
 
 
 STYLES_BODY = table_body(PIXELFIELD, 'STYLES')
+# ⚠ 「这东西不该出现」类断言必须用**剥掉注释**的版本：
+#   entry_block 取到的是「从本键到下一个键」的整段，**会带上下一档的注释**
+#   （例如 trae-orig 那一段后面就是 moonstone-trae 的注释块，
+#    注释里提到 flowMask ⇒ 不剥注释就判「有 flowMask」⇒ 假红）。 */
+STYLES_BODY_CODE = table_body(PIXELFIELD_CODE, 'STYLES')
 PARAMS_BODY = table_body(PIXELFIELD, 'P')
 PALETTES_BODY = table_body(PIXELFIELD, 'PALETTES')
 PALETTE_TRAE = entry_block(PALETTES_BODY, 'trae')
@@ -566,11 +571,13 @@ for f in REMOVED_FILES:
     check(f'白名单不再列 {f}', f not in allowed)
 check('portal.js 不再有 GhostFX 守卫（变体引擎没了，守卫是死代码）',
       'GhostFX' not in PORTAL_JS_CODE)
-# 2026-11-03 第十轮：门户切到「月白·TRAE」合档（方块用原方案、流动用 TRAE）。
-# ⚠ 判据用 "'moonstone-trae'"：TRAE 原版那一档仍在引擎里，
-#   但**门户不再用它**（合档才是当前要的那个画面）。
-check('portal.js 用的是 moonstone-trae（合档：方块用原方案、流动用 TRAE）',
-      "'moonstone-trae'" in PORTAL_JS_CODE)
+# 2026-11-04 第十一轮：门户切到「TRAE·原版方块」（TRAE 底、方块用原方案）。
+# ⚠ 判据用 "'trae-orig'"：TRAE 原版那一档仍在引擎里，
+#   但**门户不再用它**（新档才是当前要的那个画面）。
+check('portal.js 用的是 trae-orig（TRAE 底 + 原版方块）',
+      "'trae-orig'" in PORTAL_JS_CODE)
+check('portal.js 不再用 moonstone-trae（合档：底座是原方案，方向已被用户纠正）',
+      "'moonstone-trae'" not in PORTAL_JS_CODE)
 check('portal.js 不再用 moonstone-swirl（那一档已不是门户默认）',
       "'moonstone-swirl'" not in PORTAL_JS_CODE)
 # 已被用户否掉的两档（月白·乱潮 / 月白·转潮）必须从引擎里删干净 ——
@@ -1067,11 +1074,11 @@ check('moonstone 档没被这一批动过（登录页那一档）',
       'traeMode:' not in entry_block(STYLES_BODY, 'moonstone'))
 
 # 门户已经切到新档
-# ⚠ 2026-11-03 第十轮：门户切到「月白·TRAE」合档 ⇒ 这两条改成合档。
-#   TRAE 原版那一档**保留在引擎里**，只是门户不再用它。
-check("portal.js 用的是 createStyle(canvas, 'moonstone-trae', opt)",
-      "createStyle(canvas, 'moonstone-trae', opt)" in PORTAL_JS_CODE)
-check('portal.js 不再自己传 columns（合档吃引擎默认列数）',
+# ⚠ 2026-11-04 第十一轮：门户切到「TRAE·原版方块」⇒ 这两条改成新档。
+#   TRAE 原版与合档那两档**保留在引擎里**，只是门户不再用它们。
+check("portal.js 用的是 createStyle(canvas, 'trae-orig', opt)",
+      "createStyle(canvas, 'trae-orig', opt)" in PORTAL_JS_CODE)
+check('portal.js 不再自己传 columns（档位吃引擎默认列数）',
       'columns: 118' not in PORTAL_JS_CODE)
 
 
@@ -1144,11 +1151,123 @@ for k in ['moonstone', 'moonstone-flow', 'pixel-flow', 'trae']:
           'flowMask:' not in entry_block(STYLES_BODY, k))
 check('trae 档（TRAE 原版）仍然保留', bool(entry_block(STYLES_BODY, 'trae')))
 
-# 门户已经切到合档
-check("portal.js 用的是 createStyle(canvas, 'moonstone-trae', opt)",
-      "createStyle(canvas, 'moonstone-trae', opt)" in PORTAL_JS_CODE)
-check('portal.js 不再自己传 columns（合档吃引擎默认列数）',
+# ⚠ 2026-11-04 第十一轮：门户改用 'trae-orig'（TRAE 底 + 原版方块），
+#   合档（'moonstone-trae'）这一档**保留在引擎里**，只是门户不再用它。
+check("portal.js 用的是 createStyle(canvas, 'trae-orig', opt)",
+      "createStyle(canvas, 'trae-orig', opt)" in PORTAL_JS_CODE)
+check('portal.js 不再自己传 columns（档位吃引擎默认列数）',
       'columns: 118' not in PORTAL_JS_CODE)
+check('合档那一档仍然保留在引擎里（随时能切回去）',
+      bool(entry_block(STYLES_BODY, 'moonstone-trae')))
+
+
+# ─────────────────────────────────────────────────────────────
+sec('PF-28 「TRAE·原版方块」新档（2026-11-04：TRAE 原版为底，只换方块那一层）')
+
+# 用户原话：「这个 trae 原版为基础，做一个新方案，就是里面的方块方案
+#   改一下，改成我们原版方案，其他一律不动」
+to = entry_block(STYLES_BODY, 'trae-orig')
+check('引擎新增了 trae-orig 档（TRAE 底 + 原版方块）', bool(to))
+check('新档用 moonstone-trae 配色（纯黑底 + 月白银白）',
+      "palette: 'moonstone-trae'" in to)
+
+# 底座参数必须与 TRAE 原版一字不差
+for name, val, desc in [
+    ('traeMode', '1', '走 TRAE 分支（整条渲染路径换掉）'),
+    ('traeGrid', '16', '粗网格步长'),
+    ('traeMouse', '1', '指针交互'),
+    ('traeBlocks', '1', '方块层换成原方案'),
+]:
+    check('新档的 ' + name + ' = ' + val + '（' + desc + '）',
+          re.search(re.escape(name) + r':\s*' + re.escape(val) + r',', to) is not None)
+
+# 方块层的参数必须是**原方案的值**
+for name, val, desc in [
+    ('trail', '0.80', '余晖渐隐'),
+    ('hyst', '0.035', '迟滞'),
+    ('lit', '0.10', '密度伺服目标（原方案 moonstone 的默认值）'),
+]:
+    check('新档的方块层参数 ' + name + ' = ' + val + '（原方案的 ' + desc + '）',
+          re.search(re.escape(name) + r':\s*' + re.escape(val) + r',', to) is not None)
+
+# ⚠ 新档**不许**带合档那一档的东西（那是「原方案为底」的路线）
+#   ⇒ 用剥掉注释的版本判（注释里提到 flowMask 属于说明，不是参数）
+to_code = entry_block(STYLES_BODY_CODE, 'trae-orig')
+check('新档没有 flowMask（新档不走「遮罩源换 TRAE」那条路）',
+      'flowMask' not in to_code)
+check('新档没有 flowThresh / flowSoft / flowSolo',
+      'flowThresh' not in to_code and 'flowSoft' not in to_code and
+      'flowSolo' not in to_code)
+check('新档没有波（waves）——底座是 TRAE，不是原方案的三道波',
+      'waves' not in to_code)
+
+# 配色：纯黑底 + 月白银白两档
+mt = entry_block(PALETTES_BODY, 'moonstone-trae')
+check('引擎新增 moonstone-trae 配色', bool(mt))
+check('moonstone-trae 的底色是纯黑（TRAE 原版的底）',
+      re.search(r'bg:\s*\[\s*0\s*,\s*0\s*,\s*0\s*\]', mt) is not None)
+check('moonstone-trae 的浪身色是月白银灰 rgb(136,140,148)',
+      re.search(r'accent:\s*\[\s*136\s*,\s*140\s*,\s*148\s*\]', mt) is not None)
+check('moonstone-trae 的浪尖色是月白银白 rgb(244,245,248)',
+      re.search(r'white:\s*\[\s*244\s*,\s*245\s*,\s*248\s*\]', mt) is not None)
+
+# 新增引擎参数默认值必须全为 0（不传时与改版前逐位一致）
+for pname in ['traeBlocks', 'traeSoft']:
+    check('引擎新增 ' + pname + ' 参数（默认 0 ⇒ 不传时逐位一致）',
+          re.search(re.escape(pname) + r':\s*0,', PARAMS_BODY) is not None)
+
+# 方块模式的两段实现必须在
+check('引擎新增方块模式的几何 computeTraeBlocks',
+      'function computeTraeBlocks(' in PIXELFIELD)
+check('引擎新增方块模式的渲染 renderTraeBlocks',
+      'function renderTraeBlocks(' in PIXELFIELD)
+check('方块模式走自己的渲染分支（TRAE 原版那段不受影响）',
+      re.search(r'if \(tBlocks\) \{ renderTraeBlocks\(t\); return; \}', PIXELFIELD) is not None)
+
+# 晶格必须是原方案那套公式（12px）
+check('方块模式的晶格用原方案公式（SS × round(w/列数/SS)）',
+      re.search(r'tCell = SS \* Math\.max\(2, Math\.round\(w / COLUMNS / SS\)\);', PIXELFIELD)
+      is not None)
+check('方块模式的点宽按亚像素换算（原方案 2 亚像素 / 3 亚像素两档）',
+      re.search(r'var b1 = p\.pxBody > 0 \? Math\.min\(SS, p\.pxBody \| 0\) : 2;', PIXELFIELD)
+      is not None and
+      re.search(r'var b2 = p\.pxCrest > 0 \? Math\.min\(SS, p\.pxCrest \| 0\) : 3;', PIXELFIELD)
+      is not None)
+
+# 亮度来源必须还是 TRAE 的公式
+check('方块模式的亮度仍是 TRAE 的 0.562 + 0.438n',
+      re.search(r'var bright = 0\.562 \+ 0\.438 \* nAt;', PIXELFIELD) is not None)
+
+# 选点、余晖、迟滞三层必须是原方案的算法
+check('方块模式用原方案的软门选点（每格固定随机门槛 rSel）',
+      re.search(r'var sel = \(pOn \+ psoft - tSel\[idx\]\) / psoft;', PIXELFIELD) is not None)
+check('方块模式用原方案的每格随机亮度 rAmp',
+      re.search(r'band = sel \* \(\(1 - p\.jitterAmp\) \+ p\.jitterAmp \* tAmp\[idx\]\);',
+                PIXELFIELD) is not None)
+check('方块模式用原方案的余晖（峰值留住、每步衰减 trail）',
+      re.search(r'var e = band > prev \? band : prev \* p\.trail;', PIXELFIELD) is not None)
+# 方块模式里必须接密度伺服（否则密度钉死在初始值，遇到不同的屏幕宽度会失控）
+m_blk = re.search(r'function renderTraeBlocks\(t\) \{(.*?)\n    \}', PIXELFIELD, re.S)
+check('方块模式里接了密度伺服（litInBand 驱动 pickGain）',
+      m_blk is not None and 'servoStep(stats.litInBand, false);' in m_blk.group(1))
+check('方块模式把亮区格数当成「波带」用（bandCells = mask>0 的格数）',
+      re.search(r'stats\.bandCells = region;', PIXELFIELD) is not None)
+check('方块模式用原方案的迟滞（alpha 下降按帧限速）',
+      re.search(r'if \(a1 < tA1Prev\[idx\]\)', PIXELFIELD) is not None)
+
+# TRAE 原版那一段必须一个字没动（晶格仍是 7px、块仍是 5×5、三态仍在）
+check('TRAE 原版的晶格没被动（仍是 7px）',
+      re.search(r'var bu = \(cx \* TR_CELL \+ TR_DOT / 2\) / w;', PIXELFIELD) is not None)
+check('TRAE 原版的三态缓冲仍在（tState：0 黑 / 1 绿 / 2 白）',
+      re.search(r'var tState = null;\s*/\* 每格：0 黑 / 1 绿 / 2 白 \*/', PIXELFIELD) is not None)
+check('TRAE 原版仍在（trae 档没被这一批动过）',
+      bool(entry_block(STYLES_BODY, 'trae')))
+check('trae 档没有开 traeBlocks（原版不受影响）',
+      'traeBlocks:' not in entry_block(STYLES_BODY_CODE, 'trae'))
+
+# 门户已经切到新档
+check("portal.js 用的是 createStyle(canvas, 'trae-orig', opt)",
+      "createStyle(canvas, 'trae-orig', opt)" in PORTAL_JS_CODE)
 
 # 回归计数公式必须认 [PASS]/[FAIL]（否则这几百项静态断言在计数里全是 0）
 check('回归脚本的计数公式同时认 ✅ 与 [PASS]',

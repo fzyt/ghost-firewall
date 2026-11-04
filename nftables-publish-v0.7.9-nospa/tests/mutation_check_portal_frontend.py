@@ -55,6 +55,7 @@ TEST_PY = os.path.join(ROOT, 'tests', 'test_portal_frontend.py')
 TEST_JS = os.path.join(ROOT, 'tests', 'test_pixelfield_hardedge.js')
 TEST_JS2 = os.path.join(ROOT, 'tests', 'test_pixelfield_trae.js')
 TEST_JS3 = os.path.join(ROOT, 'tests', 'test_pixelfield_moonstone_trae.js')
+TEST_JS4 = os.path.join(ROOT, 'tests', 'test_pixelfield_trae_orig.js')
 
 # 本脚本会动的文件（只这些）
 REL_FILES = [
@@ -130,8 +131,15 @@ def run_tests():
     r4 = subprocess.run([node, TEST_JS3],
                         capture_output=True, text=True, cwd=ROOT,
                         timeout=300, env=env)
-    return r4.returncode, (out + r2.stdout + r2.stderr
-                           + r3.stdout + r3.stderr + r4.stdout + r4.stderr)
+    if r4.returncode != 0:
+        return r4.returncode, (out + r2.stdout + r2.stderr
+                               + r3.stdout + r3.stderr + r4.stdout + r4.stderr)
+    r5 = subprocess.run([node, TEST_JS4],
+                        capture_output=True, text=True, cwd=ROOT,
+                        timeout=600, env=env)
+    return r5.returncode, (out + r2.stdout + r2.stderr
+                           + r3.stdout + r3.stderr + r4.stdout + r4.stderr
+                           + r5.stdout + r5.stderr)
 
 
 def mutate(rel, old, new):
@@ -538,7 +546,7 @@ MUTATIONS = [
     # ── G. 接线 / 加载顺序 / 安全面 / 占位符 ──
     # ⚠ 2026-11-03 第十轮：门户切到「月白·TRAE」合档，锚点跟着改。
     ('N-59', '门户退回 moonstone-swirl（用户点名否掉的那一档）', PJS,
-     "createStyle(canvas, 'moonstone-trae', opt)",
+     "createStyle(canvas, 'trae-orig', opt)",
      "createStyle(canvas, 'moonstone-swirl', opt)"),
     ('N-60', 'GhostFX 守卫被复活（变体引擎没了，守卫是死代码）', PJS,
      "  (function mountField() {\n    var canvas = document.getElementById('pix');",
@@ -640,8 +648,10 @@ MUTATIONS = [
     ('M-19', 'TRAE 分支的几何被绕过（退回老路径 ⇒ 不是 TRAE 的画面）', PIX,
      'if (p.traeMode > 0) { renderTrae(t); return; }',
      'if (p.traeMode > 0) { computeTrae(stepIdx * p.step); return; }'),
+    # ⚠ 2026-11-04 第十一轮：鼠标影响因子被抽成了共用函数 tMouseFactor()
+    #   （TRAE 原版与新档共用一段）⇒ 锚点跟着改。
     ('M-20', '鼠标影响因子被拆掉（指针附近不再泛绿）', PIX,
-     'mf = (1 - stt * stt * (3 - 2 * stt)) * TR_MS;', 'mf = 0;'),
+     '      return (1 - stt * stt * (3 - 2 * stt)) * TR_MS;', '      return 0;'),
     # ── S. 月白·TRAE 合档（2026-11-03 第十轮）────────────────────
     # 用户原话：「方块使用我们现在网关用的方案（原方案），
     #   然后流动保留trae的流动方案」
@@ -661,18 +671,75 @@ MUTATIONS = [
      'mask = m1 * m2;'),
     ('M-26', '独当模式的 band = 1 被删（flowSolo 不起作用）',
      PIX, '            if (solo) band = 1;', '            if (false) band = 1;'),
-    ('M-27', '门户不用合档（背景退回 TRAE 原版）', PJS,
-     "createStyle(canvas, 'moonstone-trae', opt)",
+    ('M-27', '门户不用新档（背景退回 TRAE 原版）', PJS,
+     "createStyle(canvas, 'trae-orig', opt)",
      "createStyle(canvas, 'trae', opt)"),
     # ⚠ 锚点必须**唯一**：裸 'palette: \'moonstone\'' 在 moonstone-flow 里也有，
     #   而 mutate() 替换的是**第一个**匹配 ⇒ 会改错档。带上 label 才唯一。
     ('M-28', '合档被改成 TRAE 的绿白配色（不是月白了）', PIX,
      "      label: '月白·TRAE',\n      note: '原方案的方块（随机疏密/明暗参差/尾部渐隐）+ TRAE 的域扭曲流动。月白银白。',\n      palette: 'moonstone',",
      "      label: '月白·TRAE',\n      note: '原方案的方块（随机疏密/明暗参差/尾部渐隐）+ TRAE 的域扭曲流动。月白银白。',\n      palette: 'trae',"),
+    # ── T. 「TRAE·原版方块」新档（2026-11-04 第十一轮）──────────
+    # 用户原话：「以 trae 原版为基础……里面的方块方案改一下，
+    #   改成我们原版方案，其他一律不动」
+    # ⇒ 这批最危险的退化是「改回原样」：底座悄悄换回原方案、
+    #   或者方块悄悄换回 TRAE 的硬边 ⇒ 画面看着差不多，其实不是那一档。
+    ('T-01', '新档的方块层开关被关掉（退回 TRAE 原版的绿白硬边）', PIX,
+     '        traeBlocks: 1,', '        traeBlocks: 0,'),
+    ('T-02', '新档的配色被换成 TRAE 的绿白（不是月白银白）', PIX,
+     "      palette: 'moonstone-trae',", "      palette: 'trae',"),
+    ('T-03', '引擎的方块模式分支被跳过（又画成 TRAE 原版）', PIX,
+     '      if (tBlocks) { renderTraeBlocks(t); return; }',
+     '      if (tBlocks) { renderTrae(t); return; }'),
+    ('T-04', '方块模式的晶格被换回 TRAE 的 7px（不是原方案的 12px）', PIX,
+     '        tCell = SS * Math.max(2, Math.round(w / COLUMNS / SS));',
+     '        tCell = TR_CELL;'),
+    ('T-05', '方块模式的余晖被删（尾巴不褪了）', PIX,
+     '          var e = band > prev ? band : prev * p.trail;',
+     '          var e = band;'),
+    ('T-06', '方块模式的迟滞被删（卡在阈值上的格子会闪）', PIX,
+     '          if (a1 < tA1Prev[idx]) {', '          if (false) {'),
+    ('T-07', '方块模式的软门被换成硬切（点会「啪」地蹦出来）', PIX,
+     '            var sel = (pOn + psoft - tSel[idx]) / psoft;',
+     '            var sel = pOn > 0 ? 1 : 0;'),
+    ('T-08', '方块模式每格的随机亮度被去掉（明暗参差没了）', PIX,
+     '            if (sel > 0) band = sel * ((1 - p.jitterAmp) + p.jitterAmp * tAmp[idx]);',
+     '            if (sel > 0) band = sel;'),
+    ('T-09', '方块模式的亮度来源被换掉（不再是 TRAE 的 0.562+0.438n）', PIX,
+     '          var bright = 0.562 + 0.438 * nAt;', '          var bright = nAt;'),
+    ('T-10', '方块模式的密度伺服被摘掉（密度钉死在初始值）', PIX,
+     '        servoStep(stats.litInBand, false);\n      }\n\n'
+     '      /* 清单换成这一帧画过的格（下一帧拿它擦旧点） */',
+     '      }\n\n'
+     '      /* 清单换成这一帧画过的格（下一帧拿它擦旧点） */'),
+    ('T-11', '新档的余晖参数被改（原方案是 0.80）', PIX,
+     '        trail: 0.80,', '        trail: 0.40,'),
+    ('T-12', '新档的密度目标被改（原方案是 0.10）', PIX,
+     '        lit: 0.10,', '        lit: 0.30,'),
 ]
 
 
 def main():
+    # ── 分片并行（2026-11-04 第十一轮补）──────────────────────
+    # 为什么要分片：这一批的变异条数已经 186 条，而每条都要跑
+    # 「静态断言 + 4 个行为级测试」＝ 约 2 分钟 ⇒ 单进程要 6 小时。
+    # ⇒ 支持 `--shard I/N`：把变异按序号取模分给 N 个进程，
+    #   每个进程在**自己的仓库副本**里跑（副本互不干扰）。
+    #   用法: python3 tests/mutation_check_portal_frontend.py --shard 1/6
+    # ⚠ 不带参数时行为与从前完全一样（跑全部）⇒ 不影响既有用法。
+    muts = MUTATIONS
+    if len(sys.argv) >= 3 and sys.argv[1] == '--shard':
+        try:
+            si, sn = (int(x) for x in sys.argv[2].split('/'))
+        except ValueError:
+            print('!! --shard 的参数格式是 I/N（I 从 0 开始）')
+            return 2
+        if sn < 1 or si < 0 or si >= sn:
+            print('!! --shard 参数越界：I=%d N=%d' % (si, sn))
+            return 2
+        muts = [m for k, m in enumerate(MUTATIONS) if k % sn == si]
+        print('分片 %d/%d：本次只跑 %d 条' % (si, sn, len(muts)))
+
     if not os.path.isfile(TEST_PY):
         print(f'!! 找不到测试文件 {TEST_PY}')
         return 2
@@ -687,7 +754,7 @@ def main():
           % (out.count('[PASS]'), out.count('✅') + out.count('[PASS]')))
 
     caught, missed = 0, []
-    for mid, desc, rel, old, new in MUTATIONS:
+    for mid, desc, rel, old, new in muts:
         restore()
         try:
             mutate(rel, old, new)
@@ -716,7 +783,7 @@ def main():
 
     print()
     print('=' * 60)
-    print(f'  变异 {len(MUTATIONS)} 条，捕获 {caught} 条，漏网 {len(missed)} 条')
+    print(f'  变异 {len(muts)} 条，捕获 {caught} 条，漏网 {len(missed)} 条')
     if missed:
         print('  漏网的变异：')
         for m in missed:

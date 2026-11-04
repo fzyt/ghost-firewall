@@ -74,6 +74,13 @@
          末端合成还会再做一次 linear→sRGB，屏幕上看到的是 122,248,196。
          差这一档整个画面的绿色就暗一截，和 TRAE 完全不像。 */
     trae:      { bg: [0, 0, 0],       accent: [122, 248, 196], white: [255, 255, 255], bloom: [70, 200, 140] },
+    /* ── 月白银白（TRAE 底 + 原版方块，2026-11-04）─────────────
+     * 底色沿用 TRAE 的**纯黑**，点的两档颜色沿用月白原方案：
+     *   accent = 浪身银灰 rgb(136,140,148)
+     *   white  = 浪尖银白 rgb(244,245,248)
+     * ⚠ 与 moonstone 的唯一区别是**底色**：moonstone 是 rgb(10,10,11)，
+     *   这里是纯黑 —— 「TRAE 底，其余不动」的一部分。 */
+    'moonstone-trae': { bg: [0, 0, 0], accent: [136, 140, 148], white: [244, 245, 248], bloom: [186, 190, 200] },
   };
 
   /* ══════════════════════════════════════════════════════════
@@ -331,6 +338,55 @@
         traeMode: 1,
         traeGrid: 16,
         traeMouse: 1,
+      },
+    },
+    /* ── TRAE·原版方块（2026-11-04）────────────────────────────
+     *
+     * 用户原话：「以 trae 原版为基础，做一个新方案，就是里面的方块方案
+     *   改一下，改成我们原版方案，其他一律不动」
+     *
+     * ⇒ **底座一字不改**：流体场（域扭曲 FBM）、取样位移 ×35、
+     *   两条时间轴（真实秒 / 真实÷2）、纯黑底、指针交互、
+     *   以及「哪里亮」的来源 —— 全部是 TRAE 原版的
+     *   brightness = 0.562 + 0.438·n。
+     *
+     * ⇒ **只换「方块」那一层**：
+     *   晶格   TRAE 的 7px（5px 点 + 2px 缝） → 原方案的 12px 晶格
+     *   画法   TRAE 的 5×5 实心块             → 原方案的小点（2 亚像素）
+     *   选点   TRAE 的硬阈值 + 绿白二选一      → 原方案的软门
+     *                                        （每格固定随机门槛 rSel）
+     *   明暗   TRAE 的整块同色                → 原方案的每格随机亮度 rAmp
+     *   余晖   TRAE 没有（原版只有 0/1/2 三态）→ 原方案的 trail 渐隐
+     *   迟滞   TRAE 没有                       → 原方案的 hyst
+     *   抖动   TRAE 没有                       → 原方案的 statJit + 时间抖动
+     *   配色   TRAE 的绿/白                    → 月白银白（两档按亮度分）
+     *
+     * ⚠ 与「月白·TRAE」那一档（moonstone-trae）是**两回事**：
+     *   那一档的底座是**原方案**（三道波 + 遮罩），只把流动换成 TRAE；
+     *   这一档的底座是 **TRAE 原版**，只把方块换成原方案。
+     *   ⇒ 月白·TRAE 那一档保留不动。 */
+    'trae-orig': {
+      label: 'TRAE·原版方块',
+      note: 'TRAE 原版的流动与构图，方块换成原方案：12px 晶格、小点、月白银白、尾部渐隐。',
+      palette: 'moonstone-trae',
+      params: {
+        traeMode: 1,
+        traeGrid: 16,
+        traeMouse: 1,
+        /* ★ 方块层开关：1 = 用原方案的方块（其余 TRAE 参数一律不动） */
+        traeBlocks: 1,
+        /* 原方案的方块层参数，数值与 moonstone 原档**一字不差**：
+         *   trail 0.80（尾部渐隐）、hyst 0.035（alpha 下降限速）、
+         *   lit 0.10（密度伺服的目标点亮比例 = 原方案 moonstone 的默认值）。
+         * 其余（pickSoft 0.18 / jitterAmp 0.20 / statJit 0.06 / fade 0.06 /
+         * accentT 0.30 / whiteT 0.80 / ditherAmt 0.05 …）一律用 P 表里的
+         * **原版默认值**，不重复写 ⇒ 「方块方案 = 原版方案」是逐参数兑现的。
+         * ⚠ 实测（1440×900，16 秒让伺服收敛）：lit 0.10 ⇒ 屏幕覆盖 2.98%、
+         *   点亮格 7.03%、亮区 27.8%（区内点亮 25.3%）；
+         *   对照 TRAE 原版屏幕覆盖 4.09%、原方案 moonstone 点亮格 9.26%。 */
+        trail: 0.80,
+        hyst: 0.035,
+        lit: 0.10,
       },
     },
     /* ── 月白·TRAE（2026-11-03）────────────────────────────────
@@ -834,6 +890,23 @@
     /* 鼠标交互（TRAE 原版：指针附近白块泛绿、绿块泛白）。
      * 0 = 关；>0 = 开（强度用 TRAE 原版 uMouseStrength）。 */
     traeMouse: 0,
+    /* ── 「TRAE 底 + 原版方块」开关（2026-11-04）──────────────
+     *
+     * 用户原话：「以 trae 原版为基础，做一个新方案，就是里面的方块方案
+     *   改一下，改成我们原版方案，其他一律不动」。
+     *
+     * traeBlocks = 1 时，TRAE 分支里**只把方块那一层**换成原方案：
+     *   晶格 7px → 12px、5×5 实心块 → 原方案的小点、
+     *   硬阈值绿白二选一 → 原方案的软门选点 + 每格随机亮度、
+     *   并补上原方案的余晖（trail）、迟滞（hyst）、抖动（statJit）。
+     * 场的算法、流场参数、两条时间轴、底色、指针交互**一律不动**。
+     *
+     * ⚠ 默认 0 ⇒ 不传时 TRAE 原版与改版前**逐位一致**。 */
+    traeBlocks: 0,
+    /* TRAE 亮度 → 原方案 mask 的斜坡宽度（亮度域）。
+     *   0 = 用默认（= TRAE 的阈值抖动幅度 TR_JIT = 0.08）。
+     * ⚠ 默认 0 ⇒ 不传时行为不变。 */
+    traeSoft: 0,
   };
 
   /* ══════════════════════════════════════════════════════════
@@ -1170,6 +1243,28 @@
     var tMouseX = 0.5, tMouseY = 0.5;    /* 指针位置（UV，v 向上） */
     var tRect = null;                    /* 画布矩形（缓存，避免每次 pointermove 触发布局） */
 
+    /* ══════════════════════════════════════════════════════════
+       「TRAE 底 + 原版方块」模式的缓冲（2026-11-04）
+       ══════════════════════════════════════════════════════════
+       为什么必须另开一套：TRAE 原版每格只有 0/1/2 三态（黑/绿/白），
+       而原方案的方块层需要**跨帧**的每格亮度值（余晖 trail）与
+       **逐帧**的 alpha（迟滞 hyst）⇒ tState 那三态根本承载不了。
+       ⇒ 两套缓冲完全分开，TRAE 原版那一套一个字不动。 */
+    var tBlocks = 0;            /* 1 = 方块层换成原方案 */
+    var tCell = TR_CELL;        /* 晶格边长（CSS px）：原方案 = 12 */
+    var tDotSize = 0;           /* 浪身小点的设备像素边长 */
+    var tDotOff = 0;            /* 浪身小点的设备像素偏移 */
+    var tCrestSize = 0;         /* 浪尖方块的设备像素边长 */
+    var tCrestOff = 0;          /* 浪尖方块的设备像素偏移 */
+    var tPeak = null;           /* 本几何步的每格亮度（余晖后） */
+    var tPrevPeak = null;       /* 上一几何步的每格亮度（步间插值用） */
+    var tA1Prev = null;         /* 上一帧的浪身 alpha（迟滞用） */
+    var tA2Prev = null;         /* 上一帧的浪尖 alpha（迟滞用） */
+    var tSel = null;            /* 每格固定随机门槛（原方案的 rSel） */
+    var tAmp = null;            /* 每格固定亮度因子（原方案的 rAmp） */
+    var tJit = null;            /* 每格固定值域偏移（原方案的 rJit） */
+    var tPhase = null;          /* 每格抖动相位（原方案的 dphase） */
+
     /* 粗网格双线性采样：网格坐标 = 画布像素（y 向下） */
     function tSample(arr, px, py) {
       var fx = (px - tGx0) / tGrid, fy = (py - tGy0) / tGrid;
@@ -1201,8 +1296,18 @@
 
     /* 重建 TRAE 分支的缓冲（尺寸变了才调） */
     function setupTrae() {
-      tCols = Math.ceil(w / TR_CELL);
-      tRows = Math.ceil(h / TR_CELL);
+      tBlocks = p.traeBlocks > 0 ? 1 : 0;
+      if (tBlocks) {
+        /* 晶格照抄**原方案**：cell = SS × max(2, round(w / COLUMNS / SS))
+         *   ⇒ 1200px 宽 / 112 列时正好 12px（SS=4 个亚像素，每亚像素 3px）。
+         * ⚠ 用**同一个公式**而不是写死 12：窗口变宽时原方案自己也会加密
+         *   （1920px 时 cell = 16px）⇒ 两边始终是同一套晶格。 */
+        tCell = SS * Math.max(2, Math.round(w / COLUMNS / SS));
+      } else {
+        tCell = TR_CELL;
+      }
+      tCols = Math.ceil(w / tCell);
+      tRows = Math.ceil(h / tCell);
       tGrid = p.traeGrid > 0 ? p.traeGrid : 16;
       /* 颜色场要覆盖取样点：位移最大 73.5px ⇒ 上下各垫 80px、左右垫 16px */
       tGx0 = -16; tGy0 = -80;
@@ -1215,31 +1320,74 @@
       tMF = new Float32Array(tCols * tRows);
       tPrevLit = new Int32Array(tCols * tRows);
       tPrevCount = 0;
+      if (tBlocks) {
+        var n = tCols * tRows;
+        tPeak = new Float32Array(n);
+        tPrevPeak = new Float32Array(n);
+        tA1Prev = new Float32Array(n);
+        tA2Prev = new Float32Array(n);
+        tSel = new Float32Array(n);
+        tAmp = new Float32Array(n);
+        tJit = new Float32Array(n);
+        tPhase = new Float32Array(n);
+        /* 每格固定随机量：**与原方案同一套种子、同一套索引**
+         *   （rSel 1013904223 / rAmp 22695477 / rJit 69069 / dphase 134775813）
+         * ⇒ 晶格相同时（都是 12px），rSel 的取值与原方案**逐格一致**
+         * ⇒ 「块内随机疏密」的花纹是同一套，不是另一套随机。 */
+        for (var bi = 0; bi < n; bi++) {
+          tSel[bi] = rnd(bi, 1013904223);
+          tAmp[bi] = rnd(bi, 22695477);
+          tJit[bi] = (rnd(bi, 69069) - 0.5) * 2;
+          tPhase[bi] = rnd(bi, 134775813) * 6.2831853;
+        }
+      } else {
+        tPeak = null; tPrevPeak = null; tA1Prev = null; tA2Prev = null;
+        tSel = null; tAmp = null; tJit = null; tPhase = null;
+      }
       /* 输出缓冲用设备分辨率（点阵是 CSS 像素 ⇒ 设备像素要乘 dpr） */
       var dw = canvas.width, dh = canvas.height;
       tImg = ctx.createImageData(dw, dh);
       tImgData = tImg.data;
       tRect = canvas.getBoundingClientRect();
       var dprT = dw / Math.max(1, w);
-      tPitch = TR_CELL * dprT;
-      tDotDev = Math.max(1, Math.round(TR_DOT * dprT));
+      tPitch = tCell * dprT;
+      if (tBlocks) {
+        /* 原方案的小点尺寸（亚像素 → 设备像素）：
+         *   浪身 2 亚像素、偏移 1 亚像素；浪尖 3 亚像素、偏移 0。
+         *   一个亚像素 = cell / SS 个 CSS px（12px 晶格 ⇒ 3px）。 */
+        var b1 = p.pxBody > 0 ? Math.min(SS, p.pxBody | 0) : 2;
+        var b2 = p.pxCrest > 0 ? Math.min(SS, p.pxCrest | 0) : 3;
+        var sub = tCell / SS;
+        tDotSize = Math.max(1, Math.round(b1 * sub * dprT));
+        tDotOff = Math.round((((SS - b1) / 2) | 0) * sub * dprT);
+        tCrestSize = Math.max(1, Math.round(b2 * sub * dprT));
+        tCrestOff = Math.round((((SS - b2) / 2) | 0) * sub * dprT);
+      } else {
+        tDotDev = Math.max(1, Math.round(TR_DOT * dprT));
+      }
       /* 底色先铺一遍，之后每帧只改方块那点像素 */
       var bg = pal.bg;
       for (var i = 0; i < tImgData.length; i += 4) {
         tImgData[i] = bg[0]; tImgData[i + 1] = bg[1]; tImgData[i + 2] = bg[2]; tImgData[i + 3] = 255;
       }
+      /* 几何步的 EMA 重新收敛（晶格变了，密度分布也变了） */
+      bandFracEma = 0;
+      litFracEma = 0;
+      errFilt = 0;
       lastStep = -1;
     }
 
-    /* TRAE 的几何：两张粗网格（颜色场 + 位移场）+ 逐格判定 */
-    function computeTrae(t) {
-      if (!tField) return;
+    /* ── TRAE 的两层场（颜色场 + 位移场）────────────────────
+     * 两档（TRAE 原版 / 原版方块）**共用**这一段 ⇒ 场的算法绝对一致，
+     * 变的只有「采样点按哪套晶格取」和「亮不亮怎么判」。
+     * ⚠ 抽出来纯粹是为了不复制粘贴；数值一个没动。 */
+    function traeFields(t) {
       /* 两条时间轴（TRAE 实测）：
        *   流体层 uTime = 真实秒（clock.elapsedTime）
        *   像素化层 uTime = 每 2 帧推进一次 ≈ 真实时间的一半（实测比值 0.51） */
       var tt = t * TR_SPEED;                       /* 流体层 uTime * uSpeed */
       var s = t * 0.5 * TR_FSPEED;                 /* 像素化层 uTime * speed */
-      var gx, gy, u, v, i;
+      var gx, gy, u, v;
 
       /* ── 颜色场网格 ─────────────────────────────── */
       for (gy = 0; gy < tGh; gy++) {
@@ -1264,6 +1412,24 @@
           tFlowY[r2 + gx] = qy * 0.7 * 2.0 * 1.5 * TR_FSCALE;
         }
       }
+    }
+
+    /* 鼠标影响因子（TRAE 原文）：
+     *   mouseFactor = (1 - smoothstep(0, uMouseRadius, dist)) * uMouseStrength
+     * ⚠ mouseFactor 可以 >1（GLSL 的 mix 不夹）⇒ 这里也不夹。 */
+    function tMouseFactor(bu, bv) {
+      if (p.traeMouse <= 0) return 0;
+      var mdx = bu - tMouseX, mdy = bv - tMouseY;
+      var md = Math.sqrt(mdx * mdx + mdy * mdy);
+      var stt = TR_MR > 0 ? md / TR_MR : (md >= 0 ? 1 : 0);
+      if (stt > 1) stt = 1; else if (stt < 0) stt = 0;
+      return (1 - stt * stt * (3 - 2 * stt)) * TR_MS;
+    }
+
+    /* TRAE 的几何：两张粗网格（颜色场 + 位移场）+ 逐格判定 */
+    function computeTrae(t) {
+      if (!tField) return;
+      traeFields(t);
 
       /* ── 逐格判定 ──────────────────────────────────
        *   blockPos    = blockId * 7
@@ -1302,18 +1468,8 @@
           } else {
             tState[idx] = 0;
           }
-          /* 鼠标影响因子（TRAE 原文）：
-           *   mouseFactor = (1 - smoothstep(0, uMouseRadius, dist)) * uMouseStrength
-           * ⚠ mouseFactor 可以 >1（GLSL 的 mix 不夹）⇒ 这里也不夹。 */
-          var mf = 0;
-          if (p.traeMouse > 0) {
-            var mdx = bu - tMouseX, mdy = bv - tMouseY;
-            var md = Math.sqrt(mdx * mdx + mdy * mdy);
-            var stt = TR_MR > 0 ? md / TR_MR : (md >= 0 ? 1 : 0);
-            if (stt > 1) stt = 1; else if (stt < 0) stt = 0;
-            mf = (1 - stt * stt * (3 - 2 * stt)) * TR_MS;
-          }
-          tMF[idx] = mf;
+          /* 鼠标影响因子（TRAE 原文，与原版逐位一致） */
+          tMF[idx] = tMouseFactor(bu, bv);
         }
       }
       stats.lit = lit;
@@ -1337,6 +1493,8 @@
      *   屏幕上看到的是 srgb_encode(c) ⇒ 绿是 rgb(122,248,196)。 */
     function renderTrae(t) {
       if (!tImgData) return;
+      /* ── 方块模式走另一条渲染路径（TRAE 原版那段一个字不动）── */
+      if (tBlocks) { renderTraeBlocks(t); return; }
       var stepIdx = Math.floor(t / p.step);
       if (stepIdx !== lastStep) {
         computeTrae(stepIdx * p.step);
@@ -1406,6 +1564,233 @@
       /* 清单换成这一帧的亮格（下一帧拿它擦旧点） */
       tPrevCount = 0;
       for (var k = 0; k < tState.length; k++) if (tState[k]) tPrevLit[tPrevCount++] = k;
+    }
+
+    /* ══════════════════════════════════════════════════════════
+       「TRAE 底 + 原版方块」：几何 + 渲染（2026-11-04）
+       ══════════════════════════════════════════════════════════
+       场的算法（域扭曲 FBM / 取样位移 ×35 / 两条时间轴）走
+       traeFields() ⇒ 与 TRAE 原版**同一份**，数值完全一致。
+       这里只做两件事：
+         ① 把 TRAE 的亮度换算成原方案的 mask（0~1）
+         ② 之后整套走原方案的方块层
+            （软门选点 / 每格随机亮度 / 余晖 / 迟滞 / 抖动）
+       ⚠ TRAE 原版的 tState（0/1/2 三态）**不用**：
+         三态承载不了余晖（需要跨帧的每格亮度）⇒ 另开 tPeak 一套。 */
+    function computeTraeBlocks(t) {
+      if (!tField) return;
+      traeFields(t);
+
+      /* ── 亮度 → mask 的斜坡 ─────────────────────────
+       * TRAE 的阈值是 thr = 0.87 − 0.08·rand：
+       *   rand ≈ 1 ⇒ thr ≈ 0.79（这格「有可能亮」）
+       *   rand ≈ 0 ⇒ thr ≈ 0.87（这格得「必亮」才够）
+       * ⇒ 把这段区间 [0.79, 0.87] 映射成原方案的 mask [0, 1]：
+       *   mask = 0 ⇒ 刚好踩在 TRAE 的最低门槛上
+       *   mask = 1 ⇒ 已经过了 TRAE 的最高门槛
+       * 亮区的**位置**仍然由 TRAE 决定，只是边界从硬切变成渐变
+       * ⇒ 原方案那种「块内随机疏密」才出得来。
+       * ⚠ traeSoft 可调；0 = 用 TRAE 的阈值抖动幅度（TR_JIT = 0.08）。 */
+      var soft = p.traeSoft > 0 ? p.traeSoft : TR_JIT;
+      var lo = TR_THR - soft;
+      var psoft = p.pickSoft > 0 ? p.pickSoft : 0.18;
+      var region = 0, idx = 0;
+      for (var cy = 0; cy < tRows; cy++) {
+        for (var cx = 0; cx < tCols; cx++) {
+          /* 格心（原方案晶格的中心，屏幕坐标 y 向下） */
+          var px = cx * tCell + tCell * 0.5;
+          var py = cy * tCell + tCell * 0.5;
+          var bu = px / w;
+          var bv = 1 - py / h;             /* TRAE 的 vUv（v 向上） */
+          /* 位移场在格心处采样 */
+          var dx = tSample(tFlowX, px, py);
+          var dy = tSample(tFlowY, px, py);
+          /* 颜色场在「格心 − 位移」处采样 */
+          var su = bu - dx / w;
+          var sv = bv - dy / h;
+          var nAt = tSample(tField, su * w, (1 - sv) * h);
+          var bright = 0.562 + 0.438 * nAt;   /* TRAE 的亮度公式 */
+          var mask = (bright - lo) / soft;
+          if (mask < 0) mask = 0; else if (mask > 1) mask = 1;
+
+          /* ── 原方案的选点（算法一字不改）──────────────
+           *   pOn = mask^1.6 × pickGain（密度伺服调的就是它）
+           *   sel = (pOn + pickSoft − rSel) / pickSoft，夹到 0..1
+           *   亮度再乘 (1−jitterAmp) + jitterAmp × rAmp
+           * ⇒ 块内随机疏密 + 明暗参差（原方案的灵魂）。 */
+          var band = 0;
+          if (mask > 0) {
+            region++;
+            var pOn = Math.pow(mask, 1.6) * p.pickGain;
+            if (pOn > 1) pOn = 1;
+            var sel = (pOn + psoft - tSel[idx]) / psoft;
+            if (sel < 0) sel = 0; else if (sel > 1) sel = 1;
+            if (sel > 0) band = sel * ((1 - p.jitterAmp) + p.jitterAmp * tAmp[idx]);
+          }
+          band *= p.gain;
+
+          /* ── 余晖（原方案）：峰值留住、每步衰减 trail ──
+           *   TRAE 原版没有这一层（原版每格只有 0/1/2 三态），
+           *   正是「方块方案换成原方案」里要补上的一条。 */
+          var prev = tPeak[idx];
+          var e = band > prev ? band : prev * p.trail;
+          tPeak[idx] = e;
+
+          tMF[idx] = tMouseFactor(bu, bv);
+          idx++;
+        }
+      }
+      stats.cells = tCols * tRows;
+      stats.bandCells = region;
+      stats.bandFrac = region / Math.max(1, tCols * tRows);
+    }
+
+    /* 一个矩形刷回底色 */
+    function tEraseRect(d, dw, dh, x0, y0, size, bg) {
+      if (x0 >= dw || y0 >= dh || x0 < 0 || y0 < 0) return;
+      for (var yy = 0; yy < size; yy++) {
+        var py = y0 + yy;
+        if (py >= dh) break;
+        var o = (py * dw + x0) * 4;
+        for (var xx = 0; xx < size; xx++) {
+          if (x0 + xx >= dw) break;
+          d[o] = bg[0]; d[o + 1] = bg[1]; d[o + 2] = bg[2]; d[o + 3] = 255;
+          o += 4;
+        }
+      }
+    }
+
+    /* 一个矩形以透明度 a 叠在当前像素上（src-over） */
+    function tBlendRect(d, dw, dh, x0, y0, size, r, g, b, a) {
+      if (x0 >= dw || y0 >= dh || x0 < 0 || y0 < 0) return;
+      for (var yy = 0; yy < size; yy++) {
+        var py = y0 + yy;
+        if (py >= dh) break;
+        var o = (py * dw + x0) * 4;
+        for (var xx = 0; xx < size; xx++) {
+          if (x0 + xx >= dw) break;
+          d[o]     = d[o]     + (r - d[o])     * a;
+          d[o + 1] = d[o + 1] + (g - d[o + 1]) * a;
+          d[o + 2] = d[o + 2] + (b - d[o + 2]) * a;
+          d[o + 3] = 255;
+          o += 4;
+        }
+      }
+    }
+
+    /* 方块模式的渲染：原方案的画法
+     *   ① 12px 晶格（与原方案同一套公式）
+     *   ② 浪身小点 = 2 亚像素（12px 晶格下 = 6px），accent 色
+     *   ③ 浪尖方块 = 3 亚像素（= 9px），white 色（盖在浪身上）
+     *   ④ 两档 alpha 用原方案的色阶斜坡（accentT / whiteT / fade）
+     *   ⑤ 迟滞（hyst）：alpha 下降按帧限速，卡在阈值上的格子不闪
+     *   ⑥ 抖动（statJit + 时间抖动）：边界溶成参差的一圈
+     * ⚠ 不画辉光：TRAE 原版没有辉光层，月白的雾会把纯黑底搞脏。 */
+    function renderTraeBlocks(t) {
+      if (!tImgData) return;
+      var stepIdx = Math.floor(t / p.step);
+      if (stepIdx !== lastStep) {
+        tPrevPeak.set(tPeak);
+        computeTraeBlocks(stepIdx * p.step);
+        lastStep = stepIdx;
+        geoCount++;
+      }
+      var lerp = t / p.step - stepIdx;      /* 0..1，两个几何步之间的位置 */
+      var d = tImgData;
+      var bg = pal.bg;
+      var dw = canvas.width, dh = canvas.height;
+      var acc = pal.accent, wht = pal.white;
+      var fade = p.fade > 0.001 ? p.fade : 0.001;
+      var half = fade * 0.5;
+      var tLo1 = p.accentT - half, tLo2 = p.whiteT - half;
+      var hyst = p.hyst;
+      var jitAmp = p.statJit * 0.5;
+      var dth = p.ditherAmt * 0.5;
+      var dRate = p.ditherSpeed * 6.2831853;
+
+      /* ── 擦上一帧（用上一帧的清单）────────────────── */
+      for (var i = 0; i < tPrevCount; i++) {
+        var pidx = tPrevLit[i];
+        var pcx = pidx % tCols, pcy = (pidx / tCols) | 0;
+        var ex = Math.floor(pcx * tPitch), ey = Math.floor(pcy * tPitch);
+        tEraseRect(d, dw, dh, ex + tDotOff, ey + tDotOff, tDotSize, bg);
+        tEraseRect(d, dw, dh, ex + tCrestOff, ey + tCrestOff, tCrestSize, bg);
+      }
+
+      /* ── 画这一帧 ────────────────────────────────── */
+      var litCount = 0, idx = 0;
+      for (var cy = 0; cy < tRows; cy++) {
+        for (var cx = 0; cx < tCols; cx++) {
+          /* 步间插值（原方案：几何按 1/30 秒采样，渲染在步间线性过渡） */
+          var v = tPrevPeak[idx] + (tPeak[idx] - tPrevPeak[idx]) * lerp;
+          /* 抖动：每格固定相位的时间平滑摆动 + 每格固定的空间偏移 */
+          var off = Math.sin(t * dRate + tPhase[idx]) * dth + tJit[idx] * jitAmp;
+          var vv = v + off;
+          /* 两档 alpha（原方案的色阶斜坡：对称，边界是渐变不是硬切） */
+          var a1 = (vv - tLo1) / fade;
+          if (a1 < 0) a1 = 0; else if (a1 > 1) a1 = 1;
+          var a2 = (vv - tLo2) / fade;
+          if (a2 < 0) a2 = 0; else if (a2 > 1) a2 = 1;
+          /* 迟滞：alpha 下降按帧限速 ⇒ 卡在阈值上的格子不会一帧掉到 0 */
+          if (a1 < tA1Prev[idx]) {
+            var lo1 = tA1Prev[idx] - hyst;
+            if (lo1 < 0) lo1 = 0;
+            if (a1 < lo1) a1 = lo1;
+          }
+          if (a2 < tA2Prev[idx]) {
+            var lo2 = tA2Prev[idx] - hyst;
+            if (lo2 < 0) lo2 = 0;
+            if (a2 < lo2) a2 = lo2;
+          }
+          tA1Prev[idx] = a1;
+          tA2Prev[idx] = a2;
+          if (a1 <= 0.002 && a2 <= 0.002) { idx++; continue; }
+          litCount++;
+          var x0 = Math.floor(cx * tPitch), y0 = Math.floor(cy * tPitch);
+          /* 指针影响：TRAE 是「指针附近绿↔白互换」，月白配色里没有绿
+           *   ⇒ 统一往 white 靠（越靠近指针越白）。 */
+          var mf = tMF[idx];
+          var mixf = mf > 1 ? 1 : mf;
+          var cr = acc[0], cg = acc[1], cb = acc[2];
+          if (mixf > 0) {
+            cr += (wht[0] - cr) * mixf;
+            cg += (wht[1] - cg) * mixf;
+            cb += (wht[2] - cb) * mixf;
+          }
+          if (a1 > 0.002) {
+            tBlendRect(d, dw, dh, x0 + tDotOff, y0 + tDotOff, tDotSize, cr, cg, cb, a1);
+          }
+          if (a2 > 0.002) {
+            tBlendRect(d, dw, dh, x0 + tCrestOff, y0 + tCrestOff, tCrestSize,
+                       wht[0], wht[1], wht[2], a2);
+          }
+          idx++;
+        }
+      }
+      ctx.putImageData(tImg, 0, 0);
+
+      /* ── 统计 + 密度伺服（原方案那一套）──────────────
+       *   bandCells = 亮区（mask > 0）的格数 —— 相当于原方案的「波带」，
+       *   伺服的目标是「亮区里点亮多少」⇒ 整体密度随 TRAE 的亮区大小浮动，
+       *   而不是钉死一个绝对值。 */
+      stats.lit = litCount;
+      stats.litFrac = litCount / Math.max(1, tCols * tRows);
+      stats.litInBand = stats.bandCells > 0 ? litCount / stats.bandCells : 0;
+      if (!calibrating) {
+        bandFracEma = bandFracEma > 0
+          ? bandFracEma + (stats.bandFrac - bandFracEma) * 0.002
+          : stats.bandFrac;
+        litFracEma = litFracEma > 0
+          ? litFracEma + (stats.litFrac - litFracEma) * 0.12
+          : stats.litFrac;
+        servoStep(stats.litInBand, false);
+      }
+
+      /* 清单换成这一帧画过的格（下一帧拿它擦旧点） */
+      tPrevCount = 0;
+      for (var k = 0; k < tA1Prev.length; k++) {
+        if (tA1Prev[k] > 0.002 || tA2Prev[k] > 0.002) tPrevLit[tPrevCount++] = k;
+      }
     }
 
     function resize() {
