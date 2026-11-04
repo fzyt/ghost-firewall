@@ -27,21 +27,65 @@
   /* ── 像素场背景 ───────────────────────────────────────────
    * 和门脸页同一个引擎（pixelfield.js），纯装饰。
    *
-   * 2026-11-04 第十一轮：用户原话「这个 trae 原版为基础，做一个新方案，
-   *   就是里面的方块方案改一下，改成我们原版方案，其他一律不动」
-   * ⇒ 换成 'trae-orig' 档 —— **底座是 TRAE 原版，只换方块那一层**：
-   *   · 底座 ← **TRAE 原版**：域扭曲 FBM（有机等值线）、取样位移 ×35、
-   *     两条时间轴、纯黑底、指针交互、「哪里亮」的来源
-   *     （brightness = 0.562 + 0.438·n）
-   *   · 方块 ← **原方案**：12px 晶格 + 6px 小点、每格固定随机门槛（软门）、
-   *     每格随机亮度（明暗参差）、余晖（尾部渐隐）、迟滞、抖动溶解
-   *   · 配色 ← 月白银白（accent 银灰 / white 银白两档）
+   * 2026-11-04 第十二轮：用户原话「这两种改动后都不好看了。
+   *   这样吧，我们就按照原版和原版trae打开随机显示吧」
+   * ⇒ 门户背景**每次打开**在两档之间随机挑一个：
+   *   · 'moonstone' —— **原版**月白几何（三道波 + 遮罩 + 余晖 + 辉光，
+   *     固定方向流动；改版前门户用的就是它，登录页现在也还是它）
+   *   · 'trae'      —— **TRAE 原版**（7px 晶格、5×5 绿白方块、
+   *     指针附近泛绿、纯黑底）
    *
-   * 'trae' 档（TRAE 原版逐行移植）与 'moonstone-trae' 档（上一轮的合档，
-   * 底座是原方案、流动是 TRAE）都**保留**，随时能切回去。
+   * 两档都是各自**原封不动**的原版，不做任何混合 —— 前两轮做的
+   * 'trae-orig'（TRAE 底 + 原版方块）与 'moonstone-trae'（原版底 + TRAE 流动）
+   * 用户明确说「都不好看」，**门户不再用它们**；那两档仍留在引擎里，
+   * 改一行就能切回去。
+   *
+   * 想固定看某一档：URL 加 ?pfstyle=moonstone 或 ?pfstyle=trae。
+   *   （随机是没法定住截图/对比用的；不写这个参数就随机。）
+   *
    * createStyle 会连配色带参数一起套上；引擎不存在或接口对不上
    * 就退回 mount()，再不行就什么都不画 —— 背景画不出来无所谓，
    * 页面照常用。 */
+
+  /* 门户背景的两档候选。
+   * ⚠ 顺序不影响概率（两档等概率），只影响「随机值映射到哪一档」。 */
+  var BG_STYLES = ['moonstone', 'trae'];
+
+  /* 从 URL 查询串里取一个参数值（?pfstyle=xxx），取不到返回 ''。
+   * 不用正则：门户页的查询串很简单，split 就够，也省得踩正则里的
+   * 转义坑（这个文件里已经有 path.match(/[A-Za-z0-9一-龥]/) 这种）。 */
+  function queryParam(name) {
+    var search = '';
+    try { search = (window.location && window.location.search) || ''; }
+    catch (e) { return ''; }
+    if (search.charAt(0) === '?') search = search.slice(1);
+    var parts = search.split('&');
+    for (var i = 0; i < parts.length; i++) {
+      if (!parts[i]) continue;
+      var kv = parts[i].split('=');
+      if (kv[0] !== name) continue;
+      var v = kv.slice(1).join('=');
+      try { return decodeURIComponent(v); } catch (e) { return v; }
+    }
+    return '';
+  }
+
+  /* 挑这一次的背景档位：
+   *   1) URL 显式指定（?pfstyle=moonstone / ?pfstyle=trae）⇒ 用它；
+   *   2) 否则在两档里**随机**挑一个 —— 每次打开重新挑，不记在
+   *      localStorage/sessionStorage 里（用户要的就是「打开随机」）。
+   * ⚠ 指定的档位必须**在候选里**才认，否则忽略并回退随机 ——
+   *   档名写错时静默传一个不存在的档位给引擎，背景会整片空掉。 */
+  function pickBgStyle() {
+    var want = queryParam('pfstyle');
+    if (want) {
+      for (var i = 0; i < BG_STYLES.length; i++) {
+        if (BG_STYLES[i] === want) return want;
+      }
+    }
+    return BG_STYLES[Math.floor(Math.random() * BG_STYLES.length)];
+  }
+
   (function mountField() {
     var canvas = document.getElementById('pix');
     if (!canvas || !window.GhostPixelField) return;
@@ -49,14 +93,13 @@
       var reduce = !!(window.matchMedia &&
         window.matchMedia('(prefers-reduced-motion: reduce)').matches);
       /* ⚠ 不在这里覆盖 lit / columns：
-         点亮比例与晶格密度都由样式自己定（'trae-orig' 那一档
-         吃引擎默认的 118 列，不吃 columns），opt.params 会**盖掉**
+         点亮比例与晶格密度都由样式自己定，opt.params 会**盖掉**
          样式里的同名参数，这里一旦写死，以后调样式就会对不上。 */
       var opt = {
         static: reduce,
       };
       if (window.GhostPixelField.createStyle) {
-        window.GhostPixelField.createStyle(canvas, 'trae-orig', opt);
+        window.GhostPixelField.createStyle(canvas, pickBgStyle(), opt);
       } else if (window.GhostPixelField.mount) {
         window.GhostPixelField.mount(canvas, opt);
       }

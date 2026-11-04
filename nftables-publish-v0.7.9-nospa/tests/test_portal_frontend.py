@@ -169,6 +169,7 @@ PORTAL_HTML = read('portal.html')
 BASE_CSS = read('base.css')
 PIXELFIELD = read('pixelfield.js')
 PORTAL_JS = read('portal.js')
+LOGIN_JS = read('login.js')
 FINGERPRINT_JS = read('fingerprint.js')
 GATEWAY_PY = read('auth_gateway.py', base=BACKEND)
 # 回归入口脚本（断言计数公式在它里面）
@@ -179,6 +180,7 @@ PORTAL_HTML_CODE = strip_html_comments(PORTAL_HTML)
 PORTAL_JS_CODE = strip_js_comments(PORTAL_JS)
 PIXELFIELD_CODE = strip_js_comments(PIXELFIELD)
 FINGERPRINT_JS_CODE = strip_js_comments(FINGERPRINT_JS)
+LOGIN_JS_CODE = strip_js_comments(LOGIN_JS)
 
 # 2026-11-02：14 套变体引擎 + 切换器已删除。
 # 这里**故意不读** fx.js / switcher.* ——
@@ -571,12 +573,13 @@ for f in REMOVED_FILES:
     check(f'白名单不再列 {f}', f not in allowed)
 check('portal.js 不再有 GhostFX 守卫（变体引擎没了，守卫是死代码）',
       'GhostFX' not in PORTAL_JS_CODE)
-# 2026-11-04 第十一轮：门户切到「TRAE·原版方块」（TRAE 底、方块用原方案）。
-# ⚠ 判据用 "'trae-orig'"：TRAE 原版那一档仍在引擎里，
-#   但**门户不再用它**（新档才是当前要的那个画面）。
-check('portal.js 用的是 trae-orig（TRAE 底 + 原版方块）',
-      "'trae-orig'" in PORTAL_JS_CODE)
-check('portal.js 不再用 moonstone-trae（合档：底座是原方案，方向已被用户纠正）',
+# 2026-11-04 第十二轮：门户改成「原版 / TRAE 原版」每次打开随机。
+# ⚠ 判据一律对**剥掉注释**的源码做（PORTAL_JS_CODE）：
+#   portal.js 的注释里写满了档名（含被否掉的那些），
+#   直接对原文做子串判断会假红/假绿。
+check('portal.js 不再用 trae-orig（用户说那档不好看，已改成随机两档）',
+      "'trae-orig'" not in PORTAL_JS_CODE)
+check('portal.js 不再用 moonstone-trae（合档：用户说不好看）',
       "'moonstone-trae'" not in PORTAL_JS_CODE)
 check('portal.js 不再用 moonstone-swirl（那一档已不是门户默认）',
       "'moonstone-swirl'" not in PORTAL_JS_CODE)
@@ -1074,10 +1077,12 @@ check('moonstone 档没被这一批动过（登录页那一档）',
       'traeMode:' not in entry_block(STYLES_BODY, 'moonstone'))
 
 # 门户已经切到新档
-# ⚠ 2026-11-04 第十一轮：门户切到「TRAE·原版方块」⇒ 这两条改成新档。
+# ⚠ 2026-11-04 第十二轮：门户改成「原版 / TRAE 原版」随机两档。
 #   TRAE 原版与合档那两档**保留在引擎里**，只是门户不再用它们。
-check("portal.js 用的是 createStyle(canvas, 'trae-orig', opt)",
-      "createStyle(canvas, 'trae-orig', opt)" in PORTAL_JS_CODE)
+check('门户背景改成「原版 moonstone / TRAE 原版 trae」两档随机',
+      "var BG_STYLES = ['moonstone', 'trae'];" in PORTAL_JS_CODE)
+check('门户传给引擎的是随机挑出来的那一档',
+      'createStyle(canvas, pickBgStyle(), opt)' in PORTAL_JS_CODE)
 check('portal.js 不再自己传 columns（档位吃引擎默认列数）',
       'columns: 118' not in PORTAL_JS_CODE)
 
@@ -1153,8 +1158,8 @@ check('trae 档（TRAE 原版）仍然保留', bool(entry_block(STYLES_BODY, 'tr
 
 # ⚠ 2026-11-04 第十一轮：门户改用 'trae-orig'（TRAE 底 + 原版方块），
 #   合档（'moonstone-trae'）这一档**保留在引擎里**，只是门户不再用它。
-check("portal.js 用的是 createStyle(canvas, 'trae-orig', opt)",
-      "createStyle(canvas, 'trae-orig', opt)" in PORTAL_JS_CODE)
+check('门户背景是「原版 / TRAE 原版」两档随机（不是固定某一档）',
+      'createStyle(canvas, pickBgStyle(), opt)' in PORTAL_JS_CODE)
 check('portal.js 不再自己传 columns（档位吃引擎默认列数）',
       'columns: 118' not in PORTAL_JS_CODE)
 check('合档那一档仍然保留在引擎里（随时能切回去）',
@@ -1265,9 +1270,48 @@ check('TRAE 原版仍在（trae 档没被这一批动过）',
 check('trae 档没有开 traeBlocks（原版不受影响）',
       'traeBlocks:' not in entry_block(STYLES_BODY_CODE, 'trae'))
 
-# 门户已经切到新档
-check("portal.js 用的是 createStyle(canvas, 'trae-orig', opt)",
-      "createStyle(canvas, 'trae-orig', opt)" in PORTAL_JS_CODE)
+# 门户不再固定用新档
+check('门户不再固定用某一档（源码里没有写死的 createStyle(canvas, xxx, opt)）',
+      re.search(r"createStyle\(canvas, '[^']+', opt\)", PORTAL_JS_CODE) is None)
+
+# ─────────────────────────────────────────────────────────────
+sec('PF-29 门户背景「原版 / TRAE 原版」随机两档（2026-11-04）')
+
+# 用户原话：「这两种改动后都不好看了。这样吧，我们就按照原版和原版trae
+#   打开随机显示吧」
+# ⇒ 每次打开门户，在 'moonstone'（原版）与 'trae'（TRAE 原版）之间随机挑一个。
+# ⚠ 这里的静态断言只能钉住「结构」；「随机到底有没有生效」由
+#   行为级测试 tests/test_portal_bgstyle.js 钉（源码文本钉不住随机）。
+
+check('候选表正好是两档原版',
+      re.search(r"var BG_STYLES = \['moonstone', 'trae'\];",
+                PORTAL_JS_CODE) is not None)
+check('两档在引擎里都存在（原版没被删）',
+      bool(entry_block(STYLES_BODY, 'moonstone')) and
+      bool(entry_block(STYLES_BODY, 'trae')))
+check('真的用了随机（Math.random 在挑档位）',
+      re.search(r"Math\.floor\(Math\.random\(\) \* BG_STYLES\.length\)",
+                PORTAL_JS_CODE) is not None)
+check('随机结果被真正传给引擎',
+      'createStyle(canvas, pickBgStyle(), opt)' in PORTAL_JS_CODE)
+check('源码里没有写死某一档',
+      re.search(r"createStyle\(canvas, '[^']+', opt\)", PORTAL_JS_CODE) is None)
+check('URL 覆盖参数名是 pfstyle',
+      "queryParam('pfstyle')" in PORTAL_JS_CODE)
+check('URL 里写了不存在的档名会回退随机（不能传空档给引擎）',
+      re.search(r"if \(BG_STYLES\[i\] === want\) return want;",
+                PORTAL_JS_CODE) is not None)
+check('登录页不受影响（仍是原版 moonstone）',
+      "createStyle(canvas, 'moonstone', opt)" in LOGIN_JS_CODE)
+
+_pick = re.search(r"function pickBgStyle\(\) \{(.*?)\n  \}", PORTAL_JS_CODE, re.S)
+check('挑档位的函数存在', _pick is not None)
+if _pick:
+    _pick_body = _pick.group(1)
+    check('挑档位的函数体里没有 localStorage/sessionStorage（每次打开都重新抽）',
+          'localStorage' not in _pick_body and 'sessionStorage' not in _pick_body)
+    check('挑档位的函数体走的是 Math.random', 'Math.random' in _pick_body)
+
 
 # 回归计数公式必须认 [PASS]/[FAIL]（否则这几百项静态断言在计数里全是 0）
 check('回归脚本的计数公式同时认 ✅ 与 [PASS]',

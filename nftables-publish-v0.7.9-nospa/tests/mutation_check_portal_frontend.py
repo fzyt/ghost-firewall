@@ -23,6 +23,7 @@
   L  压暗层被撤回（TRAE 纵向渐变 / 旧版开关 / 中间段不透明度）
   F  改版外溢到登录页
   G  安全面 / 加载顺序 / 占位符
+  P  门户背景「原版 / TRAE 原版」随机两档（写死 / 少一档 / 覆盖失效）
 
 每条变异都独立重写源文件，并强制 PYTHONDONTWRITEBYTECODE=1：否则连续写入时
 Python 只按 mtime+size 判过期，两条大小相近的变异会复用上一条的 .pyc，
@@ -56,6 +57,7 @@ TEST_JS = os.path.join(ROOT, 'tests', 'test_pixelfield_hardedge.js')
 TEST_JS2 = os.path.join(ROOT, 'tests', 'test_pixelfield_trae.js')
 TEST_JS3 = os.path.join(ROOT, 'tests', 'test_pixelfield_moonstone_trae.js')
 TEST_JS4 = os.path.join(ROOT, 'tests', 'test_pixelfield_trae_orig.js')
+TEST_JS5 = os.path.join(ROOT, 'tests', 'test_portal_bgstyle.js')
 
 # 本脚本会动的文件（只这些）
 REL_FILES = [
@@ -137,9 +139,17 @@ def run_tests():
     r5 = subprocess.run([node, TEST_JS4],
                         capture_output=True, text=True, cwd=ROOT,
                         timeout=600, env=env)
-    return r5.returncode, (out + r2.stdout + r2.stderr
+    if r5.returncode != 0:
+        return r5.returncode, (out + r2.stdout + r2.stderr
+                               + r3.stdout + r3.stderr + r4.stdout + r4.stderr
+                               + r5.stdout + r5.stderr)
+    # 门户背景「原版 / TRAE 原版」随机两档（2026-11-04 第十二轮）
+    r6 = subprocess.run([node, TEST_JS5],
+                        capture_output=True, text=True, cwd=ROOT,
+                        timeout=300, env=env)
+    return r6.returncode, (out + r2.stdout + r2.stderr
                            + r3.stdout + r3.stderr + r4.stdout + r4.stderr
-                           + r5.stdout + r5.stderr)
+                           + r5.stdout + r5.stderr + r6.stdout + r6.stderr)
 
 
 def mutate(rel, old, new):
@@ -545,8 +555,10 @@ MUTATIONS = [
 
     # ── G. 接线 / 加载顺序 / 安全面 / 占位符 ──
     # ⚠ 2026-11-03 第十轮：门户切到「月白·TRAE」合档，锚点跟着改。
+    # ⚠ 2026-11-04 第十二轮：门户改成「原版 / TRAE 原版」随机两档，
+    #   锚点跟着改（不再有写死的档名可替换）。
     ('N-59', '门户退回 moonstone-swirl（用户点名否掉的那一档）', PJS,
-     "createStyle(canvas, 'trae-orig', opt)",
+     "createStyle(canvas, pickBgStyle(), opt)",
      "createStyle(canvas, 'moonstone-swirl', opt)"),
     ('N-60', 'GhostFX 守卫被复活（变体引擎没了，守卫是死代码）', PJS,
      "  (function mountField() {\n    var canvas = document.getElementById('pix');",
@@ -671,9 +683,9 @@ MUTATIONS = [
      'mask = m1 * m2;'),
     ('M-26', '独当模式的 band = 1 被删（flowSolo 不起作用）',
      PIX, '            if (solo) band = 1;', '            if (false) band = 1;'),
-    ('M-27', '门户不用新档（背景退回 TRAE 原版）', PJS,
-     "createStyle(canvas, 'trae-orig', opt)",
-     "createStyle(canvas, 'trae', opt)"),
+    ('M-27', '门户退回被否掉的合档 moonstone-trae', PJS,
+     "createStyle(canvas, pickBgStyle(), opt)",
+     "createStyle(canvas, 'moonstone-trae', opt)"),
     # ⚠ 锚点必须**唯一**：裸 'palette: \'moonstone\'' 在 moonstone-flow 里也有，
     #   而 mutate() 替换的是**第一个**匹配 ⇒ 会改错档。带上 label 才唯一。
     ('M-28', '合档被改成 TRAE 的绿白配色（不是月白了）', PIX,
@@ -716,6 +728,40 @@ MUTATIONS = [
      '        trail: 0.80,', '        trail: 0.40,'),
     ('T-12', '新档的密度目标被改（原方案是 0.10）', PIX,
      '        lit: 0.10,', '        lit: 0.30,'),
+
+    # ── P. 「原版 / TRAE 原版」随机两档（2026-11-04 第十二轮）──
+    # 用户原话：「我们就按照原版和原版trae打开随机显示吧」
+    # ⇒ 这批最危险的退化是「随机看着在、其实没随机」：
+    #   写死第一个、写死最后一个、候选表少一档、两档对调、URL 覆盖失效 ——
+    #   这些退化**页面上完全看不出异常**（背景照常画、照常动），
+    #   只有行为级测试（tests/test_portal_bgstyle.js）能抓住。
+    #   ⇒ 这组变异就是给那个测试的「杀虫剂」。
+    ('P-01', '随机被写死成第一个（永远显示原版）', PJS,
+     'return BG_STYLES[Math.floor(Math.random() * BG_STYLES.length)];',
+     'return BG_STYLES[0];'),
+    ('P-02', '随机被写死成最后一个（永远显示 TRAE 原版）', PJS,
+     'return BG_STYLES[Math.floor(Math.random() * BG_STYLES.length)];',
+     'return BG_STYLES[BG_STYLES.length - 1];'),
+    ('P-03', '候选表少一档（只剩原版 ⇒ 随机名存实亡）', PJS,
+     "var BG_STYLES = ['moonstone', 'trae'];",
+     "var BG_STYLES = ['moonstone'];"),
+    ('P-04', '候选表少一档（只剩 TRAE 原版）', PJS,
+     "var BG_STYLES = ['moonstone', 'trae'];",
+     "var BG_STYLES = ['trae'];"),
+    ('P-05', 'URL 覆盖被忽略（?pfstyle= 钉不住某一档）', PJS,
+     "    var want = queryParam('pfstyle');\n    if (want) {",
+     "    var want = '';\n    if (want) {"),
+    ('P-06', 'URL 里写错档名也不回退（把不存在的档位传给引擎）', PJS,
+     '      for (var i = 0; i < BG_STYLES.length; i++) {\n'
+     '        if (BG_STYLES[i] === want) return want;\n'
+     '      }',
+     '      return want;'),
+    ('P-07', '挑出来的档位没传给引擎（永远用原版）', PJS,
+     'window.GhostPixelField.createStyle(canvas, pickBgStyle(), opt);',
+     "window.GhostPixelField.createStyle(canvas, 'moonstone', opt);"),
+    ('P-08', '两档顺序被对调（random=0 与 random≈1 落反了）', PJS,
+     "var BG_STYLES = ['moonstone', 'trae'];",
+     "var BG_STYLES = ['trae', 'moonstone'];"),
 ]
 
 
