@@ -156,6 +156,31 @@
   验证步骤与验收点见 `报告/门户防火墙控制卡片-端到端验证步骤-2026-11-04.md`（用户自己验）。
 - `.238` 的 `router_ip4` 同步**无法远程执行**（机器离线）⇒ 只能代码侧自愈。
 
+### 工具侧修的一个真问题：MutationGuard 并行互踩
+
+这一轮做**全仓 35 个变异脚本的分片全扫**时翻出来的（跟本批改动无关，
+但会让任何并行分片都不可靠）。
+
+**症状**：多份仓库副本并行跑变异脚本时，
+`functional.py` 直接 `FileNotFoundError` 崩掉，
+报 `/tmp/mutguard-xxx.pre-restore.pre-restore.../backend/app.py` 不存在；
+`test_mutation_guard_concurrent_edit.py` 的 4 条断言全乱。
+
+**根因**：`tests/_mutation_guard.py` 的 `_restore_stale()` 扫的是**全局**
+`/tmp/mutguard-*`（`tempfile.gettempdir()`），
+把**别的进程正在用**的活快照当成「上次被硬杀的残留」来还原。
+而快照里的路径是**相对于各自副本**的 ⇒ 跨副本还原 ⇒ 路径必然对不上。
+
+**修法**：快照里额外记一个**属主 PID**；
+`_restore_stale()` 遇到「PID 还活着」的快照直接跳过 —— 那不是残留，是别人正在用。
+
+**验证**：3 个实例并行跑 `test_mutation_guard_concurrent_edit.py`，
+全部 13/13 通过（修复前会互踩）。
+
+⚠️ 附带一条经验：**并行跑变异时每片必须给独立的 `TMPDIR`** ——
+Python 的 `tempfile.gettempdir()` 认 `TMPDIR`，
+这样每片的快照与残留扫描都落在自己的目录里。
+
 ## [v0.18.0] - 2026-11-04
 
 两件事：**管理面板（5443）也做一套像素场背景** + **把防火墙控制开放到门户（开关式）**。
