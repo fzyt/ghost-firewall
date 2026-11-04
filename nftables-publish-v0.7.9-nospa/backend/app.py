@@ -72,6 +72,15 @@ _CONFIG_FILE_MODE = 0o640
 # 定义在文件顶部：validate_config() 要用它做「网关端口不能占用面板端口」的交叉校验。
 HTTPS_PORT = int(os.environ.get("NFTABLES_WEB_HTTPS_PORT", "5443"))
 
+# 面板启动时探测到的**实际绑定地址**（2026-11-04）。
+#
+# 为什么要记下来：面板**只绑 LAN IP**（127.0.0.1 连不上是设计如此），
+# 所以「把面板自己经网关反代出来」时，上游地址不能用 127.0.0.1，
+# 得用它绑的那个地址。
+# 运行时探测的值最准（环境变量 / 探测 LAN 接口）；
+# 拿不到时退回配置里的 router_ip4（路由器本机的 LAN 地址）。
+PANEL_BIND_ADDR = ''
+
 
 def _apply_shared_secret_perms(path):
     """给共享机密文件套上 root:nftweb 640 —— 与 init 脚本 prepare_nftweb_files 一致。
@@ -641,7 +650,7 @@ def _require_auth():
     - 未登录返回 401
     """
     path = request.path
-    client_ip = request.remote_addr or ''
+    client_ip = _client_ip()
 
     # Content-Length 上限检查（认证前拦截大请求体）
     max_cl = app.config.get('MAX_CONTENT_LENGTH')
@@ -2512,6 +2521,18 @@ _STATIC_ALLOWED_EXT = {'.' + e for e in _STATIC_EXTENSIONS} | {
     '.html', '.txt', '.otf', '.eot', '.webp',
 }
 
+# 共享静态文件白名单（2026-11-04）
+#
+# 这些文件**不在** frontend/ 里，而是与门户共用 backend/static/ 下的一份源码。
+# 面板的静态服务在 frontend/ 找不到时会回退到这里取 —— 但**只取白名单里的**。
+#
+# ⚠️ 为什么必须白名单而不是整个目录：
+#   backend/static/ 里还有门户页本身（portal.html / login.html / portal.js），
+#   整个目录开放等于让面板顺带把门户页面也提供出去。
+SHARED_STATIC_FILES = frozenset({
+    'pixelfield.js',
+})
+
 
 def _static_path_allowed(filename):
     """静态路由的放行判定：路径不能穿越，扩展名必须在白名单里。
@@ -2542,6 +2563,20 @@ def serve_static(filename):
         return jsonify({"error": "not found"}), 404
     if not _static_path_allowed(filename):
         return jsonify({"error": "forbidden"}), 403
+    # ── 共享资源回退（2026-11-04）─────────────────────────────
+    # 像素场引擎 backend/static/pixelfield.js 是**门户与面板共用**的一份源码。
+    #
+    # ⚠️ 为什么不在 frontend/ 里放一份拷贝：
+    #   引擎 2700+ 行 / 146KB。两份拷贝必然漂移 —— 改了一边忘了另一边，
+    #   门户和面板的背景会越走越远，**而且页面上完全看不出来**
+    #   （两套画面都"正常"，只是不一样了）。
+    #   ⇒ 面板的静态服务回退到 backend/static/ 取同一份源码。
+    #
+    # ⚠️ 回退**只放行白名单里的文件**：backend/static/ 里还有门户页
+    #   （portal.html / login.html / portal.js …），把整个目录暴露给面板
+    #   等于让面板顺带提供门户页面 —— 不需要，且没必要。
+    if filename in SHARED_STATIC_FILES:
+        return send_from_directory('static', filename)
     return send_from_directory('../frontend', filename)
 
 
@@ -2576,6 +2611,44 @@ def get_config():
                        # 版本号：前端保存时必须带回来，服务端据此判断
                        # 「这份快照是不是已经过期了」（见 _config_rev）
                        config_rev=_config_rev(config)))
+
+
+# ── 客户端真实 IP ────────────────────────────────────────────
+#
+# 为什么需要这个函数（2026-11-04，开防火墙控制入口时踩出来的）：
+#   面板被认证网关（nginx）反代时（/fw/ 入口），Flask 看到的
+#   request.remote_addr 是 **nginx 的回环地址 127.0.0.1**，
+#   不是来访者的真实地址。
+#   ⇒ 面板自己的「来源网段白名单」判定会被**整个绕过**：
+#     任何能走到网关的人，在面板看来都像「本机」。
+#     网关侧那条 `allow <lan_cidr>; deny all` 是第一道防线，
+#     但面板自己也应该认得真实来源 —— 两道防线都得在。
+#
+# 修法：反代时 nginx 会带 X-Real-IP（网关配置里就是这么设的）。
+#   只有当对端**本身就是回环**时才采信这个头 ——
+#   局域网里任何机器直连面板时 remote_addr 是它自己的 IP（不是回环），
+#   伪造 X-Real-IP 不起作用。
+#
+# ⚠️ 唯一能伪造的是「面板所在机器上的本地进程」——
+#    那本来就有本机权限，不构成越权面。
+# ⚠️ 只认 X-Real-IP，不认 X-Forwarded-For：后者是**逐跳追加**的，
+#    链路上多一层代理时「最左边那个」到底是谁并不确定。
+#    认证网关只设 X-Real-IP，一个头就够。
+_LOOPBACK_V4 = ('127.0.0.1', '::1', '::ffff:127.0.0.1')
+
+
+def _client_ip():
+    """本次请求的**真实**客户端 IP。
+
+    直连面板 ⇒ request.remote_addr（内核给的，不可伪造）。
+    经本机网关反代 ⇒ X-Real-IP 里的真实地址（只在对端是回环时才采信）。
+    """
+    remote = (request.remote_addr or '').strip()
+    if remote in _LOOPBACK_V4 or remote.startswith('127.'):
+        fwd = (request.headers.get('X-Real-IP') or '').strip()
+        if fwd:
+            return fwd
+    return remote
 
 
 def _client_is_lan(client_ip):
@@ -2621,7 +2694,7 @@ def get_knock_info():
       敲门端口序列就是「密钥」，一旦从公网可读，端口敲门就失去意义，
       所以 WAN 场景必须由用户在 LAN 上查看后手工填进客户端脚本。
     """
-    client_ip = request.remote_addr or ''
+    client_ip = _client_ip()
     if not _client_is_lan(client_ip):
         return jsonify({
             'success': False,
@@ -2727,7 +2800,7 @@ def post_config():
             'errors': errs,
         }), 400
 
-    requester_ip = request.remote_addr or ''
+    requester_ip = _client_ip()
     risks = _detect_risks(old_cfg, new_cfg, requester_ip)
 
     # trusted_ip4 归一化成单值再落盘。
@@ -3121,7 +3194,7 @@ def preview_rules_changes():
             pass
 
     diff = _diff_nft_rules(old_rules_text, new_rules_text)
-    requester_ip = request.remote_addr or ''
+    requester_ip = _client_ip()
     risks = _detect_risks(old_cfg, new_cfg, requester_ip)
 
     return jsonify({
@@ -9474,6 +9547,25 @@ def _gateway_services(config):
         if "://" in addr:
             protocol, _, addr = addr.partition("://")
             protocol = protocol.lower()
+        else:
+            # ⚠ 协议以规则里的 **target_protocol** 字段为准（2026-11-04 修）。
+            #
+            # 为什么之前不对：界面上有「协议」这一项、校验也只认它
+            # （_validate_rp_service 白名单 http/https），
+            # 但这一段生成器**从来没读过它** —— 协议一直是从地址里的
+            # scheme 猜的，猜不到就一律 http。
+            # ⇒ 后果：上游是 HTTPS 时生成的是 proxy_pass http://…，
+            #   而上游只听 HTTPS ⇒ 502。
+            #   实测踩到：把「防火墙控制」入口指向面板自己（5443 是 HTTPS）
+            #   生成的配置就是 http://192.168.100.232:5443/ ⇒ 打不开，
+            #   而界面上看不出任何异常（规则显示「已启用」、没有报错）。
+            #
+            # 既有规则的 target_protocol 都是 http ⇒ 行为逐条不变。
+            # 地址里带 scheme（"://"）时仍以地址为准 ——
+            # 那是手工改过配置的高级写法，不在校验能覆盖的范围内。
+            proto = str(r.get("target_protocol", "") or "").strip().lower()
+            if proto in ("http", "https"):
+                protocol = proto
         if protocol not in ("http", "https"):
             continue
         host, _, port = addr.rpartition(":")
@@ -9860,6 +9952,17 @@ def _nginx_service_location(L, rule, prefix, protocol, host, tport,
         for _attr in ("href", "src", "action"):
             sf_rules.append((f'{_attr}="/', f'{_attr}="{prefix}/'))
 
+        # CSS 里的 url('/x') / url("/x") 同样是**根绝对路径**
+        # （@font-face 的字体文件、CSS 背景图都走这条）。
+        # ⚠ 2026-11-04 真机实测踩到：面板的 styles.css 里字体写的是
+        #   url('/assets/fonts/Outfit-Regular.ttf') ⇒ 浏览器按 absolute-path
+        #   解析到 /assets/... ⇒ 跑出本 location ⇒ 404 ⇒ 字体静默不生效
+        #   （页面照样能用，只是掉回系统字体，**看不出哪里错了**）。
+        # ⚠ 只改「url( + 引号紧跟」这一种形态：
+        #   不碰 url(/x)（无引号）与 data: URI（内嵌数据，改了会坏）。
+        for _q in ("'", '"'):
+            sf_rules.append((f'url({_q}/', f'url({_q}{prefix}/'))
+
     if sf_rules:
         # sub_filter 必须在明文正文上做：上游若压缩了正文就匹配不到
         L.append('        proxy_set_header Accept-Encoding "";')
@@ -9869,7 +9972,15 @@ def _nginx_service_location(L, rule, prefix, protocol, host, tport,
         #   [warn] duplicate MIME type "text/html"
         # 每次 nginx -t / reload 都刷一行。真机实测确认：省掉 text/html
         # 后 text/html 照样被替换（nginx 文档原文：in addition to "text/html"）。
-        L.append("        sub_filter_types application/javascript text/css;")
+        #
+        # ⚠️ text/javascript **必须**列上（2026-11-04 真机实测踩到）：
+        #   Python 3.12+ 的 mimetypes 把 .js 映射成 **text/javascript**
+        #   （不是 application/javascript）。只写后者的话，
+        #   **JS 正文根本没被改写** ⇒ 窄模式对「API 路径写在 JS 里」的上游
+        #   完全失效。实测症状：页面能开、静态资源全 200，
+        #   但 app.js 里的 '/api/auth/status' 没被改写 ⇒ 404，
+        #   前端表现为「一直卡在加载中 / 登录状态取不到」。
+        L.append("        sub_filter_types application/javascript text/javascript text/css;")
         for _old, _new in sf_rules:
             L.append(f'        sub_filter "{_nginx_dquote(_old)}" '
                      f'"{_nginx_dquote(_new)}";')
@@ -11059,6 +11170,131 @@ def rp_detect_protocol_relative():
                     "data": {"count": count, "samples": samples, "error": err}})
 
 
+# ── 防火墙控制入口（2026-11-04）──────────────────────────────
+#
+# 把**面板自己**经认证网关暴露出来，在门户里点一下就能进防火墙控制台。
+#
+# 为什么需要「预设」而不是让用户自己填一条反代规则：
+#   面板的 API 路径是**根绝对**的（/api/config、/api/auth/login…），
+#   静态资源也是根绝对（/styles.css、/assets/*、/app.js、/fx.js）。
+#   ⇒ 走路径前缀入口（/fw/）时，浏览器会把这些请求解析到**网关的根路径**上，
+#     而不是 /fw/ 下面 ⇒ 页面能打开、数据接口全 404。
+#   修法是网关的路径改写（生成器里本来就有这两个开关）：
+#     api_path_prefix=/api    —— 窄模式：把 '/api 前缀字面量改写成 '/fw/api'
+#                                （生成的 sub_filter 带 application/javascript，
+#                                 所以 app.js 里的 '/api/xxx' 也会被改写）
+#     rewrite_root_paths=true —— 宽模式：把 href="/x" / src="/x" 改成 "/fw/x"
+#   这两个是界面上的高级字段，填漏一个就出现「页面能开、数据全 404」，
+#   而且症状极具迷惑性（用户以为是自己部署坏了）⇒ 这里直接给配好的规则。
+FW_CONSOLE_PREFIX = '/fw'
+FW_CONSOLE_NAME = '防火墙控制'
+
+
+def _fw_console_target(config):
+    """防火墙控制入口的上游地址（host:port）。
+
+    ⚠ 面板**只绑 LAN IP**（127.0.0.1 连不上是设计如此）——
+      所以上游不能用 127.0.0.1，得用它绑的那个地址。
+    优先用运行时探测到的绑定地址（最准），拿不到时退回配置里的 router_ip4。
+    """
+    host = (PANEL_BIND_ADDR or str(config.get('router_ip4') or '').strip())
+    if not host:
+        return ''
+    return f'{host}:{HTTPS_PORT}'
+
+
+def _rp_add_validated_rule(config, rp, clean):
+    """把一条**已校验**的反代规则落盘并生效。
+
+    返回 (rule_id, err_msg, http_status)：
+      err_msg 为 None ⇒ 成功；否则是给前端看的错误文案。
+
+    ⚠ 顺序必须与 v0.8.1 以来一致：**先部署、后落盘** ——
+      部署失败时规则不落盘，等于没发生（否则这条坏规则会永久留在配置里，
+      之后每一次反代保存都会重新生成同样失败的 nginx 配置并返回 500，
+      整个功能瘫掉）。
+    """
+    new_id = _next_id("rp", [r["id"] for r in rp["rules"]])
+    now_iso = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    rule = {"id": new_id, **clean,
+            "created_at": now_iso, "updated_at": now_iso}
+    rp["rules"].append(rule)
+
+    # 交叉校验：这条反代的目标如果已经有端口转发指向它，就形成了一条免登录
+    # 的公网入口 —— DNAT 走 nftables，根本不经过 nginx 的认证层。
+    # 必须放在 append 之后（config 里才是候选状态）、部署之前（拦住才不生成
+    # nginx 配置）。rp 是 config 的子字典引用，所以 pop 能干净地撤销 append。
+    conflicts = _rp_forward_conflicts(config)
+    if conflicts:
+        rp["rules"].pop()
+        return None, "；".join(conflicts), 400
+
+    deploy_ok, deploy_msg = _deploy_all_rules(config)
+    if not deploy_ok:
+        rp["rules"].pop()
+        return None, f"网关配置未生效，规则已丢弃: {deploy_msg}", 500
+
+    _save_rp_config(config)
+
+    fw_ok, fw_msg = _apply_ruleset(config)
+    if not fw_ok:
+        return new_id, fw_msg, 500
+    return new_id, None, 200
+
+
+@app.route('/api/reverse-proxy/fw-console', methods=['POST'])
+def rp_add_fw_console():
+    """一键添加「防火墙控制」入口。
+
+    幂等：已经有 /fw 前缀的规则时不重复添加，直接返回那条规则。
+
+    暴露面：public_access=false（**仅内网**）。
+      面板 v0.8.0 起的设计是「面板没有任何公网入口」，
+      这条入口不破坏它 —— 网关侧 allow <lan_cidr>; deny all，
+      公网用户即使登录了门户，点进来也会被网关挡成 403。
+      （面板自己也认得真实来源 IP，见 _client_ip()，两道防线都在。）
+    """
+    config, rp = _get_rp_config()
+    rules = rp["rules"]
+
+    for r in rules:
+        if _safe_path_prefix(r.get("path_prefix", "")) == FW_CONSOLE_PREFIX:
+            return jsonify({"success": True, "data": {
+                "rule_id": r.get("id"),
+                "message": "防火墙控制入口已存在（可在列表里直接开关它）",
+                "created": False}})
+
+    target = _fw_console_target(config)
+    if not target:
+        return jsonify({"success": False,
+                        "message": "面板不知道自己的地址（router_ip4 为空），"
+                                   "请先到「网络接口」里填好路由器 IP 再试"}), 400
+
+    data = {
+        "name": FW_CONSOLE_NAME,
+        "path_prefix": FW_CONSOLE_PREFIX,
+        "host": "",
+        "target_address": target,
+        "target_protocol": "https",
+        "public_access": False,
+        "enabled": True,
+        "icon": "FW",
+        # 路径改写：面板的 API 与静态资源都是根绝对路径（见上面的说明）
+        "api_path_prefix": "/api",
+        "rewrite_root_paths": True,
+    }
+    clean, err = _validate_rp_service(data, existing={}, all_rules=rules)
+    if err:
+        return jsonify({"success": False, "message": err}), 400
+
+    new_id, err_msg, status = _rp_add_validated_rule(config, rp, clean)
+    if err_msg:
+        return jsonify({"success": False, "message": err_msg}), status
+    return jsonify({"success": True, "data": {
+        "rule_id": new_id, "message": "防火墙控制入口已添加",
+        "created": True, "nginx_reloaded": True}})
+
+
 @app.route('/api/reverse-proxy/rules', methods=['POST'])
 def rp_create_rule():
     """新建一条反代服务。
@@ -11076,35 +11312,11 @@ def rp_create_rule():
     if err:
         return jsonify({"success": False, "message": err}), 400
 
-    new_id = _next_id("rp", [r["id"] for r in rp["rules"]])
-    now_iso = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S+08:00")
-    rule = {"id": new_id, **clean,
-            "created_at": now_iso, "updated_at": now_iso}
-    rp["rules"].append(rule)
-
-    # 交叉校验：这条反代的目标如果已经有端口转发指向它，就形成了一条免登录
-    # 的公网入口 —— DNAT 走 nftables，根本不经过 nginx 的认证层。
-    # 必须放在 append 之后（config 里才是候选状态）、部署之前（拦住才不生成
-    # nginx 配置）。rp 是 config 的子字典引用，所以 pop 能干净地撤销 append。
-    conflicts = _rp_forward_conflicts(config)
-    if conflicts:
-        rp["rules"].pop()
-        return jsonify({"success": False, "message": "；".join(conflicts)}), 400
-
-    # 顺序：先部署、后落盘。
-    # 部署失败时**不保存**，否则这条规则会永久留在配置里 —— 之后每一次
-    # 反代保存都会重新生成同样失败的 nginx 配置并返回 500，整个功能瘫掉。
-    # _get_rp_config 每次请求都重新 load_config()，所以不落盘即等于没发生。
-    deploy_ok, deploy_msg = _deploy_all_rules(config)
-    if not deploy_ok:
-        return jsonify({"success": False,
-                        "message": f"网关配置未生效，规则已丢弃: {deploy_msg}"}), 500
-
-    _save_rp_config(config)
-
-    fw_ok, fw_msg = _apply_ruleset(config)
-    if not fw_ok:
-        return jsonify({"success": False, "message": fw_msg}), 500
+    # 落盘与生效的顺序（先部署后落盘、冲突回滚）统一走 _rp_add_validated_rule，
+    # 「防火墙控制」预设那条规则走的是同一段 ⇒ 两处行为不会分叉。
+    new_id, err_msg, status = _rp_add_validated_rule(config, rp, clean)
+    if err_msg:
+        return jsonify({"success": False, "message": err_msg}), status
 
     return jsonify({"success": True, "data": {
         "rule_id": new_id, "message": "反代服务已创建",
@@ -11265,7 +11477,7 @@ def rp_test_rule(rule_id):
 
     # ③ 审计：让「口令泄露后扫内网」留下痕迹。
     print(f'[AUDIT] rp_test_rule rule={rule_id} target={host}:{port} '
-          f'reachable={reachable} from={request.remote_addr or "-"}', flush=True)
+          f'reachable={reachable} from={_client_ip() or "-"}', flush=True)
 
     return jsonify({"success": True, "data": {
         "target_reachable": reachable,
@@ -11501,7 +11713,7 @@ def rp_download_cert(cert_id):
     ⚠️ 这道检查放在**任何文件访问之前**：先确认再查证书存不存在，
     否则未确认的调用者仍能靠 404/200 的差别把证书列表探出来。
     """
-    ip = request.remote_addr or 'unknown'
+    ip = _client_ip() or 'unknown'
     allowed, retry_after = _check_rate_limit(ip)
     if not allowed:
         return jsonify({
@@ -11962,7 +12174,7 @@ def auth_status():
 @app.route('/api/auth/login', methods=['POST'])
 def auth_login():
     # 限流检查
-    ip = request.remote_addr or 'unknown'
+    ip = _client_ip() or 'unknown'
     allowed, retry_after = _check_rate_limit(ip)
     if not allowed:
         resp = jsonify({
@@ -12006,7 +12218,7 @@ def auth_logout():
 def auth_setup():
     """首次设置密码（要求当前无密码文件存在）"""
     # setup 也加限流（防止恶意用户抢占 setup 流程）
-    ip = request.remote_addr or 'unknown'
+    ip = _client_ip() or 'unknown'
     allowed, retry_after = _check_rate_limit(ip)
     if not allowed:
         resp = jsonify({
@@ -12060,7 +12272,7 @@ def auth_setup():
 def auth_change_password():
     """已登录用户修改密码"""
     # 限流：和登录失败共用同一套限制（防暴力枚举旧密码）
-    client_ip = request.remote_addr or 'unknown'
+    client_ip = _client_ip() or 'unknown'
     allowed, retry_after = _check_rate_limit(client_ip)
     if not allowed:
         resp = jsonify({'success': False, 'code': 'RATE_LIMITED', 'message': '尝试次数过多，请稍后再试'})
@@ -13033,6 +13245,11 @@ def _start_servers():
         print(f'           2. 或确认 config.json 里 lan_if 写对了（当前：{_cfg.get("lan_if")!r}）', flush=True)
         print(f'           3. 实在要临时开放：export NFTABLES_WEB_BIND=0.0.0.0（会打日志，属显式降级）', flush=True)
         _sys.exit(1)
+
+    # 记下实际绑定地址：「防火墙控制入口」的上游地址要用它
+    # （面板只绑 LAN IP，127.0.0.1 连不上）。
+    global PANEL_BIND_ADDR
+    PANEL_BIND_ADDR = _bind
 
     https_server = make_server(_bind, HTTPS_PORT, app, ssl_context=ssl_ctx, threaded=True)
 

@@ -48,6 +48,18 @@ APP_MUTANTS = [
      '        for _attr in ("href", "src", "action"):\n            sf_rules.append((f\'{_attr}="/\', f\'{_attr}="{prefix}/\'))',
      '        for _attr in ("src", "action"):\n            sf_rules.append((f\'{_attr}="/\', f\'{_attr}="{prefix}/\'))'),
 
+    # ── CSS 里的 url() 形态（2026-11-04 真机 .232 实测补）──────────
+    # 少这两条的症状极隐蔽：@font-face 的字体 404 ⇒ 页面照样能用，
+    # 只是掉回系统字体，**看不出哪里错了**。
+    ('宽模式漏掉 CSS 里的 url() 形态（@font-face 的字体跑出 location ⇒ 404）',
+     '''        for _q in ("'", '"'):
+            sf_rules.append((f'url({_q}/', f'url({_q}{prefix}/'))''',
+     '        pass  # 变异：CSS 的 url() 不改写'),
+
+    ('宽模式把 url() 的斜杠吃掉（改出来的路径少一层，字体照样 404）',
+     """            sf_rules.append((f'url({_q}/', f'url({_q}{prefix}/'))""",
+     """            sf_rules.append((f'url({_q}', f'url({_q}{prefix}'))"""),
+
     # ── 前缀拼接错 ──────────────────────────────────────────────
     ('宽模式前缀后面少一个斜杠（改写出来的路径少一层）',
      '            sf_rules.append((f\'{_attr}="/\', f\'{_attr}="{prefix}/\'))',

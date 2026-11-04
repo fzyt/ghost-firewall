@@ -181,7 +181,18 @@ def main():
     conf = gen_conf(app, [rule('/ght', rewrite_root_paths=True)])
     check('开关打开时生成了 sub_filter', 'sub_filter ' in conf)
     sf = parse_sub_filters(conf)
-    check('恰好三条（href/src/action）', len(sf) == 3, str(sf))
+    # ⚠️ 2026-11-04 真机实测补：CSS 里的 url('/x') / url("/x") 也是
+    #   **根绝对路径**（@font-face 的字体文件、CSS 背景图都走这条）
+    #   ⇒ 宽模式从 3 条变 5 条。
+    #   少一条的症状极隐蔽：字体 404 ⇒ 页面照样能用，只是掉回系统字体，
+    #   **看不出哪里错了**（真机 .232 上就是这么踩到的）。
+    check('恰好五条（3 条属性 + 2 条 CSS url()）', len(sf) == 5, str(sf))
+    check('三条属性形态都在（href/src/action）',
+          all(any(old.startswith(a + '="/') for old, _n in sf)
+              for a in ('href', 'src', 'action')), str(sf))
+    check('两条 CSS url() 形态都在（单引号 + 双引号）',
+          any(old == "url('/" for old, _n in sf)
+          and any(old == 'url("/' for old, _n in sf), str(sf))
     page = ('<link rel="stylesheet" href="/static/style.css">\n'
             '<script src="/app.js"></script>\n'
             '<form action="/submit"></form>\n'
@@ -196,6 +207,14 @@ def main():
     check('首页链接 href="/" 变成 href="/ght/"', 'href="/ght/"' in out)
     check('相对路径原样保留（不被误伤）',
           'href="css/rel.css"' in out and 'href="/ght/css/rel.css"' not in out)
+    # CSS 正文里的 url() 也得带前缀（字体/背景图）
+    css = "@font-face{font-family:X;src:url('/assets/fonts/A.ttf')}"
+    out_css = nginx_sub_filter(css, sf)
+    check('CSS 里的 url() 带上前缀（字体不再跑出 location）',
+          "url('/ght/assets/fonts/A.ttf')" in out_css, out_css)
+    check('CSS 里的相对 url() 原样保留（不被误伤）',
+          "url('fonts/A.ttf')" in nginx_sub_filter(
+              "a{background:url('fonts/A.ttf')}", sf))
 
     print()
     print('=== 3. 窄模式（api_path_prefix）的既有输出逐字不变 ===')
@@ -212,7 +231,7 @@ def main():
     conf_both = gen_conf(app, [rule('/x', api_path_prefix='/api/',
                                      rewrite_root_paths=True)])
     sf_both = parse_sub_filters(conf_both)
-    check('共五条（2 窄 + 3 宽）', len(sf_both) == 5, str(len(sf_both)))
+    check('共七条（2 窄 + 5 宽）', len(sf_both) == 7, str(len(sf_both)))
     check('Accept-Encoding 仍然只出现一次',
           conf_both.count('proxy_set_header Accept-Encoding "";') == 1)
     out_both = nginx_sub_filter(page, sf_both)

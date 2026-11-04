@@ -182,16 +182,61 @@ check('validate_config 内不再残留 rp_targets 内联逻辑',
       'rp_targets = set()' not in fn_src(APP_SRC, 'validate_config'),
       '两份逻辑迟早分叉 —— 反代的 PUT 就是这么漏的')
 
-for fn in ('rp_create_rule', 'rp_update_rule'):
+# ⚠️ 2026-11-04：新建路径改成走共用函数 _rp_add_validated_rule
+#   （「防火墙控制」预设那条规则要复用同一段「校验→部署→落盘」流程，
+#   两处各写一份迟早分叉）。
+#   ⇒ 断言不能再死盯 rp_create_rule 的函数体 ——
+#   逻辑搬个家就假红，而真正的风险（交叉校验被摘掉）反倒没人看。
+#   这里改成「解析调用链」：函数自己没做 ⇒ 看它转交给的那个共用函数。
+def effective_body(fn):
+    """取函数的**实际生效体**。
+
+    逻辑搬家不该让断言假红，逻辑丢失必须被抓 ——
+    所以不能只认「函数自己写了没」，得顺着调用链找到真正干活的代码。
+    """
     body = fn_src(APP_SRC, fn)
+    if '_rp_add_validated_rule(' in body:
+        return fn_src(APP_SRC, '_rp_add_validated_rule')
+    return body
+
+
+def conflict_branch(body):
+    """抠出「交叉校验 → 失败返回」这一段。
+
+    为什么必须卡这一段、而不是整个函数体：函数里**还有另一处撤销**
+    （部署失败时丢弃规则），它同样是 rp["rules"].pop()。
+    整函数体匹配 ⇒ 撤掉冲突分支的 pop，另一处还在 ⇒ 断言照样过 ⇒
+    「冲突时不撤销」这个缺陷就测不出来了（这正是变异脚本要抓的那条）。
+    """
+    i = body.find('_rp_forward_conflicts(')
+    if i < 0:
+        return ''
+    j = body.find('return', i)
+    return body[i:j] if j > 0 else body[i:]
+
+
+for fn in ('rp_create_rule', 'rp_update_rule'):
+    body = effective_body(fn)
     check(f'{fn} 调用了交叉校验',
           '_rp_forward_conflicts(' in body,
           '不调用就能构造免登录入口：先建转发、再建指向同一后端的反代')
     check(f'{fn} 校验在部署之前',
           body.find('_rp_forward_conflicts(') != -1
           and body.find('_rp_forward_conflicts(') < body.find('_deploy_all_rules('))
+    _seg = conflict_branch(body)
     check(f'{fn} 冲突时撤销了内存里的改动',
-          re.search(r'rp\["rules"\]\.pop\(\)|rule\.update\(original\)', body) is not None)
+          re.search(r'rp\["rules"\]\.pop\(\)|rule\.update\(original\)', _seg) is not None,
+          '冲突分支里没有撤销动作 ⇒ 脏规则留在内存里')
+
+# 反向护栏：新建必须走共用落盘函数（防火墙控制预设复用同一段）。
+# 这两条不是「顺手加的」—— 本轮就是因为把新建路径改成了共用函数，
+# 才发现 FIX-5 的断言需要跟着改成解析调用链；那两条断言改完以后，
+# 「有人图省事绕过共用函数、直接自己 append」就没人拦了。
+check('rp_create_rule 走共用落盘函数（防火墙控制预设复用同一段）',
+      '_rp_add_validated_rule(' in fn_src(APP_SRC, 'rp_create_rule'),
+      '两条路径各写一份 ⇒ 迟早分叉')
+check('rp_add_fw_console 也走同一个共用落盘函数',
+      '_rp_add_validated_rule(' in fn_src(APP_SRC, 'rp_add_fw_console'))
 
 # ─────────────────────────────────────────────────────────────
 sec('FIX-6  手动更新 IPv6 写中转文件')

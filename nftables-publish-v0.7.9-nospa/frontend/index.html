@@ -17,10 +17,23 @@
   <script src="/assets/tailwind.js"></script>
   <script defer src="/assets/alpine.js"></script>
   <script defer src="/fx.js"></script>
+  <!-- 像素场背景（2026-11-04，与服务门户同一套引擎 + 同一份候选表）。
+       ⚠️ pixelfield.js **不在** frontend/ 里：它与门户共用 backend/static/ 下
+       的一份源码（146KB / 2700+ 行），面板的静态服务回退到那里取 ——
+       两处各放一份拷贝必然漂移，改了一边忘了另一边页面上根本看不出来。
+       详见 backend/app.py 的 SHARED_STATIC_FILES。 -->
+  <script defer src="/pixelfield.js"></script>
+  <!-- 背景选档与挂载（面板自己那份引导，见 frontend/pixelbg.js） -->
+  <script defer src="/pixelbg.js"></script>
   <link rel="stylesheet" href="styles.css">
 </head>
 
 <body class="nf-app">
+
+  <!-- 像素场背景：与服务门户同一套引擎，每次打开在「原版月白」与
+       「TRAE 原版」之间随机。画布放在**最底层**（DOM 序在 .nf-ambience 之前，
+       三个层同为 z-index:0 ⇒ 像素场垫底 → 细网格 → 环境光 → 内容）。 -->
+  <canvas id="nf-pix" class="nf-pix" aria-hidden="true"></canvas>
 
   <!-- 环境光：两盏跟随指针的光源 + 一层细网格。
        放在最底层（z-index:0），内容层 z-index:1 压在上面。 -->
@@ -2087,6 +2100,16 @@
             <button @click="newRpRule()"
               class="px-4 py-2 bg-black text-white rounded text-sm hover:bg-gray-800 transition-colors">
               添加规则
+            </button>
+            <!-- 防火墙控制入口：一键把面板自己经网关暴露出来（2026-11-04）。
+                 为什么要单独一个按钮：面板的 API 与静态资源都是根绝对路径，
+                 走 /fw/ 前缀入口必须同时打开网关的路径改写，
+                 手填那两个高级字段很容易漏 ⇒ 后端给配好的规则。
+                 加完就是一条普通反代规则 —— 「启用这条服务」就是那个开关。 -->
+            <button @click="addFwConsole()" :disabled="rp.loading"
+              title="添加一条 /fw/ 规则，把防火墙管理面板经认证网关暴露出来（仅内网可访问）"
+              class="px-4 py-2 border border-black rounded text-sm hover:bg-gray-50 disabled:opacity-50 transition-colors">
+              添加防火墙控制入口
             </button>
           </div>
           <p class="text-xs text-amber-600 mb-4">⚠️ 规则添加/修改完毕后，需点击右上角「应用规则」，防火墙才会放行对应端口，公网方可访问。</p>

@@ -81,6 +81,10 @@ MUTATIONS = [
      '                        "message": f"配置已保存但网关部署失败：{deploy_msg}"}), 500', 1),
 
     # ── FIX-5  反代 CRUD 漏交叉校验（免认证 DNAT 直达） ──────────────
+    # ⚠️ 锚点 2026-11-04 更新：新建路径改走共用函数 _rp_add_validated_rule
+    #   （防火墙控制预设复用同一段），交叉校验与回滚都搬进了那个共用函数。
+    #   「rp["rules"].pop()」在 app.py 里出现 **2 次**（冲突分支 + 部署失败分支），
+    #   所以锚点必须带上下文，否则 count != expect ⇒ 整条被跳过 ⇒ 白测。
     ('FIX-5 rp_create_rule 不做交叉校验', 'app',
      '    conflicts = _rp_forward_conflicts(config)\n'
      '    if conflicts:\n'
@@ -90,7 +94,30 @@ MUTATIONS = [
      '        rp["rules"].pop()', 1),
 
     ('FIX-5 rp_create_rule 冲突时不撤销 append', 'app',
-     '        rp["rules"].pop()\n', '        pass  # 变异：脏规则留在内存里\n', 1),
+     '    if conflicts:\n'
+     '        rp["rules"].pop()\n'
+     '        return None, "；".join(conflicts), 400',
+     '    if conflicts:\n'
+     '        pass  # 变异：脏规则留在内存里\n'
+     '        return None, "；".join(conflicts), 400', 1),
+
+    # ⚠️ 本轮新增：新建路径绕开共用落盘函数 ⇒ 交叉校验随之失效。
+    # 这条对应的是「重构引入的新风险」——共用函数里带着交叉校验，
+    # 谁要是图省事直接自己 append，校验就没了。
+    # ⚠️ 锚点必须带上 rp_create_rule 专属的那两行注释：
+    #   「new_id, err_msg, status = _rp_add_validated_rule(...)」这行
+    #   rp_add_fw_console 里也有一模一样的（count=2），
+    #   而变异脚本只替换**第一个**命中 ⇒ 不收紧就会改到 fw-console 那条去。
+    ('FIX-5 rp_create_rule 绕开共用落盘函数（交叉校验随之失效）', 'app',
+     '    # 落盘与生效的顺序（先部署后落盘、冲突回滚）统一走 _rp_add_validated_rule，\n'
+     '    # 「防火墙控制」预设那条规则走的是同一段 ⇒ 两处行为不会分叉。\n'
+     '    new_id, err_msg, status = _rp_add_validated_rule(config, rp, clean)\n'
+     '    if err_msg:\n'
+     '        return jsonify({"success": False, "message": err_msg}), status',
+     '    # 落盘与生效的顺序（先部署后落盘、冲突回滚）统一走 _rp_add_validated_rule，\n'
+     '    # 「防火墙控制」预设那条规则走的是同一段 ⇒ 两处行为不会分叉。\n'
+     '    new_id = _next_id("rp", [r["id"] for r in rp["rules"]])\n'
+     '    err_msg, status = None, 200', 1),
 
     ('FIX-5 rp_update_rule 不做交叉校验', 'app',
      '    conflicts = _rp_forward_conflicts(config)\n'

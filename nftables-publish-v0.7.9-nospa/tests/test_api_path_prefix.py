@@ -200,8 +200,19 @@ conf_with = gen_conf([rule_with])
 check('填了前缀 → 生成 sub_filter 块', 'sub_filter' in conf_with)
 check('sub_filter_once off（页面里多处引用都要改）',
       'sub_filter_once off;' in conf_with)
+# ⚠️ 2026-11-04 真机实测补：text/javascript 必须列上。
+#   Python 3.12+ 的 mimetypes 把 .js 映射成 **text/javascript**
+#   （不是 application/javascript）⇒ 只列后者时 **JS 正文根本没被改写**，
+#   窄模式对「API 路径写在 JS 里」的上游完全失效。
+#   实测症状很有欺骗性：页面能开、静态资源全 200，只有 app.js 里的
+#   '/api/auth/status' 没被改写 ⇒ 404 ⇒ 前端表现为「一直卡在加载中」。
+_sft_lines = [ln for ln in conf_with.splitlines() if 'sub_filter_types' in ln]
 check('sub_filter_types 只含文本类型（不动 JSON）',
-      'sub_filter_types application/javascript text/css;' in conf_with)
+      'sub_filter_types application/javascript text/javascript text/css;' in conf_with,
+      '实际: ' + str(_sft_lines))
+check('sub_filter_types 里没有 JSON 类型（改 JSON 会把响应体改坏）',
+      not any('json' in ln for ln in _sft_lines),
+      '实际: ' + str(_sft_lines))
 # nginx 的 sub_filter_types 默认已含 text/html，重复写会报
 # [warn] duplicate MIME type "text/html" —— 每次 nginx -t / reload 都刷一行
 check('sub_filter_types 不重复写 text/html（避免 nginx 警告）',

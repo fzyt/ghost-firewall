@@ -123,15 +123,25 @@ APP_MUTANTS = [
      '        # sub_filter_once removed'),
 
     # JSON 响应被改写 → 解析直接炸
+    # ⚠️ 锚点 2026-11-04 更新：text/javascript 必须列上（Python 3.12+ 的
+    #   mimetypes 把 .js 映射成 text/javascript，不是 application/javascript）
+    #   ⇒ 只列后者时 JS 正文根本没被改写 ⇒ 窄模式对 JS 里的 API 路径失效。
     ('sub_filter_types 把 application/json 也算进去（改坏 JSON 响应）',
-     '        L.append("        sub_filter_types application/javascript text/css;")',
-     '        L.append("        sub_filter_types application/javascript text/css application/json;")'),
+     '        L.append("        sub_filter_types application/javascript text/javascript text/css;")',
+     '        L.append("        sub_filter_types application/javascript text/javascript text/css application/json;")'),
 
     # nginx 的 sub_filter_types 默认已含 text/html，重复写会报
     # [warn] duplicate MIME type "text/html" —— 每次 nginx -t / reload 刷一行
     ('sub_filter_types 重复写 text/html（nginx 每次 reload 都报 duplicate MIME type）',
-     '        L.append("        sub_filter_types application/javascript text/css;")',
-     '        L.append("        sub_filter_types text/html application/javascript text/css;")'),
+     '        L.append("        sub_filter_types application/javascript text/javascript text/css;")',
+     '        L.append("        sub_filter_types text/html application/javascript text/javascript text/css;")'),
+
+    # ⚠️ 本轮新增：漏掉 text/javascript ⇒ JS 正文不改写 ⇒ 窄模式对
+    #   「API 路径写在 JS 里」的上游完全失效（页面能开、静态资源全 200，
+    #   只有 app.js 里的 '/api/xxx' 404 —— 症状极隐蔽）。
+    ('sub_filter_types 漏掉 text/javascript（JS 正文不改写，窄模式对 JS 里的 API 路径失效）',
+     '        L.append("        sub_filter_types application/javascript text/javascript text/css;")',
+     '        L.append("        sub_filter_types application/javascript text/css;")'),
 
     # 上游压缩了正文 → sub_filter 匹配不到 → 功能静默失效
     ('不再清掉上游压缩（sub_filter 在压缩正文上匹配不到）',

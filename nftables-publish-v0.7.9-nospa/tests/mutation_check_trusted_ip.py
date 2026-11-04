@@ -57,11 +57,11 @@ MUTANTS = [
      "    pass"),
 
     ('归一化提到风险检测之前（多值告警永远不触发）',
-     "    requester_ip = request.remote_addr or ''\n"
+     "    requester_ip = _client_ip()\n"
      "    risks = _detect_risks(old_cfg, new_cfg, requester_ip)\n"
      "\n"
      "    # trusted_ip4 归一化成单值再落盘。",
-     "    requester_ip = request.remote_addr or ''\n"
+     "    requester_ip = _client_ip()\n"
      "    _e0, _ = _trusted_ip_single(new_cfg.get('trusted_ip4'))\n"
      "    new_cfg['trusted_ip4'] = _e0 or ''\n"
      "    risks = _detect_risks(old_cfg, new_cfg, requester_ip)\n"

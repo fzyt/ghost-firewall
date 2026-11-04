@@ -24,6 +24,7 @@
   F  改版外溢到登录页
   G  安全面 / 加载顺序 / 占位符
   P  门户背景「原版 / TRAE 原版」随机两档（写死 / 少一档 / 覆盖失效）
+  Q  面板（5443）像素场接线（引擎只有一份 / 画布 / 脚本 / 层级 / 候选表）
 
 每条变异都独立重写源文件，并强制 PYTHONDONTWRITEBYTECODE=1：否则连续写入时
 Python 只按 mtime+size 判过期，两条大小相近的变异会复用上一条的 .pyc，
@@ -58,6 +59,9 @@ TEST_JS2 = os.path.join(ROOT, 'tests', 'test_pixelfield_trae.js')
 TEST_JS3 = os.path.join(ROOT, 'tests', 'test_pixelfield_moonstone_trae.js')
 TEST_JS4 = os.path.join(ROOT, 'tests', 'test_pixelfield_trae_orig.js')
 TEST_JS5 = os.path.join(ROOT, 'tests', 'test_portal_bgstyle.js')
+TEST_JS6 = os.path.join(ROOT, 'tests', 'test_panel_pixelbg.js')
+TEST_PY2 = os.path.join(ROOT, 'tests', 'test_panel_frontend.py')
+TEST_PY3 = os.path.join(ROOT, 'tests', 'test_fw_console.py')
 
 # 本脚本会动的文件（只这些）
 REL_FILES = [
@@ -66,6 +70,12 @@ REL_FILES = [
     os.path.join('backend', 'static', 'portal.js'),
     os.path.join('backend', 'static', 'portal.html'),
     os.path.join('backend', 'auth_gateway.py'),
+    # 面板侧（2026-11-04 第十三轮：面板也做一套像素场）
+    os.path.join('backend', 'app.py'),
+    os.path.join('frontend', 'index.html'),
+    os.path.join('frontend', 'styles.css'),
+    os.path.join('frontend', 'pixelbg.js'),
+    os.path.join('frontend', 'app.js'),
 ]
 ORIG = {}
 for rel in REL_FILES:
@@ -107,6 +117,12 @@ def run_tests():
       ⇒ 变异必须能被**行为级**测试抓住才算数。
 
     返回 (rc, 输出)。
+
+    ⚠️ 2026-11-04：各测试的超时从 300s 放宽到 600s（最慢那条从 600s 到 900s）。
+       原因：全扫是**分片并行**跑的，6 核机器上 4~6 个分片同时扛 CPU，
+       墙钟时间会被拉长 —— 上一轮就有 2 个分片因为「跑得慢被超时杀掉」
+       而**整片退出**，剩下的变异一条没跑（当成「跑完了」其实没跑）。
+       超时杀进程是把「慢」误判成「挂」；宁可多等，也别把没跑完的当跑完了。
     """
     env = {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'}
     node = shutil.which('node')
@@ -115,30 +131,30 @@ def run_tests():
         return 2, 'node not found in PATH'
     r = subprocess.run([sys.executable, TEST_PY],
                        capture_output=True, text=True, cwd=ROOT,
-                       timeout=300, env=env)
+                       timeout=600, env=env)
     rc = r.returncode
     out = r.stdout + r.stderr
     if rc != 0:
         return rc, out
     r2 = subprocess.run([node, TEST_JS],
                         capture_output=True, text=True, cwd=ROOT,
-                        timeout=300, env=env)
+                        timeout=600, env=env)
     if r2.returncode != 0:
         return r2.returncode, out + r2.stdout + r2.stderr
     r3 = subprocess.run([node, TEST_JS2],
                         capture_output=True, text=True, cwd=ROOT,
-                        timeout=300, env=env)
+                        timeout=600, env=env)
     if r3.returncode != 0:
         return r3.returncode, out + r2.stdout + r2.stderr + r3.stdout + r3.stderr
     r4 = subprocess.run([node, TEST_JS3],
                         capture_output=True, text=True, cwd=ROOT,
-                        timeout=300, env=env)
+                        timeout=600, env=env)
     if r4.returncode != 0:
         return r4.returncode, (out + r2.stdout + r2.stderr
                                + r3.stdout + r3.stderr + r4.stdout + r4.stderr)
     r5 = subprocess.run([node, TEST_JS4],
                         capture_output=True, text=True, cwd=ROOT,
-                        timeout=600, env=env)
+                        timeout=900, env=env)
     if r5.returncode != 0:
         return r5.returncode, (out + r2.stdout + r2.stderr
                                + r3.stdout + r3.stderr + r4.stdout + r4.stderr
@@ -146,10 +162,44 @@ def run_tests():
     # 门户背景「原版 / TRAE 原版」随机两档（2026-11-04 第十二轮）
     r6 = subprocess.run([node, TEST_JS5],
                         capture_output=True, text=True, cwd=ROOT,
-                        timeout=300, env=env)
-    return r6.returncode, (out + r2.stdout + r2.stderr
+                        timeout=600, env=env)
+    if r6.returncode != 0:
+        return r6.returncode, (out + r2.stdout + r2.stderr
+                               + r3.stdout + r3.stderr + r4.stdout + r4.stderr
+                               + r5.stdout + r5.stderr + r6.stdout + r6.stderr)
+    # 面板侧像素场（2026-11-04 第十三轮）
+    r7 = subprocess.run([node, TEST_JS6],
+                        capture_output=True, text=True, cwd=ROOT,
+                        timeout=600, env=env)
+    if r7.returncode != 0:
+        return r7.returncode, (out + r2.stdout + r2.stderr
+                               + r3.stdout + r3.stderr + r4.stdout + r4.stderr
+                               + r5.stdout + r5.stderr + r6.stdout + r6.stderr
+                               + r7.stdout + r7.stderr)
+    r8 = subprocess.run([sys.executable, TEST_PY2],
+                        capture_output=True, text=True, cwd=ROOT,
+                        timeout=600, env=env)
+    if r8.returncode != 0:
+        return r8.returncode, (out + r2.stdout + r2.stderr
+                               + r3.stdout + r3.stderr + r4.stdout + r4.stderr
+                               + r5.stdout + r5.stderr + r6.stdout + r6.stderr
+                               + r7.stdout + r7.stderr + r8.stdout + r8.stderr)
+    # ⚠️ 防火墙控制入口（2026-11-04 第十四轮 R 组）——
+    #   R 组变异改的是 backend/app.py 里的「防火墙控制」预设与生成器，
+    #   而覆盖它们的测试是 tests/test_fw_console.py。
+    #   2026-11-04 实测：这一段**漏接** ⇒ R-02 / R-04 / R-06 / R-09 四条
+    #   变异全部「漏网」（改了代码，测试照样全绿）。
+    #   教训跟「东西不该出现」那类断言一样：
+    #   **跑了什么测试，决定了哪些变异抓得到** ——
+    #   变异清单里加了新组，就必须把对应的新测试接进 runner。
+    r9 = subprocess.run([sys.executable, TEST_PY3],
+                        capture_output=True, text=True, cwd=ROOT,
+                        timeout=600, env=env)
+    return r9.returncode, (out + r2.stdout + r2.stderr
                            + r3.stdout + r3.stderr + r4.stdout + r4.stderr
-                           + r5.stdout + r5.stderr + r6.stdout + r6.stderr)
+                           + r5.stdout + r5.stderr + r6.stdout + r6.stderr
+                           + r7.stdout + r7.stderr + r8.stdout + r8.stderr
+                           + r9.stdout + r9.stderr)
 
 
 def mutate(rel, old, new):
@@ -170,6 +220,11 @@ PIX = os.path.join('backend', 'static', 'pixelfield.js')
 PJS = os.path.join('backend', 'static', 'portal.js')
 PHT = os.path.join('backend', 'static', 'portal.html')
 GW = os.path.join('backend', 'auth_gateway.py')
+# 面板侧（2026-11-04 第十三轮）
+APP = os.path.join('backend', 'app.py')
+FINX = os.path.join('frontend', 'index.html')
+FCSS = os.path.join('frontend', 'styles.css')
+FPIX = os.path.join('frontend', 'pixelbg.js')
 CSSF = os.path.join('backend', 'static', 'base.css')
 
 # 白名单那一行（auth_gateway.py:211-212）
@@ -762,6 +817,110 @@ MUTATIONS = [
     ('P-08', '两档顺序被对调（random=0 与 random≈1 落反了）', PJS,
      "var BG_STYLES = ['moonstone', 'trae'];",
      "var BG_STYLES = ['trae', 'moonstone'];"),
+
+    # ── R. 防火墙控制入口（2026-11-04 第十四轮）────────────────
+    # 用户原话：「5443 能不能以一种开关的形式，开放到门户里？
+    #   也就是 8443 里面登录后，可以直接进入防火墙控制」
+    # ⇒ 复用反代规则（enabled 就是开关）+ 网关内反代 /fw/ + 仅内网。
+    #
+    # 这批最危险的退化全是**静默**的：
+    #   · 面板判来源 IP 时不信 X-Real-IP ⇒ 面板自己的网段限制被绕过，
+    #     而界面上看不出任何异常（规则照样「已启用」）
+    #   · 预设规则的 public_access 变 true ⇒ 面板从「无公网入口」变成公网可达
+    #   · 两处路径改写被摘掉 ⇒ 页面能开、数据与字体全 404
+    #   · 生成器忽略 target_protocol ⇒ 上游 HTTPS 被代理成 http:// ⇒ 502
+    ('R-01', '面板不再信任 X-Real-IP（反代后所有来源都被当成本机）', APP,
+     "        fwd = (request.headers.get('X-Real-IP') or '').strip()\n"
+     "        if fwd:\n            return fwd",
+     "        fwd = ''\n        if fwd:\n            return fwd"),
+    # ⚠️ 与 R-01 方向相反、但**危险得多**的那条：
+    #   「谁来都采信 X-Real-IP」⇒ 局域网里任何机器直连面板时，
+    #   伪造一个 X-Real-IP 就能伪装成内网地址 ⇒ 面板自己的网段白名单形同虚设。
+    #   R-01（完全不信任）只是让反代后的来源认不出来（功能退化），
+    #   R-11（无脑信任）才是**可被利用的越权面** —— 之前没人测这一条。
+    ('R-11', '面板对任何来源都采信 X-Real-IP（伪造头即可绕过网段白名单）', APP,
+     "    remote = (request.remote_addr or '').strip()\n"
+     "    if remote in _LOOPBACK_V4 or remote.startswith('127.'):\n"
+     "        fwd = (request.headers.get('X-Real-IP') or '').strip()\n"
+     "        if fwd:\n"
+     "            return fwd\n"
+     "    return remote",
+     "    remote = (request.remote_addr or '').strip()\n"
+     "    fwd = (request.headers.get('X-Real-IP') or '').strip()\n"
+     "    if fwd:\n"
+     "        return fwd\n"
+     "    return remote"),
+    ('R-02', '防火墙控制入口被设成公网可达（面板多了一个公网入口）', APP,
+     '        "public_access": False,\n        "enabled": True,',
+     '        "public_access": True,\n        "enabled": True,'),
+    ('R-03', '预设规则不开了 API 路径改写（面板的接口全 404）', APP,
+     '        "api_path_prefix": "/api",\n        "rewrite_root_paths": True,',
+     '        "api_path_prefix": "",\n        "rewrite_root_paths": True,'),
+    ('R-04', '预设规则不开了根绝对路径改写（字体与图片全 404）', APP,
+     '        "api_path_prefix": "/api",\n        "rewrite_root_paths": True,',
+     '        "api_path_prefix": "/api",\n        "rewrite_root_paths": False,'),
+    ('R-06', '生成器又忽略 target_protocol（https 上游被代理成 http）', APP,
+     "            proto = str(r.get(\"target_protocol\", \"\") or \"\").strip().lower()\n"
+     "            if proto in (\"http\", \"https\"):\n"
+     "                protocol = proto",
+     "            proto = ''\n"
+     "            if proto in (\"http\", \"https\"):\n"
+     "                protocol = proto"),
+    ('R-07', 'sub_filter 不再处理 text/javascript（JS 里的 API 路径不改写）', APP,
+     '        L.append("        sub_filter_types application/javascript text/javascript text/css;")',
+     '        L.append("        sub_filter_types application/javascript text/css;")'),
+    ('R-08', 'CSS 里的 url() 不再改写（字体 404，页面悄悄掉回系统字体）', APP,
+     '        for _q in ("\'", \'"\'):\n'
+     '            sf_rules.append((f\'url({_q}/\', f\'url({_q}{prefix}/\'))',
+     '        pass'),
+    ('R-09', '预设入口不查幂等（每点一次就多一条 /fw 规则）', APP,
+     '    for r in rules:\n'
+     '        if _safe_path_prefix(r.get("path_prefix", "")) == FW_CONSOLE_PREFIX:',
+     '    for r in []:\n'
+     '        if _safe_path_prefix(r.get("path_prefix", "")) == FW_CONSOLE_PREFIX:'),
+    ('R-10', '门户卡片不再用规则自带的图标（防火墙控制显示成路径首字母）', PJS,
+     "    ico.textContent = (s.icon && String(s.icon).trim())\n"
+     "      ? String(s.icon).trim()\n"
+     "      : glyph(s, used);",
+     "    ico.textContent = glyph(s, used);"),
+
+    # ── Q. 面板（5443）也做一套像素场（2026-11-04 第十三轮）────
+    # 用户原话：「这个5443界面你要么也做一套」
+    # ⇒ 面板接上与服务门户**同一份**引擎源码（backend/static/pixelfield.js，
+    #   面板从那里取，不在 frontend/ 留拷贝），背景同样是两档原版随机。
+    #
+    # 这批最危险的退化：
+    #   · 引擎在 frontend/ 留了一份拷贝 ⇒ 两边从此各改各的，画面越走越远
+    #     （而且**页面上完全看不出来**，两套画面都"正常"）
+    #   · 静态服务的回退分支被删 / 白名单漏了 pixelfield.js ⇒ 面板 404
+    #   · 画布或脚本引用被删 ⇒ 背景整层消失，页面照常（不报错）
+    #   · 画布被挪到环境光之后 ⇒ 层级反了，被环境光压住
+    ('Q-01', '面板的共享静态回退被删（面板拿不到引擎 → 404）', APP,
+     "    if filename in SHARED_STATIC_FILES:\n"
+     "        return send_from_directory('static', filename)\n",
+     ''),
+    ('Q-02', '共享白名单漏了 pixelfield.js（回退分支形同虚设）', APP,
+     "    'pixelfield.js',\n", ''),
+    ('Q-03', '面板页面不引引擎脚本了（背景整层消失）', FINX,
+     '  <script defer src="/pixelfield.js"></script>\n', ''),
+    ('Q-04', '面板页面的像素场画布被删了', FINX,
+     '  <canvas id="nf-pix" class="nf-pix" aria-hidden="true"></canvas>\n\n', ''),
+    ('Q-05', '面板页面不引引导脚本了（选档与挂载没人做）', FINX,
+     '  <script defer src="/pixelbg.js"></script>\n', ''),
+    ('Q-06', '画布的样式规则被删（画布不铺满 / 层级乱）', FCSS,
+     '.nf-pix {\n  position: fixed;', '.nf-pix-disabled {\n  position: fixed;'),
+    ('Q-07', '画布被挪到环境光之后（层级反了，被环境光压住）', FINX,
+     '  <canvas id="nf-pix" class="nf-pix" aria-hidden="true"></canvas>\n\n'
+     '  <!-- 环境光：两盏跟随指针的光源 + 一层细网格。',
+     '  <!-- 环境光：两盏跟随指针的光源 + 一层细网格。'),
+    ('Q-08', '面板引导脚本的候选表少一档（只剩原版）', FPIX,
+     "var CANDIDATES = ['moonstone', 'trae'];",
+     "var CANDIDATES = ['moonstone'];"),
+    ('Q-09', '面板引导脚本的随机被写死成第一个', FPIX,
+     'return CANDIDATES[Math.floor(r * CANDIDATES.length)];',
+     'return CANDIDATES[0];'),
+    ('Q-10', '面板引导脚本不再支持 ?pfstyle= 钉死某一档', FPIX,
+     "    var want = queryParam('pfstyle');", "    var want = '';"),
 ]
 
 

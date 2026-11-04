@@ -248,7 +248,12 @@
 
     var ico = document.createElement('div');
     ico.className = 'ico';
-    ico.textContent = glyph(s, used);
+    /* 图标优先用规则自带的 icon 字段（门户 API 会返回它）。
+     * 没有就退回路径首字母 —— 那是老逻辑，一直用着。
+     * 「防火墙控制」这类入口用它自己的标识（FW）比路径首字母清楚。 */
+    ico.textContent = (s.icon && String(s.icon).trim())
+      ? String(s.icon).trim()
+      : glyph(s, used);
 
     var nm = document.createElement('div');
     nm.className = 'nm';

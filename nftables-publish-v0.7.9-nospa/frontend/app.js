@@ -2159,6 +2159,30 @@ function app() {
       }
     },
 
+    // ── 防火墙控制入口（一键添加）────────────────────────────
+    //
+    // 把**面板自己**经认证网关暴露出来，门户里点一下就能进防火墙控制台。
+    //
+    // 为什么不让用户自己填一条反代规则：面板的 API 与静态资源都是
+    // **根绝对路径**（/api/config、/styles.css、/assets/*…），
+    // 走 /fw/ 前缀入口时必须同时打开网关的路径改写
+    // （api_path_prefix + rewrite_root_paths），
+    // 否则「页面能打开、数据接口全 404」—— 症状极具迷惑性，
+    // 用户会以为是自己部署坏了。⇒ 后端直接给一条配好的规则。
+    async addFwConsole() {
+      this.rp.loading = true;
+      try {
+        const resp = await api.post('/api/reverse-proxy/fw-console', {});
+        const data = unwrap(resp) || {};
+        await this.loadReverseProxy();
+        this.showToast(data.message || '防火墙控制入口已添加', 'success');
+      } catch (e) {
+        this.showToast('添加失败: ' + e.message, 'error');
+      } finally {
+        this.rp.loading = false;
+      }
+    },
+
     async testRpRule(rule) {
       // v0.8.1 规则恒有 id。旧的 `rule.domain` 兜底是 v0.8.0 残留，
       // 留着会拼出 /rules/nas.test/test 这种必然 404 的路径。
