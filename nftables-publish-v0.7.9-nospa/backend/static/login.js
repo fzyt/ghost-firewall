@@ -33,10 +33,58 @@
 
   /* ── 像素场背景 ───────────────────────────────────────────
    * 和门脸页、门户页同一个引擎（pixelfield.js），纯装饰。
-   * 用月白（moonstone）那套配色 —— 跟门户页、门脸页对齐。
    * 参数跟门脸页一致（列数 / 亮度都走引擎默认），这样移植过来的
    * 登录页和 demo 门脸页是同一片场。
-   * 引擎加载失败也只是少一层背景，登录流程不受影响。 */
+   * 引擎加载失败也只是少一层背景，登录流程不受影响。
+   *
+   * ⚠️ 2026-11-04 第十五轮：登录页的档位也改成**每次打开随机**，
+   *   候选与门户页、面板完全一致：原版月白（moonstone）/ TRAE 原版（trae）。
+   *   以前这里是写死的 'moonstone'（登录页只有一种观感）。
+   *   用户原话：「遮罩调淡 + 两边登录页都随机」。
+   *
+   *   为什么登录页也随机：登录页是**用户看到面板的第一眼**，
+   *   固定一档 ⇒ 每次进来都一样；随机两档 ⇒ 和打开门户/面板时
+   *   同一套随机规则，观感统一。
+   *
+   *   ⚠️ 档名写错时**忽略并回退随机**，不把不存在的档位传给引擎 ——
+   *   引擎拿到不认识的档位会整片空掉（背景没了，页面还是能用，
+   *   但用户会以为「网页坏了」）。 */
+  var BG_STYLES = ['moonstone', 'trae'];
+
+  /* 从 URL 查询串里取一个参数值（?pfstyle=xxx），取不到返回 ''。
+   * 不用正则：登录页的查询串很简单（?next= 与 ?pfstyle=），
+   * split 就够，也省得踩正则里的转义坑。 */
+  function queryParam(name) {
+    var search = '';
+    try {
+      search = (window.location && window.location.search) || '';
+    } catch (e) { return ''; }
+    if (!search) return '';
+    var parts = String(search).replace(/^\?/, '').split('&');
+    for (var i = 0; i < parts.length; i++) {
+      var kv = parts[i].split('=');
+      if (kv[0] === name) {
+        var v = kv.length > 1 ? kv[1] : '';
+        try { return decodeURIComponent(v); } catch (e) { return v; }
+      }
+    }
+    return '';
+  }
+
+  /* 挑这一次的背景档位：
+   *   1) URL 显式指定（?pfstyle=moonstone / ?pfstyle=trae）⇒ 用它；
+   *   2) 否则在两档里**随机**挑一个 —— 每次打开重新挑，不记存储。
+   *   ⚠️ 指定的档位必须**在候选里**才认，否则忽略并回退随机。 */
+  function pickBgStyle() {
+    var want = queryParam('pfstyle');
+    if (want) {
+      for (var i = 0; i < BG_STYLES.length; i++) {
+        if (BG_STYLES[i] === want) return want;
+      }
+    }
+    return BG_STYLES[Math.floor(Math.random() * BG_STYLES.length)];
+  }
+
   (function mountField() {
     var canvas = document.getElementById('pix');
     if (!canvas || !window.GhostPixelField) return;
@@ -48,7 +96,7 @@
         bloom: true,
       };
       if (window.GhostPixelField.createStyle) {
-        window.GhostPixelField.createStyle(canvas, 'moonstone', opt);
+        window.GhostPixelField.createStyle(canvas, pickBgStyle(), opt);
       } else if (window.GhostPixelField.mount) {
         window.GhostPixelField.mount(canvas, opt);
       }

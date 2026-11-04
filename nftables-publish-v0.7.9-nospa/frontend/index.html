@@ -102,7 +102,14 @@
     </div>
   </div>
     <!-- 侧边导航 -->
-    <aside class="nf-sidebar">
+    <!-- ⚠️ 2026-11-04 第十五轮：未认证时**整个藏起来**。
+         登录遮罩从 88% 调到 58% 之后，遮罩下面那半个面板
+         （侧栏 + 主内容）会透出来 —— 实拍里能看清「底层内容」四个字
+         和底部模糊的表格块，看着像渲染坏了。
+         ⇒ 面板的界面只在**登录之后**存在；没登录时屏幕上只该有
+         像素场背景 + 登录卡片。
+         （模态框都在 </main> 之外，不受影响。） -->
+    <aside x-show="auth.authenticated" class="nf-sidebar">
       <div class="nf-brand">
         <div class="flex items-center gap-3">
           <div class="nf-brand__mark">
@@ -142,7 +149,7 @@
     </aside>
 
     <!-- 主内容区 -->
-    <main class="nf-main">
+    <main x-show="auth.authenticated" class="nf-main">
 
       <!-- Toast -->
       <div x-show="toast.show" x-transition
