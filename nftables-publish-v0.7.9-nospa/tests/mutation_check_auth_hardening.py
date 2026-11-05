@@ -49,7 +49,7 @@ MUTATIONS = [
      '        host = (u.hostname or "").strip().lower()\n        if not host:\n            return False'),
 
     # ⚠️ 锚点 2026-10-30 更新：P1-11 修复把 CSRF 的判定从
-    # 「Origin 的主机 == Host 头的���机」换成了**服务端自己知道的域名**
+    # 「Origin 的主机 == Host 头的主机」换成了**服务端自己知道的域名**
     # （_trusted_host_names）+ 端口纳入比较。旧锚点
     # 「return host != (request.host or "").split(":")[0]...」已经不存在了 ——
     # 锚点失配等于这条缺陷从此没人守，所以必须跟着实现一起改。

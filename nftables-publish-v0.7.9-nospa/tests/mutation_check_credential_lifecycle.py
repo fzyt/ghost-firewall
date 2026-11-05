@@ -13,7 +13,7 @@
 这些退化**读起来完全正常**，成功路径也确实工作 ——
 只有真的把修复拆掉，测试才会变红。所以下面每条变异都往「退化」方向改。
 
-⚠️ 为什么不�� tests/_mutation_guard.py 的 MutationGuard
+⚠️ 为什么不用 tests/_mutation_guard.py 的 MutationGuard
 --------------------------------------------------
 MutationGuard 的保险丝是「把**整个快照**的所有文件从快照写回去」。
 同一个仓库里有另外两个 agent 在并行改 backend/app.py 的**其它区域** ——

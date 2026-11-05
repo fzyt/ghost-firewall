@@ -267,7 +267,12 @@ _fb = sh_func('apk_install_via_local_file')
 _fb_idx = SETUP_SRC.index('apk_install_via_local_file()')
 _fb_ctx = SETUP_SRC[max(0, _fb_idx - 1600):_fb_idx] + _fb
 check('兜底安装前会校验文件是不是真的包',
-      'apk_file_looks_valid' in _fb,
+      # ⚠️ 必须查**去注释版**（2026-11-05 加固）：
+      #    断言是在问「代码里有没有调用这个校验」，
+      #    而 _fb 是带注释的函数体 —— 将来谁在这个函数里写一句
+      #    「这里要调 apk_file_looks_valid」之类的说明，
+      #    断言就会被注释顶住（setup_resume 的 M20 就是这么漏网的）。
+      'apk_file_looks_valid' in strip_sh_comments(_fb),
       '不校验 ⇒ 镜像缺包体时装上一张 HTML 错误页，报包格式不对')
 check('兜底失败时给出「镜像缺包体」的可读原因（不是让人去查签名）',
       '缺包体' in _fb or '不是有效的 apk 包' in _fb)

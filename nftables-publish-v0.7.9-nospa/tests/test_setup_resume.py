@@ -140,13 +140,26 @@ def strip_comments(src):
     return '\n'.join(ln for ln in src.split('\n') if not ln.strip().startswith('#'))
 
 
-def fn_body(src, name):
+def fn_body(src, name, strip=True):
+    """切出某个函数的源码（做结构断言用）。
+
+    ⚠️ 默认**去掉整行注释**（2026-11-05 修 M20 漏网时加的）：
+       注释里出现的函数名会被 `in` / 正则当成**调用点**。
+       v0.19.3 那轮在 setup.sh 里加了一句
+       「（实测细节见 apk_install_via_local_file 上方的说明）」的注释，
+       正好把 M20 变异的断言顶住了 ——
+       变异把真实调用换成 `if false; then`，断言却因为注释里还留着函数名而通过，
+       ⇒ 变异漏网（捕获 34/35，上一轮 5739ed6 是 35/35）。
+       断言要在**代码**里找东西，就不能让它看见注释。
+       需要保留注释原文时传 strip=False。
+    """
     key = f'{name}() {{'
     i = src.find(key)
     if i < 0:
         return ''
     j = src.find('\n}\n', i)
-    return src[i:j] if j > 0 else src[i:]
+    body = src[i:j] if j > 0 else src[i:]
+    return strip_comments(body) if strip else body
 
 
 # ------------------------------------------------------------
@@ -181,6 +194,15 @@ echo OK-LUCI2
 
 def main():
     setup = read(SETUP)
+    # ⚠️ 全文结构断言的底稿：**去注释版**。
+    #    同一个道理 —— 注释里出现的标识符会被 `in` 当成「代码里有」，
+    #    某个变异删掉真实代码后断言却照样通过（2026-11-05 的 M20 就是这么漏的）。
+    #    少数断言要的就是「连注释里也不许有」（见第 4 节的「不再有……老逻辑」），
+    #    那几条仍查全文 setup。
+    setup_code = strip_comments(setup)
+    # ⚠️ 少数断言要的就是「连注释里也不许有这句老逻辑」，
+    #    那类必须查**全文**（含注释），不能查 setup_code。
+    setup_full = setup
 
     with tempfile.TemporaryDirectory() as td:
         lib = make_lib(td)
@@ -189,9 +211,9 @@ def main():
         sec('1. 阶段化：每个阶段都有「已完成」判据')
 
         check('有 run_stage（阶段调度器）',
-              'run_stage() {' in setup)
+              'run_stage() {' in setup_code)
         check('有 mark_stage（阶段流水账）',
-              'mark_stage() {' in setup)
+              'mark_stage() {' in setup_code)
 
         stages = [
             ('依赖安装', 'stage_deps_done', 'install_deps'),
@@ -206,7 +228,7 @@ def main():
         ]
         for label, chk, act in stages:
             check(f'阶段「{label}」有判据函数 {chk}()',
-                  f'{chk}() {{' in setup)
+                  f'{chk}() {{' in setup_code)
             check(f'阶段「{label}」在 main 里走 run_stage',
                   re.search(rf'run_stage\s+"{re.escape(label)}"\s+{chk}\s+{act}',
                             setup) is not None)
@@ -226,7 +248,7 @@ def main():
         sec('2. 失败提示：告诉用户「重跑即可续装」')
 
         check('有 print_retry_hint（重试指引）',
-              'print_retry_hint() {' in setup)
+              'print_retry_hint() {' in setup_code)
         hint = fn_body(setup, 'print_retry_hint')
         check('指引里出现「重新执行」',
               '重新执行' in hint)
@@ -244,20 +266,20 @@ def main():
               'print_retry_hint' in d)
 
         check('有 EXIT 兜底（set -e 撞上的失败也要有指引）',
-              'on_exit() {' in setup and "trap 'on_exit $?' EXIT" in setup)
+              'on_exit() {' in setup and "trap 'on_exit $?' EXIT" in setup_code)
         oe = fn_body(setup, 'on_exit')
         check('EXIT 兜底只在失败时出声（退出码 0 不刷屏）',
               re.search(r'"\$rc"\s+-ne\s+0', oe) is not None)
         check('EXIT 兜底在已经打过指引时不重复打',
               'RETRY_HINT_SHOWN' in oe)
         check('全部完成后会标记 INSTALL_COMPLETED（不该再打指引）',
-              'INSTALL_COMPLETED=1' in setup)
+              'INSTALL_COMPLETED=1' in setup_code)
 
         # ── 3. apk 不会卡死 / 不会白等 ─────────────────────────
         sec('3. apk：超时保护 + 自动换源 + 本地文件兜底')
 
         check('有 run_with_timeout（OpenWrt 没有 timeout 命令）',
-              'run_with_timeout() {' in setup)
+              'run_with_timeout() {' in setup_code)
         rwt = fn_body(setup, 'run_with_timeout')
         check('超时用 /proc/<pid> 判存活（busybox 的 kill 不支持 -0）',
               '/proc/$pid' in rwt)
@@ -267,7 +289,7 @@ def main():
               re.search(r'wait\s+"\$pid".*\|\|\s*rc=\$\?', rwt, re.S) is not None)
 
         check('有 apk_update_with_failover（当前源失败就换国内镜像）',
-              'apk_update_with_failover() {' in setup)
+              'apk_update_with_failover() {' in setup_code)
         check('候选镜像含中科大/南大/清华',
               all(h in setup for h in
                   ('mirrors.ustc.edu.cn', 'mirror.nju.edu.cn',
@@ -298,7 +320,7 @@ def main():
               not re.search(r'apk\)\s+apk update\s*;;', pu))
 
         check('有 apk_install_via_local_file（换下载器的兜底）',
-              'apk_install_via_local_file() {' in setup)
+              'apk_install_via_local_file() {' in setup_code)
         lf = fn_body(setup, 'apk_install_via_local_file')
         check('兜底用 apk fetch（apk 自带下载器，绕开坏掉的 wget）',
               'apk fetch' in lf)
@@ -312,7 +334,7 @@ def main():
               not re.search(r'apk update\s*>/dev/null', pia))
 
         check('有 free_package_cache（apk 包体会撑爆小 overlay）',
-              'free_package_cache() {' in setup)
+              'free_package_cache() {' in setup_code)
         fpc = fn_body(setup, 'free_package_cache')
         check('只删 *.apk 包体，保留索引（删了索引每个包都要重下全量索引）',
               '/var/cache/apk/*.apk' in fpc and 'APKINDEX' not in fpc)
@@ -322,13 +344,15 @@ def main():
 
         check('不再有「非交互模式就跳过项目部署」的老逻辑',
               '跳过项目部署（目标目录 ${INSTALL_DIR} 已存在且非空，非交互模式）'
-              not in setup)
+              not in setup_full)
         dp = fn_body(setup, 'deploy_project')
         check('目录已存在时改为覆盖安装（并说明配置不受影响）',
               '将覆盖安装目录' in dp and 'CONFIG_DIR' in dp)
         # ⚠️ 必须只查**本地路径分支**：GitHub 分支也写 VERSION，
         #    拿整个函数去查的话，本地分支不写版本也照样能过（这正是 M29 漏网的原因）。
-        local_branch = dp[dp.find('if [ -n "$ARG_LOCAL" ]; then'):dp.find('# GitHub 安装')]
+        # ⚠️ 结束锚点用**代码**（local tag=）而不是注释（"# GitHub 安装"）——
+        #    dp 现在是去注释版，注释锚点已经不存在了。
+        local_branch = dp[dp.find('if [ -n "$ARG_LOCAL" ]; then'):dp.find('local tag=')]
         check('部署后记录版本（供「已完成」判据比对）',
               'INSTALL_DIR}/VERSION' in local_branch,
               '查的是本地路径分支，不是整个函数')
@@ -343,9 +367,9 @@ def main():
               'ARG_LOCAL' in sd and 'deploy_tree_matches' in sd,
               '只看版本号 ⇒ 改了代码没 bump 版本号时会静默跳过部署')
         check('源比对是**整棵树**逐文件 md5（只比一个代表文件会漏）',
-              'deploy_tree_matches() {' in setup and 'md5sum' in setup)
+              'deploy_tree_matches() {' in setup and 'md5sum' in setup_code)
         check('源比对排除运行时产物（__pycache__/*.pyc 不该算进来）',
-              '__pycache__' in setup and "*.pyc" in setup)
+              '__pycache__' in setup and "*.pyc" in setup_code)
         check('部署判据要求 VERSION 文件存在（老版装出来的目录没这文件 ⇒ 不能判成已完成）',
               re.search(r'\[\s*-f\s+"\$\{INSTALL_DIR\}/VERSION"\s*\]\s*\|\|\s*return 1',
                         strip_comments(sd)) is not None,
@@ -374,7 +398,7 @@ def main():
               'NGINX_UCI_CONF' in sl)
         check('LuCI 判据要求的路径都在脚本顶部定义成变量（可注入 ⇒ 可测）',
               'UHTTPd_CONF="/etc/config/uhttpd"' in setup
-              and 'NGINX_UCI_CONF="/etc/config/nginx"' in setup)
+              and 'NGINX_UCI_CONF="/etc/config/nginx"' in setup_code)
 
         # ── 6. 依赖顺序 ────────────────────────────────────────
         sec('6. 依赖顺序：curl 必须在 nginx-full 之前，wget-ssl 最后')

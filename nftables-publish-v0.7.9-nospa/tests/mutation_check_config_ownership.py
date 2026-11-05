@@ -52,13 +52,18 @@ MUTANTS = [
 })"""),
 
     # ── 纵深防御：config_rev 版本闸 ──────────────────────────────────
+    # ⚠️ 2026-11-05 修锚点：v0.19.2 的 P1-24 把版本闸从「嵌套在 if 里」改成
+    #    「函数体层级 + 提前 return」，缩进从 8 空格变成 4 空格。
+    #    锚点还停在老缩进 ⇒ 这两条变异从 v0.19.2 起就**一直没在跑**
+    #    （脚本会报「锚点未命中」并返回 1，但没人看那行）。
+    #    ⇒ 锚点必须跟着源码的缩进走。
     ('版本闸不再拒收过期快照（改成永不触发）',
-     "        if sent_rev != cur_rev:",
-     "        if False:"),
+     "    if sent_rev != cur_rev:",
+     "    if False:"),
 
     ('版本闸改成一律拒收（连新快照也存不进去）',
-     "        if sent_rev != cur_rev:",
-     "        if sent_rev:"),
+     "    if sent_rev != cur_rev:",
+     "    if sent_rev:"),
 
     ('版本号把 reverse_proxy 也算进去（反代页改一条就莫名 409）',
      """    payload = {k: v for k, v in (config or {}).items()
