@@ -2,6 +2,101 @@
 
 所有重要更改均记录在此文件中。
 
+## [v0.19.3] - 2026-11-05
+
+**在 `.232`（OpenWrt 25.12.5 / apk-tools 3.0.5）真机复验 v0.19.1 的 apk 修复，
+发现并修掉两个「本地测试永远抓不到」的真 bug —— 兜底安装路径在真机上其实是死代码。**
+
+---
+
+## 一、`apk_file_looks_valid` 在真机上恒返回 false（v0.19.1 的修复没修好）
+
+### 现象
+
+`.232` 上跑「apk 三个缺陷」的真机复验，兜底安装路径 `apk_install_via_local_file`
+**恒定失败**。而它在开发机（Ubuntu）上的 25 项测试是**绿的**。
+
+### 原因：两条判据都写错了
+
+| # | v0.19.1 的判据 | `.232` 上的真机事实 | 后果 |
+|---|---|---|---|
+| ① | 用 `od -An -tx1 -N2` 读包头字节 | **OpenWrt 25.12.5 上根本没有 `od`**（busybox 也不带这个 applet），实测 `od: not found` | 魔数读出来是**空串** ⇒ 判定恒为假 |
+| ② | 魔数判 `1f8b`（gzip 流） | apk-tools 3.x 的包是 **ADB v3** 格式，头 3 字节是 "ADB"（`414442`，完整 4 字节 "ADBd"）；连索引文件 `APKINDEX.*.tar.gz` 也是 ADB 格式（文件名带 `.tar.gz`，内容根本不是 gzip，实测 `gzip -t` 报 "invalid magic"） | 判据在 25.12 上**永远为假** |
+
+两条叠起来 ⇒ `apk_file_looks_valid` 恒返回 false
+⇒ `apk_install_via_local_file` 永远走不下去
+⇒ **三个 apk 缺陷里的「缺陷二」其实并没有被修好**。
+
+### 为什么本地测试结构性地抓不到
+
+- 开发机有 `od` ⇒ 永远走第一层降级，读得到字节；
+- 本地测试造的是 **gzip 头**的假包 ⇒ 恰好符合**错的**判据。
+
+⇒ 静态断言 + 在开发机上跑一遍，这类问题**不可能**被发现。必须到目标设备上真跑。
+
+### 改了什么
+
+| 位置 | 改前 | 改后 |
+|---|---|---|
+| 包头魔数 | 只认 `1f8b`（gzip） | **认 `414442`（ADB v3）** + 仍认 `1f8b`（apk-tools 2.x 的 tar.gz 包） |
+| 读字节 | 只有 `od` | **三层降级**：`od` → `hexdump`（busybox applet，OpenWrt 必有）→ shell 内建 `read -n`（busybox ash 实测支持读二进制） |
+| 体积下限 | 在魔数检查之后 | 提到最前面（`[ -s ]` + `>= 64 字节`），逻辑等价但更早短路 |
+
+新增函数 `apk_file_has_apk_magic()`，专门负责取包头；
+`apk_file_looks_valid()` 改成「体积 + 委托它」。
+
+---
+
+## 二、按真机事实更正 3 处与事实不符的注释
+
+v0.19.1 只更正了 1 处（`apk_install_via_local_file` 上方那段）。
+`.232` 真机复验又找出 3 处错的：
+
+| 位置 | 原来写的 | 真机实测 |
+|---|---|---|
+| `pkg_install_apk` 兜底段 | 「`apk fetch` 用的是 apk **自带**的下载器（不走外部 wget）」 | apk-tools 3.0.5 下载**索引和包体都会外调外部下载器**（实测 `ps` 抓到 `wget -q -T 60 <url> -O -`；`apk update` 调 8 次、`apk fetch` 调 1 次） |
+| `apk_install_via_local_file` 括注 | 「设备的 `/usr/bin/wget` 是 busybox 的 uclient-fetch 软链」 | `.232` 上 `/usr/bin/wget` → `/usr/libexec/wget-ssl`（GNU Wget 1.25.0）；而且 apk 用的 `-q -T 60 -O -` 这套参数 **GNU wget 和 uclient-fetch 都接受**（都实测过） |
+| 三处「ADB integrity error」 | 缺包体的报错写成 `ADB integrity error` | 拿一张 HTML 错误页当 `.apk` 装，apk 报的是 **`file format is invalid or inconsistent`**；`ADB integrity error` 是**包体被截断**时 apk 自己的哈希校验说的话，两者不是一回事 |
+
+⇒ 注释里的报错原文错了，排查时就会照着错误信息去找错方向（找签名 / 找 apk），
+而真正的原因是「当前镜像缺包体」。
+
+---
+
+## 三、顺带实测确认的两件事（写进注释，避免以后再猜）
+
+1. **apk 的 `--timeout` 会传给外部下载器**（`apk --timeout 5` ⇒ 下载器收到 `-T 5`），
+   **但它管不住「卡在 TCP connect 阶段」的连接** ——
+   GNU wget 的 `-T` 是**读超时**，connect 阶段另算（uclient-fetch 的 `-T` 是总超时）。
+   ⇒ 真机实测（`.232`，`--repository http://192.0.2.1:9/...` 这个连不上的地址）：
+     - **裸跑 `apk --timeout 5 ... update`：248 秒**才失败（TCP SYN 重试耗完）
+     - **套上 `run_with_timeout 10`：10 秒**被收掉，退出码 124、残留 apk 进程 0
+   ⇒ **外层 `run_with_timeout` 才是真正兜底的那一层**，内层 `--timeout` 只是加分项。
+2. **下载器对 404 的行为不一致**：GNU wget 与 uclient-fetch 都是「报错 + 落盘 0 字节」
+   （会被 `[ -s ]` 挡掉）；而 **不带 `--fail` 的 curl 会把 HTML 错误页原样存成 `.apk`**
+   （实测落盘 193 字节、头两字节 `3c68`）—— 这正是魔数校验要挡的场景。
+
+---
+
+## 四、测试与变异
+
+- `tests/test_setup_apk_fallback.py`：**25 → 44 项**
+  - 新增第 4 节：真机口径的包头判定
+  - **关键**：把 PATH 削成「只有 `wc`/`tr`」来**模拟 OpenWrt 上没有 `od` 的环境**，
+    再跑一遍同样的文件判定（三种工具组合各 5 个文件）
+  - 补回两段「真跑 `apk_supports_timeout` 探测」的行为断言
+    （重写测试文件时一度误删，变异脚本立刻报 F-02 漏网 ⇒ 已补回）
+- `tests/mutation_check_c_batch.py`：**28 → 31 条**
+  - F-04/F-05 的锚点随实现更新
+  - 新增 F-10（不认 ADB v3 包头）、F-11（去掉 hexdump 降级层）、F-12（去掉 shell 内建兜底层）
+  - 实测 **31 / 31 全捕获，漏网 0**
+
+---
+
+## 五、配套
+
+- 真机验证报告：`报告/apk三缺陷真机验证-2026-11-05.md`
+
 ## [v0.19.2] - 2026-11-05
 
 **用户拍板的 4 条争议条目**：P2-5 与 P1-24 落地，P2-23 与 P2-24 保持现状并写断言钉住。

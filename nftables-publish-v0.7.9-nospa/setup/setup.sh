@@ -143,7 +143,8 @@ pkg_install_apk() {
             #   python3-pip / acme-acmesh 在 ustc 上都是 404），
             #   而那种源 `apk update` 是**成功**的 ⇒ 只靠上面的 failover
             #   永远不会换源 ⇒ 同一个包反复失败，最后报一个
-            #   "ADB integrity error"（镜像问题被伪装成签名问题，排查方向全偏）。
+            #   "file format is invalid or inconsistent"
+            #   （镜像问题被伪装成包格式问题，排查方向全偏）。
             #   ⇒ 失败后**强制轮换**到下一个镜像。
             apk_rotate_mirror || true
             sleep $((attempt * 2))
@@ -153,16 +154,16 @@ pkg_install_apk() {
     # ---- 兜底：换一条下载路径，手工下包再本地安装 ----
     #
     # 为什么需要（2026-10-30/31 在 .156 / .142 / .230 连续三台复现）：
-    #   `apk add` 在 OpenWrt 上是**外调 wget** 下载包体的，而设备上的
-    #   /usr/bin/wget 是指向 /bin/uclient-fetch 的软链（busybox 自带），
-    #   下载大包时会中途断流 ⇒ apk 校验哈希对不上：
-    #       ADB integrity error
+    #   `apk add` 下载大包时会中途断流 ⇒ apk 校验哈希对不上，
     #   同一个事务里的其它包（openssl-util / socat / ca-certificates）
     #   会被一起带崩。
     #
-    #   而 `apk fetch` 用的是 apk **自带**的下载器（不走外部 wget），
-    #   实测同一个包（nginx-full 446421 字节）下载得干干净净。
-    #   ⇒ 换下载器就绕开了故障点。
+    #   ⚠️ 原来这里写的是「而 `apk fetch` 用的是 apk **自带**的下载器
+    #   （不走外部 wget），实测同一个包（nginx-full 446421 字节）下载得
+    #   干干净净 ⇒ 换下载器就绕开了故障点」—— **这条在 25.12 上不成立**
+    #   （实测细节见 apk_install_via_local_file 上方的说明）：apk-tools 3.0.5
+    #   下载索引和包体**都会外调外部下载器**，换命令并不换下载路径。
+    #   ⇒ 兜底真正的价值是「拿到一个可以单独校验、单独重试的文件」。
     if apk_install_via_local_file "$pkg"; then
         ok "  ✅ ${pkg} 已通过「下载到本地再安装」的方式装上"
         return 0
@@ -184,12 +185,21 @@ pkg_install_apk() {
 # ⚠️ 2026-11-04 更正一条**与事实不符**的注释（三个 apk 缺陷之一）：
 #   原来这里写着「apk fetch 用的是 apk 自带的下载器（不走外部 wget），
 #   实测同一个包下载得干干净净」—— **在 25.12 上不成立**：
-#   apk-tools 3.0.5 的包体下载同样外调 wget（设备的 /usr/bin/wget 是
-#   busybox 的 uclient-fetch 软链），大包照样中途断流。
+#   apk-tools 3.0.5 下载**索引和包体都会外调外部下载器**。
 #   ⇒ 这条兜底路径在 25.12 上**并不比正常路径更可靠**，
 #     它真正的价值是「拿到一个可以单独校验、单独重试的文件」。
-#   ⇒ 所以下面加了 apk_file_looks_valid 校验：镜像缺包体时 wget 拿到的是
-#     一张 HTML 错误页，直接装会报 "ADB integrity error"（伪装成签名问题）。
+#   ⇒ 所以下面加了 apk_file_looks_valid 校验：镜像缺包体时下载器拿到的是
+#     一张 HTML 错误页，直接装会报 "file format is invalid or inconsistent"。
+#
+# ⚠️ 2026-11-05 在 .232 真机把上面这段的细节又校准了一次（.232 = OpenWrt 25.12.5）：
+#   · apk 外调下载器时用的参数是 **uclient-fetch 风格**的
+#     `-q -T 60 <url> -O -`（实测 ps 里抓到的调用）。
+#   · 这套参数 **GNU wget（wget-ssl）和 busybox uclient-fetch 都接受** ——
+#     实测 .232 上 /usr/bin/wget 指向 /usr/libexec/wget-ssl（GNU Wget 1.25.0），
+#     不是 uclient-fetch 软链；原来注释里那句「/usr/bin/wget 是 uclient-fetch
+#     软链」是设备相关的描述，换台机器就不成立。
+#   · apk 自己的 HTTP 栈（链接的是 libmbedcrypto）负责 https，
+#     外调下载器这条路径失败时它会兜底。
 apk_install_via_local_file() {
     local pkg="$1"
     local work="/tmp/apk-local.$$"
@@ -210,9 +220,11 @@ apk_install_via_local_file() {
     fi
 
     # ⚠️ 2026-11-04：下载到的可能**根本不是包**。
-    #   镜像的索引里有这个名字、但包体 404 ⇒ wget 拿到一张 HTML 错误页。
-    #   直接装的话 apk 报 "ADB integrity error" —— 一个镜像问题
-    #   被伪装成签名问题，排查方向完全被带偏。
+    #   镜像的索引里有这个名字、但包体 404 ⇒ 下载器拿到一张 HTML 错误页。
+    #   直接装的话 apk 报 "file format is invalid or inconsistent" ——
+    #   一个镜像问题被伪装成「包格式不对」，排查方向完全被带偏。
+    #   （.232 真机实测的错误原文；不是 "ADB integrity error" —— 那是
+    #    「包体被截断」时 apk 自己的哈希校验报的话，两者别混。）
     if ! apk_file_looks_valid "$f"; then
         warn "  下载到的不是有效的 apk 包（当前镜像缺包体：$(basename "$f")，$(wc -c < "$f" 2>/dev/null | tr -d ' ') 字节）"
         rm -rf "$work"
@@ -576,22 +588,80 @@ apk_supports_timeout() {
 # 判断下载到的文件是不是**真的 apk 包**。
 #
 # 为什么需要（2026-11-04 在 .238 全新部署时踩到）：
-#   某个镜像的**索引里有这个包名，包体却是 404** ⇒ wget 把一张 HTML
+#   某个镜像的**索引里有这个包名，包体却是 404** ⇒ 下载器把一张 HTML
 #   错误页存成了 .apk。直接 apk add 会报：
-#       ADB integrity error
-#   —— 一个「镜像缺包体」的网络问题，被伪装成了「签名校验失败」，
-#   排查方向整个偏掉（人会去查密钥、去关签名校验）。
+#       file format is invalid or inconsistent
+#   —— 一个「镜像缺包体」的网络问题，被伪装成了「包格式不对」，
+#   排查方向整个偏掉（人会去查 apk、去找包体）。
 #
-# 判据：apk 包是 gzip 流，头两字节必须是 1f 8b；HTML/文本错误页一定不是。
-# 顺带挡掉「截断成 0 字节 / 几十字节」的半截文件。
+# ⚠️ 2026-11-05 在 .232（OpenWrt 25.12.5 / apk-tools 3.0.5）真机实测，
+#    修正了原实现里**两条写错了的判据**（错的那版见 CHANGELOG v0.19.3）：
+#
+#   ① 包头不是 gzip 魔数！
+#      apk-tools 3.x 的包是 **ADB v3** 格式，头 3 字节是 "ADB"（41 44 42），
+#      完整 4 字节是 "ADBd"；连索引文件 APKINDEX.*.tar.gz 也是 ADB 格式
+#      （文件名带 .tar.gz，内容根本不是 gzip，实测 gzip -t 直接报 invalid magic）。
+#      ⇒ 原来判 "1f8b"（gzip）**在 25.12 上永远为假**，合法包全被当成无效
+#        ⇒ 兜底安装路径等于死代码（本地测试跑在有 od 的开发机上，发现不了）。
+#      apk-tools 2.x（OpenWrt 24.10）的包才是 tar.gz（1f8b）⇒ 两种都得认。
+#
+#   ② 读字节**不能用 od**！
+#      OpenWrt 25.12.5 上**根本没有 od**（busybox 也不带这个 applet），
+#      实测 `od -An -tx1` 直接报 "od: not found" ⇒ 魔数读出来是空串
+#      ⇒ 判定恒为假 ⇒ 同上，兜底路径在真机上等于死代码。
+#      busybox 自带 hexdump（实测 /usr/bin/hexdump -> busybox），用它；
+#      再不行就用 shell 内建 read -n 读定长字节（busybox ash 实测支持）。
+#
+# 体积下限 64 字节顺带挡掉「0 字节 / 几十字节」的半截文件。
+# ⚠️ 「下载中断的半截包」不在本函数的职责内 —— 那种文件头是合法的，
+#   由 apk 自己的哈希校验兜住（报错是 apk 自己的措辞，测得 "Connection aborted"）。
 apk_file_looks_valid() {
     local f="$1"
     [ -s "$f" ] || return 1
-    local magic sz
-    magic="$(od -An -tx1 -N2 "$f" 2>/dev/null | tr -d ' \n')"
-    [ "$magic" = "1f8b" ] || return 1
+    local sz
     sz="$(wc -c < "$f" 2>/dev/null | tr -d ' ')"
-    [ -n "$sz" ] && [ "$sz" -ge 64 ]
+    [ -n "$sz" ] && [ "$sz" -ge 64 ] || return 1
+    apk_file_has_apk_magic "$f"
+}
+
+# 文件头是不是 apk 包的魔数？
+#
+# ⚠️ 三层降级是**必需的**，不是防御性过度：
+#   od      —— 开发机 / 部分 Linux 有；**OpenWrt 上没有**
+#   hexdump —— busybox applet，OpenWrt 一定有（实测 /usr/bin/hexdump -> busybox）
+#   read -n —— shell 内建，最后兜底，不依赖任何外部命令
+#   实测（.232, OpenWrt 25.12.5）：od 缺失、hexdump 可用、read -n 可用。
+apk_file_has_apk_magic() {
+    local f="$1" magic="" b=""
+    # ① od（开发机 / 部分 Linux 有）
+    if command -v od >/dev/null 2>&1; then
+        magic="$(od -An -tx1 -N3 "$f" 2>/dev/null | tr -d ' \n')"
+        if [ -n "$magic" ]; then
+            case "$magic" in
+                414442*|1f8b*) return 0 ;;
+            esac
+            return 1
+        fi
+    fi
+    # ② hexdump（busybox applet，OpenWrt 一定有）
+    if command -v hexdump >/dev/null 2>&1; then
+        magic="$(hexdump -v -n 3 -e '1/1 "%02x"' "$f" 2>/dev/null | tr -d ' \n')"
+        if [ -n "$magic" ]; then
+            case "$magic" in
+                414442*|1f8b*) return 0 ;;
+            esac
+            return 1
+        fi
+    fi
+    # ③ 最后兜底：shell 内建读定长字节，直接和魔数**原始字节**比
+    #    （busybox ash 实测 read -n 能读二进制字节）
+    b=""
+    IFS= read -r -n 3 b < "$f" 2>/dev/null
+    [ "$b" = "ADB" ] && return 0
+    b=""
+    IFS= read -r -n 2 b < "$f" 2>/dev/null
+    [ "$b" = "$(printf '\037\213')" ] && return 0
+    return 1
 }
 
 # 强制轮换到**下一个**镜像（不跟当前的重复）。
@@ -599,7 +669,8 @@ apk_file_looks_valid() {
 # 为什么需要（三个 apk 缺陷之二）：
 #   实测有镜像「索引全、包体缺」——`apk update` 在这种源上是**成功**的，
 #   所以只靠 apk_update_with_failover 永远不会换源 ⇒ 同一个包反复失败，
-#   最后报一个毫无线索的 "ADB integrity error"。
+#   最后报一个毫无线索的 "file format is invalid or inconsistent"
+#   （.232 真机实测：拿一张 HTML 错误页当 .apk 装，报的就是这句）。
 #   ⇒ 装包失败时，除了刷索引，还要**主动换一个源**再试。
 apk_rotate_mirror() {
     local repo cur host

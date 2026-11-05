@@ -338,19 +338,18 @@ F_MUTATIONS = [
        'APK_NET_TIMEOUT="${APK_NET_TIMEOUT:-0}"\n')],
      'apk'),
 
-    ('F-04  apk_file_looks_valid 不再校验 gzip 魔数（HTML 错误页被当成包）',
+    ('F-04  apk_file_looks_valid 不再校验包头（HTML 错误页被当成包）',
      SETUP,
-     [('    magic="$(od -An -tx1 -N2 "$f" 2>/dev/null | tr -d \' \\n\')"\n'
-       '    [ "$magic" = "1f8b" ] || return 1\n',
-       '    magic="$(od -An -tx1 -N2 "$f" 2>/dev/null | tr -d \' \\n\')"\n')],
+     [('    apk_file_has_apk_magic "$f"\n',
+       '    return 0\n')],
      'apk'),
 
     ('F-05  apk_file_looks_valid 不再校验体积（截断的半截文件被当成包）',
      SETUP,
      [('    sz="$(wc -c < "$f" 2>/dev/null | tr -d \' \')"\n'
-       '    [ -n "$sz" ] && [ "$sz" -ge 64 ]\n',
+       '    [ -n "$sz" ] && [ "$sz" -ge 64 ] || return 1\n',
        '    sz="$(wc -c < "$f" 2>/dev/null | tr -d \' \')"\n'
-       '    [ -n "$sz" ]\n')],
+       '    [ -n "$sz" ] || return 1\n')],
      'apk'),
 
     ('F-06  apk_rotate_mirror 不再轮换（同一个包反复失败）',
@@ -379,6 +378,65 @@ F_MUTATIONS = [
      SETUP,
      [('        if run_with_timeout "${APK_INSTALL_TIMEOUT:-600}" apk add ${apk_opts} "$pkg"; then\n',
        '        if apk add ${apk_opts} "$pkg"; then\n')],
+     'apk'),
+
+    ('F-10  不认 ADB v3 包头（25.12 上所有合法包都被拒）',
+     SETUP,
+     [('        magic="$(od -An -tx1 -N3 "$f" 2>/dev/null | tr -d \' \\n\')"\n'
+       '        if [ -n "$magic" ]; then\n'
+       '            case "$magic" in\n'
+       '                414442*|1f8b*) return 0 ;;\n'
+       '            esac\n'
+       '            return 1\n'
+       '        fi\n',
+       '        magic="$(od -An -tx1 -N3 "$f" 2>/dev/null | tr -d \' \\n\')"\n'
+       '        if [ -n "$magic" ]; then\n'
+       '            case "$magic" in\n'
+       '                1f8b*) return 0 ;;\n'
+       '            esac\n'
+       '            return 1\n'
+       '        fi\n'),
+      ('        magic="$(hexdump -v -n 3 -e \'1/1 "%02x"\' "$f" 2>/dev/null | tr -d \' \\n\')"\n'
+       '        if [ -n "$magic" ]; then\n'
+       '            case "$magic" in\n'
+       '                414442*|1f8b*) return 0 ;;\n'
+       '            esac\n'
+       '            return 1\n'
+       '        fi\n',
+       '        magic="$(hexdump -v -n 3 -e \'1/1 "%02x"\' "$f" 2>/dev/null | tr -d \' \\n\')"\n'
+       '        if [ -n "$magic" ]; then\n'
+       '            case "$magic" in\n'
+       '                1f8b*) return 0 ;;\n'
+       '            esac\n'
+       '            return 1\n'
+       '        fi\n')],
+     'apk'),
+
+    ('F-11  去掉 hexdump 降级层（OpenWrt 上没有 od 时读不到包头）',
+     SETUP,
+     [('    # ② hexdump（busybox applet，OpenWrt 一定有）\n'
+       '    if command -v hexdump >/dev/null 2>&1; then\n'
+       '        magic="$(hexdump -v -n 3 -e \'1/1 "%02x"\' "$f" 2>/dev/null | tr -d \' \\n\')"\n'
+       '        if [ -n "$magic" ]; then\n'
+       '            case "$magic" in\n'
+       '                414442*|1f8b*) return 0 ;;\n'
+       '            esac\n'
+       '            return 1\n'
+       '        fi\n'
+       '    fi\n',
+       '    # ② hexdump 层被删掉了\n')],
+     'apk'),
+
+    ('F-12  去掉 shell 内建兜底层（连 hexdump 都没有的机器上读不到包头）',
+     SETUP,
+     [('    b=""\n'
+       '    IFS= read -r -n 3 b < "$f" 2>/dev/null\n'
+       '    [ "$b" = "ADB" ] && return 0\n'
+       '    b=""\n'
+       '    IFS= read -r -n 2 b < "$f" 2>/dev/null\n'
+       '    [ "$b" = "$(printf \'\\037\\213\')" ] && return 0\n'
+       '    return 1\n',
+       '    return 1\n')],
      'apk'),
 ]
 
