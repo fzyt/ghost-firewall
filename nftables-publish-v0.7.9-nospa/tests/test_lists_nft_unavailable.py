@@ -27,8 +27,10 @@
 （前端那边由 tests/test_lists_partial_failure.js 负责）。
 """
 import importlib.util as ilu
+import json
 import os
 import sys
+import tempfile
 import time
 import types
 
@@ -78,6 +80,17 @@ NFT_SET_OUT = """table inet fw4 {
 def main():
     app = load_app()
     client = app.app.test_client()
+
+    # ⚠️ 2026-11-08（P1-26 改 fail-closed）：配置读不出来时面板
+    #    **拒绝所有来源**（不是「不限制」）。本测试的请求从 127.0.0.1 来，
+    #    ⇒ 必须先给一份可用配置，否则拿到的是 403 IP_NOT_ALLOWED，
+    #    而不是被测的 503 NFT_UNAVAILABLE / 500 NFT_SET_READ_FAILED。
+    _cfg_dir = tempfile.mkdtemp(prefix='nftunavail-')
+    app.CONFIG_PATH = os.path.join(_cfg_dir, 'config.json')
+    with open(app.CONFIG_PATH, 'w', encoding='utf-8') as f:
+        json.dump({'panel_allowed_nets': '127.0.0.1/32',
+                   'lan_subnet4': '127.0.0.1/32'}, f)
+    app._NETS_CACHE.update(mtime=None, nets=None)
 
     # 名单端点要登录。直接写 session（面板的判定就是 session['authenticated']
     # 加上世代号与当前一致）—— 走真实 /api/auth/login 会把测试拖进密码文件、

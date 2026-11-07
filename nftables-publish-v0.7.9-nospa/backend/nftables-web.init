@@ -252,6 +252,43 @@ start() {
     #   后端 app.py 已经改成不依赖 HOME（路径写死 /root），
     #   但这里仍然设上 —— 面板进程将来用到别的 ~ 路径时不会重蹈覆辙。
     export HOME=/root
+
+    # ── 访问边界降级逃生口（P1-26 改 fail-closed，2026-11-08）────────
+    #
+    # 背景：面板在「配置读不出来 / 损坏」时会**拒绝所有来源**（fail-closed）。
+    # 但「首次设置 / 重置口令」走的是 /api/auth/setup 那个接口 ——
+    # 它必须**能从浏览器访问到面板**，否则配置一丢就再也回不去了
+    # （那个接口正是用来重建配置的，形成死锁）。
+    #
+    # 这个环境变量是配置的**兜底白名单**（与配置里的网段取并集）：
+    #   · 配置正常时：无影响（配置里的网段照旧生效）
+    #   · 配置丢失/损坏时：LAN 内的管理员仍能进面板做重新初始化
+    #   · **公网来源：仍然被拒**（fail-closed 的安全目标没丢）
+    #
+    # ⚠️ 为什么在 init 脚本里探测而不是写死：
+    #    LAN 网段是 DHCP 拿的，写死会在换网段/换机时失效；
+    #    这里优先读配置里的 lan_subnet4，配置不在了就按 br-lan 的
+    #    实际地址推一个 /24（app.py 探测绑定地址用的是同一个 lan_if）。
+    #
+    # ⚠️ 探测不到就不导出 ⇒ 降级时全拒 ⇒ 只能 SSH 修。
+    #    这是刻意的：宁可锁在门外，也不放行来路不明的网段。
+    if [ -z "$NFTABLES_WEB_PANEL_ALLOWED_NETS" ]; then
+        _fb_nets=""
+        if [ -f "$CONFIG_FILE" ]; then
+            _fb_nets="$(sed -n 's/.*"lan_subnet4"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+                        "$CONFIG_FILE" 2>/dev/null | head -1)"
+        fi
+        if [ -z "$_fb_nets" ]; then
+            _fb_ip="$(ip -4 -o addr show dev br-lan 2>/dev/null \
+                      | awk '{print $4}' | cut -d/ -f1 | head -1)"
+            [ -n "$_fb_ip" ] && _fb_nets="${_fb_ip%.*}.0/24"
+        fi
+        if [ -n "$_fb_nets" ]; then
+            export NFTABLES_WEB_PANEL_ALLOWED_NETS="$_fb_nets"
+            echo "降级逃生口：NFTABLES_WEB_PANEL_ALLOWED_NETS=$_fb_nets"
+        fi
+    fi
+
     cd "$APP_DIR" || return 1
     python3 app.py > "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"

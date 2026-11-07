@@ -265,17 +265,17 @@ E_MUTATIONS = [
     ('E-02  降级原因不再记录（告警条永远不出现）',
      APP_PY,
      [('        _set_access_boundary_degraded(\n'
-       '            f\'配置文件 {CONFIG_PATH} 不存在 —— 面板当前**不限制访问来源**，\'\n'
-       '            \'任何能连到面板端口的人都能访问（含管理接口）\')\n',
+       '            f\'配置文件 {CONFIG_PATH} 不存在 —— 面板当前**已拒绝所有来源访问**\'\n'
+       '            \'（访问边界降级）。请 SSH 到本机重建该配置后重启面板服务。\')\n',
        '        pass\n')],
      'c'),
 
     ('E-03  配置恢复后不清降级原因（告警变成「狼来了」，真告警没人看）',
      APP_PY,
-     [('    if nets:\n'
-       '        _set_access_boundary_degraded(\'\')\n',
-       '    if nets:\n'
-       '        pass\n')],
+     [('        if not degraded:\n'
+       '            _set_access_boundary_degraded(\'\')\n',
+       '        if not degraded:\n'
+       '            pass\n')],
      'c'),
 
     ('E-04  前端不再读告警字段（告警条永远不显示）',
@@ -296,13 +296,50 @@ E_MUTATIONS = [
        '  z-index: 95;\n')],
      'c'),
 
-    ('E-07  降级原因里不写清后果（管理员不知道此刻谁都能访问面板）',
+    ('E-07  降级原因里不写清后果与修复步骤（管理员不知道面板已拒绝所有来源、不知道怎么修）',
      APP_PY,
-     [('            f\'配置文件 {CONFIG_PATH} 不存在 —— 面板当前**不限制访问来源**，\'\n'
-       '            \'任何能连到面板端口的人都能访问（含管理接口）\')\n',
+     [('            f\'配置文件 {CONFIG_PATH} 不存在 —— 面板当前**已拒绝所有来源访问**\'\n'
+       '            \'（访问边界降级）。请 SSH 到本机重建该配置后重启面板服务。\')\n',
        '            f\'配置文件 {CONFIG_PATH} 不存在\')\n')],
      'c'),
+
+    # ── fail-closed 三条降级路径（2026-11-08 用户拍板改 fail-closed）──
+    # 每条降级路径各一条：任何一条被改回「不限制来源」，
+    # 都必须被测试逮住 —— 否则 fail-closed 会被悄悄退化掉，
+    # 而退化后的表现（面板谁都能进）恰恰是没人会主动报的问题。
+    ('E-08  配置损坏时改回 fail-open（谁都能连面板端口）',
+     APP_PY,
+     [('                nets = list(_DENY_ALL_NETS)\n            else:',
+       '                nets = []\n            else:')],
+     'c'),
+
+    ('E-09  配置读取抛异常时改回 fail-open',
+     APP_PY,
+     [('            nets = list(_DENY_ALL_NETS)\n    if nets:',
+       '            nets = []\n    if nets:')],
+     'c'),
+
+    ('E-10  配置不存在时改回 fail-open（谁都能连面板端口）',
+     APP_PY,
+     [('        nets = list(_DENY_ALL_NETS)\n    else:',
+       '        nets = []\n    else:')],
+     'c'),
+
+    # ── 下面这条钉住 2026-11-08 改 fail-closed 时挖出来的坑 ──
+    ('E-11  降级时也清降级状态（告警被自己抹掉，降级了就没人看得见）',
+     APP_PY,
+     [('        if not degraded:\n'
+       '            _set_access_boundary_degraded(\'\')\n',
+       '        if True:\n'
+       '            _set_access_boundary_degraded(\'\')\n')],
+     'c'),
 ]
+# ⚠️ 曾试过一条「缓存命中判断漏掉 is not None」的变异（E-12），**它是无效变异**：
+#    缓存判断位于 os.stat 成功的 else 分支内，配置缺失路径根本走不到 ⇒
+#    去掉那个条件不改变任何行为 ⇒ 测试当然不红。
+#    留着它是**双保险**（防以后把判断挪出 else），但不能算作变异条目。
+#    （这轮踩到的另一个教训：注释里写「必须」却写错了推理，
+#      差点把一段误导性的说明留在代码里。）
 
 # ─────────────────────────────────────────────────────────────
 # F 组：setup.sh 的三个 apk 缺陷

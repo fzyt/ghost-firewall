@@ -143,21 +143,31 @@ os.unlink(CFG) if os.path.exists(CFG) else None
 mod.CONFIG_PATH = CFG
 mod._NETS_CACHE.update(mtime=None, nets=None)
 got = mod._panel_allowed_networks()
-check('配置文件不存在时不限制（返回空）', got == [], str(got))
+# ⚠️ 2026-11-08（P1-26 改 fail-closed，用户拍板）：
+#    降级时**拒绝所有来源**，不是「不限制」。
+#    「不限制」= 任何能连到面板端口的人都能用管理接口 = 假防护。
+check('配置文件不存在时拒绝所有来源（fail-closed，不是返回空）',
+      got != [], str(got))
+check('配置文件不存在时真实来源不在允许网段内（真的被拒）',
+      not mod._ip_in_nets('203.0.113.9', got)
+      and not mod._ip_in_nets('192.168.100.5', got), str(got))
 
 r = get('203.0.113.9')
-check('配置缺失时公网来源也不被这道边界拦（不制造假防护）', r.status_code == 401,
-      f'HTTP {r.status_code}')
+check('配置缺失时公网来源被边界挡住（403 = 降级态生效，不制造假防护）',
+      r.status_code == 403, f'HTTP {r.status_code}')
 
 with open(CFG, 'w') as f:
     f.write('{ 这不是 JSON')
 mod.CONFIG_PATH = CFG
 mod._NETS_CACHE.update(mtime=None, nets=None)
 got = mod._panel_allowed_networks()
-check('配置损坏时不限制而不是拿 DEFAULT 里的陌生网段', got == [], str(got))
+check('配置损坏时拒绝所有来源（不是拿 DEFAULT 里的陌生网段，也不是不限制）',
+      got != [], str(got))
+check('配置损坏时真实来源不在允许网段内',
+      not mod._ip_in_nets('203.0.113.9', got), str(got))
 r = get('203.0.113.9')
-check('配置损坏时不会把自己锁在外面（401 = 过边界）', r.status_code == 401,
-      f'HTTP {r.status_code}')
+check('配置损坏时来源被边界挡住（403 = 降级态生效）',
+      r.status_code == 403, f'HTTP {r.status_code}')
 
 
 # ══════════════════════════════════════════════════════════════════

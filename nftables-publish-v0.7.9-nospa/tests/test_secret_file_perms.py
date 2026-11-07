@@ -224,6 +224,15 @@ def main():
     try:
         app = load_app({}, paths)
 
+        # ⚠️ 2026-11-08（P1-26 改 fail-closed）：配置读不出来时面板
+        #    **拒绝所有来源**（不是「不限制」）。本测试的登录请求来自
+        #    192.168.100.50（模拟 LAN 内的管理员）⇒ 必须先有一份可用配置，
+        #    否则拿到的是 403 IP_NOT_ALLOWED，而不是被测的登录链路。
+        #    用 save_config 预置，落盘权限契约也顺带被钉住。
+        app.save_config({'lan_subnet4': '192.168.100.0/24', 'wan_if': 'eth0',
+                         'lan_if': 'br-lan', 'router_ip4': '192.168.100.1'})
+        app._NETS_CACHE.update(mtime=None, nets=None)
+
         # ── 1. 口令哈希 ────────────────────────────────────────────────
         sec('1. 面板口令哈希（AUTH_PASSWORD_FILE）')
 

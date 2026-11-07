@@ -519,18 +519,38 @@ _STATIC_EXTENSIONS = ('js', 'css', 'png', 'jpg', 'jpeg', 'gif', 'svg', 'ico', 'w
 
 _NETS_CACHE = {'mtime': None, 'nets': None}
 
+# 「拒绝一切来源」的哨兵网段（P1-26 改 fail-closed，2026-11-08 用户拍板）。
+#
+# 为什么不用空列表表达：调用方是
+#     if _allow_nets and not _ip_in_nets(client_ip, _allow_nets):
+# 空列表是 falsy ⇒ 会被当成「不限制」⇒ 表达不了 fail-closed。
+#
+# 为什么用 0.0.0.0/32：它只匹配 0.0.0.0 这一个地址，真实来源不可能是它。
+# 而 _ip_in_nets 要求版本相同（IPv4 地址不匹配 IPv6 网段，反之亦然），
+# 所以任何真实 IPv4 客户端都落不进去 ⇒ 效果就是「全部拒绝」。
+# （IPv6 客户端在更早一行已按 IPV6_NOT_ALLOWED 拒掉，走不到这里。）
+_DENY_ALL_NETS = (ipaddress.ip_network('0.0.0.0/32'),)
+
 # 访问边界**降级**状态（P1-26，2026-11-04）。
 #
-# 这里记的是「面板当前不限制访问来源」这件事 + 为什么。
+# 这里记的是「面板当前拒绝所有来源访问」这件事 + 为什么 + 怎么修。
 # 它必须能被界面看到：原来只有服务端日志一行 [WARN]，
 # 界面上完全看不出来 ⇒ 管理员不知道自己的面板此刻谁都能访问。
 _ACCESS_DEGRADED = {'reason': ''}
 
 
 def _set_access_boundary_degraded(reason):
-    """记录/清除「访问边界降级」状态。"""
-    _ACCESS_DEGRADED['reason'] = reason or ''
-    return _ACCESS_DEGRADED['reason']
+    """记录/清除「访问边界降级」状态。
+
+    同一原因只打印一次：降级状态下**每个请求**都会走到这里，
+    不去重的话同一个 WARN 会把日志刷爆（fail-closed 下还会每个请求回 403）。
+    """
+    reason = reason or ''
+    changed = _ACCESS_DEGRADED.get('reason', '') != reason
+    _ACCESS_DEGRADED['reason'] = reason
+    if changed and reason:
+        print(f'[WARN] {reason}', flush=True)
+    return reason
 
 
 def access_boundary_warning():
@@ -571,76 +591,109 @@ def _ip_in_nets(ip_str, nets):
 
 
 def _panel_allowed_networks():
-    """面板允许访问的来源网段。返回 [] 表示不限制（保持既有行为）。
+    """面板允许访问的来源网段。
+
+    ⚠️ 2026-11-08（P1-26 改 fail-closed，用户拍板）：
+       取不到配置时**拒绝所有来源**，不再是不限制。
+       降级时返回 _DENY_ALL_NETS（见上面常量的说明），
+       调用方 `if _allow_nets and not _ip_in_nets(...)` 于是会拒掉一切。
 
     优先级：
       1. 配置里显式写了 panel_allowed_nets → 用它（要放行 VPN 之类就用这个）
-      2. 没写，但**真实配置文件存在** → 用 lan_subnet4（默认跟随，零配置）
-      3. 配置文件缺失/损坏，取不到 lan_subnet4 → 不限制
+      2. 没写，但**真实配置文件存在且没坏** → 用 lan_subnet4（默认跟随，零配置）
+      3. 配置文件缺失/损坏/读不出来 → **拒绝所有来源**（fail-closed）
 
-    第 3 条不能省：DEFAULT_CONFIG 里 lan_subnet4 写的是 192.168.4.0/24，
-    那是别人的网段。真拿它去判定会把管理员自己锁在门外 —— 代码里
+    第 3 条为什么不能拿 DEFAULT_CONFIG 的 lan_subnet4 顶替：
+    那个默认值写的是 192.168.4.0/24（别人的网段），
+    真拿它去判定会把管理员锁在门外 —— 代码里
     _config_lost_after_setup() 早就在防同一类问题了。
-
     「文件存在」不等于「文件可用」：配置被写坏时 load_config() 会回落到
-    DEFAULT_CONFIG，而那个默认值里的 lan_subnet4 正是陌生网段。只判
-    os.path.exists 会让「文件存在但内容是坏的」这一种情况照样锁死管理员 ——
-    所以这里必须再问一次 _config_corrupted()。
+    DEFAULT_CONFIG，而那个默认值里的 lan_subnet4 正是陌生网段。
+    只判 os.path.exists 会让「文件存在但内容是坏的」照样锁死管理员 ——
+    所以必须再问一次 _config_corrupted()。
+
+    ⚠️ fail-closed 的代价（要知道才能接受这个取舍）：
+       降级期间面板**完全不可达**（含 8443 网关的 /fw/ 入口 ——
+       那条路经本机 nginx 回环，但 _client_ip() 采信 X-Real-IP，
+       面板看到的是访客真实 IP，同样落在拒绝名单里）。
+       唯一的恢复路径是 **SSH 到本机修好配置再重启面板**。
+       好消息：SSH 端口在 lan_allowed_ports 里，防火墙放行 22 ⇒ 带外通道是通的。
+       装机时序也是安全的：setup.sh 的 init_config（写配置）排在
+       setup_service（起服务）之前（setup.sh:2524 / :2526），
+       所以「服务已起但配置还没写」这个窗口不存在。
 
     ⚠️ 环境变量 NFTABLES_WEB_PANEL_ALLOWED_NETS 是**额外**放行的网段，
     跟配置里的取并集。Docker 测试环境要用它：容器里探测到的 lan_subnet4
     还是 OpenWrt 的 192.168.4.0/24，而实际来源是 docker 网关
     （172.x.0.1），不在里面 → 面板会回 IP_NOT_ALLOWED 把人锁在门外。
-    注意：配置里本来就不限制（nets 为空）时保持不限制 ——
-    环境变量是「额外放行」，不是「收紧」。
+    ⚠️ 降级（fail-closed）时这个并集**照样生效** ——
+    它是进程启动时就有的、不依赖配置文件的可信信息，
+    正好当降级期间的运维逃生口用。
 
-    ⚠️ 2026-11-04（P1-26）：第 3 种情况是**fail-open** ——
-    配置读不出来时**不限制来源**（不是「拒绝所有人」）。
-    为什么不是 fail-closed：fail-closed 会把管理员自己锁在门外，
-    而配置坏了的时候恰恰最需要面板能打开（哪怕只是看状态）。
-    面板本来还有两道网络侧的防线（只绑 LAN IP + 防火墙只放行 LAN 网段），
-    所以 fail-open 的实际暴露面限于「能到达面板端口的人」。
-    ⇒ 代价是这个降级状态**必须让人看得见**：
-    原来只有服务端日志里一行 [WARN]，界面上完全看不出来 ——
-    现在把它挂到 /api/auth/status 的 access_boundary_warning 上，
-    前端在登录页与主界面都显示一条醒目告警（P1-26 要求的「至少暴露到 UI」）。
+    降级状态必须让人看得见：原来只有服务端日志一行 [WARN]，
+    界面上完全看不出来 ⇒ 现在把它挂到 /api/auth/status 的
+    access_boundary_warning 上，前端在登录页与主界面都显示醒目告警。
+    （fail-closed 后面板打不开，界面告警看不到了 ⇒
+    降级文案里必须自带修复步骤，服务端日志是唯一的第一现场。）
     """
+    degraded = False
+    stamp = None
     try:
         stamp = os.stat(CONFIG_PATH).st_mtime_ns
     except OSError:
+        degraded = True
         _set_access_boundary_degraded(
-            f'配置文件 {CONFIG_PATH} 不存在 —— 面板当前**不限制访问来源**，'
-            '任何能连到面板端口的人都能访问（含管理接口）')
-        return []                       # 配置不存在 → 不限制
-    if _NETS_CACHE['mtime'] == stamp:
-        return _NETS_CACHE['nets']
-    try:
-        cfg = load_config()
-        bad, err = _config_corrupted()
-        if bad:
-            print(f'[WARN] 配置损坏（{err}），面板访问边界本次不限制', flush=True)
+            f'配置文件 {CONFIG_PATH} 不存在 —— 面板当前**已拒绝所有来源访问**'
+            '（访问边界降级）。请 SSH 到本机重建该配置后重启面板服务。')
+        # 配置不存在 → 拒绝一切（fail-closed）
+        nets = list(_DENY_ALL_NETS)
+    else:
+        # ⚠️ 缓存命中判断带了 `mtime is not None` ——
+        #    在**当前结构下这是冗余的**（本判断位于 os.stat 成功的 else 分支内，
+        #    stamp 必然不是 None）。留着它是**双保险**：万一以后把这段判断
+        #    挪到 else 外面，配置缺失时就会拿 stamp(None) 去比缓存里的 None
+        #    而命中，返回 None —— None 在调用方是 falsy ⇒ 等于「不限制」
+        #    ⇒ fail-closed 被悄悄绕开。
+        #    （这个坑是真的：E-12 变异去掉这个判断时测试没红，
+        #      因为当前结构下它确实不影响行为 —— 留着是为了防结构变化。）
+        if _NETS_CACHE['mtime'] is not None and _NETS_CACHE['mtime'] == stamp:
+            return _NETS_CACHE['nets']
+        try:
+            cfg = load_config()
+            bad, err = _config_corrupted()
+            if bad:
+                degraded = True
+                _set_access_boundary_degraded(
+                    f'配置文件已损坏（{err}）—— 面板当前**已拒绝所有来源访问**'
+                    '（访问边界降级）。请 SSH 到本机修复 '
+                    f'{CONFIG_PATH} 后重启面板服务。')
+                nets = list(_DENY_ALL_NETS)
+            else:
+                nets = _parse_net_list(cfg.get('panel_allowed_nets'))
+                if not nets:
+                    nets = _parse_net_list(cfg.get('lan_subnet4'))
+        except Exception as e:              # noqa: BLE001
+            degraded = True
             _set_access_boundary_degraded(
-                f'配置文件已损坏（{err}）—— 面板当前**不限制访问来源**，'
-                '任何能连到面板端口的人都能访问（含管理接口）')
-            nets = []
-        else:
-            nets = _parse_net_list(cfg.get('panel_allowed_nets'))
-            if not nets:
-                nets = _parse_net_list(cfg.get('lan_subnet4'))
-    except Exception as e:              # noqa: BLE001
-        print(f'[WARN] 面板访问边界读取失败（{type(e).__name__}: {e}），本次不限制', flush=True)
-        _set_access_boundary_degraded(
-            f'访问边界配置读取失败（{type(e).__name__}: {e}）—— 面板当前**不限制访问来源**，'
-            '任何能连到面板端口的人都能访问（含管理接口）')
-        nets = []
+                f'访问边界配置读取失败（{type(e).__name__}: {e}）—— '
+                '面板当前**已拒绝所有来源访问**（访问边界降级）。'
+                f'请 SSH 到本机检查 {CONFIG_PATH} 后重启面板服务。')
+            nets = list(_DENY_ALL_NETS)
     if nets:
-        _set_access_boundary_degraded('')
+        # ⚠️ 降级时**不能**清降级状态：此时 nets 是哨兵（非空），
+        #    若照常清空，告警会被这一行抹掉 —— 降级了就没人看得见了。
+        if not degraded:
+            _set_access_boundary_degraded('')
         extra = _parse_net_list(PANEL_ALLOWED_NETS_ENV)
         if extra:
             for n in extra:
                 if n not in nets:
                     nets.append(n)
-    _NETS_CACHE.update(mtime=stamp, nets=nets)
+    if stamp is None:
+        # 配置不存在 ⇒ 不写缓存（见上面 stamp is not None 的说明）
+        _NETS_CACHE.update(mtime=None, nets=None)
+    else:
+        _NETS_CACHE.update(mtime=stamp, nets=nets)
     return nets
 
 

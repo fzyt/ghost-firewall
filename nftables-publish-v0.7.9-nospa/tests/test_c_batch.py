@@ -321,8 +321,19 @@ check('/api/auth/status 带上了 access_boundary_warning',
 check('配置损坏 / 缺失两条路径都会记录降级原因',
       APP_SRC.count('_set_access_boundary_degraded(') >= 3,
       '出现 %d 次' % APP_SRC.count('_set_access_boundary_degraded('))
-check('降级原因里写清了后果（不限制来源）',
-      '不限制访问来源' in APP_SRC)
+check('降级原因里写清了后果（已拒绝所有来源访问）',
+      '已拒绝所有来源访问' in APP_SRC)
+check('降级原因里带上了修复步骤（fail-closed 后面板打不开，告警是唯一入口）',
+      'SSH 到本机' in APP_SRC and '重启面板服务' in APP_SRC)
+# ⚠️ 2026-11-08（P1-26 改 fail-closed）：降级时必须给**非空**网段。
+#    调用点是 `if _allow_nets and not _ip_in_nets(...)`，
+#    空列表是 falsy ⇒ 会被当成「不限制」⇒ 表达不了 fail-closed。
+check('调用点是「非空才判定」（所以降级必须给非空网段）',
+      re.search(r'if\s+_allow_nets\s+and\s+not\s+_ip_in_nets\(', APP_SRC) is not None)
+check('代码里有「拒绝一切」的哨兵网段',
+      '_DENY_ALL_NETS' in APP_SRC
+      and re.search(r'_DENY_ALL_NETS\s*=\s*\(ipaddress\.ip_network\(\'0\.0\.0\.0/32\'\),\)',
+                    APP_SRC) is not None)
 check('前端把告警读进了状态',
       'access_boundary_warning' in APP_JS and 'auth.accessWarning' in APP_JS)
 check('页面里有告警条', 'nf-access-warn' in INDEX_HTML)
@@ -344,27 +355,80 @@ _deg_cfg = os.path.join(_deg_td, 'cfg.json')
 app.CONFIG_PATH = _deg_cfg
 app._NETS_CACHE.update(mtime=None, nets=None)
 
-# (a) 配置文件缺失 ⇒ 不限制来源 ⇒ 必须记下原因
+# (a) 配置文件缺失 ⇒ fail-closed：拒绝所有来源，且必须记下原因
 if os.path.exists(_deg_cfg):
     os.unlink(_deg_cfg)
 app._NETS_CACHE.update(mtime=None, nets=None)
-app._panel_allowed_networks()
+_nets_missing = app._panel_allowed_networks()
 _r_missing = app.access_boundary_warning()
 check('配置缺失时降级原因被真的记下来了（运行时）',
       bool(_r_missing), repr(_r_missing[:80]))
-check('配置缺失时的原因写清了「不限制访问来源」（运行时）',
-      '不限制访问来源' in _r_missing, repr(_r_missing[:80]))
+check('配置缺失时的原因写清了「已拒绝所有来源访问」（运行时）',
+      '已拒绝所有来源访问' in _r_missing, repr(_r_missing[:80]))
+# ⚠️ 行为级断言（2026-11-08 加）：光看文案不够 ——
+#    降级时如果给的是空列表，调用方的 `if _allow_nets and ...` 会短路
+#    ⇒ 等于「不限制」，fail-closed 根本没生效（退化还不容易被看出来）。
+check('配置缺失时给的是非空网段（空列表在调用方等于「不限制」）',
+      bool(_nets_missing), '实际=%r' % (_nets_missing,))
+check('配置缺失时真实来源 IP 一律不在允许网段内（fail-closed 真生效）',
+      not app._ip_in_nets('192.168.100.5', _nets_missing)
+      and not app._ip_in_nets('127.0.0.1', _nets_missing),
+      '实际允许网段=%r' % (_nets_missing,))
 
-# (b) 配置损坏 ⇒ 同上
+# (a2) 逃生口：环境变量放行的网段在降级期间**仍然有效**
+#      （它是进程启动时就有的、不依赖配置文件的可信信息）
+app.PANEL_ALLOWED_NETS_ENV = '10.0.0.0/8'
+app._NETS_CACHE.update(mtime=None, nets=None)
+_nets_env = app._panel_allowed_networks()
+check('降级期间环境变量放行的网段仍然有效（运维逃生口）',
+      app._ip_in_nets('10.1.2.3', _nets_env),
+      '实际允许网段=%r' % (_nets_env,))
+app.PANEL_ALLOWED_NETS_ENV = ''
+app._NETS_CACHE.update(mtime=None, nets=None)
+
+# (b) 配置损坏 ⇒ 同上（fail-closed）
 with open(_deg_cfg, 'w', encoding='utf-8') as f:
     f.write('{ broken json ')
 app._NETS_CACHE.update(mtime=None, nets=None)
-app._panel_allowed_networks()
+_nets_bad = app._panel_allowed_networks()
 _r_bad = app.access_boundary_warning()
 check('配置损坏时降级原因被真的记下来了（运行时）',
       bool(_r_bad), repr(_r_bad[:80]))
-check('配置损坏时的原因写清了「不限制访问来源」（运行时）',
-      '不限制访问来源' in _r_bad, repr(_r_bad[:80]))
+check('配置损坏时的原因写清了「已拒绝所有来源访问」（运行时）',
+      '已拒绝所有来源访问' in _r_bad, repr(_r_bad[:80]))
+check('配置损坏时给的是非空网段（否则等于「不限制」）',
+      bool(_nets_bad), '实际=%r' % (_nets_bad,))
+check('配置损坏时真实来源 IP 一律不在允许网段内（fail-closed 真生效）',
+      not app._ip_in_nets('192.168.100.5', _nets_bad),
+      '实际允许网段=%r' % (_nets_bad,))
+
+# (b2) 配置**读取抛异常** ⇒ 第三条降级路径，同样必须 fail-closed
+#      这条路径以前没有任何覆盖 ⇒ 把 `nets = []` 改回去测试也不会红（漏网）。
+#      注意：文件必须存在，否则会先命中 (a) 的「配置不存在」分支。
+with open(_deg_cfg, 'w', encoding='utf-8') as f:
+    json.dump({'panel_allowed_nets': '192.168.100.0/24',
+               'lan_subnet4': '192.168.100.0/24'}, f)
+app._NETS_CACHE.update(mtime=None, nets=None)
+_orig_load = app.load_config
+
+
+def _boom_load(*_a, **_k):
+    raise RuntimeError('模拟配置读取失败')
+
+
+app.load_config = _boom_load
+try:
+    _nets_exc = app._panel_allowed_networks()
+finally:
+    app.load_config = _orig_load
+check('配置读取抛异常时降级原因被记下来了（运行时）',
+      '已拒绝所有来源访问' in app.access_boundary_warning(),
+      repr(app.access_boundary_warning()[:80]))
+check('配置读取抛异常时给的是非空网段（否则等于「不限制」）',
+      bool(_nets_exc), '实际=%r' % (_nets_exc,))
+check('配置读取抛异常时真实来源 IP 一律不在允许网段内（fail-closed 真生效）',
+      not app._ip_in_nets('192.168.100.5', _nets_exc),
+      '实际允许网段=%r' % (_nets_exc,))
 
 # (c) 配置恢复正常 ⇒ 降级原因必须**清掉**
 #     （否则管理员修好配置后还一直挂着告警 ⇒ 狼来了 ⇒ 真告警没人看）
