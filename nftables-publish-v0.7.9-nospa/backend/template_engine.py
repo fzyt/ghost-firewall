@@ -334,6 +334,23 @@ def _inject_list_elements(template, elements):
     元素在写入前必须逐个过一遍 IP 校验 —— 这个文件来自落盘数据，
     一旦被手工改坏（写进 `delete table` 之类），会随规则集一起 nft -f 下去。
     校验失败就丢弃该元素并继续，绝不把可疑内容拼进规则。
+
+    ⚠️ 光靠 `ipaddress.ip_address()` 的解析结果**不够**（2026-11-08 补，
+    对账残留 C2 的第四个口子）：
+
+      Python 3.9+ 的 `ipaddress` **认** IPv6 的 scope-id ——
+      `IPv6Address('fe80::1%br-lan')` 解析成功
+      ⇒ 下面那个 `except ValueError` 根本不触发
+      ⇒ 带 scope-id 的元素被原样拼进 `elements = { ... }` 行
+      ⇒ **nft 加载失败**（nft 1.1.7 实测：syntax error, unexpected junk）。
+
+      这条路径是「点应用规则」时**生成整份规则集**的那条 ——
+      也就是说名单文件里的一个脏值能让面板从此**每一次 apply 都失败**
+      （`nft -c -f` 语法预检直接挂，预检在 os.replace 之前，
+      所以已生效的规则不变，但面板失去了对防火墙的控制能力）。
+
+      为什么这里必须自己判：这个模块**不依赖 app.py**
+      （模板引擎是独立的），拿不到 `_valid_ip` ⇒ 只能就地判。
     """
     import ipaddress
     for placeholder, key in (
@@ -345,8 +362,12 @@ def _inject_list_elements(template, elements):
         want6 = key.endswith('6')
         lines, dropped = [], 0
         for elem in _format_set_elements(elements.get(key)):
+            s = elem.strip()
+            if '%' in s:      # IPv6 scope-id 后缀 ⇒ nft 不认，丢弃
+                dropped += 1
+                continue
             try:
-                addr = ipaddress.ip_address(elem.strip())
+                addr = ipaddress.ip_address(s)
             except ValueError:
                 dropped += 1
                 continue

@@ -1551,9 +1551,36 @@ def _is_port(v):
 
 
 def _valid_ip(v, version=None):
-    """合法 IPv4/IPv6 返回 True（version=4/6 时强制指定版本）"""
+    """合法 IPv4/IPv6 返回 True（version=4/6 时强制指定版本）
+
+    ⚠️ 必须显式拒绝 IPv6 的 scope-id（`fe80::1%br-lan` 里 `%br-lan` 那截）
+    ------------------------------------------------------------------
+    为什么不能用「ipaddress 能解析就算合法」：
+
+      Python 3.9+ 的 `ipaddress` **认** scope-id ——
+      `IPv6Address('fe80::1%br-lan')` 解析成功，`str()` 还会**原样保留**
+      `%br-lan`。⇒ 宽松判定会把它当合法地址放行。
+
+      但 **nft 不认**。scope-id 写进规则集就是非法语法，
+      `nft -f` 整份文件加载失败 ⇒ 规则不生效、开机自动加载也失败。
+      （Shannon #60 / P2-15：名单条目写 `nft add element` 时未严格解析）
+
+    为什么是**判非法**而不是「把 scope-id 剥掉」：
+
+      scope-id 是**链路本地地址**的接口标识，不是地址本身。
+      名单、白名单、信任 IP 全都是**按地址匹配**的，带 scope-id 毫无意义；
+      而把 `fe80::1%br-lan` 悄悄改成 `fe80::1` 等于**替用户改了他填的值**，
+      且 `fe80::1` 作转发目标本来就是无意义的（`_bad_forward_target` 会拒）。
+
+    ⇒ 一处收紧，覆盖全部下游：`_safe_ip`（trusted_ip6 / router_ip6）、
+      `validate_config` 的 trusted/router/forward 目标、名单添加。
+    """
+    s = str(v).strip()
+    # '%' 只可能出现在 IPv6 的 scope-id 后缀里（IPv4 不接受 '%'）
+    if '%' in s:
+        return False
     try:
-        addr = ipaddress.ip_address(str(v).strip())
+        addr = ipaddress.ip_address(s)
     except ValueError:
         return False
     if version == 4:
@@ -3128,6 +3155,65 @@ def restore_config():
             # 虽然也被 except 兜住，但那时 tmp 已经被写过一轮，白折腾。
             raise ValueError('备份文件内容不是配置对象')
         restored['auth_token_epoch'] = current_epoch
+
+        # ⚠️ 备份里**缺**的必填字段，用**当前生效值**补上（2026-11-08）
+        #
+        # 为什么：老版本存的备份可能压根没有这些字段（那时它们还不存在），
+        # 直接判非法 = 用户连回退都做不了 —— 恢复功能等于废了。
+        #
+        # 「当前生效值」= 默认值 + 原始文件（**文件优先**，
+        # 与 load_config() 的合并顺序一致）：
+        #   · 文件里写了 ⇒ 用用户**自己写的**那个值；
+        #   · 文件里没写 ⇒ 用 DEFAULT_CONFIG 的值 ——
+        #     而那**正是当前生效的值**（load_config 就是这么合并的）
+        #     ⇒ 补它等于**保持现状**，不是放宽边界。
+        #
+        # ⚠️ 为什么不能直接拿 load_config() 的返回值：
+        #   load_config() 在**配置损坏**时会把那个文件**移走**
+        #   （os.replace 成 .broken.<ts>）—— 恢复流程里不该有这种副作用。
+        #   这里只读文件、只做合并，不碰磁盘。
+        #
+        # ⚠️ 为什么只补「缺失」、**不补「非法」**：
+        #   备份里 panel_allowed_nets = 0.0.0.0/0 那种**过宽的值**，
+        #   仍然会被下面的 validate_config 拒掉 —— 那才是 C3 要堵的洞。
+        #   缺失 ≠ 放宽边界；过宽才是。
+        _current_cfg = {}
+        try:
+            with open(CONFIG_PATH, 'r') as f:
+                _raw_cfg = json.load(f)
+            if isinstance(_raw_cfg, dict):
+                _current_cfg = _raw_cfg
+        except (json.JSONDecodeError, OSError):
+            _current_cfg = {}
+        _effective_cfg = dict(DEFAULT_CONFIG)
+        _effective_cfg.update(_current_cfg)
+        for _key in ('router_ip4', 'trusted_ip4'):
+            if not str(restored.get(_key) or '').strip():
+                _cur_val = _effective_cfg.get(_key)
+                if _cur_val:
+                    restored[_key] = _cur_val
+
+        # ⚠️ 恢复前必须跑一遍 validate_config（2026-11-08 补，对账残留 C3）
+        #
+        # 为什么：保存配置那条路（save_config）会调 validate_config，
+        # 非法值当场被拒；**但恢复这条路不调** ⇒
+        # 一个被改坏的备份（backup 被人手工编辑过，或从别处拷来的）
+        # 里的非法值会被原样恢复。
+        #
+        # 后果具体是什么：`panel_allowed_nets` 写成 `0.0.0.0/0` 时，
+        # 访问边界等于「不设」——而面板的来源判定里，
+        # 超宽网段是明确要挡的（`validate_config` 里 /0 与 /1 都拒）。
+        # 恢复完就变成「谁都能连 5443」。
+        #
+        # 为什么调 validate_config 是安全的：
+        #   它是**纯配置校验**（区间内零 subprocess、不查设备状态），
+        #   只看配置自身 ⇒ 不会因为设备环境而误判。
+        #
+        # 为什么放在 epoch 继承之后：校验的必须是**最终要落盘的那一份**。
+        errs = validate_config(restored)
+        if errs:
+            raise ValueError('备份配置未通过校验，已拒绝恢复: '
+                             + '; '.join(errs[:8]))
         # tmp 落盘那一刻就是 0640（_ensure_file_mode 先建好、open('w') 只截断
         # 不改权限 ⇒ 没有「写完再 chmod」那个窗口）。
         _ensure_file_mode(tmp_path, _CONFIG_FILE_MODE)
@@ -4204,14 +4290,48 @@ def _apply_ruleset_locked(config):
             return False, f'备份现有规则校验失败，已中止应用（未改动现有规则）: {e}'
     os.replace(tmp_path, RULES_PATH)
 
-    # 3. 首次应用前额外备份一次完整 ruleset（仅当两个 backup 都不存在时）
-    if not os.path.exists(RULES_PATH + '.backup') \
-            and not os.path.exists('/etc/nftables.d/99-custom-rules.nft.backup'):
+    # 3. 首次应用前额外备份一次完整 ruleset（仅当 backup 不存在时）
+    #
+    # ⚠️ 路径用 `RULES_PATH + '.backup'` 而不是写死
+    # `/etc/nftables.d/99-custom-rules.nft.backup`（2026-11-08 改）：
+    #   ① 上面 `_config_corrupted()` 检查的正是 `RULES_PATH + '.backup'` ——
+    #      写死路径时两者**不是同一个文件**（RULES_PATH 可被环境变量改），
+    #      检查的那个备份压根不会被创建。
+    #   ② 写死的路径没法在测试里隔离（会真写进本机 /etc）。
+    # 默认部署下 RULES_PATH = /etc/nftables.d/99-custom-rules.nft
+    # ⇒ 拼出来的路径与原来**完全一样**，行为不变。
+    _rules_backup = RULES_PATH + '.backup'
+    if not os.path.exists(_rules_backup):
         try:
             # 注意：stdout= 与 capture_output=True 互斥，同时传会抛
             # TypeError("stdout and stderr arguments may not be used with
             # capture_output")，导致这份备份从来就没成功写过
-            with open('/etc/nftables.d/99-custom-rules.nft.backup', 'w') as bf:
+            with open(_rules_backup, 'w') as bf:
+                # ⚠️ 权限必须**先收口再让 nft 往里写**（2026-11-08 补，对账残留 C4）
+                #
+                # 为什么：这份备份装的是**完整 ruleset**，
+                # 里面有白/黑名单 IP 与信任 IP —— 敏感度与规则集本体一致
+                # （本体就是 0600，见上面 `_ensure_file_mode(tmp_path, 0o600)`）。
+                # 而 `open(...,'w')` 的权限由 **umask** 派生 ⇒ 默认 0644
+                # ⇒ 设备上任何本地用户都能把防火墙规则集读走。
+                #
+                # 为什么不是「写完再 chmod」：那是**有窗口**的 ——
+                # 写完到 chmod 之间，文件内容已经完整且权限还松着。
+                # 现在是刚创建（还是空文件）就 chmod，之后 nft 才开始写。
+                #
+                # 对照：同一段代码里的 `.lastgood`（回滚材料）
+                # 早就 `os.chmod(lastgood, 0o600)` 了；配置备份也做了
+                # （`_ensure_file_mode(CONFIG_PATH + '.backup', _CONFIG_FILE_MODE)`）。
+                # ⇒ 规则集备份是同一类操作里的**漏网**。
+                try:
+                    os.chmod(_rules_backup, 0o600)
+                except OSError as e:
+                    # 权限没收口 ⇒ 这个文件不能留（内容完整但对本地用户可读）。
+                    # 删掉它，好过留一个"看着像备份、实际漏权限"的文件。
+                    _unlink_quiet(_rules_backup)
+                    print(f'[WARN] 备份 ruleset 权限收口失败，已丢弃该备份: {e}',
+                          flush=True)
+                    raise
                 r = subprocess.run(['nft', 'list', 'ruleset'], stdout=bf,
                                    stderr=subprocess.PIPE, timeout=5)
             if r.returncode != 0:
@@ -6926,11 +7046,36 @@ def _format_list_elements(elements, want6):
 
     返回 (合法元素列表, 被丢弃的条数)。丢弃的元素**不写进规则集** ——
     这个文件会被 nft -f 直接执行，脏数据等于往防火墙里塞指令。
+
+    ⚠️ 这里**不能**只靠 `ipaddress.ip_address()` 的解析结果（2026-11-08 补，
+    对账残留 C2 的第三个口子）：
+
+      Python 3.9+ 的 `ipaddress` **认** IPv6 的 scope-id ——
+      `IPv6Address('fe80::1%br-lan')` 解析成功，
+      ⇒ 上面那个 `except ValueError` 根本不会触发 ⇒ 脏元素被原样写进
+      `elements = { ... }` 行 ⇒ **nft 加载失败**。
+
+      nft 1.1.7 实测（隔离 netns，`nft -c -f`）：
+        elements = { fe80::1%eth0 }        ⇒ syntax error, unexpected junk
+        ip6 saddr fe80::1%eth0 accept     ⇒ syntax error, unexpected junk
+      ⇒ 连**合法**的 scope-id nft 都不认 ⇒ 带 scope-id 的元素会让**整份**
+        规则集文件加载失败 ⇒ 开机加载与「应用规则」双双失效。
+
+    为什么这里必须单独判：这个函数读的是 **lists.json**，
+    而 lists.json 不只由面板写入（root 手工编辑、老版本留下的文件都会进来）。
+    面板自己写进去的路径（list_add）已经被 `_detect_ip_version` 拦住，
+    但**这道闸是最后一道** ⇒ 名单文件里的脏值绝不能进规则集。
+
+    为什么判**非法**而不是剥掉 scope-id：名单按地址匹配，
+    带 scope-id 没有任何匹配意义；而剥掉等于替用户改填的值。
     """
     out, dropped = [], 0
     for elem in (elements or []):
         text = str(elem).strip()
         if not text:
+            continue
+        if '%' in text:      # IPv6 scope-id 后缀 ⇒ nft 不认，丢弃
+            dropped += 1
             continue
         try:
             addr = ipaddress.ip_address(text)
@@ -7057,18 +7202,31 @@ def _list_type_from_set(set_name):
 
 
 def _detect_ip_version(ip):
-    """返回 4 / 6，非法返回 None（标准库 ipaddress，无外部依赖）"""
+    """返回 4 / 6，非法返回 None（标准库 ipaddress，无外部依赖）
+
+    ⚠️ IPv6 的 scope-id（`fe80::1%br-lan`）在这里也必须判非法 ——
+    这个函数是**名单添加**路径自己的校验入口，不走 `_valid_ip`，
+    而 Python 3.9+ 的 ipaddress 认 scope-id ⇒ 宽松判定会放行，
+    于是带 scope-id 的地址被写进 lists.json（配置被写脏），
+    真正写 nft set 时才被内核拒（那时已经晚了）。
+
+    理由与 `_valid_ip` 相同：scope-id 是链路本地地址的接口标识，
+    名单按地址匹配，带它没有意义；而 nft 不认 ⇒ 写进规则集是非法语法。
+    """
     try:
         import ipaddress
-        if '/' in ip:  # CIDR 不允许加入 set
+        s = str(ip).strip()
+        if '%' in s:      # IPv6 scope-id 后缀 ⇒ 判非法
+            return None
+        if '/' in s:  # CIDR 不允许加入 set
             return None
         try:
-            ipaddress.IPv4Address(ip)
+            ipaddress.IPv4Address(s)
             return 4
         except (ipaddress.AddressValueError, ValueError):
             pass
         try:
-            ipaddress.IPv6Address(ip)
+            ipaddress.IPv6Address(s)
             return 6
         except (ipaddress.AddressValueError, ValueError):
             pass

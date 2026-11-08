@@ -1,0 +1,19 @@
+=== 0. 环境 ===
+nftables v1.1.7 (Commodore Bullmoose #8)
+
+=== 1. 基线：不含 scope-id 的地址字面量（应当成功） ===
+  基线：语法预检通过（说明字面量写法本身合法）
+
+=== 2. 关键用例：地址字面量带 scope-id ===
+  结果：预检**失败** ⇒ /tmp/tmp.LLEI5j2rDS/bad.nft:4:26-26: Error: syntax error, unexpected junk
+expected any of: newline, semicolon, comma, ., <<, >>, &, ^, /, -, @, fib, socket, tproxy, osf, synproxy, set, add, update, delete, reset, accept, drop, continue, jump, goto, return, flow, meter, <number>, <string>, <quoted string>, <string with a trailing asterisk>, th, ether, vlan, arp, ip, icmp, igmp, ip6, icmpv6, ah, esp, comp, udp, udplite, tcp, dccp, vxlan, gre, gretap, geneve, sctp, rt, rt0, rt2, srh, hbh, frag, dst, mh, meta, mark, iif, iifname, iiftype, oif, oifname, oiftype, skuid, skgid, nftrace, rtclassid, ibrname, obrname, pkttype, cpu, iifgroup, oifgroup, cgroup, time, ct, counter, last, tunnel, log, limit, quota, hour, day, reject, snat, dnat, masquerade, redirect, queue, dup, fwd, numgen, jhash, symhash, comment, notrack, exthdr, ipsec, xt, '{', '(', '|', '$'
+        ip6 saddr fe80::1%eth0 accept
+                         ^
+  ⇒ 面板 apply 的语法预检就会挂 ⇒ apply 永久中止
+  ⇒ 但已生效的规则不变（预检在 os.replace 之前，不会落盘）
+
+=== 3. 对照：集合元素带 scope-id（之前已测过，这里复现一遍） ===
+  结果：预检失败 ⇒ /tmp/tmp.LLEI5j2rDS/elem.nft:4:29-29: Error: syntax error, unexpected junk
+expected any of: newline, colon, comma, ., <<, >>, &, ^, /, -, timeout, expires, ct, counter, last, limit, quota, comment, '}', '|'
+        elements = { fe80::1%eth0 }
+                            ^

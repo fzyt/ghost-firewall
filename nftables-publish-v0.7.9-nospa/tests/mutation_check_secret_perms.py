@@ -100,25 +100,31 @@ MUTATIONS = [
      [('        _ensure_file_mode(CONFIG_PATH + \'.backup\', _CONFIG_FILE_MODE)\n',
        '', 0, 'all')]),
 
-    # ⚠️ 2026-11-08：这条的锚点跟着 restore_config 的实现改过一次。
-    # 原来的锚点是「_ensure_file_mode(tmp_path, ...) 紧跟 shutil.copy(backup_path, tmp_path)」
-    # —— 2026-11-08 修了「恢复配置回退 auth_token_epoch」之后，restore 路径不再
-    # 整份拷贝 backup，改成「读 JSON → 改世代号 → 写 tmp」，两行锚点就失配了，
+    # ⚠️ 2026-11-08：这条的锚点跟着 restore_config 的实现改过**两次**。
+    #
+    # 第一次：原来的锚点是「_ensure_file_mode(tmp_path, ...) 紧跟 shutil.copy(backup_path, tmp_path)」
+    # —— 修了「恢复配置回退 auth_token_epoch」之后，restore 路径不再整份拷贝 backup，
+    # 改成「读 JSON → 改世代号 → 写 tmp」，两行锚点就失配了，
     # 变异被**静默跳过**（扫描器报「锚点未命中」，当失败处理才没被当成通过）。
     #
-    # 这条变异本身**依然有意义**：restore 路径现在用
+    # 第二次（2026-11-08 C3）：锚点换成了「_ensure_file_mode 紧跟 epoch 赋值」那一整块，
+    # 结果 C3 又往这两行**中间插了一段**（缺失字段继承当前生效值）⇒ 又失配 ⇒
+    # 变异又被静默跳过 ⇒ 脚本自报 10/11，扫描器把这一份标成 [BAD]。
+    #
+    # ⇒ 教训：**锚点要钉在「这段代码独有的语义」上，不要钉在
+    #    「A 和 B 恰好挨在一起」上** —— 往中间插一行就全废。
+    #    现在用的是**纯代码**三行（`json.dump(restored, ...)` 只有 restore_config 有），
+    #    不含任何注释 ⇒ 改注释、插代码都不会再把它打散。
+    #
+    # 这条变异本身**依然有意义**：restore 路径用
     # 「_ensure_file_mode 先建好 tmp(0640) → open('w') 只截断不改权限」落盘，
     # 去掉 _ensure_file_mode 就会按 umask 建出 0644 的 tmp ⇒ 落盘有可读窗口。
-    # 所以保留这条，只把锚点挪到 restore_config 里独有的那一处
-    # （用 restored['auth_token_epoch'] 这行定位，避免和 save_config 的同形代码撞）。
     ('M10 恢复用的 tmp 不预建权限（open 按 umask 建 ⇒ 先 0644）',
-     [('        restored[\'auth_token_epoch\'] = current_epoch\n'
-       '        # tmp 落盘那一刻就是 0640（_ensure_file_mode 先建好、open(\'w\') 只截断\n'
-       '        # 不改权限 ⇒ 没有「写完再 chmod」那个窗口）。\n'
-       '        _ensure_file_mode(tmp_path, _CONFIG_FILE_MODE)',
-       '        restored[\'auth_token_epoch\'] = current_epoch\n'
-       '        # tmp 落盘那一刻就是 0640（_ensure_file_mode 先建好、open(\'w\') 只截断\n'
-       '        # 不改权限 ⇒ 没有「写完再 chmod」那个窗口）。\n', 0, 1)]),
+     [('        _ensure_file_mode(tmp_path, _CONFIG_FILE_MODE)\n'
+       '        with open(tmp_path, \'w\') as f:\n'
+       '            json.dump(restored, f, indent=2, ensure_ascii=False)\n',
+       '        with open(tmp_path, \'w\') as f:\n'
+       '            json.dump(restored, f, indent=2, ensure_ascii=False)\n', 0, 1)]),
 
     ('M11 _ensure_file_mode 整体退化：不再预建文件（只剩事后 chmod）',
      [('        fd = os.open(path, os.O_CREAT | os.O_WRONLY, mode)\n'
