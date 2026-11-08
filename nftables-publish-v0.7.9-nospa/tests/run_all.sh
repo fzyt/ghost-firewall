@@ -111,6 +111,18 @@ for f in tests/test_*.py; do
     FAILED="$FAILED $f"
     printf '  ❌ %-42s ✅%s ❌%s rc=%s\n' "$(basename "$f")" "$p" "$fl" "$rc"
     printf '%s\n' "$out" | grep '❌' | head -5 | sed 's/^/       /'
+  elif [ "$p" -eq 0 ] && [ "$fl" -eq 0 ]; then
+    # ── 指标失真兜底（2026-11-08 加）────────────────────────
+    # rc=0 且断言数为 0 ⇒ 这份文件的断言**一条都没进硬指标**。
+    # 典型场景：用了 unittest 默认输出（`... ok`，不带任何标记），
+    # 于是日志里显示成「✅ xxx ✅0 ❌0」——看着"通过"，
+    # 实际整份文件的断言被静默漏计，指标自己骗自己。
+    # 本项目已因此栽过三次：
+    #   test_portal_frontend.py（282 项）+ test_pixelfield_trae.js（20 项）
+    #   test_device_info.py（14 项）
+    # ⇒ 只要出现 0 断言就判失败，逼作者把输出格式改合规。
+    FAILED="$FAILED $(basename "$f")(0 断言未计入)"
+    printf '  ❌ %-42s 断言数 0 —— 输出格式不被计数规则识别\n' "$(basename "$f")"
   else
     printf '  ✅ %-42s ✅%s ❌%s\n' "$(basename "$f")" "$p" "$fl"
   fi
@@ -127,6 +139,10 @@ for f in tests/test_*.js; do
     FAILED="$FAILED $f"
     printf '  ❌ %-42s ✅%s ❌%s rc=%s\n' "$(basename "$f")" "$p" "$fl" "$rc"
     printf '%s\n' "$out" | tail -15 | sed 's/^/       /'
+  elif [ "$p" -eq 0 ] && [ "$fl" -eq 0 ]; then
+    # 同上：0 断言 = 输出格式不合规，判失败（别让它悄悄漏计）
+    FAILED="$FAILED $(basename "$f")(0 断言未计入)"
+    printf '  ❌ %-42s 断言数 0 —— 输出格式不被计数规则识别\n' "$(basename "$f")"
   else
     printf '  ✅ %-42s ✅%s ❌%s\n' "$(basename "$f")" "$p" "$fl"
   fi

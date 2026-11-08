@@ -73,20 +73,28 @@ function makeData(data) {
 }
 
 /**
- * x-for 循环体里的表达式，其作用域是**循环变量**（iface / idx），
+ * x-for 循环体里的表达式，其作用域是**循环变量**（iface / a / idx），
  * 不在 Alpine 顶层 scope 上。
  *
  * ⚠️ 不给它们定义就会全部报「iface is not defined」——
  * 而那是**求值器的缺陷**，不是页面的缺陷。
  * ⇒ 求值时把循环变量也放进作用域。
+ *
+ * 页面里有**两层** x-for：
+ *   外层 (iface, idx) in deviceInfo.data.interfaces
+ *   内层 (a, idx) in iface.ipv4 / iface.ipv6
+ * 所以作用域里要同时有 iface、a、idx。
  */
 function makeScope(data) {
   const scope = { ...makeData(data) };
   // 用真实数据里的第一个接口当循环变量（x-for 的作用域就是这一个元素）
   const list = (data && data.interfaces) || [];
-  scope.iface = list[0] || {
+  const first = list[0] || {
     name: '', state: '', ipv4: [], ipv6: [], rx_bytes: 0, tx_bytes: 0,
   };
+  scope.iface = first;
+  // 内层循环变量：第一个地址（没有就空串）
+  scope.a = (first.ipv4 && first.ipv4[0]) || (first.ipv6 && first.ipv6[0]) || '';
   scope.idx = 0;
   return scope;
 }

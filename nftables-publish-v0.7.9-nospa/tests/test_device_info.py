@@ -28,6 +28,7 @@
 """
 import os
 import sys
+import traceback
 import unittest
 
 BACKEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'backend')
@@ -251,5 +252,88 @@ class TestLiveCollect(unittest.TestCase):
         self.assertIsInstance(d['interfaces'], list)
 
 
+# ── 输出适配：让每个用例都打一行 [PASS]/[FAIL] ───────────────
+#
+# 为什么必须加这个（2026-11-08 实测踩到）：
+#
+# unittest 默认输出是
+#   test_xxx (__main__.TestClass.test_xxx) ... ok
+# **不带任何标记** ⇒ 全量回归的计数规则只认「行首是 ✅ 或 [PASS]」，
+# 于是这个文件的 14 项断言**一条都进不了硬指标**，
+# 回归日志里显示成「✅ test_device_info.py ✅0 ❌0」——
+# 看着像"通过"，实际是 14 项被静默漏计，指标自己骗自己。
+#
+# 这是本项目**第二次**踩同一类坑：
+# 第一次是 test_portal_frontend.py（282 项）与 test_pixelfield_trae.js（20 项），
+# 当年的修法是在 run_all.sh 里加「两种标记一起数」。
+# ⇒ 这次改成**在测试文件侧**输出合规标记，
+#    并在 run_all.sh 里再加一道「rc=0 但断言数为 0 ⇒ 报警」的兜底，两头堵死。
+#
+# ⚠️ 标记必须打在**行首**（可带缩进）：回归的计数规则是行首锚定，
+#    否则会被当成日志行漏掉 —— 这正是本项目之前踩过的另一个坑。
+#
+# ⚠️ 不用 emoji：AGENTS.md 明确要求终端输出禁用 emoji，统一用 [PASS]/[FAIL]。
+
+def _short_id(test):
+    """只取方法名：test_id 形如 module.Class.method。"""
+    return test.id().rsplit('.', 1)[-1]
+
+
+def _print_err(err):
+    """打印失败 traceback（打 stdout，和 [FAIL] 行挨着，方便看）。"""
+    exc_type, exc, tb = err
+    for line in traceback.format_exception(exc_type, exc, tb):
+        print('       %s' % line.rstrip())
+
+
+class _MarkingResult(unittest.TestResult):
+    """把每个用例的结果打成一 [PASS] / [FAIL] 行。
+
+    为什么自己写而不用 unittest.TextTestResult：
+    TextTestResult 的行尾是「ok」/「FAIL」，既不带我们的标记，
+    又会被计数规则忽略（等于白写）。这里直接接管输出。
+    """
+
+    def addSuccess(self, test):
+        super().addSuccess(test)
+        print('  [PASS] %s' % _short_id(test))
+
+    def addFailure(self, test, err):
+        super().addFailure(test, err)
+        print('  [FAIL] %s' % _short_id(test))
+        _print_err(err)
+
+    def addError(self, test, err):
+        super().addError(test, err)
+        print('  [FAIL] %s' % _short_id(test))
+        _print_err(err)
+
+    def addSkip(self, test, reason):
+        super().addSkip(test, reason)
+        # [SKIP] 不被计数规则认（既不算通过也不算失败）——
+        # 与 run_all.sh 里「[跳过]不匹配 ⇒ 不计数」的既有约定一致
+        print('  [SKIP] %s  — %s' % (_short_id(test), reason))
+
+    def addSubTest(self, test, subtest, outcome):
+        # 基类的 addSubTest **不会**回调 addSuccess/addFailure ⇒
+        # 用了 subTest 的用例会一条标记都不打 ⇒ 必须单独处理，
+        # 否则又是一次静默漏计。
+        super().addSubTest(test, subtest, outcome)
+        if outcome is None:
+            print('  [PASS] %s' % _short_id(subtest))
+        elif issubclass(outcome[0], test.skipException):
+            print('  [SKIP] %s  — %s' % (_short_id(subtest), outcome[1]))
+        else:
+            print('  [FAIL] %s' % _short_id(subtest))
+            _print_err(outcome)
+
+
 if __name__ == '__main__':
-    unittest.main(verbosity=2)
+    suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
+    result = _MarkingResult()
+    suite.run(result)
+    failed = len(result.failures) + len(result.errors)
+    print('\n' + '=' * 60)
+    print('  用例 %d / 通过 %d / 失败 %d' % (result.testsRun, result.testsRun - failed, failed))
+    print('=' * 60)
+    sys.exit(0 if result.wasSuccessful() else 1)

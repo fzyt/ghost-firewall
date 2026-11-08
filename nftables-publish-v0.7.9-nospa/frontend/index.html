@@ -334,21 +334,52 @@
                   <tbody>
                     <template x-for="(iface, idx) in (deviceInfo.data.interfaces || [])" :key="idx">
                       <tr class="border-b last:border-0">
-                        <td class="py-2 pr-4 font-medium" x-text="iface.name"></td>
-                        <td class="py-2 pr-4">
+                        <td class="py-2 pr-4 font-medium whitespace-nowrap" x-text="iface.name"></td>
+                        <td class="py-2 pr-4 whitespace-nowrap">
                           <span class="inline-flex items-center gap-1">
                             <span class="w-2 h-2 rounded-full inline-block"
                               :class="iface.state === 'up' ? 'bg-green-500' : 'bg-gray-400'"></span>
                             <span x-text="iface.state || '未知'"></span>
                           </span>
                         </td>
-                        <td class="py-2 pr-4 font-mono text-xs break-all"
-                            x-text="(iface.ipv4 || []).join(', ') || '—'"></td>
-                        <td class="py-2 pr-4 font-mono text-xs break-all"
-                            x-text="(iface.ipv6 || []).join(', ') || '—'"></td>
-                        <td class="py-2 pr-4 text-right text-gray-600"
+                        <!--
+                          地址列不能用 break-all：它在**任意字符**处断行，
+                          实测把 192.168.100.249 断成「192.168.100.24」+「9」，
+                          IPv6 更惨（两条地址连在一起读都读不出来）。
+                          ⇒ 用 break-words（按词断，IPv4 的点号是断点）
+                          + whitespace-normal，并给列设最小宽度，
+                          让长 IPv6 换行而不是把别的列挤扁。
+
+                          多条地址**每条一行**：用逗号连在一起时，
+                          两个 IPv6（各 39 字符）挤在一行根本分不清边界。
+                        -->
+                        <td class="py-2 pr-4 font-mono text-xs break-words whitespace-normal min-w-[9rem]">
+                          <template x-if="(iface.ipv4 || []).length">
+                            <div>
+                              <template x-for="(a, idx) in iface.ipv4" :key="'v4-' + idx">
+                                <div x-text="a"></div>
+                              </template>
+                            </div>
+                          </template>
+                          <template x-if="!(iface.ipv4 || []).length">
+                            <div class="text-gray-400">—</div>
+                          </template>
+                        </td>
+                        <td class="py-2 pr-4 font-mono text-xs break-words whitespace-normal min-w-[12rem]">
+                          <template x-if="(iface.ipv6 || []).length">
+                            <div>
+                              <template x-for="(a, idx) in iface.ipv6" :key="'v6-' + idx">
+                                <div x-text="a"></div>
+                              </template>
+                            </div>
+                          </template>
+                          <template x-if="!(iface.ipv6 || []).length">
+                            <div class="text-gray-400">—</div>
+                          </template>
+                        </td>
+                        <td class="py-2 pr-4 text-right text-gray-600 whitespace-nowrap"
                             x-text="fmtBytes(iface.rx_bytes)"></td>
-                        <td class="py-2 text-right text-gray-600"
+                        <td class="py-2 text-right text-gray-600 whitespace-nowrap"
                             x-text="fmtBytes(iface.tx_bytes)"></td>
                       </tr>
                     </template>
