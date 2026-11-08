@@ -42,7 +42,22 @@ const ALLOW_NETWORK = process.argv.includes('--allow-network');
 const ONLY_PAGE = (process.argv.find(a => a.startsWith('--page=')) || '').split('=')[1];
 
 // 点这些等于删数据/改防火墙，先跑别的，最后按需开
-const DESTRUCTIVE_PAT = /(删除|删|清空|删除规则|flush|应用防火墙|applyRules|removeDdns|deleteRp|deletePreset|恢复配置|restoreConfig|重置)/i;
+//
+// ⚠️ 2026-11-08 真机实测补漏：原来这条只写了中文标签和少量英文动作名，
+// 英文动作名一旦和中文标签对不上就漏网。这条补了 8 个动作：
+//   restartDdns()      标签「重启服务」   → POST /api/ddns/restart 200（click 档真执行过）
+//   reloadNginx()      标签「重载 Nginx」 → POST /api/reverse-proxy/nginx/reload 200（同上）
+//   uploadRpCert()     标签「上传证书」   → 会弹文件选择器，浏览器里会卡住脚本
+//   pickRpReupload()   标签「重新上传」   → 弹文件选择器，和 uploadRpCert 一个毛病
+//   requestRpCert()    标签「申请证书」   → 要打 ACME 外网，无 WAN 的机器上必失败
+//   renewRpCert()      标签「续期」       → 同上
+//   confirmSaveConfig()标签「确认保存」   → 真正落盘配置并应用防火墙规则
+//   applyPreset()      标签「应用预设」   → 按预设改名单/规则
+// 前两个在 .232 的 click 档**真被执行过**（本该只在 --destructive 档执行）；
+// 后六个运行时不可见，但按钮所在 tab 一激活就会漏。
+// 所以这条现在**动作名和中文标签都写**。删数据类按钮靠中文「删除/清空」兜住，
+// 但「重启服务」这种没有关键词的必须靠英文动作名兜。
+const DESTRUCTIVE_PAT = /(删除|删|清空|删除规则|flush|应用防火墙|applyRules|removeDdns|deleteRp|deletePreset|恢复配置|restoreConfig|重置|restartDdns|重启服务|uploadRpCert|上传证书|pickRpReupload|重新上传|requestRpCert|申请证书|renewRpCert|续期证书|reloadNginx|重载 ?nginx|confirmSaveConfig|确认保存|applyPreset|应用预设)/i;
 
 // 基础设施级操作：会改网络/系统自身状态。
 //
@@ -53,7 +68,22 @@ const DESTRUCTIVE_PAT = /(删除|删|清空|删除规则|flush|应用防火墙|a
 // 删一条白名单可以重来，把网络搞挂就没法收场了。
 // 所以这类按钮**永远不会自动执行**，必须显式加 --allow-network，
 // 且应当先确认自己有一条带外恢复通道（Proxmox 控制台 / IPMI / 串口）再开。
-const NETWORK_PAT = /(restartNetwork|重启网络|togglePppoe|PPPoE\s*拨号|installChinaIps|安装中国IP|repairInitScript|修复 init|install_ipv6|updateIpv6\s*\(\)|reboot|重启路由器)/i;
+//
+// ⚠️ 2026-11-08 真机实测补漏：注释里点名的三个元凶，实际只有两个在保护里。
+// saveNetworkConfig() 不匹配任何一项 —— 原来的 NETWORK_PAT 只有
+// `install_ipv6`（下划线），而实际动作名是 installIpv6Cron()（驼峰），
+// 两者永远对不上。实测 .232 上两个都真执行了：
+//   POST /api/network/config 400（saveNetworkConfig）
+//   POST /api/network/install-ipv6-cron 200（installIpv6Cron）
+// .232 没有 PPPoE 账号，后端按设计 400 拒了保存；但在 .224 那样的真机上，
+// 这一发就是真的把网络配置写下去 —— 2026-10-06 事故的防线在这里是漏的。
+//
+// 同类漏网还有 updateChinaIps()（「立即刷新中国IP」）：它和 installChinaIps()
+// 是两个不同动作，原来只护了后者。两者都会去更新 /etc/nftables/china-ips.nft
+// （几百 MB 的下载 + 写盘），归网络级。
+//
+// 所以现在动作名和中文标签都写全。
+const NETWORK_PAT = /(restartNetwork|重启网络|saveNetworkConfig|保存网络配置|togglePppoe|PPPoE\s*拨号|installChinaIps|安装中国IP|updateChinaIps|立即刷新中国IP|installIpv6Cron|安装定时更新|repairInitScript|修复 init|install_ipv6|updateIpv6\s*\(\)|reboot|重启路由器)/i;
 
 // 侧边栏 14 个导航按钮是"测试的搬运工"而不是被测对象：点了会改 currentNav，
 // 把当前页的元素全换掉，后续 nth() 就指错位置了。probe 阶段已经逐个点过
