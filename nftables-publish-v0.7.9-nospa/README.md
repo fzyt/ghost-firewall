@@ -212,6 +212,12 @@ frontend/
   但 nftables 官方示例里的经典 NAT 用例同样是**小写** `postrouting` —— 如果宿主机
   管理员手写的 ruleset 或其它 nft 原生工具也在 `table ip nat` 里用了小写链名，
   首次应用规则时那些规则会被一起删掉。宿主机上有自定义 nft 规则时请先确认。
+  ⚠️ 前导块用的是「先建空链脚手架、再 `delete chain`」两步（`delete` 遇到不存在的
+  链会报错，所以必须先 create 出空链）。**不要**图省事改成 `destroy chain` ——
+  `destroy` 命令要 **nft ≥ 1.1.x** 才认识（实测 nft 1.0.6 完全不认识，会把
+  `destroy` 当成对象名报语法错误；1.1.3 / 1.1.7 才解析通过），改了就把
+  linux_gateway 的最低 nft 版本要求整个抬上去。详见
+  `报告/nft-destroy命令可行性调研-20261108.md`。
 - **单网卡机器不能开 PPPoE**（已做拦截，见 CHANGELOG）。像 Proxmox 虚拟机这种只有
   一张物理网卡的设备，`eth0` 已经是 br-lan 的唯一从属端口，再把 WAN 绑上去会让
   桥塌掉、整机失联。面板会检测不到独立 WAN 网卡并拒绝保存（返回
