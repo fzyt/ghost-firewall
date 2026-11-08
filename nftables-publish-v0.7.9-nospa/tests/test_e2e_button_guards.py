@@ -214,6 +214,9 @@ EXPECT = {
     'loadAliyunRecords':  ('normal', '加载'),
     'loadAliyunStatus':   ('normal', '加载'),
     'loadDdns':           ('normal', '通用 DDNS'),
+    # 系统信息页的加载（2026-11-08 新增）。
+    # 它是**只读采集**，不改任何状态 ⇒ 归 normal 档（不是网络级/破坏性级）。
+    'loadDeviceInfo':     ('normal', '刷新'),
     'loadFirewallStatus': ('normal', '加载'),
     'loadGatewayStatus':  ('normal', '刷新状态'),
     'loadLists':          ('normal', '加载'),

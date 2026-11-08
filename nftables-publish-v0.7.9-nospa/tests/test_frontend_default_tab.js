@@ -177,9 +177,23 @@ function evalXShow(expr, ctx) {
   check('防火墙状态排在导航第一位',
     navIds[0] && navIds[0].id === 'firewall-status',
     '第一项=' + (navIds[0] ? navIds[0].id : '无'));
-  check('网络接口紧随其后（配置项之间的次序没被打乱）',
-    navIds[1] && navIds[1].id === 'network',
-    '第二项=' + (navIds[1] ? navIds[1].id : '无'));
+  // 「网络接口」必须是**第一个配置项**。
+  //
+  // ⚠️ 不能写成「排在第二项」—— 那是把「状态页的个数」写死了。
+  // 2026-11-08 加了「系统信息」这个状态页（排在防火墙状态之后），
+  // 原来那条断言就红了 —— 但配置项之间的次序其实一点没乱。
+  // ⇒ 改成「在配置项序列里排第一」，意图不变，且不再受状态页增减影响。
+  //
+  // 怎么区分「状态页」和「配置项」？本项目的分法是：
+  //   · 状态页：firewall-status / system-info —— 只读展示
+  //   · 配置页：其余 —— 用户能改配置
+  const STATUS_PAGE_IDS = ['firewall-status', 'system-info'];
+  const configIds = navIds
+    .map(i => i.id)
+    .filter(id => !STATUS_PAGE_IDS.includes(id));
+  check('网络接口是第一个配置项（配置项之间的次序没被打乱）',
+    configIds[0] === 'network',
+    '配置项序列=' + configIds.join(', '));
   check('导航项没有重复',
     new Set(navIds.map(i => i.id)).size === navIds.length,
     '共 ' + navIds.length + ' 项');

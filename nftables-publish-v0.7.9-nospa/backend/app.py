@@ -2,6 +2,7 @@
 from flask import Flask, jsonify, request, send_from_directory, send_file, session
 import os, subprocess, shutil, json, time, re, hmac, hashlib, base64, datetime, uuid, fcntl, io, zipfile, secrets, ssl, ipaddress, socket, threading, contextlib, sys
 from template_engine import load_template, generate_rules
+import device_info
 
 # ======================= 认证配置 =======================
 AUTH_PASSWORD_FILE = os.environ.get(
@@ -13273,6 +13274,39 @@ def _ruleset_is_functional():
     if 'type filter hook input' not in out and 'type filter hook' not in out:
         return False, '未找到 filter 类型的 hook 链'
     return True, '正常'
+
+
+@app.route('/api/system/info', methods=['GET'])
+def system_info():
+    """设备基本信息（型号、固件、CPU、内存、存储、运行时间、网络接口）。
+
+    **只读**：采集器只读 /proc、/sys、/etc，不写任何东西、
+    不执行任何会改状态的命令。
+
+    为什么不走 ubus/rpcd：
+    OpenWrt 的 ubus 走本地 socket，`POST /ubus` 会被 rpcd 的 ACL 挡住
+    （`/usr/share/rpcd/acl.d/` 下默认没有任何规则授权 `system.*`）。
+    面板跑在 nginx 后面、权限也被降过 ⇒ 走 ubus 既不可靠也不安全。
+    能用 /proc、/sys、/etc 读到的，一律直接读文件。
+
+    采集器本身不会抛异常（读不到就是 None），
+    所以这个接口**不会因为设备环境差异而 500** ——
+    页面上显示「未知」比整页报错有用。
+    """
+    if not _is_authenticated():
+        return jsonify({'success': False, 'code': 'AUTH_REQUIRED', 'message': '未登录'}), 401
+    try:
+        data = device_info.collect_all()
+    except Exception as e:
+        # 采集器理论上不抛（它内部逐项吞异常），
+        # 但真抛了也不能让页面整个挂掉 —— 返回一份空壳 + 错误说明。
+        print(f'[ERROR] 设备信息采集失败: {type(e).__name__}: {e}', flush=True)
+        return jsonify({
+            'success': False,
+            'code': 'COLLECT_FAILED',
+            'message': '采集设备信息失败，详情请查看面板日志',
+        }), 500
+    return jsonify({'success': True, 'data': data})
 
 
 @app.route('/api/rules/health', methods=['GET'])

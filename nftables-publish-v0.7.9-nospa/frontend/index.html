@@ -139,7 +139,7 @@
       </div>
       <nav class="nf-nav">
         <template x-for="item in navItems" :key="item.id">
-          <button @click="currentNav = item.id; if (item.id === 'ddns') loadDdns(); if (item.id === 'syslog') loadSystemLogs(); if (item.id === 'lists') loadLists(); if (item.id === 'firewall-status') loadFirewallStatus(); if (item.id === 'reverse-proxy') loadReverseProxy();"
+          <button @click="currentNav = item.id; if (item.id === 'ddns') loadDdns(); if (item.id === 'syslog') loadSystemLogs(); if (item.id === 'lists') loadLists(); if (item.id === 'firewall-status') loadFirewallStatus(); if (item.id === 'system-info') loadDeviceInfo(); if (item.id === 'reverse-proxy') loadReverseProxy();"
             :class="currentNav === item.id ? 'is-active' : ''"
             class="nf-navitem">
             <span class="nf-navitem__dot" aria-hidden="true"></span>
@@ -195,6 +195,174 @@
       <!-- 加载遮罩 -->
       <div x-show="loading" class="flex items-center justify-center py-20">
         <div class="text-gray-400">加载配置中...</div>
+      </div>
+
+      <!-- ========== 系统信息 ========== -->
+      <div class="nf-page" x-show="currentNav === 'system-info'"
+           x-transition:enter="nfx-enter"
+           x-transition:enter-start="nfx-enter-start"
+           x-transition:enter-end="nfx-enter-end">
+        <div class="flex items-center justify-between mb-6">
+          <h1 class="text-2xl font-bold">系统信息</h1>
+          <button @click="loadDeviceInfo()" :disabled="deviceInfo.loading"
+            class="px-3 py-1 border rounded text-xs disabled:opacity-50">
+            <span x-text="deviceInfo.loading ? '采集中…' : '刷新'"></span>
+          </button>
+        </div>
+
+        <!-- 采集失败：明说「查不到」，不要画一堆空值让人以为设备坏了 -->
+        <div x-show="deviceInfo.error"
+             class="rounded border border-red-300 bg-red-50 px-4 py-3 mb-4">
+          <div class="text-sm text-red-800"
+               x-text="'采集设备信息失败：' + (deviceInfo.error || '未知错误')"></div>
+          <div class="text-xs text-red-700 mt-1">
+            面板与设备之间的连接可能已断开，请刷新页面重试。
+          </div>
+        </div>
+
+        <!-- 首次进入时的加载态 -->
+        <div x-show="!deviceInfo.loaded && !deviceInfo.error"
+             class="text-gray-400 text-sm py-8 text-center">
+          正在采集设备信息…
+        </div>
+
+        <template x-if="deviceInfo.loaded && deviceInfo.data">
+          <div>
+            <!-- ── 设备与固件 ─────────────────────────────────── -->
+            <div class="bg-gray-50 border rounded-lg p-5 mb-6">
+              <h2 class="font-semibold mb-4">设备与固件</h2>
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+                <div class="flex gap-2">
+                  <span class="text-gray-500 w-24 shrink-0">设备型号</span>
+                  <span class="font-medium break-all"
+                        x-text="deviceInfo.data.model || '未知（该设备未提供型号信息）'"></span>
+                </div>
+                <div class="flex gap-2">
+                  <span class="text-gray-500 w-24 shrink-0">固件版本</span>
+                  <span class="font-medium break-all"
+                        x-text="deviceInfo.data.os.pretty_name || '未知'"></span>
+                </div>
+                <div class="flex gap-2">
+                  <span class="text-gray-500 w-24 shrink-0">内核版本</span>
+                  <span class="font-medium break-all"
+                        x-text="deviceInfo.data.os.kernel || '未知'"></span>
+                </div>
+                <div class="flex gap-2">
+                  <span class="text-gray-500 w-24 shrink-0">运行时间</span>
+                  <span class="font-medium" x-text="fmtUptime(deviceInfo.data.uptime_seconds)"></span>
+                </div>
+              </div>
+            </div>
+
+            <!-- ── CPU ────────────────────────────────────────── -->
+            <div class="bg-gray-50 border rounded-lg p-5 mb-6">
+              <h2 class="font-semibold mb-4">处理器</h2>
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+                <div class="flex gap-2">
+                  <span class="text-gray-500 w-24 shrink-0">型号</span>
+                  <span class="font-medium break-all"
+                        x-text="deviceInfo.data.cpu.model || '未知'"></span>
+                </div>
+                <div class="flex gap-2">
+                  <span class="text-gray-500 w-24 shrink-0">核心数</span>
+                  <span class="font-medium"
+                        x-text="deviceInfo.data.cpu.cores ? deviceInfo.data.cpu.cores + ' 核' : '未知'"></span>
+                </div>
+                <div class="flex gap-2">
+                  <span class="text-gray-500 w-24 shrink-0">主频</span>
+                  <span class="font-medium"
+                        x-text="deviceInfo.data.cpu.mhz ? deviceInfo.data.cpu.mhz + ' MHz' : '未知'"></span>
+                </div>
+                <div class="flex gap-2">
+                  <span class="text-gray-500 w-24 shrink-0">架构</span>
+                  <span class="font-medium" x-text="deviceInfo.data.cpu.arch || '未知'"></span>
+                </div>
+              </div>
+            </div>
+
+            <!-- ── 内存与存储 ─────────────────────────────────── -->
+            <div class="bg-gray-50 border rounded-lg p-5 mb-6">
+              <h2 class="font-semibold mb-4">内存与存储</h2>
+
+              <div class="mb-5">
+                <div class="flex items-center justify-between text-sm mb-1">
+                  <span class="text-gray-500">物理内存</span>
+                  <span class="font-medium"
+                        x-text="fmtKb(deviceInfo.data.memory.total_kb) + '，已用 '
+                               + fmtKb(deviceInfo.data.memory.used_kb)"></span>
+                </div>
+                <div class="w-full bg-gray-200 rounded-full h-2 overflow-hidden">
+                  <div class="h-2 rounded-full"
+                       :class="usageColor(usagePercent(deviceInfo.data.memory.used_kb, deviceInfo.data.memory.total_kb))"
+                       :style="'width:' + (usagePercent(deviceInfo.data.memory.used_kb, deviceInfo.data.memory.total_kb) || 0) + '%'"></div>
+                </div>
+              </div>
+
+              <div>
+                <div class="flex items-center justify-between text-sm mb-1">
+                  <span class="text-gray-500">根分区</span>
+                  <span class="font-medium"
+                        x-text="fmtKb(deviceInfo.data.storage.total_kb) + '，已用 '
+                               + fmtKb(deviceInfo.data.storage.used_kb)"></span>
+                </div>
+                <div class="w-full bg-gray-200 rounded-full h-2 overflow-hidden">
+                  <div class="h-2 rounded-full"
+                       :class="usageColor(usagePercent(deviceInfo.data.storage.used_kb, deviceInfo.data.storage.total_kb))"
+                       :style="'width:' + (usagePercent(deviceInfo.data.storage.used_kb, deviceInfo.data.storage.total_kb) || 0) + '%'"></div>
+                </div>
+              </div>
+            </div>
+
+            <!-- ── 网络接口 ───────────────────────────────────── -->
+            <div class="bg-gray-50 border rounded-lg p-5 mb-6">
+              <h2 class="font-semibold mb-4">网络接口</h2>
+              <div x-show="!deviceInfo.data.interfaces || deviceInfo.data.interfaces.length === 0"
+                   class="text-sm text-gray-500">没有采集到对外接口</div>
+
+              <div class="overflow-x-auto">
+                <table class="w-full text-sm">
+                  <thead>
+                    <tr class="text-left text-gray-500 border-b">
+                      <th class="py-2 pr-4 font-normal">接口</th>
+                      <th class="py-2 pr-4 font-normal">状态</th>
+                      <th class="py-2 pr-4 font-normal">IPv4</th>
+                      <th class="py-2 pr-4 font-normal">IPv6</th>
+                      <th class="py-2 pr-4 font-normal text-right">已收</th>
+                      <th class="py-2 font-normal text-right">已发</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <template x-for="(iface, idx) in (deviceInfo.data.interfaces || [])" :key="idx">
+                      <tr class="border-b last:border-0">
+                        <td class="py-2 pr-4 font-medium" x-text="iface.name"></td>
+                        <td class="py-2 pr-4">
+                          <span class="inline-flex items-center gap-1">
+                            <span class="w-2 h-2 rounded-full inline-block"
+                              :class="iface.state === 'up' ? 'bg-green-500' : 'bg-gray-400'"></span>
+                            <span x-text="iface.state || '未知'"></span>
+                          </span>
+                        </td>
+                        <td class="py-2 pr-4 font-mono text-xs break-all"
+                            x-text="(iface.ipv4 || []).join(', ') || '—'"></td>
+                        <td class="py-2 pr-4 font-mono text-xs break-all"
+                            x-text="(iface.ipv6 || []).join(', ') || '—'"></td>
+                        <td class="py-2 pr-4 text-right text-gray-600"
+                            x-text="fmtBytes(iface.rx_bytes)"></td>
+                        <td class="py-2 text-right text-gray-600"
+                            x-text="fmtBytes(iface.tx_bytes)"></td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <p class="text-xs text-gray-500">
+              数据来自设备的 /proc 与 /etc，只读采集，不做任何修改。
+              读不到的项显示「未知」—— 面板不会用编出来的数字填补空缺。
+            </p>
+          </div>
+        </template>
       </div>
 
       <!-- ========== 网络接口 ========== -->

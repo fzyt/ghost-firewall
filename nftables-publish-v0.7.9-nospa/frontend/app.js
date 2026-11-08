@@ -68,6 +68,10 @@ function app() {
       // 不是把配置页全打乱（配置项之间的顺序是有含义的：
       // 网络接口 → 端口转发 → 信任IP 是「先有网、再有转发、再定谁能进」的链路）。
       { id: 'firewall-status', label: '防火墙状态', icon: '🛡️' },
+      // 「系统信息」紧跟在「防火墙状态」后面 ——
+      // 两者都是「看一眼设备现在怎么样」的状态页，不是配置项。
+      // 排在一起是因为用户排查时的顺序就是：设备本身 → 防火墙状态。
+      { id: 'system-info', label: '系统信息', icon: 'ℹ️' },
       { id: 'network', label: '网络接口' },
       { id: 'knock', label: '端口敲门' },
       { id: 'ports', label: '端口转发' },
@@ -163,6 +167,21 @@ function app() {
       rules_file: '',
       detail: '',
       watchdog: null,
+    },
+
+    // 设备基本信息（/api/system/info）。
+    //
+    // 为什么要单独一个页：面板此前**只展示「配置」和「状态」**，
+    // 从不展示「这台设备本身是什么样」—— 型号、固件版本、CPU、内存、
+    // 磁盘、开了多久、哪些接口。这些是排查问题的第一手事实：
+    // 用户报「面板打不开」时，第一句要问的就是「你这台什么设备、什么固件」。
+    //
+    // loaded 与 error 分开：查不到 ≠ 没加载。混为一谈会让用户以为设备坏了。
+    deviceInfo: {
+      loading: false,
+      loaded: false,
+      error: '',
+      data: null,
     },
 
     // 修改密码（/api/auth/change-password）。
@@ -1587,6 +1606,85 @@ function app() {
       } finally {
         this.rulesHealth.loading = false;
       }
+    },
+
+    // ── 设备基本信息 ────────────────────────────────────────────
+    async loadDeviceInfo() {
+      this.deviceInfo.loading = true;
+      this.deviceInfo.error = '';
+      try {
+        const d = await api.get('/api/system/info');
+        const info = unwrap(d);
+        // 整份替换而不是逐字段合并：后端可能新增字段，
+        // 合并会让旧字段的残值留在界面上。
+        this.deviceInfo = {
+          loading: false,
+          loaded: true,
+          error: '',
+          data: info || null,
+        };
+      } catch (e) {
+        this.deviceInfo = {
+          ...this.deviceInfo,
+          loading: false,
+          loaded: false,
+          error: e.message || '查询失败',
+        };
+      }
+    },
+
+    // ── 设备信息的展示辅助 ──────────────────────────────────────
+    //
+    // 「读不到」一律显示「未知」，**不显示 0** ——
+    // 内存 0 KB、磁盘 0 KB 会被误读成「设备没有内存」，
+    // 而真实情况是「这一项没采到」。
+    fmtKb(kb) {
+      if (kb === null || kb === undefined || isNaN(kb)) return '未知';
+      const n = Number(kb);
+      if (n < 1024) return n + ' KB';
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' MB';
+      return (n / 1024 / 1024).toFixed(2) + ' GB';
+    },
+
+    fmtBytes(b) {
+      if (b === null || b === undefined || isNaN(b)) return '未知';
+      const n = Number(b);
+      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+      let v = n;
+      let i = 0;
+      while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+      return (i === 0 ? v : v.toFixed(1)) + ' ' + units[i];
+    },
+
+    // 运行时间：秒 → 「3 天 4 小时 12 分」
+    fmtUptime(sec) {
+      if (sec === null || sec === undefined || isNaN(sec)) return '未知';
+      let s = Math.floor(Number(sec));
+      if (s < 0) return '未知';
+      const d = Math.floor(s / 86400);
+      const h = Math.floor((s % 86400) / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      const parts = [];
+      if (d) parts.push(d + ' 天');
+      if (h || d) parts.push(h + ' 小时');
+      parts.push(m + ' 分');
+      return parts.join(' ');
+    },
+
+    // 内存/磁盘占用百分比：算不出就返回 null（模板显示「未知」）
+    usagePercent(used, total) {
+      if (used === null || used === undefined || total === null || total === undefined) return null;
+      const t = Number(total);
+      if (!t) return null;
+      return Math.round(Number(used) / t * 100);
+    },
+
+    // 内存/磁盘占用条的颜色：超过 90% 标红，超过 75% 标黄
+    usageColor(pct) {
+      if (pct === null || pct === undefined) return 'bg-gray-300';
+      if (pct >= 90) return 'bg-red-500';
+      if (pct >= 75) return 'bg-amber-500';
+      return 'bg-green-500';
     },
 
     // ── 修改密码 ────────────────────────────────────────────────
