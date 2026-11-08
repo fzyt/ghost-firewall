@@ -3093,23 +3093,48 @@ def restore_config():
         except OSError as e:
             print(f'[WARN] restore_config 加锁失败（继续无锁恢复）: {e}', flush=True)
 
-        # 2. 先写临时文件再 replace：shutil.copy 是「边读边写」直接落到
-        #    CONFIG_PATH，中途失败/磁盘满会留下一个截断的 JSON。
+        # 2. 先写临时文件再 replace：直接往 CONFIG_PATH 写的话，中途失败/磁盘满
+        #    会留下一个截断的 JSON。
         #    而 load_config 遇到截断 JSON 会当损坏处理 → 备份成
         #    .corrupted.* 后**静默回落到 DEFAULT_CONFIG**，
         #    等于「恢复配置」反而把配置弄丢了。
         # 恢复用的 tmp：落盘那一刻就必须是 0640。
-        # shutil.copy 会先按 umask 建文件（默认 0644）拷完才 copystat ⇒ 有窗口。
-        # 顺序要紧：先用目标权限把 tmp 建好，再往里拷
+        # 直接 open(tmp,'w') 会按 umask 建文件（默认 0644）⇒ 有窗口。
+        # 顺序要紧：先用目标权限把 tmp 建好，再往里写
         # （open 对已存在文件只截断、不改权限 ⇒ 没有窗口）。
+        # ⚠️ **世代号必须从当前配置继承，不能从 backup 继承**（2026-11-08 真机 e2e 发现）
+        #
+        # auth_token_epoch 是**安全状态**而不是配置项：它只由改密码路径递增
+        # （_bump_token_epoch），通用 POST /api/config 改不了它 —— 本文件下方的
+        # READONLY 名单里就列着它。原来的实现是 shutil.copy(backup) 整份覆盖，
+        # 绕过了那道保护，于是「恢复配置」把 epoch 从 1 回退到 0。
+        #
+        # 两个方向的后果：
+        #   ① 当前会话立刻失效 —— 实测 .232：restore 之后所有 API 返回 401，
+        #      面板上所有操作按钮变成 disabled，用户被硬踢下线且前端不提示
+        #      （restoreConfig() 只是弹一句「配置已恢复」，看不出自己被踢了）。
+        #   ② 更严重：epoch 调小 = 撤销「改密码作废全部会话」的保证 ——
+        #      改密码之前签发的旧令牌会重新生效。
+        #
+        # 「恢复配置」恢复的是防火墙配置，不是安全状态，所以这里只恢复其余字段，
+        # 世代号保留当前值。
+        current_epoch = _current_token_epoch()
+        with open(backup_path, 'r') as f:
+            restored = json.load(f)      # 校验恢复出来的确实是完整 JSON
+        if not isinstance(restored, dict):
+            # 备份文件不是配置对象（被人手工改坏）⇒ 拒绝覆盖正式配置。
+            # 不加这一句，isinstance 失败会在下一行赋值时抛 TypeError，
+            # 虽然也被 except 兜住，但那时 tmp 已经被写过一轮，白折腾。
+            raise ValueError('备份文件内容不是配置对象')
+        restored['auth_token_epoch'] = current_epoch
+        # tmp 落盘那一刻就是 0640（_ensure_file_mode 先建好、open('w') 只截断
+        # 不改权限 ⇒ 没有「写完再 chmod」那个窗口）。
         _ensure_file_mode(tmp_path, _CONFIG_FILE_MODE)
-        shutil.copy(backup_path, tmp_path)
-        # copystat 会把**备份文件**的权限带过来；
-        # 备份文件要是被手工改宽了，恢复出来的主配置就跟着变宽 ——
-        # 主配置里有 DDNS token。落盘那一刻就钉死成 0640。
-        _ensure_file_mode(tmp_path, _CONFIG_FILE_MODE)
-        with open(tmp_path, 'r') as f:
-            json.load(f)          # 校验恢复出来的确实是完整 JSON
+        with open(tmp_path, 'w') as f:
+            json.dump(restored, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_path, _CONFIG_FILE_MODE)   # 重申（tmp 本来就是 0640），不是补救
         os.replace(tmp_path, CONFIG_PATH)
         return jsonify({"success": True, "message": "配置已恢复，请刷新页面"})
     except Exception as e:
