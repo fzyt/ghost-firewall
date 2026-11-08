@@ -1,0 +1,19 @@
+{
+  "_comment": [
+    "破坏性操作前的安全闸用的配置样本 —— 192.168.100.232 真机上的配置（2026-11-08 读取，已剔除敏感项）。",
+    "用途：precheck_generated_rules.py 用它生成规则集，检查生成的规则会不会把管理通道（SSH 22 / 面板 5443）一起关掉。",
+    "为什么需要它：.232 那类机器没有 WAN 网卡、没有带外通道（无串口/IPMI），",
+    "一旦 applyRules 把 fw4 表 flush 掉之后没放行 LAN 侧端口，就再也连不上了 —— 连收场的机会都没有。",
+    "lan_allowed_ports=[22,5443] 就是「放行管理通道」的那道保险，样本里必须保留它。",
+    "⚠️ 这份是**只读样本**，不是可以直接写回设备的配置：域名字段是脱敏后的，设备上的真实值以设备为准。"
+  ],
+  "lan_allowed_ports": [22, 5443],
+  "base_domain": "siyuan.fzyto.top",
+  "cookie_domain": ".siyuan.fzyto.top",
+  "gateway_port": 8443,
+  "auth_lan_bypass": true,
+  "trusted_ip4": "192.168.100.232",
+  "lan_subnet4": "192.168.100.0/24",
+  "lan_if": "br-lan",
+  "wan_if": "pppoe-wan"
+}
