@@ -185,6 +185,13 @@ frontend/
 └── assets/                       # 静态资源
 ```
 
+> 面板的**跟随鼠标动效**（追光 / 磁性按钮 / 倾斜卡片）已于 2026-11-08 移除 ——
+> 原 `frontend/fx.js` 整个引擎连同引用一并删除，页面不再挂 `pointermove`
+> 监听、也不再跑任何 rAF 循环。
+> 光源与卡片柔光**保留但固定不动**（CSS 变量的缺省值接管）。
+> ⚠ 另注：网关/门户侧的 `backend/static/fx.js`（背景变体引擎）更早就在
+> v0.18.0 删掉了，与面板这个 fx.js **是两回事**。
+
 > 面板与门户的像素场引擎是**同一份**源码（`backend/static/pixelfield.js`）：
 > 面板的静态服务在 `frontend/` 找不到时会**回退**到 `backend/static/` 取，
 > 但只放行白名单里的文件（见 `backend/app.py` 的 `SHARED_STATIC_FILES`）。

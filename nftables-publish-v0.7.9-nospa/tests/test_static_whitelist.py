@@ -96,7 +96,11 @@ def main():
     allow = app._static_path_allowed
 
     # 前端真正需要的资源类型必须放行（放行错了 = 前端白屏）
-    for good in ('index.html', 'app.js', 'fx.js', 'styles.css',
+    # ⚠ 2026-11-08：fx.js 已删（跟随鼠标的指针动效引擎整体移除）⇒ 不再列入。
+    #    放行判定看的是**扩展名**（.js 在白名单里），不是文件名，
+    #    所以文件删了 allow('fx.js') 仍会是 True —— 那不代表它还能被取到，
+    #    取不到是因为文件不存在（见下面的 404 断言）。
+    for good in ('index.html', 'app.js', 'pixelbg.js', 'styles.css',
                  'assets/alpine.js', 'assets/tailwind.js',
                  'assets/fonts/JetBrainsMono-Regular.ttf',
                  'assets/image-20260319104747-jbgsgdq.png'):
@@ -176,10 +180,29 @@ def main():
               f'实际 {r.status_code}')
 
     # 正常资源在已认证后照样能拿
-    for p in ('/app.js', '/styles.css', '/fx.js'):
+    for p in ('/app.js', '/styles.css', '/pixelbg.js'):
         r = client.get(p)
         check(f'已认证 GET {p} 正常返回', r.status_code == 200,
               f'实际 {r.status_code}')
+
+    # ── 已删除的资源不许复活（2026-11-08）────────────────────
+    # fx.js 是「跟随鼠标的指针动效引擎」，2026-11-08 整个删掉。
+    # 这里钉两条：
+    #   ① 文件真的不在磁盘上（否则可能从别处被复制回来）
+    #   ② 取不到（404）—— 放行判定只看扩展名，.js 在白名单里，
+    #      所以「路径格式合法」不等于「能取到内容」；
+    #      真正拦住的是文件不存在。
+    check('fx.js 已从磁盘删除（指针动效引擎整体移除）',
+          not os.path.isfile(os.path.join(FRONTEND, 'fx.js')))
+    r = client.get('/fx.js')
+    check('已认证 GET /fx.js 取不到（文件已删，不是白名单拦的）',
+          r.status_code == 404, f'实际 {r.status_code}')
+    # ⚠ 判的是**引用形式** src="/fx.js"，不是裸字符串 "fx.js" ——
+    #   index.html 里有一行注释写明「原 frontend/fx.js 整个引擎一并删掉了」，
+    #   那是说明文字，裸字符串判断会假红。
+    _idx = open(os.path.join(FRONTEND, 'index.html'), encoding='utf-8').read()
+    check('index.html 不再引用 fx.js（没有死链）',
+          'src="/fx.js"' not in _idx)
 
     r = client.get('/assets/fonts/JetBrainsMono-Regular.ttf')
     check('已认证 GET 字体文件正常返回', r.status_code == 200,

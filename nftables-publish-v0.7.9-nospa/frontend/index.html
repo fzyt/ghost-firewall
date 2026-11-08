@@ -16,7 +16,11 @@
 
   <script src="/assets/tailwind.js"></script>
   <script defer src="/assets/alpine.js"></script>
-  <script defer src="/fx.js"></script>
+  <!-- 跟随鼠标的指针动效（追光 / 磁性按钮 / 倾斜卡片）已于 2026-11-08 移除。
+       原 frontend/fx.js 整个引擎连同本行引用一并删掉了。
+       页面上的光源与柔光**保留但固定不动** —— styles.css 里这些效果用的
+       CSS 变量都带缺省值（--lx: 50vw / --mx: 50% / --mag-x: 0px / --tilt-x: 0deg），
+       引擎不在时就是静态效果，不会闪、不会报错。 -->
   <!-- 像素场背景（2026-11-04，与服务门户同一套引擎 + 同一份候选表）。
        ⚠️ pixelfield.js **不在** frontend/ 里：它与门户共用 backend/static/ 下
        的一份源码（146KB / 2700+ 行），面板的静态服务回退到那里取 ——

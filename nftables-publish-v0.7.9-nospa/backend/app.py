@@ -11400,7 +11400,7 @@ def rp_detect_protocol_relative():
 #
 # 为什么需要「预设」而不是让用户自己填一条反代规则：
 #   面板的 API 路径是**根绝对**的（/api/config、/api/auth/login…），
-#   静态资源也是根绝对（/styles.css、/assets/*、/app.js、/fx.js）。
+#   静态资源也是根绝对（/styles.css、/assets/*、/app.js、/pixelbg.js）。
 #   ⇒ 走路径前缀入口（/fw/）时，浏览器会把这些请求解析到**网关的根路径**上，
 #     而不是 /fw/ 下面 ⇒ 页面能打开、数据接口全 404。
 #   修法是网关的路径改写（生成器里本来就有这两个开关）：
