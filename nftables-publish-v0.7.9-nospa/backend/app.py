@@ -5957,12 +5957,35 @@ def _manage_ddns_cron(config):
     cron_entry = "*/10 * * * * /opt/nftables-web-v2/aliyun-ddns-update.py"
     has_enabled = any(rec.get("enabled") for rec in config.get("records", []))
 
-    # 读取当前 crontab（crontab -l 在无 crontab 时返回非 0，属正常情况）
+    # 读取当前 crontab
+    #
+    # ⚠️ fail-closed：读不到 crontab 就**不要写**（P0-10 的同型残留，
+    # 2026-11-08 面板侧 53 条静态判定对账时坐实）。
+    #
+    # 原来这里是
+    #     current_crontab = result.stdout if result.returncode == 0 else ""
+    # —— 读失败被当成「crontab 本来就是空的」，于是后面的 `crontab -`
+    # 拿「只有 DDNS 那一条」（甚至一条都没有）覆盖整个 root crontab：
+    # `/etc/init.d/acme renew` 与 `/opt/nftables-web/renew-certs.sh`
+    # 双双被抹，而接口照样返回「配置已保存」。
+    #
+    # P0-10 当年修了 `_upsert_cron_for()` 与 `install_china_ips()` 两处，
+    # **漏了这一处**。三处里只有这里用双引号写 `["crontab", "-l"]`，
+    # 另外两处是单引号 `['crontab', '-l']` 且带 returncode 检查 ——
+    # 引号风格的差异正好标出了这处没跟上 P0-10。
+    #
+    # 触发条件是**运维故障**（spool 被删/损坏、磁盘异常、crontab 被 shadow），
+    # 不需要攻击者参与，也不会有任何人察觉。
     try:
         result = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=10)
-        current_crontab = result.stdout if result.returncode == 0 else ""
-    except Exception:
-        current_crontab = ""
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as e:
+        return False, f"读取 crontab 失败，已中止（未做任何修改）: {e}"
+    if result.returncode != 0:
+        return False, (f"读取 crontab 失败，已中止（未做任何修改）: "
+                       f"{(result.stderr or result.stdout).strip()}"
+                       f"（若本机确实一条 cron 都没有，请先手工 `crontab -` 建一条，"
+                       f"再来保存）")
+    current_crontab = result.stdout
 
     # 删除旧的 DDNS cron 条目
     lines = [line for line in current_crontab.splitlines()
