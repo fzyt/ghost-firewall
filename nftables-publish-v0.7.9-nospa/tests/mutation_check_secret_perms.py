@@ -100,10 +100,25 @@ MUTATIONS = [
      [('        _ensure_file_mode(CONFIG_PATH + \'.backup\', _CONFIG_FILE_MODE)\n',
        '', 0, 'all')]),
 
-    ('M10 恢复用的 tmp 不预建权限（shutil.copy 按 umask 建 ⇒ 先 0644）',
-     [('        _ensure_file_mode(tmp_path, _CONFIG_FILE_MODE)\n'
-       '        shutil.copy(backup_path, tmp_path)',
-       '        shutil.copy(backup_path, tmp_path)', 0, 1)]),
+    # ⚠️ 2026-11-08：这条的锚点跟着 restore_config 的实现改过一次。
+    # 原来的锚点是「_ensure_file_mode(tmp_path, ...) 紧跟 shutil.copy(backup_path, tmp_path)」
+    # —— 2026-11-08 修了「恢复配置回退 auth_token_epoch」之后，restore 路径不再
+    # 整份拷贝 backup，改成「读 JSON → 改世代号 → 写 tmp」，两行锚点就失配了，
+    # 变异被**静默跳过**（扫描器报「锚点未命中」，当失败处理才没被当成通过）。
+    #
+    # 这条变异本身**依然有意义**：restore 路径现在用
+    # 「_ensure_file_mode 先建好 tmp(0640) → open('w') 只截断不改权限」落盘，
+    # 去掉 _ensure_file_mode 就会按 umask 建出 0644 的 tmp ⇒ 落盘有可读窗口。
+    # 所以保留这条，只把锚点挪到 restore_config 里独有的那一处
+    # （用 restored['auth_token_epoch'] 这行定位，避免和 save_config 的同形代码撞）。
+    ('M10 恢复用的 tmp 不预建权限（open 按 umask 建 ⇒ 先 0644）',
+     [('        restored[\'auth_token_epoch\'] = current_epoch\n'
+       '        # tmp 落盘那一刻就是 0640（_ensure_file_mode 先建好、open(\'w\') 只截断\n'
+       '        # 不改权限 ⇒ 没有「写完再 chmod」那个窗口）。\n'
+       '        _ensure_file_mode(tmp_path, _CONFIG_FILE_MODE)',
+       '        restored[\'auth_token_epoch\'] = current_epoch\n'
+       '        # tmp 落盘那一刻就是 0640（_ensure_file_mode 先建好、open(\'w\') 只截断\n'
+       '        # 不改权限 ⇒ 没有「写完再 chmod」那个窗口）。\n', 0, 1)]),
 
     ('M11 _ensure_file_mode 整体退化：不再预建文件（只剩事后 chmod）',
      [('        fd = os.open(path, os.O_CREAT | os.O_WRONLY, mode)\n'
