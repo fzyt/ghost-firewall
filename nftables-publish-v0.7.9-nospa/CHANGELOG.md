@@ -2,6 +2,69 @@
 
 所有重要更改均记录在此文件中。
 
+## [v0.19.7] - 2026-11-09
+
+**`.232` 真机重新上线后的核验轮：修掉两处新缺陷 —— 一处是安全闸对真实设备误报
+（破坏性档在默认配置的机器上永远跑不了），一处是系统信息页把 IPv6 链路本地地址吞掉。**
+
+---
+
+## 一、D1：安全闸只认一种放行形态 ⇒ 默认配置的机器上破坏性档永远跑不了
+
+| 项 | 内容 |
+|---|---|
+| 现象 | `tests/precheck_generated_rules.py` 对 `.232` **当前生效**的规则文件判「管理通道没有保障」，退出码 1 |
+| 根因 | 闸门只认「形态 A」：LAN 链里显式的 `iifname $LAN_IF tcp dport { 22, 5443 } accept`；而 `.232` 跑的是 **LAN 模式**（`access_mode: "lan"`），模板生成的是「形态 B」——`meta nfproto ipv4 accept`（LAN 侧整片放行） |
+| 为什么严重 | `app.py` 的 `DEFAULT_CONFIG["access_mode"]` 默认值就是 `"lan"` ⇒ **默认配置的机器上闸门永远判 FAIL** ⇒ 破坏性档永远跑不了，闸门形同虚设 |
+| 为什么没早发现 | 上一轮 9.1「安全前提已验证」**验错了对象**：验的是 fixture 生成的规则，而 fixture 缺 `access_mode` 键 ⇒ 「键缺失 → trusted」⇒ 生成的是形态 A，压根不是设备真实生效的那份 |
+
+修法（`tests/precheck_generated_rules.py`）：
+
+- 新增「形态 B」识别：链内整行精确匹配 `meta nfproto ipv4 accept` / `accept` / `iifname $LAN_IF accept`
+- 明确排除：`meta nfproto ipv6 accept`（IPv6 不覆盖 IPv4 的 SSH/面板）、`ip saddr <某IP> accept`（只放行一个源地址）
+- 丢弃规则识别从「行首就是 `meta nfproto ipv4 drop`」放宽为「**行尾是 drop**」（`meta nfproto ipv4 log prefix "..." drop` 同样是丢弃），排序检查对两种形态都做
+- 样本配置 `tests/fixtures/lan232-config.json` 补上 `"access_mode": "lan"`（对齐设备实况），并在注释里写明「漏掉这个键会走另一条分支，安全闸验的就不是设备真实生效的规则」
+
+验证：安全闸对 `.232` 真规则文件判 **PASS（退出码 0）**；运行时 `nft list ruleset` 复核 `input_lan` 链尾确实是 `meta nfproto ipv4 accept`。
+行为级测试 13 → **28 项**（形态 A / 形态 B 各一套好坏例）；变异脚本 8 → **13 条**（新增 P9~P13），**13/13 全捕获**。
+
+## 二、D2：IPv6 采集把 scope 当成 flags ⇒ 链路本地地址被整条吞掉
+
+| 项 | 内容 |
+|---|---|
+| 现象 | 面板系统信息页 `.232` 的 `br-lan` 显示 `ipv6: null`，设备上明明有 `fe80::be24:11ff:fe48:325b/64` |
+| 根因 1 | `/proc/net/if_inet6` 的列是「地址 / ifindex / 前缀长度 / **scope** / **flags** / 接口名」（Linux v6.12 `net/ipv6/addrconf.c` 的 `if6_seq_show`），代码把**第 4 列 scope 当成了 flags** ⇒ 链路本地地址的 scope=`0x20`（`RT_SCOPE_LINK`）命中「临时地址」判断 ⇒ 整条丢弃 |
+| 根因 2 | 临时/隐私地址的位是 **`0x01`**（`IFA_F_TEMPORARY`，`include/uapi/linux/if_addr.h`），代码用的是 `0x20` —— 而 `0x20` 是 `IFA_F_DEPRECATED`（已弃用）⇒ 原实现是「已弃用的被丢弃、真正的隐私地址反而留着」 |
+| 为什么没早发现 | 现有测试 `test_temporary_address_excluded` **把这个 bug 锁成了「预期行为」**（注释还写着「0x20 = 临时地址」）——测试是照着实现写的，不是照着内核格式写的；开发机上的地址都是全局地址（scope=0x00）⇒ 不会被误吞 |
+
+修法（`backend/device_info.py` 的 `_ipv6_by_iface`）：按内核真实列位取值；临时地址判 `flags & 0x01`；注释里写明每一列的含义与位定义出处。
+
+测试：`tests/test_device_info.py` 把原来锁 bug 的用例改掉，并补三个用例（链路本地地址**必须**展示 / `flags=0x01` 的隐私地址不展示 / `flags=0x20` 的**已弃用**地址不是临时地址、要展示）；新增 `tests/mutation_check_device_info_ipv6.py`（5 条变异，**5/5 全捕获**）。
+
+## 三、本轮质量门
+
+| 项 | 数字 |
+|---|---|
+| 全量回归（`tests/run_all.sh --skip-mutation`） | **3853 项断言 / 0 失败**，源码指纹一致（本批 +18） |
+| 全仓隔离变异扫描 | **捕获 720 / 漏网 0 / 锚点未命中 0 / 跳过 0**，42 个脚本全部 [OK]，另 3 条等价变异 ⇒ 声明总数 ≈ **723**（上一轮 710 ⇒ +10，正好是本批新增的 10 条） |
+| 门户脚本（6 份独立副本） | 223 条，捕获 223 / 漏网 0 |
+
+⚠️ 第一遍扫描曾出现一个 `[BAD] mutation_check_p0_fixes.py`（四列全 0），
+查下来是**工具竞态、不是缺陷**：隔离扫描器启动时会把仓库拷成初始快照，
+而那一刻上一轮「在仓库里原地跑变异」的回归还没死透，
+它的 P0-9 变异正好落在 `backend/app.py` 上被快照拷了进去。
+无并发重跑后 42 个脚本全部 [OK]（p0_fixes 25/25）。
+⇒ 已给隔离扫描器加**启动前并发检查**：发现真实仓库里有变异脚本在跑就拒绝启动。
+
+## 四、本轮真机核验的其它结论（不是缺陷）
+
+- 系统信息页其余字段与设备六份命令输出**逐项一致**（`/etc/openwrt_release`、`free -m`、`df -h /`、`uptime`、`ip addr`、`ip link`）
+- 内存口径核对清楚：`free_kb` = `/proc/meminfo` 的 `MemAvailable`，`used_kb` = `MemTotal - MemAvailable`（与 `free -k` 的 `available` 列同源；两次采集间隔几十秒 ⇒ 几百 KB 浮动属正常）
+- 上一轮「调研报告 6.3」的 9 项信息面核对全部完成，`/etc/board.json` 假设被证伪（真实结构只有 `model` + `network`，**没有** `system` 对象）
+- `/etc/os-release` 分支仍被 `/etc/openwrt_release` 短路 ⇒ 固件身份字段（OPENWRT_BOARD / BUILD_DATE / FIRMWARE_URL）**没有**进面板 —— 本轮**未做**（属功能增强，不是缺陷）
+
+---
+
 ## [v0.19.6] - 2026-11-08
 
 **修掉「面板侧 53 条静态判定对账」挖出的三处残留（C2 / C3 / C4）。

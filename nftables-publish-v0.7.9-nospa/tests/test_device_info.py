@@ -13,7 +13,7 @@
 所以测试不是「断言本机采集到了什么」，而是**拿构造出来的 proc 文本喂进去**，
 断言解析结果 —— 这样每个坑都有对应的回归。
 
-本轮实际踩到并修掉的四个坑
+本轮实际踩到并修掉的五个坑
 --------------------------
   1. `/proc/net/route` 的地址是**小端**字节序（`0064A8C0` = 192.168.100.0）。
      按大端解析 ⇒ 网段变成 `0.100.168.192/24` ⇒ IPv4 一个都匹配不上。
@@ -23,6 +23,9 @@
      地址在上面那行。按「host LOCAL 行自己就是地址」去 split ⇒ body 是空串。
   4. `Main:` 是 `/proc/net/fib_trie` 的**第一行**，不是中间的分节。
      按「先找 Main: 再往下读」写 ⇒ 永远进不去 Main 表。
+  5. `/proc/net/if_inet6` 的**第 4 列是 scope，不是 flags**（2026-11-09 真机实测）。
+     把 scope 当 flags 读 ⇒ 链路本地地址（scope=0x20）被当成「临时地址」丢弃
+     ⇒ 面板上 IPv6 一栏永远空。临时地址的位是 **0x01**，0x20 是「已弃用」。
 
 沙箱：不读真设备的 proc 文件（用假的文本喂），也不碰网络。
 """
@@ -77,6 +80,14 @@ fda768ee7b990000be2411fffef80e48 02 40 00 00    ens18
 fe80000000000000be2411fffef80e48 02 40 20 80    ens18
 00000000000000000000000000000001 01 80 10 80       lo
 """
+
+# flags 列 = 0x01 ⇒ IFA_F_TEMPORARY（RFC 4941 隐私地址）⇒ 不展示
+IF_INET6_TEXT_WITH_TEMP = IF_INET6_TEXT + \
+    "240e039048c424c0be2411fffef80e49 02 40 00 01    ens18\n"
+
+# flags 列 = 0x20 ⇒ IFA_F_DEPRECATED（已弃用）⇒ **不是**临时地址 ⇒ 要展示
+IF_INET6_TEXT_WITH_DEPRECATED = IF_INET6_TEXT + \
+    "240e039048c424c0be2411fffef80e4a 02 40 00 20    ens18\n"
 
 
 class TestHexConversion(unittest.TestCase):
@@ -184,33 +195,67 @@ class TestIPv4ByIface(unittest.TestCase):
 
 
 class TestIPv6ByIface(unittest.TestCase):
-    """`/proc/net/if_inet6` 解析。"""
+    """`/proc/net/if_inet6` 解析。
 
-    def test_parses_and_groups_by_iface(self):
+    ⚠️ 2026-11-09 真机实测（.232）又抓到一个坑，列的**位置**搞错了：
+
+    `/proc/net/if_inet6` 的六列是「地址 / ifindex / 前缀长度 / **scope** /
+    **flags** / 接口名」（Linux v6.12 `net/ipv6/addrconf.c` 的 `if6_seq_show`）。
+    原来把第 4 列（scope）当 flags 读 ⇒ 链路本地地址的 scope=0x20
+    （RT_SCOPE_LINK）命中「临时地址」判断 ⇒ fe80:: 被整条丢弃
+    ⇒ 面板上 IPv6 一栏永远空。
+
+    临时/隐私地址的位是 **0x01**（IFA_F_TEMPORARY）；0x20 是「已弃用」。
+    """
+
+    def _collect(self, text):
         orig = device_info._read_text
         device_info._read_text = lambda path, limit=200000: (
-            IF_INET6_TEXT if path == '/proc/net/if_inet6' else orig(path, limit))
+            text if path == '/proc/net/if_inet6' else orig(path, limit))
         try:
-            out = device_info._ipv6_by_iface()
+            return device_info._ipv6_by_iface()
         finally:
             device_info._read_text = orig
+
+    def test_parses_and_groups_by_iface(self):
+        out = self._collect(IF_INET6_TEXT)
         self.assertIn('ens18', out)
         # 用 inet_ntop 的实际格式断言：单个 0 组不会被省略成 ::
         # （'fda7:68ee:7b99:0:...' 而非 'fda7:68ee:7b99::...'）
         self.assertIn('fda7:68ee:7b99:0:be24:11ff:fef8:e48', out['ens18'])
         self.assertIn('lo', out)
 
+    def test_link_local_address_is_shown(self):
+        """链路本地地址（fe80::）**必须**展示。
+
+        它是这个接口上真实存在的地址，藏起来等于告诉用户「这机器没有 IPv6」。
+        真机 .232 上 br-lan 就只有这一个 IPv6（`fe80::be24:11ff:fe48:325b`），
+        藏掉它 ⇒ 面板的 IPv6 一栏永远是空的。
+        """
+        out = self._collect(IF_INET6_TEXT)
+        self.assertIn('fe80::be24:11ff:fef8:e48', out['ens18'])
+
+    def test_scope_column_is_not_mistaken_for_flags(self):
+        """scope=0x20（链路本地）不是「临时地址」标志 ⇒ 不能因此丢地址。"""
+        out = self._collect(IF_INET6_TEXT)
+        # 同一行里 scope=0x20 / flags=0x80 ⇒ 地址必须在
+        self.assertEqual(len(out['ens18']), 3)
+
     def test_temporary_address_excluded(self):
-        """标志 0x20 = 临时地址（隐私地址），不展示。"""
-        orig = device_info._read_text
-        device_info._read_text = lambda path, limit=200000: (
-            IF_INET6_TEXT if path == '/proc/net/if_inet6' else orig(path, limit))
-        try:
-            out = device_info._ipv6_by_iface()
-        finally:
-            device_info._read_text = orig
+        """flags=0x01（IFA_F_TEMPORARY，隐私地址）不展示。"""
+        out = self._collect(IF_INET6_TEXT_WITH_TEMP)
         for addrs in out.values():
-            self.assertNotIn('fe80::be24:11ff:fef8:e48', addrs)
+            self.assertNotIn('240e:390:48c4:24c0:be24:11ff:fef8:e49', addrs)
+
+    def test_deprecated_address_is_not_temporary(self):
+        """flags=0x20 是 IFA_F_DEPRECATED（已弃用），**不是**临时地址 ⇒ 要展示。
+
+        这条专门盯「临时位用错」的退化：0x20 一旦被当成临时位，
+        已弃用的地址就会被丢掉；反过来真正的隐私地址（0x01）会漏出来。
+        """
+        out = self._collect(IF_INET6_TEXT_WITH_DEPRECATED)
+        self.assertIn('240e:390:48c4:24c0:be24:11ff:fef8:e4a', out['ens18'])
+        self.assertEqual(len(out['ens18']), 4)
 
 
 class TestCollectAllNeverRaises(unittest.TestCase):

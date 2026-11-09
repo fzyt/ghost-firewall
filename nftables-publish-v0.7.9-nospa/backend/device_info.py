@@ -333,8 +333,34 @@ def collect_interfaces():
 def _ipv6_by_iface():
     """`/proc/net/if_inet6` → {接口名: [地址, ...]}。
 
-    格式：地址(32位十六进制) 作用域 前缀长度 标志 接口名
-    标志第 2 位为 0x20 的是临时地址（不显示，那是隐私地址）。
+    格式（Linux v6.12 `net/ipv6/addrconf.c` 的 `if6_seq_show`）：
+
+        seq_printf(seq, "%pi6 %02x %02x %02x %02x %8s\\n",
+                   &ifp->addr, ifindex, prefix_len, scope, flags, devname);
+
+    ⇒ 六个列依次是：**地址 / ifindex / 前缀长度 / scope / flags / 接口名**。
+
+    ⚠️ 2026-11-09 真机实测（.232）抓到的坑：**第 4 列是 scope，不是 flags**。
+    原来取的是 parts[3]（scope）⇒ 链路本地地址的 scope=0x20（RT_SCOPE_LINK）
+    命中「临时地址」判断 ⇒ **fe80:: 被整条丢弃** ⇒ 面板上 IPv6 一栏永远空。
+    开发机上看不出来，是因为本机的地址都是全局地址（scope=0x00）。
+
+    flags 的位定义（`include/uapi/linux/if_addr.h`）：
+
+        0x01 IFA_F_TEMPORARY  临时/隐私地址（不展示）
+        0x02 IFA_F_NODAD
+        0x04 IFA_F_OPTIMISTIC
+        0x08 IFA_F_DADFAILED
+        0x10 IFA_F_HOMEADDRESS
+        0x20 IFA_F_DEPRECATED  已弃用（**不是**临时地址）
+        0x40 IFA_F_TENTATIVE   DAD 未完成
+        0x80 IFA_F_PERMANENT   永久
+
+    ⚠️ 临时地址的位是 **0x01**，不是 0x20（0x20 是「已弃用」）。
+    原来用 0x20 判临时 ⇒ 已弃用的地址被丢弃、真正的隐私地址反而留着。
+
+    ⚠️ 只跳过「临时/隐私」这一类：已弃用（0x20）和 DAD 未完成（0x40）的地址
+    仍然是这个接口上真实存在的地址，展示出来比藏起来有用。
     """
     out = {}
     txt = _read_text('/proc/net/if_inet6', 65536)
@@ -344,10 +370,10 @@ def _ipv6_by_iface():
         parts = line.split()
         if len(parts) < 6:
             continue
-        hex_addr, _scope, _prefix, flags, iface = parts[0], parts[1], parts[2], parts[3], parts[5]
-        # 0x20 = temporary（RFC 4941 隐私地址），不展示
+        hex_addr, _ifindex, _prefix_len, _scope, flags, iface = parts[:6]
+        # 0x01 = IFA_F_TEMPORARY（RFC 4941 隐私地址）—— 不展示
         try:
-            if int(flags, 16) & 0x20:
+            if int(flags, 16) & 0x01:
                 continue
         except ValueError:
             pass

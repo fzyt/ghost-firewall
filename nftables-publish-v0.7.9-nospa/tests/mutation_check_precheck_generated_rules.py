@@ -23,6 +23,16 @@
   P6  端口匹配用子串（220 命中 22 ⇒ 没放行 22 也算放行了）
   P7  退回「任一管理端口被放行就算过」（只放行 22、面板进不去也判 PASS）
   P8  链解析只取第一行（后面的规则根本读不到）
+  P9  摘掉「LAN 侧整片放行」（形态B）的识别
+  P10 形态B 把 IPv6 整片放行也当成覆盖 IPv4
+  P11 丢弃规则只认「行首就是 meta nfproto ipv4 drop」（漏掉带日志的 drop）
+  P12 源地址受限的放行也算整片放行
+  P13 「跳到 LAN 链」的检查被放宽（跳到别的链也算数）
+
+P9~P13 是 2026-11-09 加的：那天发现安全闸只认形态A（显式 dport 放行），
+而 .232 真机跑的是形态B（LAN 侧整片放行）⇒ 闸门对默认配置的机器永远判 FAIL。
+修好之后，必须用变异证明「这次不是把闸门改松了」——
+上面每一条都是往「误判 PASS」的方向改。
 
 保险丝：只备份 / 还原**我自己会改的那一个文件**
 （tests/precheck_generated_rules.py），不碰别人的文件。
@@ -89,10 +99,13 @@ MUTATIONS = [
      [('    jump_ok = bool(jumps)', '    jump_ok = True')]),
 
     ('P2  摘掉「放行全部管理端口」的检查',
-     [('    allow_ok = (covered == set(MGMT_PORTS))', '    allow_ok = True')]),
+     [('    allow_ok = bool(blanket) or (covered == set(MGMT_PORTS))',
+       '    allow_ok = True')]),
 
     ('P3  摘掉「放行要排在丢弃规则之前」的检查',
-     [('        order_ok = max(i for i, _, _ in mgmt_allow) < drop_at',
+     [('        order_ok = min(i for i, _ in blanket) < drop_at',
+       '        order_ok = True'),
+      ('        order_ok = max(i for i, _, _ in mgmt_allow) < drop_at',
        '        order_ok = True')]),
 
     ('P4  摘掉「define LAN_IF 要与设备网卡名一致」的检查',
@@ -108,12 +121,33 @@ MUTATIONS = [
        r"    return re.search(r'%d' % port, line) is not None")]),
 
     ('P7  退回「任一管理端口被放行就算过」',
-     [('    allow_ok = (covered == set(MGMT_PORTS))',
+     [('    allow_ok = bool(blanket) or (covered == set(MGMT_PORTS))',
        '    allow_ok = bool(covered)')]),
 
     ('P8  链解析只取第一行',
      [('        if depth == 0 and len(out) > 1:\n            break',
        '        if len(out) > 1:\n            break')]),
+
+    ('P9  摘掉「LAN 侧整片放行」（形态B）的识别',
+     [(r"re.compile(r'^meta\s+nfproto\s+ipv4\s+accept$')",
+       r"re.compile(r'^__never_matches__$')")]),
+
+    ('P10 形态B 把 IPv6 整片放行误当成覆盖 IPv4',
+     [(r"re.compile(r'^meta\s+nfproto\s+ipv4\s+accept$')",
+       r"re.compile(r'^meta\s+nfproto\s+ipv6\s+accept$')")]),
+
+    ('P11 丢弃规则只认「行首就是 meta nfproto ipv4 drop」',
+     [("    drop_at = None\n    for i, c in lan_code:\n        if DROP_RE.search(c):",
+       "    drop_at = None\n    for i, c in lan_code:\n        if c.startswith('meta nfproto ipv4 drop'):")]),
+
+    ('P12 源地址受限的放行也算整片放行',
+     [(r"re.compile(r'^meta\s+nfproto\s+ipv4\s+accept$')",
+       r"re.compile(r'^meta\s+nfproto\s+ipv4\s+accept$')\n    "
+       r"re.compile(r'^ip\s+saddr\s+.*\s+accept$')")]),
+
+    ('P13 「跳到 LAN 链」的检查被放宽（跳到别的链也算数）',
+     [("    jumps = [l.strip() for l in input_chain if 'jump' in l and 'LAN_IF' in l]",
+       "    jumps = [l.strip() for l in input_chain if 'jump' in l]")]),
 ]
 
 
@@ -152,8 +186,11 @@ def main():
                 f.write(mutated)
             rc, out = run_tests()
             if rc != 0:
+                # 证据行只取**真的失败**的断言行：
+                # 测试的用例名里本身就带 '[FAIL]' 字样（例如「输出里没有 [FAIL]」），
+                # 只按 '[FAIL] in line' 找会把这种**通过**的行当成失败证据打印出来。
                 first = next((l.strip() for l in out.splitlines()
-                              if '[FAIL]' in l), '')
+                              if '[FAIL]' in l and '[PASS]' not in l), '')
                 print('  [PASS] %s  —— 被捕获' % name)
                 if first:
                     print('      ↓ %s' % first)
