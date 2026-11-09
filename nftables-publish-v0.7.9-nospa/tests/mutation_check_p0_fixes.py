@@ -292,8 +292,18 @@ def run_tests():
     return failed, "\n".join(chunks)
 
 
+def _sha(path):
+    import hashlib
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()[:16]
+
+
 def main():
     MutationGuard(ROOT).snapshot()   # 保险丝：中断也会还原源码
+    # 基线指纹：还原后要拿它**比对**，而不是只把哈希印出来给人看
+    # （2026-11-09 加：原来只 print sha256，没有任何比较 ⇒
+    #  「没还原干净」和「测试假红」两种情况长得一模一样，没法区分）
+    _baseline = {p: _sha(p) for p in (APP, AG, TE)}
     print("=" * 74)
     print("变异验证：Shannon 渗透测试 P0 修复（v0.8.7）")
     print("=" * 74)
@@ -354,12 +364,28 @@ def main():
 
     print("\n[2] 还原校验：源码必须与变异前逐字节一致")
     import hashlib
+    _diff = []
     for p in (APP, AG, TE):
         h = hashlib.sha256(open(p, "rb").read()).hexdigest()[:16]
-        print(f"    {os.path.relpath(p, ROOT)}  sha256={h}")
+        same = (h == _baseline[p])
+        print(f"    {os.path.relpath(p, ROOT)}  sha256={h}"
+              f"  {'（与基线一致）' if same else '（⚠️ 与基线不一致！）'}")
+        if not same:
+            _diff.append(os.path.relpath(p, ROOT))
     failed, out = run_tests()
     if failed:
-        print("    ❌ 还原后测试仍不绿，源码可能没还原干净")
+        if _diff:
+            print(f"    ❌ 还原后测试仍不绿，**且源码没还原干净**：{', '.join(_diff)}")
+        else:
+            print("    ❌ 还原后测试仍不绿（源码已逐字节还原 ⇒ 是**测试假红**，不是变异残留）")
+            # ⚠️ 必须把**哪条断言红了**打出来（2026-11-09 加）：
+            #   原来只报一句「仍不绿」，排查时完全无从下手 ——
+            #   而这一条是**偶发**的（2026-11-09 在全仓扫描里出现过两次：
+            #   单独跑 3 轮 + 6 份并发都绿 ⇒ 只在满负载下出现）。
+            #   打出失败断言，才能判断是测试本身的抖动还是别的。
+            for _ln in out.splitlines():
+                if '❌' in _ln or 'Traceback' in _ln:
+                    print('      | ' + _ln[:160])
         return 1
     print("    ✅ 还原后测试恢复全绿")
 
