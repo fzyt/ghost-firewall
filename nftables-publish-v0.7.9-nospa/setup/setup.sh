@@ -2252,6 +2252,58 @@ setup_service() {
 }
 
 # ============================================================
+# 遗留备份的归位
+# ============================================================
+#
+# 为什么需要这一步：
+#   2026-11-10 在 .232 真机上发现 /etc/init.d/ 里躺着一个
+#   `nftables-web.bak.1793432750` —— 旧版 init 脚本的副本。
+#   它是 10-31 一次手工升级留下的（**当前 setup.sh 并不生成它**），
+#   但它躺在系统目录里，两个问题：
+#     · /etc/init.d 是系统目录，项目把自己的备份放这儿是越界；
+#     · 「装了什么服务」的判断会把它扫进去 ⇒ 面板的服务清单里
+#       多出一个不存在的服务（本轮已在采集器里加了一道过滤，
+#       但根子上的清理还是要做）。
+#
+# 挪到哪：${CONFIG_DIR}/backup/ —— 项目自己的目录。
+# 为什么不是删：备份的价值在于「万一要回滚」；删了就找不回来了。
+#
+# ⚠️ 只动**普通文件**，不动目录与软链：
+#   正常情况下 /etc/init.d 里可能有软链（某些发行版用它做开关），
+#   乱动会直接把服务弄坏。
+relocate_initd_backups() {
+    local moved=0
+    local f base
+    if [ ! -d /etc/init.d ]; then
+        return 0
+    fi
+    if ! mkdir -p "${CONFIG_DIR}/backup"; then
+        warn "⚠️ 建不出 ${CONFIG_DIR}/backup，遗留备份保持原样"
+        return 0
+    fi
+    chmod 700 "${CONFIG_DIR}/backup" 2>/dev/null || true
+    for f in /etc/init.d/*.bak*; do
+        if [ ! -e "$f" ]; then
+            continue
+        fi
+        if [ ! -f "$f" ] || [ -L "$f" ]; then
+            continue
+        fi
+        base="$(basename "$f")"
+        if mv "$f" "${CONFIG_DIR}/backup/" 2>/dev/null; then
+            moved=$((moved + 1))
+            ok "遗留备份已归位: ${base} → ${CONFIG_DIR}/backup/"
+        else
+            warn "⚠️ 挪不动 ${base}，请手工处理"
+        fi
+    done
+    if [ "$moved" -eq 0 ]; then
+        ok "没有遗留的 init.d 备份"
+    fi
+    return 0
+}
+
+# ============================================================
 # 8. nftables 基础配置（自动检测接口）
 # ============================================================
 setup_nftables() {
@@ -2553,6 +2605,10 @@ main() {
     run_stage "配置初始化"       stage_config_done  init_config
     run_stage "ubus 服务"        stage_ubus_done    ensure_ubus
     run_stage "服务注册与启动"   stage_service_done setup_service
+    # 遗留备份的归位**不进 run_stage**：
+    #   它必须**每次都跑** —— 「已完成就跳过」对它没有意义，
+    #   而跳过服务注册阶段的升级机器恰恰是最可能有遗留备份的。
+    relocate_initd_backups
     run_stage "nftables 引导规则" stage_nftables_done setup_nftables
     run_stage "关闭 LuCI 80/443" stage_luci_done   close_luci_ports
 

@@ -2,6 +2,136 @@
 
 所有重要更改均记录在此文件中。
 
+## [v0.19.8] - 2026-11-10
+
+**系统信息页数据面扩充：接口全字段、实时速率、面板开关、设备服务、包清单。
+全部走只读文件，不开 80、不引 ubus。顺带修掉访问边界缓存的一个真缺陷。**
+
+---
+
+## 一、为什么不开 80 端口的 api 接口（用户点名要测，实测结论是不该走）
+
+用户 2026-11-10 提出「测试一下 80 端口的 api 接口，直接接过来也行」。在 `.232` 真机实测三条：
+
+| 项 | 实测结果 |
+|---|---|
+| 80/443 有没有人在听 | **没有**。`netstat` 只有 5443 / 8443 / 8444 —— 这是本项目 `setup.sh` 的 `close_luci_ports()` 刻意关掉的（`uhttpd.main.enabled=0` + commit） |
+| 重启后会不会自己回来 | **不会**。`/etc/init.d/uhttpd` 的 `start_service()` 里 `config_get_bool enabled "$cfg" 'enabled' 1` 读到 `uhttpd.main.enabled=0` ⇒ `[ 0 -gt 0 ] || return` ⇒ 直接返回 |
+| ubus 的 HTTP 端点在哪 | 只有 uhttpd 提供 `POST /ubus`。要拿它就得 `uhttpd.main.enabled=1` 把 uhttpd 起回来 ⇒ **80/443 重新对外暴露**，而且 session login 需要**设备 root 口令** |
+
+结论：**走纯文件路线**。用户点名的数据（接口、上下行字节、功能开关）全部能从
+`/proc`、`/sys`、`/etc` 直接读到，一个字节的攻击面都不增加。这与
+`报告/系统信息页-原型说明-2026-11-08.md` 里已定的硬约束（只读 / 不依赖 ubus-rpcd /
+读不到就是「未知」）一致。
+
+⚠️ 一个容易误判的点，已写进代码注释与报告：
+`/etc/init.d/uhttpd enabled` 这个命令**会返回 true**，但那是 `rc.common` 的默认实现
+只看 `S` 符号链接在不在，而 uhttpd **没有**自定义 `enabled()` 函数 ——
+命令说谎，实际行为是安全的（`start_service` 里那道 UCI 判断才是真的）。
+
+## 二、采集器扩充（`backend/device_info.py`）
+
+| 新增 | 来源 |
+|---|---|
+| 接口链路属性 | `/sys/class/net/<if>/`：`mtu`、`address`(MAC)、`type`、`ifindex`、`carrier`、`master`(桥归属)、`speed`、`duplex` |
+| 接口错误/丢包 | `/sys/class/net/<if>/statistics/`：`rx_dropped`、`rx_errors`、`tx_dropped`、`tx_errors` |
+| 全量流量计数 | `/proc/net/dev` 的**全部 16 列**（原来只取 rx_bytes / tx_bytes） |
+| 实时速率 | 两次采样差值（零后台线程、零额外进程） |
+| 设备服务状态 | `/etc/init.d/` + `/etc/rc.d/S*` + `/var/run/*.pid` ⇒ installed / enabled / running / priority |
+| 包清单 | `/lib/apk/db/installed`（ADB 格式，数 `P:` 行）+ `/etc/apk/world` |
+
+四个「看着像数其实不是」的坑，全部按「宁可显示未知」处理：
+
+- `speed = -1` 与 `duplex = unknown` 不是读失败，是**这个接口没有链路速率概念**
+  （bridge / tun / veth / QEMU 网卡都是）⇒ 归一成 None；显示 `-1` 会误导，
+  显示 `0` 会被读成「百兆网卡」。
+- `carrier` 在链路断开时是**空文件** ⇒ 空 ≠ 0（读成 0 会被理解成「链路正常但没载波」）。
+- `/sys/class/net/<if>/master` 是**指向目录的符号链接** ⇒ `cat` 会报 "Is a directory"，
+  必须 `readlink` + `basename`。
+
+速率用「两次采样差值」而不是「累计字节 ÷ 开机时长」：后者是开机以来的平均，不是当前流量。
+代价是第一次采集没有前值 ⇒ 显示「采样中」（**不显示 0** —— 0 会被读成「这条链路没有流量」）。
+
+设备服务里 `enabled` ≠ `running`：uhttpd 的 `S50uhttpd` 软链还在（enabled=true），
+但 `uhttpd.main.enabled=0` ⇒ 开机根本不启动 ⇒ `running` 必须靠 pid 文件**且 pid 还活着**来判。
+
+## 三、面板自身的开关（`backend/app.py`）
+
+`/api/system/info` 新增 `data.panel`：访问模式 / 部署模式、12 项开关徽章、
+5 项派生计数（转发规则 / 白名单 / 黑名单 / 反代 / 证书）、DDNS 与证书状态。
+
+三个必须守住的边界：
+
+1. **读配置必须用 `_read_config_readonly()`，不能用 `load_config()`** ——
+   后者在配置损坏时会 `os.replace` 把配置文件**移走**。系统信息页是最「无害」的页面，
+   用户点开看一眼设备信息，不该因此把配置搞没。
+2. **开关判定只认真布尔值** —— `bool('yes')` 与 `bool('false')` 都是 True，
+   手工改坏的配置会让页面显示成「开」。非布尔一律当「关」（关是安全默认）。
+3. **计数按「实际生效值」算** —— 迁移顺序与 `load_config()` 完全一致
+   （先 `_migrate_forward_rules` 再合并默认值），老配置里的 `tcp_services` / `dsm_ip4`
+   要算成 1 条转发规则；反代规则里非对象的元素要滤掉（口径与 `_migrate_rp_rules` 一致）。
+
+## 四、顺带修掉的一个真缺陷：访问边界缓存的键
+
+`_NETS_CACHE` 的缓存键原来**只有 mtime**。两个真实风险：
+
+- 「配置从备份恢复」——备份工具默认保留时间戳 ⇒ mtime 不变 ⇒ 命中旧缓存
+  ⇒ 面板继续按**旧的**访问边界放行/拒绝。
+- 实测（2026-11-10）：tmpfs 上**连续创建**的两个文件 `st_mtime_ns` **完全相同**
+  （粗时钟粒度，不是纳秒级）⇒ 换配置文件也可能命中旧缓存。
+
+修法：缓存键改成「路径 + mtime_ns」，两者都变了才重算。
+
+## 五、setup.sh：把遗留的 init.d 备份挪出系统目录
+
+`.232` 真机的 `/etc/init.d/` 里躺着一个 `nftables-web.bak.1793432750` ——
+旧版 init 脚本的副本（10-31 一次手工升级留下的，**当前 setup.sh 并不生成它**）。
+两个问题：项目把自己的备份放在**系统目录**里是越界；「装了什么服务」的判断会把它扫进去。
+
+新增 `relocate_initd_backups()`：把 `/etc/init.d/*.bak*` 挪到 `${CONFIG_DIR}/backup/`。
+**不删** —— 备份的价值在于「万一要回滚」。只动普通文件，软链与目录一律不碰
+（挪软链会直接把别的服务弄坏）。这一步不进 `run_stage`（必须每次都跑，
+跳过服务注册阶段的升级机器恰恰最可能有遗留备份）。
+
+## 六、前端（`frontend/app.js` + `frontend/index.html`）
+
+- 接口表新增「交换」列（收+发）与实时速率（收/发各一行），
+  接口名下挂一行附属明细（MTU / MAC / 桥归属 / 链路速率 / 丢包 / 错误）
+- 新增「功能开关」「设备服务」「软件包」三个板块
+- 自动刷新：速率要有新样本就得刷新。5 秒一轮，只在系统信息页上排
+  （定时器到点检查 `currentNav`，离开就自动停），且自动刷新不进 loading 态
+
+⚠️ **实测发现 Alpine 3.15.8 的 `x-for` 只克隆模板的第一个子元素**：
+模板里放两个 `<tr>`，第二个被**静默**丢掉（不报错、页面照常显示，只是少一行）。
+⇒ 接口只能渲染成一行，明细放进单元格里。
+验证脚本留在 `tmp/xfor-multiroot-check.js`。
+
+⚠️ 修掉前端渲染测试的一个隐藏问题：好数据那组把数据**包了两层**
+（`makeData(REAL_DATA)` 又被 `makeScope` 包一次），`deviceInfo.data.*` 实际取不到真值。
+之前没暴露是因为所有表达式都带 `||` 兜底、从不被严格判定；
+现在有一批不带兜底的表达式（`ifaceDetail` / `fmtRate` / `panelCount`…）必须传原始数据。
+
+## 七、本轮质量门
+
+| 项 | 数字 |
+|---|---|
+| 全量回归（`tests/run_all.sh --skip-mutation`） | **4012 项断言 / 0 失败**（本批 +91） |
+| 新增行为级测试 | `test_device_info.py` 17→49；`test_system_info_endpoint.py` 32→64；`test_frontend_system_info.js` 56→112；`test_frontend_system_info_render.js` 31→64；新增 `test_setup_initd_cleanup.py` 18 项 |
+| 新增变异脚本 | `mutation_check_device_info_ext.py`（12 条）、`mutation_check_panel_switches.py`（10 条）、`mutation_check_system_info_frontend.py`（10 条）、`mutation_check_setup_initd_cleanup.py`（4 条）—— 合计 **36 条，全部捕获**，还原后逐个比对 sha256 |
+
+三个变异脚本在开发过程中**真的漏过**，都靠「样本数据太温和」而不是实现有错：
+
+- 列数下限那条变异：样本行只有 2 个字段，把下限从 16 降到 8 照样被跳过 ⇒ 测不出下限。
+- 名单 IPv6 与反代非对象元素那两条：样本里 `blacklist6` 是空的、反代规则全是对象
+  ⇒ 「少算一半」的退化看不出来。
+- setup.sh 软链那条：样本软链**名字不匹配 `*.bak*`**（压根不会被看到）、
+  且**指向悬空目标**（`[ -f ]` 为假，被第一道判据挡下）⇒ 两道判据都没测到。
+
+⇒ 教训一致：**样本必须落在判据真正生效的那条路径上**，
+「测试通过」不等于「判据被验证过」。
+
+---
+
 ## [v0.19.7] - 2026-11-09
 
 **`.232` 真机重新上线后的核验轮：修掉两处新缺陷 —— 一处是安全闸对真实设备误报
