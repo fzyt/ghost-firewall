@@ -1717,7 +1717,7 @@ function app() {
     //   测试框架是把这个方法体**抽出来单独跑**的
     //   （抽出来的函数里没有 this，方法之间互相调用会炸）⇒
     //   只用参数里的数据。
-    ifaceDetail(iface) {
+    detailOf(iface) {
       if (!iface) return '';
       const bits = [];
       if (iface.mtu) bits.push('MTU ' + iface.mtu);

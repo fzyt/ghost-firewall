@@ -195,7 +195,7 @@ for (const f of IFACE_FIELDS) {
     new RegExp('iface\\.' + f + '\\b').test(INDEX_HTML));
 }
 
-// 这几个是在 **ifaceDetail 方法内部**用的 ⇒ 要在 app.js 里找，不在模板里
+// 这几个是在 **detailOf 方法内部**用的 ⇒ 要在 app.js 里找，不在模板里
 const IFACE_DETAIL_FIELDS = ['mtu', 'mac', 'master', 'speed', 'duplex',
                              'rx_dropped', 'tx_dropped', 'rx_errors', 'tx_errors'];
 for (const f of IFACE_DETAIL_FIELDS) {
@@ -257,10 +257,10 @@ if (fmtRate) {
     '得到 ' + fmtRate(5 * 1024 * 1024));
 }
 
-const ifaceDetail = makeMethod('ifaceDetail');
-check('ifaceDetail 能被抽出来并执行', !!ifaceDetail);
-if (ifaceDetail) {
-  const d = ifaceDetail({
+const detailOf = makeMethod('detailOf');
+check('detailOf 能被抽出来并执行', !!detailOf);
+if (detailOf) {
+  const d = detailOf({
     mtu: 1500, mac: 'bc:24:11:48:32:5b', master: 'br-lan',
     speed: 1000, duplex: 'full', rx_dropped: 3, tx_dropped: 0,
     rx_errors: 0, tx_errors: 1,
@@ -272,11 +272,11 @@ if (ifaceDetail) {
   check('明细里有丢包数', /丢包 3/.test(d), d);
   check('明细里有错误数', /错误 1/.test(d), d);
   // 读不到的项**不出现**（而不是显示「未知」）
-  const empty = ifaceDetail({});
+  const empty = detailOf({});
   check('读不到时明细为空串', empty === '', JSON.stringify(empty));
-  check('null 接口不炸', ifaceDetail(null) === '');
+  check('null 接口不炸', detailOf(null) === '');
   // 0 丢包不算「有丢包」⇒ 不该显示「丢包 0」
-  const zero = ifaceDetail({ rx_dropped: 0, tx_dropped: 0, rx_errors: 0, tx_errors: 0 });
+  const zero = detailOf({ rx_dropped: 0, tx_dropped: 0, rx_errors: 0, tx_errors: 0 });
   check('丢包/错误都是 0 时不显示这两项', !/丢包/.test(zero) && !/错误/.test(zero), zero);
 }
 

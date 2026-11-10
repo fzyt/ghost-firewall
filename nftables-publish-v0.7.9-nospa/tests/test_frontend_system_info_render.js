@@ -151,7 +151,7 @@ function extractMethodBody(src, name) {
  * ⚠️ 这些方法必须**不依赖 this**（面板上都是从 Alpine 顶层调用的），
  *   抽出来单独跑时没有 this ⇒ 用 this 会直接抛。
  */
-function makeMethod(name) {
+function makeMethod(name, quiet) {
   const re = new RegExp('(?:async\\s+)?' + name + '\\s*\\(([^)]*)\\)');
   const m = re.exec(APP_JS);
   if (!m) return null;
@@ -160,7 +160,8 @@ function makeMethod(name) {
   try {
     return new Function('return function(' + m[1] + ') {' + body + '}')();
   } catch (e) {
-    console.log('    （' + name + ' 抽取失败: ' + e.message + '）');
+    // quiet 模式：不刷噪声（动态提取方法名时会遇到抽不出来的 async 方法）
+    if (!quiet) console.log('    （' + name + ' 抽取失败: ' + e.message + '）');
     return null;
   }
 }
@@ -201,12 +202,71 @@ function makeScope(data) {
   // 模板里用到的这些方法：从 app.js **真抽出来**跑，
   // 而不是随便塞个桩 —— 桩只能证明「不抛异常」，
   // 真实现才能证明「渲染出来的字是对的」。
-  for (const n of ['fmtRate', 'ifaceDetail', 'panelCount', 'svcPriority']) {
-    const fn = makeMethod(n);
+  //
+  // ⚠️ 这里必须把**页面用到的全部**格式化方法都放进来，
+  //   少放一个，Alpine 模拟那组就会在求值时抛
+  //   "fmtUptime is not defined" —— 那是**求值器的缺陷**，不是页面的缺陷。
+  //
+  // ⚠️⚠️ 方法名清单必须**从模板里动态提取**，不能写死！
+  //   写死过一版（['fmtRate', 'detailOf', ...]），后果是：
+  //   一旦有人把方法改名（比如 detailOf → ifaceDetail），
+  //   scope 里就少了这个方法 ⇒ 求值报 "X is not defined" ——
+  //   而那是**测试装置的缺陷**，不是页面的缺陷，
+  //   它会把真正该报的诊断（Alpine 把值丢掉了）给盖掉。
+  const PAGE_METHODS = extractPageMethodNames();
+  for (const n of PAGE_METHODS) {
+    const fn = makeMethod(n, true);   // quiet：抽不出来的静默跳过
     if (fn) scope[n] = fn;
   }
   return scope;
 }
+
+/**
+ * 从**模板**里提取被调用到的方法名（动态，不写死）。
+ *
+ * 只取「看起来像方法调用」的标识符：
+ *   标识符 + (  ⇒  foo(...)
+ * 排除 JS 关键字（if / for / while …）与内建（confirm / parseInt …）。
+ *
+ * ⚠️ 只保留**能成功抽取**的（makeMethod 返回非 null）。
+ *   页面里有些调用指向 async 方法（含 await），
+ *   那种方法抽不出可执行体 —— 硬塞进 scope 只会刷一屏
+ *   "await is only valid in async functions" 噪声，
+ *   把真正要看的失败盖掉。抽不出来的，本来就不是本测试能求值的对象。
+ */
+function extractPageMethodNames() {
+  const names = new Set();
+  const re = /\b([A-Za-z_$][\w$]*)\s*\(/g;
+  let m;
+  while ((m = re.exec(INDEX_HTML)) !== null) {
+    const n = m[1];
+    if (JS_RESERVED.has(n)) continue;
+    names.add(n);
+  }
+  // 页面里出现的方法调用都来自 app.js 的 Alpine 组件 ⇒ 只保留
+  // 「在 app.js 里有定义**且**能抽成可执行函数」的。
+  const out = [];
+  for (const n of names) {
+    const re2 = new RegExp('(?:async\\s+)?' + n + '\\s*\\([^)]*\\)\\s*\\{');
+    if (!re2.test(APP_JS)) continue;
+    // 抽取失败的（async 方法含 await）直接跳过，不塞 scope
+    const body = extractMethodBody(APP_JS, n);
+    if (body === null) continue;
+    if (/\bawait\b/.test(body)) continue;
+    out.push(n);
+  }
+  return out;
+}
+
+/** JS 关键字 / 保留字 —— 模板里出现 `if (` 之类不能当成方法。 */
+const JS_RESERVED = new Set([
+  'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'default', 'return',
+  'break', 'continue', 'function', 'try', 'catch', 'finally', 'throw',
+  'new', 'delete', 'typeof', 'instanceof', 'in', 'of', 'void', 'await',
+  'async', 'class', 'extends', 'super', 'this', 'const', 'let', 'var',
+  'require', 'confirm', 'alert', 'parseInt', 'parseFloat', 'Number', 'String',
+  'Boolean', 'Array', 'Object', 'JSON', 'Math', 'Date',
+]);
 
 /** 在假 data 上求值一个 Alpine 表达式。 */
 function evaluate(expr, data) {
@@ -218,6 +278,83 @@ function evaluate(expr, data) {
     return '<<求值出错: ' + e.message + '>>';
   }
 }
+
+// ================================================================
+// Alpine 求值器模拟（2026-11-10 新增）
+// ================================================================
+//
+// ⚠️ 为什么上面那个 evaluate() 不够？
+//   它用 `new Function` 直接求值 —— 那是**普通 JS 表达式**语义。
+//   而 Alpine 3.15.8 的求值器（frontend/assets/alpine.js 的 Jn）不是这么干的：
+//
+//     n = /^[\n\s]*if.*\(.*\)/.test(t.trim()) || /^(let|const)\s/.test(t.trim())
+//         ? `(async()=>{ ${t} })()` : t
+//     ... new AsyncFunction(['__self','scope'],
+//           `with (scope) { __self.result = ${n} }; __self.finished = true; return __self.result;`)
+//
+//   表达式**以 if 开头** ⇒ 被包成 `(async()=>{ ... })()` ⇒
+//   **块体里的表达式值被丢弃** ⇒ 结果恒 undefined。
+//
+//   ⇒ 这就是为什么 2026-11-10 那批「全绿」的测试里，
+//     方法名 ifaceDetail(iface) 的调用在页面上渲染成**空白**，却没人发现：
+//     文本层面的测试用的都是自己的求值器，跟 Alpine 的行为不是一回事。
+//
+// 所以这里**照抄 Alpine 的包装逻辑**再求值一次，
+// 让判据能在**没有浏览器**的环境里也复现 Alpine 的真实行为。
+//
+// 正则从 alpine.js 里抽（不手抄 —— 手抄的会和 Alpine 实际行为脱节）。
+const ALPINE_JS = fs.readFileSync(path.join(ROOT, 'frontend', 'assets', 'alpine.js'), 'utf8');
+const DETECTOR_RE = /\/\^[^/]*\/[a-z]*\.test\(/g;
+function extractAlpineDetectors() {
+  const anchor = ALPINE_JS.indexOf('__self.result = ');
+  if (anchor < 0) return null;
+  const win = ALPINE_JS.slice(Math.max(0, anchor - 800), anchor);
+  const dets = [...win.matchAll(DETECTOR_RE)].map((m) => m[0]);
+  const ifDet = dets.find((d) => /if/.test(d));
+  const declDet = dets.find((d) => /let\|const/.test(d));
+  if (!ifDet || !declDet) return null;
+  return {
+    ifRe: new RegExp(ifDet.replace(/\.test\($/, '').slice(1, -1)),
+    declRe: new RegExp(declDet.replace(/\.test\($/, '').slice(1, -1)),
+  };
+}
+
+const ALPINE_DET = extractAlpineDetectors();
+
+/**
+ * **照抄 Alpine 的求值语义**求值一个值位表达式。
+ *
+ * 关键点：Alpine 把表达式赋值给 `__self.result`，
+ * 而 `__self.result = (async()=>{ ... })()` 赋的是**一个 Promise**；
+ * Alpine 随后 await 它 —— 而那个 async IIFE 的**块体没有 return**，
+ * 所以 await 出来的值是 undefined。
+ *
+ * 这里用真实的 AsyncFunction + with(scope) 复刻一遍。
+ */
+function evaluateLikeAlpine(expr, data) {
+  if (!ALPINE_DET) return '<<Alpine 正则未抽到>>';
+  const t = String(expr).trim();
+  const wrapped = ALPINE_DET.ifRe.test(t) || ALPINE_DET.declRe.test(t);
+  const body = wrapped ? `(async()=>{ ${t} })()` : t;
+  try {
+    // eslint-disable-next-line no-new-func
+    const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+    const fn = new AsyncFunction(['__self', 'scope'],
+      `with (scope) { __self.result = ${body} }; ` +
+      `__self.finished = true; return __self.result;`);
+    const self = { result: undefined, finished: false };
+    return fn(self, makeScope(data)).then((r) => {
+      // Alpine 会对 Promise 做 then —— 这里同样 await
+      return r && typeof r.then === 'function' ? r.then((v) => v) : r;
+    });
+  } catch (e) {
+    return Promise.resolve('<<求值出错: ' + e.message + '>>');
+  }
+}
+
+// 正题在文件末尾的异步段里执行（Alpine 模拟要 await）。
+// 这里只把要用到的装置准备好。
+const ALPINE_EVAL_EXPRS = extractTextExprs();
 
 /** 抽出页面上所有 x-text 表达式的文本内容。 */
 function extractTextExprs() {
@@ -247,7 +384,7 @@ check('找到了系统信息页的 x-text 表达式', exprs.length > 0,
 //    `deviceInfo.data.model` 取到的是 undefined ——
 //    而页面上一半以上的表达式都带 `|| '未知'` 兜底，
 //    **严格判定那一组压根不检查它们** ⇒ 这个双层包装一直没被发现。
-//    现在有一批不带兜底的表达式（ifaceDetail / fmtRate / panelCount…），
+//    现在有一批不带兜底的表达式（detailOf / fmtRate / panelCount…），
 //    双层包装会让它们求值到空数据 ⇒ 必须传原始数据。
 const data = REAL_DATA;
 
@@ -336,8 +473,71 @@ for (const expr of exprs) {
     !s.startsWith('<<'), s);
 }
 
-console.log('\n' + '='.repeat(60));
-console.log('  通过 ' + PASS.length + ' / 失败 ' + FAIL.length);
-if (FAIL.length) console.log('  失败项: ' + JSON.stringify(FAIL));
-console.log('='.repeat(60));
-process.exit(FAIL.length ? 1 : 0);
+// ================================================================
+// 第 1b 组：用 Alpine 的求值器语义重算（模拟 Alpine，不靠浏览器）
+// ================================================================
+//
+// 这组是**异步**的（Alpine 的求值要 await），
+// 所以放在文件末尾单独跑，跑完再统一收尾。
+(async () => {
+  sec('第 1b 组：用 Alpine 的求值器语义重算（模拟 Alpine，不靠浏览器）');
+
+  check('从 alpine.js 抽到了求值器的正则（不手抄）', !!ALPINE_DET);
+
+  if (ALPINE_DET) {
+    // 自证：照抄的模拟器必须复现 Alpine 的真实行为。
+    //   依据是 tmp/alpine-probe.js 的浏览器实测：
+    //     x-text="ifDetail(v)" ⇒ 渲染成空（值被丢弃）
+    //     x-text="okDetail(v)" ⇒ 正常显示
+    const probeScope = {
+      ...makeScope(REAL_DATA),
+      v: 42,
+      ifDetail: (x) => 'IF:' + x,
+      okDetail: (x) => 'OK:' + x,
+    };
+    const probeEval = async (expr) => {
+      const t = expr.trim();
+      const wrapped = ALPINE_DET.ifRe.test(t) || ALPINE_DET.declRe.test(t);
+      const body = wrapped ? `(async()=>{ ${t} })()` : t;
+      // eslint-disable-next-line no-new-func
+      const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+      const fn = new AsyncFunction(['__self', 'scope'],
+        `with (scope) { __self.result = ${body} }; ` +
+        `__self.finished = true; return __self.result;`);
+      const self = { result: undefined, finished: false };
+      const r = await fn(self, probeScope);
+      return r && typeof r.then === 'function' ? await r : r;
+    };
+
+    const ifVal = await probeEval('ifDetail(v)');
+    const okVal = await probeEval('okDetail(v)');
+    check('模拟器复现 Alpine 行为：if 开头的表达式取值变 undefined',
+      ifVal === undefined, '得到 ' + JSON.stringify(ifVal));
+    check('模拟器复现 Alpine 行为：正常方法名取值正常',
+      okVal === 'OK:42', '得到 ' + JSON.stringify(okVal));
+
+    // 正题：把系统信息页所有值位表达式用 Alpine 语义重算一遍，
+    // 结果为 undefined 的就是「页面会显示空白」的格子。
+    let alpineEvaluated = 0;
+    const alpineBlank = [];
+    for (const expr of ALPINE_EVAL_EXPRS) {
+      if (!expr.trim()) continue;
+      alpineEvaluated++;
+      const v = await evaluateLikeAlpine(expr, REAL_DATA);
+      if (v === undefined || v === null) {
+        alpineBlank.push(expr);
+      }
+    }
+    check('用 Alpine 语义求值的表达式数量不为零（否则本组是空转）',
+      alpineEvaluated > 0, '共 ' + alpineEvaluated + ' 条');
+    check('用 Alpine 语义重算，没有表达式取值被丢弃（页面不会显示空白）',
+      alpineBlank.length === 0,
+      alpineBlank.length ? alpineBlank.map((e) => e.slice(0, 60)).join(' ; ') : '');
+  }
+
+  console.log('\n' + '='.repeat(60));
+  console.log('  通过 ' + PASS.length + ' / 失败 ' + FAIL.length);
+  if (FAIL.length) console.log('  失败项: ' + JSON.stringify(FAIL));
+  console.log('='.repeat(60));
+  process.exit(FAIL.length ? 1 : 0);
+})();

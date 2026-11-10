@@ -25,8 +25,8 @@
   G1  fmtRate 读不到时返回 0（「采样中」被改成「0 B/s」—— 撒谎）
   G2  panelCount 用 falsy 判断（0 条被显示成「未知」）
   G3  svcPriority 用 falsy 判断（序号 0 被显示成「—」）
-  G4  ifaceDetail 无条件显示丢包/错误（含 0）
-  G5  ifaceDetail 读不到时显示「未知」而不是不显示
+  G4  detailOf 无条件显示丢包/错误（含 0）
+  G5  detailOf 读不到时显示「未知」而不是不显示
   G6  自动刷新不再判断当前页（离开系统信息页还在打接口）
   G7  速率列引用错字段（显示成累计字节）
   G8  计数列拿不到 panel（恒显示「未知」）
@@ -58,6 +58,11 @@ INDEX_HTML = os.path.join(ROOT, 'frontend', 'index.html')
 TESTS = [
     os.path.join(ROOT, 'tests', 'test_frontend_system_info.js'),
     os.path.join(ROOT, 'tests', 'test_frontend_system_info_render.js'),
+    # Alpine 求值语义判据（2026-11-10 新增）：
+    #   模板表达式以 if/let/const 开头 ⇒ Alpine 把值丢掉 ⇒ 页面那格永远是空的。
+    #   这类退化前面的测试全都抓不到（它们用的是自己的求值器，不是 Alpine 的），
+    #   所以必须把它也纳入变异验证的测试集合。
+    os.path.join(ROOT, 'tests', 'test_frontend_alpine_expr.js'),
 ]
 
 # 我独占、也只有我会改的那两个文件。
@@ -142,7 +147,7 @@ MUTATIONS = [
      [("      if (!svc || svc.priority === null || svc.priority === undefined) return '—';",
        "      if (!svc || !svc.priority) return '—';")]),
 
-    ('G4  ifaceDetail 无条件显示丢包/错误（含 0）',
+    ('G4  detailOf 无条件显示丢包/错误（含 0）',
      APP_JS,
      [("""      const dropped = (iface.rx_dropped || 0) + (iface.tx_dropped || 0);
       const errs = (iface.rx_errors || 0) + (iface.tx_errors || 0);
@@ -153,7 +158,7 @@ MUTATIONS = [
       bits.push('丢包 ' + dropped);
       bits.push('错误 ' + errs);""")]),
 
-    ('G5  ifaceDetail 读不到时显示「未知」而不是不显示',
+    ('G5  detailOf 读不到时显示「未知」而不是不显示',
      APP_JS,
      [("      if (!iface) return '';",
        "      if (!iface) return '未知';")]),
@@ -182,6 +187,19 @@ MUTATIONS = [
      INDEX_HTML,
      [("""                      <th class="py-2 font-normal text-right">交换</th>""",
        """                      <th class="py-2 font-normal text-right"></th>""")]),
+
+    # G11：方法名改回 ifaceDetail。
+    #
+    # 这不是「随便起个名」—— ifaceDetail 以 **if** 开头，
+    # 而 Alpine 3.15.8 的求值器把「以 if 开头的表达式」当成 if 语句包起来
+    # （`(async()=>{ ... })()`），于是**表达式的值被丢弃**，
+    # 页面「接口明细」那一格**永远是空的**：
+    # 不报错、不白屏、控制台干净，所有文本层面的测试全绿。
+    #
+    # 详见 tests/test_frontend_alpine_expr.js（该文件的判据自证里有这条）。
+    ('G11 方法名改回 ifaceDetail（Alpine 会把它的值丢掉 ⇒ 那格永远空白）',
+     APP_JS,
+     [("    detailOf(iface) {", "    ifaceDetail(iface) {")]),
 ]
 
 
