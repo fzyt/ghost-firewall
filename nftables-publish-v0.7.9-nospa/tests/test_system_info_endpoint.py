@@ -139,6 +139,186 @@ def main():
     check('采集器恢复正常后返回 200', r.status_code == 200,
           '状态码 %d' % r.status_code)
 
+    # ── 第 5 组：面板自身的开关 ─────────────────────────────────
+    #
+    # 这一组盯的是**副作用边界**，不只是结构。
+    #
+    # 系统信息页是最"无害"的页面 —— 用户点开看一眼设备信息。
+    # 它绝不能顺手把配置文件移走。
+    #
+    # ⚠️ app.py 的 load_config() 在配置损坏时会 `os.replace` 把配置文件
+    # **移走**（load_config 的 1048~1053 行）⇒ 接口里必须用
+    # `_read_config_readonly()` 自己读，不能调 load_config()。
+    # 这一条不测就会漏 —— 漏了之后，用户点一次系统信息页，
+    # 面板自己这一层就把配置移走了。
+    #
+    # ⚠️ 这里**单测 `_read_config_readonly()`**、而不是从端点层面断言
+    #    「文件还在」：端点请求会先过访问守卫，而守卫本来就调
+    #    load_config()（配置损坏时 fail-closed 拒绝所有来源，
+    #    同时把损坏文件移走）—— 那是**既有设计**，与本接口无关。
+    #    端点层面的断言放到第 6 组（配置正常时）。
+
+    sec('第 5 组：只读读配置 —— 不能有副作用')
+    d2 = tempfile.mkdtemp()
+    broken = os.path.join(d2, 'broken.json')
+    with open(broken, 'w') as f:
+        f.write('{ this is not json')
+    appmod.CONFIG_PATH = broken
+    ro = appmod._read_config_readonly()
+    check('★ 配置损坏时 _read_config_readonly 返回 None', ro is None,
+          '实际 %r' % (ro,))
+    check('★ 配置文件没有被移走（_read_config_readonly 是只读的）',
+          os.path.exists(broken), '文件已消失 —— 说明它内部调了 load_config()')
+
+    # 缺文件 ⇒ None，且不能凭空造出默认配置
+    appmod.CONFIG_PATH = os.path.join(d2, 'nope.json')
+    check('配置文件不存在时返回 None',
+          appmod._read_config_readonly() is None)
+
+    # 正常文件 ⇒ 原样读出来
+    ok_cfg = os.path.join(d2, 'ok.json')
+    with open(ok_cfg, 'w') as f:
+        json.dump({'access_mode': 'trust', 'gateway_enabled': True}, f)
+    appmod.CONFIG_PATH = ok_cfg
+    ro2 = appmod._read_config_readonly()
+    check('正常配置能读出来', isinstance(ro2, dict))
+    check('读出来的就是磁盘上的内容',
+          (ro2 or {}).get('access_mode') == 'trust')
+
+    # 顶层不是对象（被手工改坏）⇒ None，不能当 dict 用
+    bad_shape = os.path.join(d2, 'list.json')
+    with open(bad_shape, 'w') as f:
+        json.dump([1, 2, 3], f)
+    appmod.CONFIG_PATH = bad_shape
+    check('顶层不是对象时返回 None',
+          appmod._read_config_readonly() is None)
+
+    sec('第 6 组：面板开关的结构与取值')
+    d3 = tempfile.mkdtemp()
+    cfgpath = os.path.join(d3, 'cfg.json')
+    with open(cfgpath, 'w') as f:
+        json.dump({
+            'lan_subnet4': '127.0.0.0/8',
+            'panel_allowed_nets': ['127.0.0.0/8'],
+            'auth_session_timeout': 1800,
+            'auth_token_epoch': 1,
+            'access_mode': 'trust',
+            'deploy_mode': 'linux_gateway',
+            'gateway_enabled': True,
+            'china_ip_block': True,
+            'forward_rules': [{'proto': 'tcp', 'src_port': 8080}],
+            'reverse_proxy': {
+                # ⚠️ 最后那个「不是对象」是**故意**放进去的：
+                #    _migrate_rp_rules 会把非 dict 的规则丢掉，
+                #    计数口径必须和它一致 ⇒ 有效规则仍是 2 条。
+                #    （放一个空的黑名单 IPv6 集合也不行 ——
+                #      那样「黑名单只算 IPv4」的退化就测不出来。）
+                'rules': [{'id': 'rp_001'}, {'id': 'rp_002'}, '不是对象'],
+                'certificates': [{'id': 'c1'}],
+            },
+        }, f)
+    appmod.CONFIG_PATH = cfgpath
+    with open(appmod.LISTS_PATH, 'w') as f:
+        json.dump({
+            'allowed4': ['1.1.1.1', '2.2.2.2'],
+            'allowed6': ['fd00::1'],
+            'blacklist4': ['3.3.3.3'],
+            'blacklist6': ['fd00::2'],
+        }, f)
+
+    r = client.get('/api/system/info')
+    data = (r.get_json() or {}).get('data') or {}
+    panel = data.get('panel')
+    check('data.panel 是对象', isinstance(panel, dict), '实际 %r' % (panel,))
+    if isinstance(panel, dict):
+        check('panel.access_mode', panel.get('access_mode') == 'trust',
+              '实际 %r' % panel.get('access_mode'))
+        check('panel.deploy_mode', panel.get('deploy_mode') == 'linux_gateway',
+              '实际 %r' % panel.get('deploy_mode'))
+        check('panel.switches 是数组', isinstance(panel.get('switches'), list))
+        sw = {s.get('key'): s for s in (panel.get('switches') or [])}
+        check('gateway_enabled 反映配置为开',
+              sw.get('gateway_enabled', {}).get('on') is True)
+        check('china_ip_block 反映配置为开',
+              sw.get('china_ip_block', {}).get('on') is True)
+        check('未写的开关默认为关',
+              sw.get('dns_lan_resolver_enabled', {}).get('on') is False)
+        check('每个开关都带中文标签',
+              all(s.get('label') for s in (panel.get('switches') or [])))
+        counts = panel.get('counts') or {}
+        check('转发规则条数', counts.get('forward_rules') == 1,
+              '实际 %r' % counts.get('forward_rules'))
+        check('白名单条数（v4+v6）', counts.get('whitelist') == 3,
+              '实际 %r' % counts.get('whitelist'))
+        check('黑名单条数（v4+v6）', counts.get('blacklist') == 2,
+              '实际 %r' % counts.get('blacklist'))
+        check('反向代理条数', counts.get('reverse_proxies') == 2,
+              '实际 %r' % counts.get('reverse_proxies'))
+        check('证书条数', counts.get('certificates') == 1,
+              '实际 %r' % counts.get('certificates'))
+
+    sec('第 7 组：面板开关的边界')
+    # 缺 reverse_proxy 键（全新安装的样子）⇒ 不能抛
+    d4 = tempfile.mkdtemp()
+    cfg4 = os.path.join(d4, 'cfg.json')
+    with open(cfg4, 'w') as f:
+        json.dump({'lan_subnet4': '127.0.0.0/8', 'auth_token_epoch': 1}, f)
+    appmod.CONFIG_PATH = cfg4
+    p4 = appmod._panel_switches(appmod._read_config_readonly())
+    check('缺 reverse_proxy 键不抛', isinstance(p4, dict))
+    check('缺 reverse_proxy 时反代条数为 0',
+          (p4 or {}).get('counts', {}).get('reverse_proxies') == 0)
+
+    # reverse_proxy 结构非法（被手工改坏）⇒ 不能抛
+    p5 = appmod._panel_switches({'reverse_proxy': '不是对象',
+                                 'forward_rules': '也不是数组'})
+    check('reverse_proxy 结构非法不抛', isinstance(p5, dict))
+    check('结构非法时计数为 0',
+          (p5 or {}).get('counts', {}).get('reverse_proxies') == 0)
+    check('forward_rules 不是数组时计数为 0',
+          (p5 or {}).get('counts', {}).get('forward_rules') == 0)
+
+    # 非布尔值 ⇒ 当 False（关是安全默认）
+    p6 = appmod._panel_switches({'gateway_enabled': 'yes'})
+    sw6 = {s['key']: s for s in p6['switches']}
+    check('非布尔值不当成「开」', sw6['gateway_enabled']['on'] is False,
+          '实际 %r' % sw6['gateway_enabled']['on'])
+
+    # config 不是 dict ⇒ 返回 None
+    check('config 不是 dict 时返回 None', appmod._panel_switches(None) is None)
+
+    # 旧格式的转发规则 ⇒ 迁移后是 1 条（不迁移就会显示 0 条）
+    p7 = appmod._panel_switches({'tcp_services': '8080,9090',
+                                 'dsm_ip4': '192.168.1.5'})
+    check('旧格式转发规则迁移后算 1 条',
+          (p7 or {}).get('counts', {}).get('forward_rules') == 1,
+          '实际 %r' % (p7 or {}).get('counts', {}).get('forward_rules'))
+
+    # 证书与 DDNS：按文件在不在判定
+    d5 = tempfile.mkdtemp()
+    appmod.NFTABLES_WEB_CERT = os.path.join(d5, 'fullchain.pem')
+    appmod.NFTABLES_WEB_KEY = os.path.join(d5, 'privkey.pem')
+    appmod.ALIYUN_DDNS_CONFIG_PATH = os.path.join(d5, 'ddns.json')
+    p8 = appmod._panel_switches({})
+    check('证书不存在时 cert_ready 为 False',
+          (p8 or {}).get('cert_ready') is False)
+    check('DDNS 配置不存在时为 False',
+          (p8 or {}).get('ddns_configured') is False)
+    for _p in (appmod.NFTABLES_WEB_CERT, appmod.NFTABLES_WEB_KEY,
+               appmod.ALIYUN_DDNS_CONFIG_PATH):
+        with open(_p, 'w') as f:
+            f.write('x')
+    p9 = appmod._panel_switches({})
+    check('证书与私钥都在时 cert_ready 为 True',
+          (p9 or {}).get('cert_ready') is True)
+    check('DDNS 配置存在时为 True',
+          (p9 or {}).get('ddns_configured') is True)
+    # 只缺私钥 ⇒ 不能算就绪
+    os.unlink(appmod.NFTABLES_WEB_KEY)
+    p10 = appmod._panel_switches({})
+    check('缺私钥时 cert_ready 为 False',
+          (p10 or {}).get('cert_ready') is False)
+
     print('\n' + '=' * 60)
     print('  通过 %d / 失败 %d' % (len(PASS), len(FAIL)))
     if FAIL:

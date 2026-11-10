@@ -518,7 +518,17 @@ _STATIC_EXTENSIONS = ('js', 'css', 'png', 'jpg', 'jpeg', 'gif', 'svg', 'ico', 'w
 # ipaddress.ip_address() 校验，根本不接受 CIDR。
 # ══════════════════════════════════════════════════════════════════
 
-_NETS_CACHE = {'mtime': None, 'nets': None}
+# 网段缓存。
+#
+# ⚠️ 缓存键**必须包含配置文件的路径**，不能只用 mtime：
+#   只用 mtime 的话，「配置从备份恢复、mtime 被保留」这种情况会命中
+#   旧缓存 ⇒ 面板继续按**旧的**访问边界放行/拒绝。
+#   （实测 2026-11-10：tmpfs 上连续创建的两个文件 st_mtime_ns **完全相同**
+#     —— 粗时钟的粒度就是那么粗，不是纳秒级。）
+#   加上路径后，「换了配置路径」也不会再命中上一个路径的缓存。
+#
+# 键：路径 + mtime_ns。两者都变了才重算。
+_NETS_CACHE = {'path': None, 'mtime': None, 'nets': None}
 
 # 「拒绝一切来源」的哨兵网段（P1-26 改 fail-closed，2026-11-08 用户拍板）。
 #
@@ -657,7 +667,13 @@ def _panel_allowed_networks():
         #    ⇒ fail-closed 被悄悄绕开。
         #    （这个坑是真的：E-12 变异去掉这个判断时测试没红，
         #      因为当前结构下它确实不影响行为 —— 留着是为了防结构变化。）
-        if _NETS_CACHE['mtime'] is not None and _NETS_CACHE['mtime'] == stamp:
+        #
+        # ⚠️ 命中条件里**必须同时比路径**（见 _NETS_CACHE 的注释）：
+        #    只比 mtime 的话，配置从备份恢复（mtime 被保留）会命中旧缓存
+        #    ⇒ 面板继续按旧的访问边界放行。
+        if (_NETS_CACHE['path'] == CONFIG_PATH
+                and _NETS_CACHE['mtime'] is not None
+                and _NETS_CACHE['mtime'] == stamp):
             return _NETS_CACHE['nets']
         try:
             cfg = load_config()
@@ -692,9 +708,9 @@ def _panel_allowed_networks():
                     nets.append(n)
     if stamp is None:
         # 配置不存在 ⇒ 不写缓存（见上面 stamp is not None 的说明）
-        _NETS_CACHE.update(mtime=None, nets=None)
+        _NETS_CACHE.update(path=None, mtime=None, nets=None)
     else:
-        _NETS_CACHE.update(mtime=stamp, nets=nets)
+        _NETS_CACHE.update(path=CONFIG_PATH, mtime=stamp, nets=nets)
     return nets
 
 
@@ -13434,6 +13450,145 @@ def _ruleset_is_functional():
     return True, '正常'
 
 
+# ── 面板自身的开关（系统信息页的「功能开关」板块）──────────────
+#
+# 设备侧服务状态由 device_info 采集 —— 那是「设备上到底在跑什么」；
+# 这一块是「**面板自己**打算做什么」，全部从 config 派生，
+# **不改变任何行为**，纯展示。
+#
+# ⚠️ 为什么不让 device_info 去读 config：
+#   采集器的契约是「只读 /proc /sys /etc，不碰面板自己的状态」，
+#   而且要能在没有 config 的环境里单独跑（测试、迁移工具）。
+#   让它读 config 会把两层搅在一起，config 的格式一变采集器跟着坏。
+
+# (config 键, 面板上显示的名字)
+PANEL_SWITCH_DEFS = [
+    ('gateway_enabled', '认证网关'),
+    ('auth_lan_bypass', 'LAN 免认证'),
+    ('luci_enabled', 'LuCI 管理界面'),
+    ('china_ip_block', '国外 IP 拦截'),
+    ('dns_lan_resolver_enabled', 'DNS 局域网解析'),
+    ('dns_lan_log', 'DNS 解析日志'),
+    ('foreign_scan_log', '国外扫描日志'),
+    ('ipv6_wan_lan_log', 'IPv6 跨 WAN/LAN 日志'),
+    ('wan_drop_log', 'WAN 丢弃日志'),
+    ('lan_drop_log', 'LAN 丢弃日志'),
+    ('forward_log', '转发日志'),
+    ('whitelist_access_log', '白名单访问日志'),
+]
+
+
+def _read_config_readonly():
+    """**只读**地读配置，不带任何副作用。
+
+    ⚠️ **这里绝对不能用 load_config()**：
+    它在配置损坏时会 `os.replace(CONFIG_PATH, broken_path)`
+    **把配置文件移走**（load_config 的第 1048~1053 行）。
+
+    系统信息页是最"无害"的页面 —— 用户点开看一眼设备信息，
+    不该因此导致配置文件被移走、面板状态被重置成出厂值。
+    ⇒ 这里自己读文件；读不出来就是 None，让这一块显示「未知」。
+    """
+    try:
+        with open(CONFIG_PATH, 'r') as f:
+            data = json.load(f)
+    except (OSError, IOError, ValueError):
+        # ValueError 覆盖 json.JSONDecodeError
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _panel_switches(config):
+    """面板自身的开关与派生计数。
+
+    参数 config 是**已经读好的**配置 dict（由调用方用
+    `_read_config_readonly()` 读，避免 load_config 的副作用）。
+
+    返回：
+      {
+        'access_mode':    'lan' / 'trust' / ...,
+        'deploy_mode':    'openwrt' / 'linux_gateway',
+        'switches':       [{'key', 'label', 'on'}, ...],
+        'counts':         {'forward_rules', 'whitelist', 'blacklist',
+                           'reverse_proxies', 'certificates'},
+        'ddns_configured': bool,
+        'cert_ready':     bool,
+      }
+
+    ⚠️ 名单条数是从**独立的名单文件**读的（load_lists），不是从 config ——
+    名单本来就是单独的文件（/etc/nftables/nftables-web-lists.json）。
+    load_lists(strict=False) 是纯读的，读不到返回空结构，不会动文件。
+    """
+    if not isinstance(config, dict):
+        return None
+
+    # ⚠️ 迁移的顺序必须和 load_config() **完全一致**：
+    #    先迁移用户配置，再合并默认值。
+    #    为什么要迁移：老配置里的 `tcp_services` / `dsm_ip4` 会被
+    #    _migrate_forward_rules 转成一条 forward_rules ——
+    #    不迁移的话，转发规则条数会显示成 0，而面板实际是生效的。
+    #    （页面显示的必须是「实际生效的值」，不是「磁盘上的原始值」。）
+    #
+    # ⚠️ 必须传**副本**：_migrate_forward_rules 会就地改 dict
+    #    （pop 旧字段），不能污染调用方手里的对象。
+    raw = _migrate_forward_rules(dict(config))
+    cfg = dict(DEFAULT_CONFIG)
+    cfg.update(raw)
+
+    switches = []
+    for key, label in PANEL_SWITCH_DEFS:
+        raw = cfg.get(key)
+        switches.append({
+            'key': key,
+            'label': label,
+            # ⚠️ 只认**真正的布尔值**。不能写 bool(cfg.get(key)) ——
+            #    bool('yes') / bool('false') 都是 True，
+            #    一个被手工改坏的配置里写了字符串 'false'，
+            #    页面就会显示成「开」。
+            #    非布尔一律当「关」：关是安全默认，显示成「开」危害更大。
+            'on': raw if isinstance(raw, bool) else False,
+        })
+
+    # ── 计数 ──
+    forward = cfg.get('forward_rules')
+    forward = forward if isinstance(forward, list) else []
+
+    # 名单：白名单 = allowed4 + allowed6，黑名单 = blacklist4 + blacklist6
+    try:
+        lists = load_lists()
+    except Exception:
+        lists = {}
+    whitelist = len(lists.get('allowed4', []) or []) + len(lists.get('allowed6', []) or [])
+    blacklist = len(lists.get('blacklist4', []) or []) + len(lists.get('blacklist6', []) or [])
+
+    # 反代与证书都在 reverse_proxy 子树里
+    rp = cfg.get('reverse_proxy')
+    rp = rp if isinstance(rp, dict) else {}
+    rp_rules = rp.get('rules')
+    rp_rules = rp_rules if isinstance(rp_rules, list) else []
+    # 只数**对象**元素 —— _migrate_rp_rules 同样会丢掉非 dict 的规则，
+    # 这里的口径必须和它一致，否则显示的条数比实际生效的多。
+    rp_rules = [r for r in rp_rules if isinstance(r, dict)]
+    rp_certs = rp.get('certificates')
+    rp_certs = rp_certs if isinstance(rp_certs, list) else []
+    rp_certs = [c for c in rp_certs if isinstance(c, dict)]
+
+    return {
+        'access_mode': cfg.get('access_mode'),
+        'deploy_mode': cfg.get('deploy_mode'),
+        'switches': switches,
+        'counts': {
+            'forward_rules': len(forward),
+            'whitelist': whitelist,
+            'blacklist': blacklist,
+            'reverse_proxies': len(rp_rules),
+            'certificates': len(rp_certs),
+        },
+        'ddns_configured': os.path.exists(ALIYUN_DDNS_CONFIG_PATH),
+        'cert_ready': os.path.exists(NFTABLES_WEB_CERT) and os.path.exists(NFTABLES_WEB_KEY),
+    }
+
+
 @app.route('/api/system/info', methods=['GET'])
 def system_info():
     """设备基本信息（型号、固件、CPU、内存、存储、运行时间、网络接口）。
@@ -13464,6 +13619,20 @@ def system_info():
             'code': 'COLLECT_FAILED',
             'message': '采集设备信息失败，详情请查看面板日志',
         }), 500
+    # 面板自身的开关：单独 try，且**只读**地读配置。
+    #
+    # ⚠️ 这里不能用 load_config()：它在配置损坏时会把配置文件
+    # `os.replace` 移走（见 load_config 的 1048~1053 行）。
+    # 系统信息页是最"无害"的页面，用户点开看一眼设备信息，
+    # 不该因此把配置文件移走、面板状态重置成出厂值。
+    #
+    # 这一块读不到也不影响设备信息 —— 单独 try，失败就置 None，
+    # 前端显示「未知」。
+    try:
+        data['panel'] = _panel_switches(_read_config_readonly())
+    except Exception as e:
+        print(f'[WARN] 面板开关采集失败: {type(e).__name__}: {e}', flush=True)
+        data['panel'] = None
     return jsonify({'success': True, 'data': data})
 
 

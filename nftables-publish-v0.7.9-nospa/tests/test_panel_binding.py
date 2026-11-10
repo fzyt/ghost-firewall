@@ -347,6 +347,48 @@ finally:
     _sp.run = _orig_run
 
 
+# ══════════════════════════════════════════════════════════════════
+sec('BIND-2.6 网段缓存的键必须包含配置路径')
+# ══════════════════════════════════════════════════════════════════
+# 2026-11-10 实测发现的坑：网段缓存原来**只用 mtime 做键**。
+#
+#   · 「配置从备份恢复」——备份工具默认保留时间戳 ⇒ mtime 不变
+#     ⇒ 命中旧缓存 ⇒ 面板继续按**旧的**访问边界放行/拒绝。
+#   · tmpfs 上连续创建的两个文件 st_mtime_ns **完全相同**
+#     （粗时钟粒度，不是纳秒级）⇒ 任何「换配置文件」都可能命中旧缓存。
+#
+# 修法：缓存键 = (路径, mtime_ns)，两者都变了才重算。
+# 这里用 os.utime 把两个文件的 mtime **强制设成同一个**，
+# 让测试不依赖文件系统的 mtime 粒度。
+
+cfg_a = os.path.join(TD, 'cache_a.json')
+cfg_b = os.path.join(TD, 'cache_b.json')
+with open(cfg_a, 'w') as f:
+    json.dump({'lan_subnet4': '10.8.0.0/24'}, f)
+with open(cfg_b, 'w') as f:
+    json.dump({'lan_subnet4': '192.168.100.0/24'}, f)
+_stamp = 1700000000.0
+os.utime(cfg_a, (_stamp, _stamp))
+os.utime(cfg_b, (_stamp, _stamp))
+check('两个配置文件的 mtime 相同（测试前提）',
+      os.stat(cfg_a).st_mtime_ns == os.stat(cfg_b).st_mtime_ns)
+
+mod.CONFIG_PATH = cfg_a
+mod._NETS_CACHE.update(path=None, mtime=None, nets=None)
+got_a = [str(n) for n in mod._panel_allowed_networks()]
+check('先读 A 的网段', got_a == ['10.8.0.0/24'], str(got_a))
+
+# 换到 B，**刻意不清缓存** —— 这正是「配置从备份恢复」的形状
+mod.CONFIG_PATH = cfg_b
+got_b = [str(n) for n in mod._panel_allowed_networks()]
+check('★ 换配置路径后不能命中上一个路径的缓存',
+      got_b == ['192.168.100.0/24'], str(got_b))
+
+mod.CONFIG_PATH = cfg_a
+got_c = [str(n) for n in mod._panel_allowed_networks()]
+check('★ 换回去同样不能命中旧缓存', got_c == ['10.8.0.0/24'], str(got_c))
+
+
 print(f'\n{"=" * 60}')
 print(f'通过 {len(PASS)} / 失败 {len(FAIL)}')
 if FAIL:
