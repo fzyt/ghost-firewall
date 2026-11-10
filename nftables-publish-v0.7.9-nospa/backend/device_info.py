@@ -48,6 +48,7 @@ OpenWrt 上的环境差异（真机上要重点验的）
 """
 import os
 import re
+import time
 
 # ── 单个文件读取的小工具 ────────────────────────────────────
 #
@@ -71,6 +72,106 @@ def _read_first_line(path):
         return None
     line = txt.splitlines()[0].strip() if txt.splitlines() else ''
     return line or None
+
+
+def _read_int(path):
+    """读一个整数值的文件；失败、空文件、不是整数一律返回 None。
+
+    ⚠️ **空文件不等于 0**。
+    sysfs 的 `carrier` 在链路断开时是**空文件**（实测 .232 的 eth1 就是），
+    读成 0 会被理解成「链路正常但没载波」，跟事实相反。
+    这里统一当成「读不到」，前端显示「未知」。
+    """
+    v = _read_first_line(path)
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except ValueError:
+        return None
+
+
+def _listdir(path):
+    """列目录；目录不存在返回空列表。"""
+    try:
+        return sorted(os.listdir(path))
+    except OSError:
+        return []
+
+
+# ── 网络接口的 sysfs 属性 ─────────────────────────────────────
+#
+# `/sys/class/net/<名字>/` 下能读到什么（2026-11-10 真机 .232 实测）：
+#
+#   mtu        1500（lo 是 65536）
+#   address    MAC
+#   type       1 = 以太网（ARPHRD_ETHER），772 = 回环（ARPHRD_LOOPBACK）
+#   ifindex    内核里的接口号
+#   carrier    1 = 链路有载波。**链路断开时这个文件是空的** ⇒ 空 ≠ 0
+#   master     → 符号链接，指向所属的桥（../../virtual/net/br-lan）
+#   speed      链路速率；虚拟网卡是 **-1**
+#   duplex     full/half；虚拟网卡是 **unknown**
+#   operstate  up/down/dormant/unknown
+#
+# 三个「看着像数其实不是」的坑：
+#
+#   1. `master` 是**指向目录的符号链接** —— `cat` 会报 "Is a directory"。
+#      ⇒ 必须 os.readlink() 再取 basename。
+#   2. `speed = -1` 与 `duplex = unknown` **不是读失败**，
+#      而是「这个接口压根没有链路速率概念」（bridge / tun / veth / QEMU 网卡都是）。
+#      ⇒ 统一归一成 None，前端显示「未知」——
+#      绝不能把 -1 显示成「-1 Mbps」，更不能显示 0（0 会被读成「百兆网卡」）。
+#   3. `carrier` 断开时是**空文件**，不是 "0"。
+
+
+def _iface_master(name):
+    """接口挂在哪个桥上；不是桥成员返回 None。"""
+    try:
+        target = os.readlink('/sys/class/net/%s/master' % name)
+    except OSError:
+        return None
+    base = os.path.basename(target.rstrip('/'))
+    return base or None
+
+
+def _iface_sysfs(name):
+    """接口的 sysfs 属性集合。读不到就是 None，不猜。"""
+    base = '/sys/class/net/%s' % name
+
+    speed = _read_int(base + '/speed')
+    if speed is not None and speed < 0:
+        # -1 = 这个接口没有链路速率概念（bridge / 虚拟网卡）
+        speed = None
+
+    duplex = _read_first_line(base + '/duplex')
+    if duplex in (None, '', 'unknown'):
+        duplex = None
+
+    return {
+        'mtu': _read_int(base + '/mtu'),
+        'mac': _read_first_line(base + '/address'),
+        'type': _read_int(base + '/type'),
+        'ifindex': _read_int(base + '/ifindex'),
+        'carrier': _read_int(base + '/carrier'),
+        'master': _iface_master(name),
+        'speed': speed,
+        'duplex': duplex,
+    }
+
+
+def _iface_statistics(name):
+    """sysfs `statistics/` 下的错误与丢包计数。
+
+    这几个值和 `/proc/net/dev` 的 drop 列**不是一回事**：
+      · `/proc/net/dev` 的 drop = 协议栈丢的包
+      · `statistics/rx_dropped`  = 网卡驱动丢的包
+    两者相加才是真正的丢包，页面要分开列。
+    """
+    base = '/sys/class/net/%s/statistics' % name
+    out = {}
+    for key in ('rx_dropped', 'rx_errors', 'tx_dropped', 'tx_errors'):
+        out[key] = _read_int('%s/%s' % (base, key))
+    return out
 
 
 # ── 固件 / 系统版本 ──────────────────────────────────────────
@@ -276,10 +377,115 @@ def collect_uptime():
 # ── 网络接口 ─────────────────────────────────────────────────
 
 
-def collect_interfaces():
-    """网络接口清单。
+# `/proc/net/dev` 每行的 16 个数字列（Linux `net/core/dev.c` 的 dev_stats 格式）：
+#
+#   收(rx)：bytes packets errs drop fifo frame compressed multicast
+#   发(tx)：bytes packets errs drop fifo colls carrier compressed
+#
+# ⚠️ 收发两段 **fifo 之后的列名不一样**（收是 frame，发是 colls），
+#    而且 tx 段还多一个 carrier ⇒ 只能**按下标**取，不能按名字。
+#    现有代码取 fields[0] / fields[8] 正好是 rx_bytes / tx_bytes —— 对的。
+#
+# 另有 2 行表头（"Inter-|   Receive …" 和 " face |bytes packets …"），
+# 数据从**第 3 行**开始。
 
-    刻意**只读 /proc**：不调 `ip`、不跑 `ifconfig`、不用 netlink ——
+_DEV_COLS = (
+    'rx_bytes', 'rx_packets', 'rx_errs', 'rx_drop', 'rx_fifo',
+    'rx_frame', 'rx_compressed', 'rx_multicast',
+    'tx_bytes', 'tx_packets', 'tx_errs', 'tx_drop', 'tx_fifo',
+    'tx_colls', 'tx_carrier', 'tx_compressed',
+)
+
+
+def _parse_net_dev(txt):
+    """`/proc/net/dev` 全文 → {接口名: {列名: 数值}}。
+
+    列不够 16 个的行直接跳过（格式不对，不是数据）。
+    单个列不是数字的，置 None 而不是丢掉整个接口 ——
+    丢掉整个接口会让「这个接口有地址但没流量」变成「这个接口不存在」。
+    """
+    out = {}
+    if not txt:
+        return out
+    for line in txt.splitlines()[2:]:
+        if ':' not in line:
+            continue
+        name, rest = line.split(':', 1)
+        name = name.strip()
+        if not name:
+            continue
+        fields = rest.split()
+        if len(fields) < 16:
+            continue
+        row = {}
+        for idx, col in enumerate(_DEV_COLS):
+            try:
+                row[col] = int(fields[idx])
+            except ValueError:
+                row[col] = None
+        out[name] = row
+    return out
+
+
+# ── 速率：两次采样差值 ────────────────────────────────────────
+#
+# 为什么不用「累计字节 ÷ 开机时长」：
+#   那是**开机以来的平均**，不是当前流量。
+#   面板上要看到「现在跑多快」，就必须有两个时间点。
+#
+# 为什么不开后台采样线程：
+#   前端轮询一次接口 = 天然产生一个采样点。
+#   采集时顺手把上一次的 (时间戳, 各接口字节数) 存下来，
+#   下一次采集时算差值 ÷ 时间差 —— 零后台线程、零额外进程、零额外文件。
+#
+# 代价与边界（都按「宁可显示未知，不显示错的」处理）：
+#   · 第一次采集没有前值 ⇒ 速率是 None ⇒ 前端显示「采样中」
+#   · 两次采样间隔太短时，除法结果噪声大（1 秒内几十字节的波动会被放大）
+#     ⇒ 间隔不足 _RATE_MIN_INTERVAL 秒一律不给数
+#   · 累计字节变小 = 计数器回绕或接口重启 ⇒ 差值为负 ⇒ 当作无数据
+#
+# 这是**进程内**状态：面板重启后第一次采样同样是「采样中」，
+# 这是对的 —— 跨重启的字节差没有意义（计数器可能已回绕）。
+
+_RATE_SNAPSHOT = {}
+_RATE_MIN_INTERVAL = 1.0
+
+
+def _apply_rates(ifaces):
+    """给接口列表补上 rx_bps / tx_bps（字节/秒），就地修改。
+
+    调一次 = 采一次样。本次累计值存进 _RATE_SNAPSHOT，
+    下次采集时与上一次比。
+    """
+    now = time.time()
+    alive = set()
+    for it in ifaces:
+        name = it['name']
+        alive.add(name)
+        rx = it.get('rx_bytes')
+        tx = it.get('tx_bytes')
+        prev = _RATE_SNAPSHOT.get(name)
+        it['rx_bps'] = None
+        it['tx_bps'] = None
+        if prev:
+            dt = now - prev['t']
+            if dt >= _RATE_MIN_INTERVAL:
+                # 字节数变小 = 计数器回绕或接口被重启 ⇒ 不是有效样本
+                if rx is not None and prev['rx'] is not None and rx >= prev['rx']:
+                    it['rx_bps'] = int((rx - prev['rx']) / dt)
+                if tx is not None and prev['tx'] is not None and tx >= prev['tx']:
+                    it['tx_bps'] = int((tx - prev['tx']) / dt)
+        _RATE_SNAPSHOT[name] = {'t': now, 'rx': rx, 'tx': tx}
+    # 接口在设备上被删掉/改名了 ⇒ 别让快照无限膨胀
+    for key in list(_RATE_SNAPSHOT.keys()):
+        if key not in alive:
+            del _RATE_SNAPSHOT[key]
+
+
+def collect_interfaces():
+    """网络接口清单（含累计流量、速率、链路属性）。
+
+    刻意**只读 /proc 和 /sys**：不调 `ip`、不跑 `ifconfig`、不用 netlink ——
     `ip`/`ifconfig` 在 BusyBox 上输出格式各异且要 fork 子进程；
     netlink 的 `recv` 在某些环境下会阻塞（实测本机就卡住），
     一个「显示系统信息」的页面不该有把面板请求挂住的风险。
@@ -287,46 +493,42 @@ def collect_interfaces():
     地址来源：
       · IPv6 → `/proc/net/if_inet6`（直接带接口名，最干净）
       · IPv4 → `/proc/net/route` 的网段 + `/proc/net/fib_trie` 的本地地址
-    """
-    # 先建「接口名 → 统计量」
-    stats = {}
-    txt = _read_text('/proc/net/dev', 65536)
-    if txt:
-        for line in txt.splitlines()[2:]:
-            if ':' not in line:
-                continue
-            name, rest = line.split(':', 1)
-            name = name.strip()
-            if not name:
-                continue
-            fields = rest.split()
-            if len(fields) < 16:
-                continue
-            try:
-                stats[name] = {'rx_bytes': int(fields[0]), 'tx_bytes': int(fields[8])}
-            except (ValueError, IndexError):
-                continue
 
-    if not stats:
+    速率见 `_apply_rates` 的说明（两次采样差值）。
+    """
+    dev = _parse_net_dev(_read_text('/proc/net/dev', 65536))
+    if not dev:
         return []
 
     v4 = _ipv4_by_iface()
     v6 = _ipv6_by_iface()
 
     out = []
-    for name in sorted(stats):
+    for name in sorted(dev):
         if name == 'lo':
             # 回环对用户没有信息量，跳过（不是「假装它不存在」——
             # 页面展示的是「对外的接口」）。
             continue
-        out.append({
+        row = dev[name]
+        item = {
             'name': name,
-            'rx_bytes': stats[name]['rx_bytes'],
-            'tx_bytes': stats[name]['tx_bytes'],
+            'rx_bytes': row.get('rx_bytes'),
+            'tx_bytes': row.get('tx_bytes'),
+            'rx_packets': row.get('rx_packets'),
+            'tx_packets': row.get('tx_packets'),
+            'rx_errs': row.get('rx_errs'),
+            'tx_errs': row.get('tx_errs'),
+            'rx_drop': row.get('rx_drop'),
+            'tx_drop': row.get('tx_drop'),
             'state': _iface_state(name),
             'ipv4': v4.get(name),
             'ipv6': v6.get(name),
-        })
+        }
+        item.update(_iface_sysfs(name))
+        item.update(_iface_statistics(name))
+        out.append(item)
+
+    _apply_rates(out)
     return out
 
 
@@ -653,6 +855,186 @@ def collect_device_model():
     return None
 
 
+# ── 设备侧服务状态 ────────────────────────────────────────────
+#
+# 面板自己管的开关只能说明「面板想干什么」，
+# 用户真正关心的是「这台设备上到底什么在跑」。
+#
+# 三个数据源（全是只读）：
+#   /etc/init.d/    装了这个服务的 init 脚本 ⇒ installed
+#   /etc/rc.d/S*    开机自启的符号链接 ⇒ enabled
+#   /var/run/*.pid  pid 文件 ⇒ running（还要确认 pid 还活着）
+#
+# ⚠️ pid 文件名 **不等于** 服务名：
+#   dropbear 的 pid 文件叫 `dropbear.main.pid`，不是 `dropbear.pid`；
+#   udhcpc 的叫 `udhcpc-br-lan.pid`。⇒ 先精确匹配 `<服务名>.pid`，
+#   再匹配 `<服务名>.<后缀>.pid`。
+#
+# ⚠️ 「enabled」只说明**会被拉起**，不说明**现在在跑** ——
+#   uhttpd 就是活例子（2026-11-10 真机 .232 实测）：
+#   /etc/rc.d/S50uhttpd 软链还在（enabled=true），
+#   但 /etc/init.d/uhttpd 的 start_service 里
+#       config_get_bool enabled "$cfg" 'enabled' 1
+#       [ $enabled -gt 0 ] || return
+#   读到 uhttpd.main.enabled=0 ⇒ 直接 return ⇒ 开机根本不启动。
+#   （`/etc/init.d/uhttpd enabled` 这个命令会返回 true，但那是 rc.common
+#     的默认实现只看 S 软链在不在，uhttpd 并**没有**自定义 enabled() 函数
+#     —— 这个命令会骗人，别拿它当「开机自启」的判据。）
+#   ⇒ **running 才是「现在真的在跑」的唯一可信依据**，enabled 只是参考。
+
+_INITD_DIR = '/etc/init.d'
+_RCD_DIR = '/etc/rc.d'
+_PID_DIR = '/var/run'
+
+# 本项目历史遗留：`/etc/init.d/nftables-web.bak.<时间戳>` 这种备份副本。
+# 它是**旧版 init 脚本的拷贝**，不是服务（2026-11-10 真机实测到过一份，
+# 10-31 那次手工升级留下的）。setup.sh 已加步骤把它们挪进
+# /etc/nftables/backup/；这里再挡一道，免得老设备升级前就露出来。
+_BACKUP_NAME_RE = re.compile(r'\.bak(\.\d+)?$')
+
+
+def _read_pid_map():
+    """{pid 文件名(去掉 .pid 后缀): pid 整数}。"""
+    out = {}
+    for fn in _listdir(_PID_DIR):
+        if not fn.endswith('.pid'):
+            continue
+        txt = _read_first_line(os.path.join(_PID_DIR, fn))
+        try:
+            out[fn[:-4]] = int(txt)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _service_pid(name, pid_map):
+    """服务的 pid；找不到、或该 pid 已经不在了，返回 None。
+
+    为什么要查 /proc/<pid> 在不在：
+    pid 文件**可能残留** —— 进程崩了但文件没被清掉。
+    照着文件报「运行中」就是在骗人。
+    """
+    pid = pid_map.get(name)
+    if pid is None:
+        for key, val in pid_map.items():
+            if key.startswith(name + '.'):
+                pid = val
+                break
+    if pid is None:
+        return None
+    return pid if os.path.isdir('/proc/%d' % pid) else None
+
+
+def collect_services():
+    """设备上的服务清单与状态。
+
+    返回 [{name, installed, enabled, running, priority}, ...]，
+    排序：先在跑的 → 再开机自启的 → 再按启动序号 → 最后按名字。
+
+    installed  /etc/init.d/ 下有它的 init 脚本
+    enabled    /etc/rc.d/ 下有 S* 软链（会被拉起，不代表一定起来）
+    running    有 pid 文件且该 pid 还活着
+    priority   rc.d 里的启动序号（S50uhttpd ⇒ 50）；没有则 None
+    """
+    initd = set()
+    for name in _listdir(_INITD_DIR):
+        p = os.path.join(_INITD_DIR, name)
+        if _BACKUP_NAME_RE.search(name):
+            continue
+        # 只要**普通文件**；软链和目录不是服务
+        if os.path.isfile(p) and not os.path.islink(p):
+            initd.add(name)
+
+    # rc.d 里的 S<序号><服务名> 软链 ⇒ 开机自启
+    enabled = {}
+    priority = {}
+    for fn in _listdir(_RCD_DIR):
+        if not fn.startswith('S'):
+            continue
+        rest = fn[1:]
+        num = ''
+        for ch in rest:
+            if not ch.isdigit():
+                break
+            num += ch
+        svc = rest[len(num):]
+        if not svc:
+            continue
+        enabled[svc] = True
+        if num:
+            try:
+                priority[svc] = int(num)
+            except ValueError:
+                pass
+
+    pid_map = _read_pid_map()
+
+    out = []
+    for name in set(initd) | set(enabled):
+        running = _service_pid(name, pid_map) is not None
+        out.append({
+            'name': name,
+            'installed': name in initd,
+            'enabled': name in enabled,
+            'running': running,
+            'priority': priority.get(name),
+        })
+    out.sort(key=lambda s: (not s['running'], not s['enabled'],
+                             s['priority'] if s['priority'] is not None else 999,
+                             s['name']))
+    return out
+
+
+# ── 软件包 ────────────────────────────────────────────────────
+#
+# OpenWrt 25.12 用 apk：/lib/apk/db/installed 是 ADB 格式，
+# 每个包一段，以 `P:<包名>` 开头 ⇒ 数 P: 行就是包数
+# （真机 .232 实测：257 个包）。
+#
+# 老版本用 opkg：/usr/lib/opkg/status 里每个包一段，以 `Package:` 开头。
+#
+# /etc/apk/world 是「用户显式要装」的清单（不含依赖），
+# 部分条目带约束后缀（`busybox><Q16G4HcA94o24kSZjd7yZlEymYd4w=`、
+# `base-files=1711~f5dae5ece4`）—— 那部分是 apk 的版本/来源约束，
+# 不是包名 ⇒ 展示前要剥掉。
+
+
+def collect_packages():
+    """装了多少包、显式装了哪些。
+
+    返回 {'total': 总数或 None, 'world': [显式安装的包名, ...]}
+    """
+    out = {'total': None, 'world': []}
+
+    # ── apk ──
+    txt = _read_text('/lib/apk/db/installed', 4 * 1024 * 1024)
+    if txt:
+        n = len([ln for ln in txt.splitlines() if ln.startswith('P:')])
+        if n:
+            out['total'] = n
+
+    # ── opkg（老系统）──
+    if out['total'] is None:
+        txt = _read_text('/usr/lib/opkg/status', 4 * 1024 * 1024)
+        if txt:
+            n = len(re.findall(r'^Package:\s*\S+', txt, re.M))
+            if n:
+                out['total'] = n
+
+    # ── world：显式安装的清单 ──
+    txt = _read_text('/etc/apk/world', 65536)
+    if txt:
+        world = []
+        for line in txt.splitlines():
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            # 先切 '<'（`pkg><hash` 形式），再切 '=' 和 '>'
+            world.append(line.split('<')[0].split('=')[0].split('>')[0])
+        out['world'] = world
+    return out
+
+
 # ── 汇总 ─────────────────────────────────────────────────────
 
 
@@ -691,6 +1073,14 @@ def collect_all():
         model = collect_device_model()
     except Exception:
         model = None
+    try:
+        services = collect_services()
+    except Exception:
+        services = []
+    try:
+        packages = collect_packages()
+    except Exception:
+        packages = {'total': None, 'world': []}
 
     return {
         'model': model,
@@ -700,4 +1090,6 @@ def collect_all():
         'storage': storage,
         'uptime_seconds': uptime,
         'interfaces': interfaces,
+        'services': services,
+        'packages': packages,
     }
