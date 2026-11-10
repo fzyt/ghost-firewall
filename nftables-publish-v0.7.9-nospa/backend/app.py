@@ -3724,6 +3724,176 @@ def _atomic_write_network_config(path, content):
     return True
 
 
+# === WAN 口检测 ===
+#
+# ⚠️ 这块代码的失败模式是「整机失联」，不是「配置不对」。
+# 挑错一个 WAN 口 = 把 LAN 桥的成员抢走 = 桥塌 = 设备当场失联。
+#
+# 2026-10-06 实测踩过一次：x86 单网卡设备上点「PPPoE 拨号」+「保存网络配置」
+# +「重启网络」，设备当场 ARP FAILED（Proxmox 未开带外口，无法远程恢复）。
+# 当时的兜底是「检测不到就猜 eth0」—— 已改成「检测不到就拒绝保存」。
+#
+# 2026-11-10 复核又挖出同一族的第二处隐患：旧的 list ports 解析**只认带引号的写法**
+#（`line.strip().split("'")[-2] if "'" in line else ''`），
+# 而 UCI 允许 `list ports eth1`（不带引号）——
+# .232 真机实测（2026-11-10）：`uci show` 把 `list ports eth1` 正常解析成
+# `ports='eth0' 'eth1'`，即**不带引号是合法的**。
+# 那种写法下 eth1 解析不到 ⇒ 被当成「没被 LAN 占用」⇒ 可能被选成 WAN
+# ⇒ WAN 抢走 LAN 桥成员 ⇒ 整机失联。
+#
+# 现在的判据是三路证据的**并集**（宁可多排除，也绝不能少排除）：
+#   1. 配置文本里声明的桥成员（config device 段的 list ports / option ports，
+#      带引号、不带引号、双引号都认）；
+#   2. lan 接口自己的 option ifname（swconfig 老写法，那里没有桥段）；
+#   3. 内核实况：/sys/class/net/<if>/master 存在 ⇒ 该口已被桥/设备接管
+#      （.232 实测：eth0 的 master 指向 br-lan，eth1 没有 master ⇒ 独立口）。
+# 第 3 条是**比文本解析更硬的证据**：文本可能漏写、写法可能怪，
+# 而「这个口挂在哪个桥上」是内核说了算。
+
+# 物理网卡的 sysfs 根目录。做成模块常量是为了让测试能指向假目录
+# （测试里 monkeypatch 这个常量，走的是和真机完全相同的代码路径）。
+SYSFS_NET_ROOT = '/sys/class/net'
+
+# UCI 段头：`config interface 'lan'` / `config device` / `config globals 'globals'`
+_UCI_SECTION_RE = re.compile(r"^config\s+(\S+)\s*(.*)$")
+# 桥成员声明：`list ports 'eth0'` / `list ports eth0` / `option ports 'eth0 eth1'`
+_UCI_PORTS_RE = re.compile(r"^(?:list|option)\s+ports\s+(.*)$")
+# 物理网卡命名：eth0 / ens33 / enp0s3 这类（前缀 + 数字）
+_PHY_IFACE_RE = re.compile(r"^(?:eth|ens|enp)\d")
+
+
+def _is_physical_iface(name):
+    """是不是一块独立的物理网卡。
+
+    ⚠️ 不能只 startswith('eth')：VLAN 子接口（eth0.10）也满足那个条件，
+    而它**绝不能**当 WAN 口用 —— 那等于把 LAN 的 VLAN 抢走。
+    物理网卡名不带 '.'，这是最省事也最准的区分。
+    """
+    if '.' in name:
+        return False
+    return bool(_PHY_IFACE_RE.match(name))
+
+
+def _uci_sections(text):
+    """把 UCI 文本切成 [(类型, 名字, [段内行])]。
+
+    段头形如 `config interface 'lan'` / `config device`，
+    名字带不带引号 UCI 都接受（这里两种都剥掉）。
+    """
+    sections = []
+    cur = None
+    for line in text.splitlines():
+        m = _UCI_SECTION_RE.match(line.strip())
+        if m:
+            cur = (m.group(1), m.group(2).strip().strip('\'"'), [])
+            sections.append(cur)
+            continue
+        if cur is not None:
+            cur[2].append(line)
+    return sections
+
+
+def _uci_declared_ports(text):
+    """配置文本里声明的全部桥成员口（所有 config device 段的 ports）。
+
+    值的写法必须容错：UCI 允许 'eth0' / "eth0" / eth0 三种
+    （.232 真机 2026-11-10 实测 `uci show` 三种都接受），
+    旧实现只认第一种 ⇒ 无引号写法整条漏掉（见上面的说明）。
+    """
+    out = set()
+    for stype, _name, body in _uci_sections(text):
+        if stype != 'device':
+            continue
+        for line in body:
+            m = _UCI_PORTS_RE.match(line.strip())
+            if not m:
+                continue
+            val = m.group(1).strip()
+            # 剥掉可能存在的外层引号（单引号 / 双引号都认）
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                val = val[1:-1]
+            # option ports 可能是空格分隔的多个口（swconfig 老写法）
+            for p in val.split():
+                if p:
+                    out.add(p)
+    return out
+
+
+def _uci_lan_ifname_ports(text):
+    """lan 接口 option ifname 里的口。
+
+    swconfig 时代的 LAN 口是直接列在 lan 接口的 `option ifname 'eth0 eth1'`，
+    那种配置里根本没有 config device 桥段 ⇒ 只看 list ports 会漏。
+    """
+    out = set()
+    for stype, name, body in _uci_sections(text):
+        if stype != 'interface' or name != 'lan':
+            continue
+        for line in body:
+            s = line.strip()
+            if not s.startswith('option') or 'ifname' not in s.split():
+                continue
+            for p in extract_uci_value(s).split():
+                if p:
+                    out.add(p)
+    return out
+
+
+def _detect_wan_device(network_text, sysfs_root=None):
+    """挑一个能当 WAN 用的独立物理网卡。
+
+    返回 (wan_device, physical, occupied)：
+      wan_device  选中的口名；None = 没有可用的独立 WAN 口
+      physical    本机全部物理网卡名（排序）
+      occupied    因被占用而被排除的物理网卡名（排序）
+
+    排除依据是三路证据的并集（见本节开头的说明）：
+    配置声明的桥成员 ∪ lan 的 option ifname ∪ sysfs 里已被接管的口。
+    """
+    root = SYSFS_NET_ROOT if sysfs_root is None else sysfs_root
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        names = []
+
+    physical = [n for n in names if _is_physical_iface(n)]
+
+    excluded = _uci_declared_ports(network_text)
+    excluded |= _uci_lan_ifname_ports(network_text)
+    # 内核实况：master 存在 ⇒ 这个口已经被某个桥/设备接管
+    for n in names:
+        if os.path.islink(os.path.join(root, n, 'master')):
+            excluded.add(n)
+
+    occupied = [n for n in physical if n in excluded]
+    for n in physical:
+        if n not in excluded:
+            return n, physical, occupied
+    return None, physical, occupied
+
+
+def _wan_device_missing_message(physical, occupied):
+    """组装「没有独立 WAN 口」的报错文案。
+
+    ⚠️ 文案必须按**实际口数**生成：旧文案写死「本机只有一张物理网卡」，
+    在多口机上是错的（真实原因是「所有物理口都已划给 LAN 桥」），
+    会把用户引到错误的排查方向上去。
+    """
+    occ_desc = ', '.join(occupied) if occupied else '未知'
+    head = f"未检测到独立的 WAN 网卡（已占用于 LAN 桥的设备：{occ_desc}）。"
+    if not physical:
+        why = ("本机没有找到任何物理网卡"
+               "（/sys/class/net 下没有 eth*/ens*/enp* 命名的接口）")
+    elif len(physical) == 1:
+        why = f"本机只有一张物理网卡（{physical[0]}），无法同时做 LAN 和 PPPoE WAN"
+    else:
+        why = (f"本机共 {len(physical)} 张物理网卡（{'、'.join(physical)}），"
+               f"它们已全部被占用，没有独立的口可用于 WAN")
+    return (f"{head}{why} —— "
+            f"继续写入会让 WAN 抢走 LAN 的网卡，导致设备失联。"
+            f"请先在 OpenWrt 里划出第二张网卡专供 WAN，或改用其它上网方式。")
+
+
 def update_uci_wan_config(path, data):
     """更新 /etc/config/network 中的 wan 接口配置"""
     with open(path, 'r') as f:
@@ -3732,7 +3902,7 @@ def update_uci_wan_config(path, data):
     new_lines = []
     has_pppoe = data.get('wan_pppoe', False)
     wan_device = sanitize_uci_value(data.get('wan_device', ''))
-    # 检测 WAN 设备：只认"不在 LAN 桥成员里"的物理网卡。
+    # 检测 WAN 设备：只认「既不在 LAN 桥成员里、也没有被任何桥接管」的物理网卡。
     #
     # ⚠️ 这里原本有个会造成失联的兜底：检测不到就 `wan_device = 'eth0'`。
     # 但 eth0 恰恰是 br-lan 的唯一从属端口（上面的检测正是为了把它排除掉），
@@ -3740,33 +3910,14 @@ def update_uci_wan_config(path, data):
     # 2026-10-06 实测踩中：x86 单网卡 OpenWrt 上点「PPPoE 拨号」+「保存网络
     # 配置」+「重启网络」，设备当场 ARP FAILED，Proxmox 未开带外口，无法远程恢复。
     # 检测不到独立 WAN 网卡就必须拒绝，绝不能猜一个设备名写进配置。
-    detected = False
-    lan_ports = set()          # 提到 try 外：异常路径下也要能报出"哪些卡被 LAN 占了"
-    try:
-        import subprocess as _sp
-        with open(path, 'r') as f:
-            for line in f:
-                if 'list ports' in line:
-                    p = line.strip().split("'")[-2] if "'" in line else ''
-                    if p:
-                        lan_ports.add(p)
-        # 用 ls /sys/class/net/ 检测接口（兼容 BusyBox）
-        r = _sp.run(['ls', '/sys/class/net/'], capture_output=True, text=True, timeout=5)
-        for name in r.stdout.strip().split():
-            if (name.startswith('eth') or name.startswith('ens') or name.startswith('enp')) and name not in lan_ports:
-                wan_device = name
-                detected = True
-                break
-    except Exception:
-        pass
-    if not detected:
-        lan_desc = ', '.join(sorted(lan_ports)) if lan_ports else '未知'
-        raise ValueError(
-            f"未检测到独立的 WAN 网卡（已占用于 LAN 桥的设备：{lan_desc}）。"
-            f"本机只有一张物理网卡，无法同时做 LAN 和 PPPoE WAN —— "
-            f"继续写入会让 WAN 抢走 LAN 的网卡，导致设备失联。"
-            f"请先在 OpenWrt 里划出第二张网卡专供 WAN，或改用其它上网方式。"
-        )
+    #
+    # 2026-11-10：旧的 list ports 解析只认带引号的写法 ⇒ 多 eth 接入 br-lan 时
+    # 漏解析 ⇒ 桥成员被当成 WAN 候选 ⇒ 同样是「WAN 抢走 LAN 的网卡」。
+    # 判据与证据来源见上面「=== WAN 口检测 ===」一节的说明。
+    wan_pick, physical, occupied = _detect_wan_device(''.join(lines))
+    if not wan_pick:
+        raise ValueError(_wan_device_missing_message(physical, occupied))
+    wan_device = wan_pick
     pppoe_username = sanitize_uci_value(data.get('wan_pppoe_username', ''))
     pppoe_password = sanitize_uci_value(data.get('wan_pppoe_password', ''))
     if not pppoe_username:
