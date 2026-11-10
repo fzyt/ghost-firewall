@@ -159,6 +159,11 @@ const BACKEND_FIELDS = [
   'storage.total_kb', 'storage.used_kb', 'storage.free_kb', 'storage.path',
   'uptime_seconds',
   'interfaces',
+  // v0.19.8 新增：面板自身的开关（由 /api/system/info 的 data.panel 提供）
+  'panel', 'panel.access_mode', 'panel.deploy_mode', 'panel.switches',
+  'panel.counts', 'panel.ddns_configured', 'panel.cert_ready',
+  // v0.19.8 新增：设备侧服务状态与包清单
+  'services', 'packages', 'packages.total', 'packages.world',
 ];
 
 // 模板里实际引用的字段路径
@@ -182,10 +187,35 @@ for (const ref of templateRefs) {
 }
 
 // 顺带确认「数组元素用到的属性」后端真的产出
-const IFACE_FIELDS = ['name', 'state', 'ipv4', 'ipv6', 'rx_bytes', 'tx_bytes'];
+const IFACE_FIELDS = ['name', 'state', 'ipv4', 'ipv6', 'rx_bytes', 'tx_bytes',
+                      // v0.19.8 新增：速率（模板直接引用）
+                      'rx_bps', 'tx_bps'];
 for (const f of IFACE_FIELDS) {
   check('接口字段 ' + f + ' 在模板里被用到了',
     new RegExp('iface\\.' + f + '\\b').test(INDEX_HTML));
+}
+
+// 这几个是在 **ifaceDetail 方法内部**用的 ⇒ 要在 app.js 里找，不在模板里
+const IFACE_DETAIL_FIELDS = ['mtu', 'mac', 'master', 'speed', 'duplex',
+                             'rx_dropped', 'tx_dropped', 'rx_errors', 'tx_errors'];
+for (const f of IFACE_DETAIL_FIELDS) {
+  check('接口明细字段 ' + f + ' 在 app.js 里被用到了',
+    new RegExp('iface\\.' + f + '\\b').test(APP_JS));
+}
+
+// 服务列表的字段
+const SVC_FIELDS = ['name', 'enabled', 'running'];
+for (const f of SVC_FIELDS) {
+  check('服务字段 ' + f + ' 在模板里被用到了',
+    new RegExp('svc\\.' + f + '\\b').test(INDEX_HTML));
+}
+check('服务字段 priority 在 app.js 里被用到了（svcPriority 方法内）',
+  /svc\.priority\b/.test(APP_JS));
+
+// 开关徽章的字段
+for (const f of ['key', 'label', 'on']) {
+  check('开关字段 ' + f + ' 在模板里被用到了',
+    new RegExp('sw\\.' + f + '\\b').test(INDEX_HTML));
 }
 
 sec('第 3 组：页面结构');
@@ -196,11 +226,94 @@ check('navItems 里有 system-info 这一项',
   /id:\s*'system-info'/.test(APP_JS));
 check('切换到该页会调用 loadDeviceInfo()',
   /item\.id === 'system-info'\) loadDeviceInfo\(\)/.test(INDEX_HTML));
-check('app.js 里有 loadDeviceInfo 方法', /async loadDeviceInfo\(\)/.test(APP_JS));
+check('app.js 里有 loadDeviceInfo 方法', /async loadDeviceInfo\(isAuto\)/.test(APP_JS));
 check('app.js 里有 deviceInfo 状态', /deviceInfo:\s*\{/.test(APP_JS));
 check('调用的是 /api/system/info', /api\/system\/info/.test(APP_JS));
 check('失败时显示错误而不是空白', /deviceInfo\.error/.test(INDEX_HTML));
 check('页面上说明数据来源只读', /只读采集/.test(INDEX_HTML));
+
+check('页面有「功能开关」板块', /功能开关/.test(INDEX_HTML));
+
+// 「交换」列必须**同时**用上收和发 —— 只算一边的话这一列就是错的，
+// 而且页面上看数字完全正常（不会报错），只有对账才发现。
+check('「交换」列是收+发（rx_bytes + tx_bytes）',
+  /fmtBytes\(\(iface\.rx_bytes \|\| 0\) \+ \(iface\.tx_bytes \|\| 0\)\)/.test(INDEX_HTML),
+  '没找到收发相加的表达式');
+
+sec('第 4 组：新增的格式化函数（2026-11-10 系统信息页数据面扩充）');
+const fmtRate = makeMethod('fmtRate');
+check('fmtRate 能被抽出来并执行', !!fmtRate);
+if (fmtRate) {
+  // ⚠️ 关键：速率读不到必须是「采样中」，**不是 0** ——
+  // 0 会被读成「这条链路没有流量」，那是撒谎。
+  check('fmtRate(null) = 采样中', fmtRate(null) === '采样中', '得到 ' + fmtRate(null));
+  check('fmtRate(undefined) = 采样中', fmtRate(undefined) === '采样中');
+  check('fmtRate(NaN) = 采样中', fmtRate(NaN) === '采样中');
+  check('fmtRate(0) = 0 B/s（真的是 0 就该显示 0）', fmtRate(0) === '0 B/s',
+    '得到 ' + fmtRate(0));
+  check('fmtRate(512) = 512 B/s', fmtRate(512) === '512 B/s', '得到 ' + fmtRate(512));
+  check('fmtRate(2048) = 2.0 KB/s', fmtRate(2048) === '2.0 KB/s', '得到 ' + fmtRate(2048));
+  check('fmtRate(5MB) 含「MB/s」', /MB\/s/.test(fmtRate(5 * 1024 * 1024)),
+    '得到 ' + fmtRate(5 * 1024 * 1024));
+}
+
+const ifaceDetail = makeMethod('ifaceDetail');
+check('ifaceDetail 能被抽出来并执行', !!ifaceDetail);
+if (ifaceDetail) {
+  const d = ifaceDetail({
+    mtu: 1500, mac: 'bc:24:11:48:32:5b', master: 'br-lan',
+    speed: 1000, duplex: 'full', rx_dropped: 3, tx_dropped: 0,
+    rx_errors: 0, tx_errors: 1,
+  });
+  check('明细里有 MTU', /MTU 1500/.test(d), d);
+  check('明细里有 MAC', /bc:24:11:48:32:5b/.test(d), d);
+  check('明细里有桥归属', /桥 br-lan/.test(d), d);
+  check('明细里有链路速率', /1000 Mbps/.test(d), d);
+  check('明细里有丢包数', /丢包 3/.test(d), d);
+  check('明细里有错误数', /错误 1/.test(d), d);
+  // 读不到的项**不出现**（而不是显示「未知」）
+  const empty = ifaceDetail({});
+  check('读不到时明细为空串', empty === '', JSON.stringify(empty));
+  check('null 接口不炸', ifaceDetail(null) === '');
+  // 0 丢包不算「有丢包」⇒ 不该显示「丢包 0」
+  const zero = ifaceDetail({ rx_dropped: 0, tx_dropped: 0, rx_errors: 0, tx_errors: 0 });
+  check('丢包/错误都是 0 时不显示这两项', !/丢包/.test(zero) && !/错误/.test(zero), zero);
+}
+
+const panelCount = makeMethod('panelCount');
+check('panelCount 能被抽出来并执行', !!panelCount);
+if (panelCount) {
+  const p = { counts: { forward_rules: 0, whitelist: 3 } };
+  // ⚠️ 0 是合法值（「一条转发规则都没有」是真实状态）⇒ 必须显示「0 条」
+  check('计数为 0 时显示「0 条」（不是「未知」）',
+    panelCount(p, 'forward_rules') === '0 条', '得到 ' + panelCount(p, 'forward_rules'));
+  check('计数为 3 时显示「3 条」',
+    panelCount(p, 'whitelist') === '3 条', '得到 ' + panelCount(p, 'whitelist'));
+  check('panel 为 null 时显示「未知」', panelCount(null, 'whitelist') === '未知');
+  check('panel 没有 counts 时显示「未知」', panelCount({}, 'whitelist') === '未知');
+  check('counts 里没有这个键时显示「未知」',
+    panelCount(p, 'nonexistent') === '未知');
+}
+
+const svcPriority = makeMethod('svcPriority');
+check('svcPriority 能被抽出来并执行', !!svcPriority);
+if (svcPriority) {
+  check('序号 50 显示 50', svcPriority({ priority: 50 }) === '50');
+  // ⚠️ 0 是合法序号（S00sysfixtime）⇒ 不能显示成「—」
+  check('序号 0 显示 0（不是「—」）', svcPriority({ priority: 0 }) === '0',
+    '得到 ' + svcPriority({ priority: 0 }));
+  check('没有序号时显示「—」', svcPriority({ priority: null }) === '—');
+  check('整个对象缺失时显示「—」', svcPriority(null) === '—');
+}
+
+sec('第 5 组：系统信息页的自动刷新（速率要连续采样才有意义）');
+
+check('有排下一次刷新的方法', /scheduleDeviceInfoRefresh\(\)/.test(APP_JS));
+check('定时器只在系统信息页上排（离开就停）',
+  /currentNav !== 'system-info'/.test(APP_JS));
+check('刷新间隔有定义', /deviceInfoRefreshMs/.test(APP_JS));
+check('自动刷新不进 loading 态（免得按钮每 5 秒闪一次）',
+  /if \(!isAuto\) this\.deviceInfo\.loading = true;/.test(APP_JS));
 
 console.log('\n' + '='.repeat(60));
 console.log('  通过 ' + PASS.length + ' / 失败 ' + FAIL.length);

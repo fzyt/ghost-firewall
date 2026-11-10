@@ -59,17 +59,110 @@ const REAL_DATA = {
     {
       name: 'br-lan', rx_bytes: 123456789, tx_bytes: 987654321,
       state: 'up', ipv4: ['192.168.100.1'], ipv6: ['fda7:68ee::1'],
+      // v0.19.8 新增
+      rx_packets: 900000, tx_packets: 700000,
+      rx_bps: 20480, tx_bps: 10240,
+      mtu: 1500, mac: 'bc:24:11:48:32:5b', master: null,
+      speed: null, duplex: null,
+      rx_dropped: 0, tx_dropped: 0, rx_errors: 0, tx_errors: 0,
+      carrier: 1, ifindex: 4, type: 1,
     },
     {
       name: 'pppoe-wan', rx_bytes: 555, tx_bytes: 666,
       state: 'down', ipv4: [], ipv6: [],
+      rx_bps: null, tx_bps: null,
+      mtu: 1500, mac: 'aa:bb:cc:dd:ee:ff', master: null,
+      speed: 1000, duplex: 'full',
+      rx_dropped: 2, tx_dropped: 0, rx_errors: 0, tx_errors: 0,
+      carrier: 0, ifindex: 5, type: 1,
     },
   ],
+  // v0.19.8 新增：面板自身的开关
+  panel: {
+    access_mode: 'lan',
+    deploy_mode: 'openwrt',
+    switches: [
+      { key: 'gateway_enabled', label: '认证网关', on: true },
+      { key: 'luci_enabled', label: 'LuCI 管理界面', on: false },
+    ],
+    counts: {
+      forward_rules: 0, whitelist: 12, blacklist: 3,
+      reverse_proxies: 2, certificates: 1,
+    },
+    ddns_configured: false,
+    cert_ready: true,
+  },
+  // v0.19.8 新增：设备侧服务状态
+  services: [
+    { name: 'dropbear', installed: true, enabled: true, running: true, priority: 19 },
+    { name: 'uhttpd', installed: true, enabled: true, running: false, priority: 50 },
+    { name: 'sysfixtime', installed: true, enabled: true, running: false, priority: 0 },
+  ],
+  // v0.19.8 新增：包清单
+  packages: { total: 257, world: ['busybox', 'dnsmasq', 'dropbear'] },
 };
 
 /** 假的 Alpine data —— 只放页面用到的字段。 */
 function makeData(data) {
   return { deviceInfo: { loading: false, loaded: true, error: '', data } };
+}
+
+/**
+ * 从 app.js 里抽出某个方法的**方法体**（花括号配平，跳过字符串与注释）。
+ */
+function extractMethodBody(src, name) {
+  const re = new RegExp('(?:async\\s+)?' + name + '\\s*\\([^)]*\\)\\s*\\{');
+  const m = re.exec(src);
+  if (!m) return null;
+  let i = m.index + m[0].length;
+  const start = i;
+  let depth = 1;
+  while (i < src.length && depth > 0) {
+    const c = src[i];
+    if (c === "'" || c === '"' || c === '`') {
+      const quote = c;
+      i++;
+      while (i < src.length && src[i] !== quote) {
+        if (src[i] === '\\') i++;
+        i++;
+      }
+      i++;
+      continue;
+    }
+    if (c === '/' && src[i + 1] === '/') {
+      while (i < src.length && src[i] !== '\n') i++;
+      continue;
+    }
+    if (c === '{') depth++;
+    else if (c === '}') depth--;
+    i++;
+  }
+  return src.slice(start, i - 1);
+}
+
+/**
+ * 抽出某个方法并变成可执行的函数。
+ *
+ * ⚠️ 为什么要**真跑**这些方法，而不是一律跳过带函数调用的表达式：
+ *   模板里 `'↓ ' + fmtRate(iface.rx_bps)` 这种表达式如果只跳过不求值，
+ *   渲染测试就等于没覆盖这段 —— 而 fmtRate 读不到时返回「采样中」还是「0」，
+ *   恰恰是这个测试该盯的（0 会被读成「这条链路没有流量」，那是撒谎）。
+ *
+ * ⚠️ 这些方法必须**不依赖 this**（面板上都是从 Alpine 顶层调用的），
+ *   抽出来单独跑时没有 this ⇒ 用 this 会直接抛。
+ */
+function makeMethod(name) {
+  const re = new RegExp('(?:async\\s+)?' + name + '\\s*\\(([^)]*)\\)');
+  const m = re.exec(APP_JS);
+  if (!m) return null;
+  const body = extractMethodBody(APP_JS, name);
+  if (body === null) return null;
+  try {
+    return new Function('return function(' + m[1] + ') {' + body + '}')();
+  } catch (e) {
+    console.log('    （' + name + ' 抽取失败: ' + e.message + '）');
+    return null;
+  }
 }
 
 /**
@@ -96,6 +189,22 @@ function makeScope(data) {
   // 内层循环变量：第一个地址（没有就空串）
   scope.a = (first.ipv4 && first.ipv4[0]) || (first.ipv6 && first.ipv6[0]) || '';
   scope.idx = 0;
+
+  // v0.19.8 新增的三层 x-for 的循环变量
+  const switches = (data && data.panel && data.panel.switches) || [];
+  scope.sw = switches[0] || { key: '', label: '', on: false };
+  const services = (data && data.services) || [];
+  scope.svc = services[0] || { name: '', enabled: false, running: false, priority: null };
+  const world = (data && data.packages && data.packages.world) || [];
+  scope.pkg = world[0] || '';
+
+  // 模板里用到的这些方法：从 app.js **真抽出来**跑，
+  // 而不是随便塞个桩 —— 桩只能证明「不抛异常」，
+  // 真实现才能证明「渲染出来的字是对的」。
+  for (const n of ['fmtRate', 'ifaceDetail', 'panelCount', 'svcPriority']) {
+    const fn = makeMethod(n);
+    if (fn) scope[n] = fn;
+  }
   return scope;
 }
 
@@ -132,7 +241,15 @@ const exprs = extractTextExprs();
 check('找到了系统信息页的 x-text 表达式', exprs.length > 0,
   '找到 ' + exprs.length + ' 个');
 
-const data = makeData(REAL_DATA);
+// ⚠️ 这里传的是**原始数据**，不是 makeData(...) 包装过的。
+//    makeScope() 内部会做一次包装（scope.deviceInfo.data = data），
+//    外面再包一层的话 deviceInfo.data 就变成了 {deviceInfo: {...}}，
+//    `deviceInfo.data.model` 取到的是 undefined ——
+//    而页面上一半以上的表达式都带 `|| '未知'` 兜底，
+//    **严格判定那一组压根不检查它们** ⇒ 这个双层包装一直没被发现。
+//    现在有一批不带兜底的表达式（ifaceDetail / fmtRate / panelCount…），
+//    双层包装会让它们求值到空数据 ⇒ 必须传原始数据。
+const data = REAL_DATA;
 
 // 只读表达式（不含函数调用）的求值结果必须「不是兜底值」。
 // 兜底值清单：页面里所有 || '...' 和 ? '...' : '...' 的字面量。
@@ -182,9 +299,16 @@ for (const [label, expr] of Object.entries(keyExprs)) {
 
 sec('第 3 组：接口表头与字段齐全');
 
-for (const col of ['接口', '状态', 'IPv4', 'IPv6', '已收', '已发']) {
+for (const col of ['接口', '状态', 'IPv4', 'IPv6', '已收', '已发', '交换']) {
   check('接口表有「' + col + '」列', INDEX_HTML.includes('>' + col + '<'));
 }
+
+// v0.19.8 新增的三块也要在页面上
+check('页面有「功能开关」板块', INDEX_HTML.includes('>功能开关<'));
+check('页面有「设备服务」板块', INDEX_HTML.includes('>设备服务<'));
+check('页面有「软件包」板块', INDEX_HTML.includes('>软件包<'));
+check('设备服务表有「开机自启」列', INDEX_HTML.includes('>开机自启<'));
+check('设备服务表有「运行中」列', INDEX_HTML.includes('>运行中<'));
 
 sec('第 4 组：坏数据不会让页面崩');
 
@@ -197,6 +321,10 @@ const EMPTY_DATA = {
   storage: { total_kb: null, used_kb: null, free_kb: null, path: '/' },
   uptime_seconds: null,
   interfaces: [],
+  // v0.19.8 新增：这几个也要能承受「全都没有」
+  panel: null,
+  services: [],
+  packages: { total: null, world: [] },
 };
 const emptyData = EMPTY_DATA;
 for (const expr of exprs) {

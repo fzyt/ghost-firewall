@@ -184,6 +184,20 @@ function app() {
       data: null,
     },
 
+    // ── 系统信息页的自动刷新 ──────────────────────────────────
+    //
+    // 速率来自后端的「两次采样差值」⇒ 不刷新就没有新样本，
+    // 页面会一直停在「采样中」。
+    //
+    // ⚠️ 为什么不是常驻轮询：
+    //   用户不在这个页面时还在打这个接口是白费。
+    //   这里的做法是：定时器到点时检查 currentNav，
+    //   不在系统信息页就**不再排下一次** ⇒ 自动停下。
+    //
+    // 间隔 5 秒：够密到能看出流量起伏，又不至于把面板打爆。
+    deviceInfoTimer: null,
+    deviceInfoRefreshMs: 5000,
+
     // 修改密码（/api/auth/change-password）。
     // 面板此前根本没有改密码入口 —— 密码只能用 ssh + 手改文件改。
     pwModal: {
@@ -1609,8 +1623,10 @@ function app() {
     },
 
     // ── 设备基本信息 ────────────────────────────────────────────
-    async loadDeviceInfo() {
-      this.deviceInfo.loading = true;
+    async loadDeviceInfo(isAuto) {
+      // 自动刷新时不进 loading 态 ——
+      // 否则每 5 秒按钮就闪一下「采集中…」，页面看着一直在动。
+      if (!isAuto) this.deviceInfo.loading = true;
       this.deviceInfo.error = '';
       try {
         const d = await api.get('/api/system/info');
@@ -1630,7 +1646,26 @@ function app() {
           loaded: false,
           error: e.message || '查询失败',
         };
+      } finally {
+        this.deviceInfo.loading = false;
+        // 无论成功失败都要排下一次 ——
+        // 失败了就停在「查询失败」也比不再刷新强（设备可能只是暂时断连）。
+        this.scheduleDeviceInfoRefresh();
       }
+    },
+
+    // 排下一次自动刷新。只在系统信息页上排。
+    scheduleDeviceInfoRefresh() {
+      if (this.deviceInfoTimer) {
+        clearTimeout(this.deviceInfoTimer);
+        this.deviceInfoTimer = null;
+      }
+      // 已经离开这个页面 ⇒ 不排下一次，自动停下。
+      if (this.currentNav !== 'system-info') return;
+      this.deviceInfoTimer = setTimeout(() => {
+        this.deviceInfoTimer = null;
+        this.loadDeviceInfo(true);
+      }, this.deviceInfoRefreshMs);
     },
 
     // ── 设备信息的展示辅助 ──────────────────────────────────────
@@ -1654,6 +1689,70 @@ function app() {
       let i = 0;
       while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
       return (i === 0 ? v : v.toFixed(1)) + ' ' + units[i];
+    },
+
+    // 速率（字节/秒）。
+    //
+    // ⚠️ 读不到显示「采样中」，**不显示 0**：
+    //   速率来自后端的「两次采样差值」，第一次采集没有前值 ⇒ 没有速率。
+    //   显示 0 会被读成「这条链路没有流量」—— 那是**撒谎**。
+    fmtRate(bps) {
+      if (bps === null || bps === undefined || isNaN(bps)) return '采样中';
+      const n = Number(bps);
+      if (n < 1024) return n + ' B/s';
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB/s';
+      return (n / 1024 / 1024).toFixed(2) + ' MB/s';
+    },
+
+    // 接口的附属明细（MTU / MAC / 桥归属 / 链路速率 / 丢包 / 错误）。
+    //
+    // 为什么做成一个方法而不是在模板里拼七八个三元表达式：
+    //   模板里拼出来的表达式读起来比这个方法难懂得多，而且没法单独测。
+    //
+    // ⚠️ 为什么读不到就不出现（而不是显示「未知」）：
+    //   这是**附属明细行**，该有的字段主表里都有；
+    //   这里堆一堆「未知」只会把真正有用的信息淹掉。
+    //
+    // ⚠️ 这里不能用 this.xxx：
+    //   测试框架是把这个方法体**抽出来单独跑**的
+    //   （抽出来的函数里没有 this，方法之间互相调用会炸）⇒
+    //   只用参数里的数据。
+    ifaceDetail(iface) {
+      if (!iface) return '';
+      const bits = [];
+      if (iface.mtu) bits.push('MTU ' + iface.mtu);
+      if (iface.mac) bits.push(iface.mac);
+      if (iface.master) bits.push('桥 ' + iface.master);
+      if (iface.speed) bits.push(iface.speed + ' Mbps');
+      if (iface.duplex) bits.push(iface.duplex);
+      const dropped = (iface.rx_dropped || 0) + (iface.tx_dropped || 0);
+      const errs = (iface.rx_errors || 0) + (iface.tx_errors || 0);
+      if (dropped) bits.push('丢包 ' + dropped);
+      if (errs) bits.push('错误 ' + errs);
+      return bits.join(' · ');
+    },
+
+    // 面板侧的派生计数：转发规则 / 白名单 / 黑名单 / 反代 / 证书。
+    //
+    // ⚠️ 0 是**合法值**（「一条转发规则都没有」是真实状态），
+    //    所以不能用 falsy 判断「读不到」—— 只能显式判 null/undefined。
+    //
+    // ⚠️ panel 从参数进来，不用 this：
+    //   测试框架是把这个方法体抽出来单独跑的（抽出来的函数里没有 this）
+    //   ⇒ 只能靠参数。参数可以是 null/undefined —— 那就返回「未知」。
+    panelCount(panel, key) {
+      if (!panel || !panel.counts) return '未知';
+      const v = panel.counts[key];
+      if (v === null || v === undefined) return '未知';
+      return v + ' 条';
+    },
+
+    // 服务的启动序号（/etc/rc.d/S50uhttpd ⇒ 50）。没有就是「—」。
+    //
+    // ⚠️ 0 是合法序号（S00sysfixtime），不能用 falsy 判断。
+    svcPriority(svc) {
+      if (!svc || svc.priority === null || svc.priority === undefined) return '—';
+      return String(svc.priority);
     },
 
     // 运行时间：秒 → 「3 天 4 小时 12 分」
