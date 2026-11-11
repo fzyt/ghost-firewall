@@ -182,6 +182,15 @@ function app() {
       loaded: false,
       error: '',
       data: null,
+      // 公网 IP：**不在**随 info 一起采 —— 它要发外部请求
+      // （最多 2 个源 × 5 秒超时）⇒ 默认不采，点了「查询」才去问。
+      publicIp: '',
+      loadingPublicIp: false,
+      // DHCP 静态绑定的新增表单
+      dhcpFormOpen: false,
+      dhcpForm: { name: '', ip: '', mac: '' },
+      dhcpFormError: '',
+      dhcpSaving: false,
     },
 
     // ── 系统信息页的自动刷新 ──────────────────────────────────
@@ -1668,7 +1677,12 @@ function app() {
         const info = unwrap(d);
         // 整份替换而不是逐字段合并：后端可能新增字段，
         // 合并会让旧字段的残值留在界面上。
+        //
+        // ⚠️ 但**公网 IP 与表单状态要保留** ——
+        //   公网 IP 是「点了查询才去问」的，不随每次刷新重问；
+        //   表单里用户已经填了一半的内容，更不能被 5 秒一次的刷新冲掉。
         this.deviceInfo = {
+          ...this.deviceInfo,
           loading: false,
           loaded: true,
           error: '',
@@ -1701,6 +1715,102 @@ function app() {
         this.deviceInfoTimer = null;
         this.loadDeviceInfo(true);
       }, this.deviceInfoRefreshMs);
+    },
+
+    // ── 公网 IP（点了「查询」才去问）────────────────────────────
+    //
+    // ⚠️ 不随 /api/system/info 一起采：它要发外部请求
+    //   （最多 2 个源 × 5 秒超时）⇒ 5 秒一次的自动刷新会把它变成
+    //   「每 5 秒问一次外网」⇒ 既拖慢页面又招流量。
+    async loadPublicIp() {
+      if (this.deviceInfo.loadingPublicIp) return;
+      this.deviceInfo.loadingPublicIp = true;
+      try {
+        const d = await api.get('/api/system/info?public_ip=1');
+        const info = unwrap(d) || {};
+        // 采不到就是采不到 —— 显示「未知」，不显示上一次的旧值
+        // （旧值会让人以为「现在还是这个 IP」）。
+        this.deviceInfo.publicIp = info.public_ip || '';
+        this.deviceInfo.data = { ...(this.deviceInfo.data || {}), public_ip: info.public_ip || null };
+      } catch (e) {
+        this.deviceInfo.publicIp = '';
+        this.deviceInfo.error = e.message || '查询失败';
+      } finally {
+        this.deviceInfo.loadingPublicIp = false;
+      }
+    },
+
+    // ── DHCP 静态绑定 ───────────────────────────────────────────
+    //
+    // ⚠️ 这是**写操作**（改设备的 /etc/config/dhcp 并重载 dnsmasq）。
+    //   失败时后端会回滚并如实说明 ⇒ 这里直接把后端的 message 显示出来，
+    //   不自己编「保存失败」。
+    openDhcpHostForm() {
+      this.deviceInfo.dhcpForm = { name: '', ip: '', mac: '' };
+      this.deviceInfo.dhcpFormError = '';
+      this.deviceInfo.dhcpFormOpen = true;
+    },
+
+    async saveDhcpHost() {
+      if (this.deviceInfo.dhcpSaving) return;
+      const f = this.deviceInfo.dhcpForm || {};
+      this.deviceInfo.dhcpSaving = true;
+      this.deviceInfo.dhcpFormError = '';
+      try {
+        const r = await api.post('/api/system/dhcp-hosts', {
+          name: (f.name || '').trim(),
+          ip: (f.ip || '').trim(),
+          mac: (f.mac || '').trim(),
+        });
+        const j = unwrap(r) || {};
+        // ⚠️ 重载 dnsmasq 失败**不算写失败**（文件是对的，只是没生效）
+        //   ⇒ 必须把这句话显示出来，不能假装完全成功。
+        const reloadMsg = (j.reload && j.reload.message) || '';
+        if (!j.reload || j.reload.ok === false) {
+          this.deviceInfo.dhcpFormError = '已保存，但' + (reloadMsg || '未重载 dnsmasq，可能未生效');
+        }
+        this.deviceInfo.dhcpFormOpen = false;
+        await this.loadDeviceInfo(true);
+      } catch (e) {
+        this.deviceInfo.dhcpFormError = e.message || '保存失败';
+      } finally {
+        this.deviceInfo.dhcpSaving = false;
+      }
+    },
+
+    async deleteDhcpHost(h) {
+      if (!h) return;
+      // ⚠️ 只认 section（uci 段名，ASCII）。
+      //   **不能**拿显示名兜底 —— 显示名可能是中文，
+      //   而 uci 段名不接受非 ASCII（后端会拒，报错还难懂）。
+      const section = h.section || '';
+      if (!section) {
+        // 匿名段（config host 没起名）没有可传的标识 ⇒ 只能手改配置文件。
+        this.deviceInfo.dhcpFormError = '这条绑定没有标识（匿名段），面板删不了，请手动编辑 /etc/config/dhcp';
+        return;
+      }
+      if (!window.confirm('确定删除静态绑定「' + (h.name || section) + '」？')) return;
+      this.deviceInfo.dhcpFormError = '';
+      try {
+        const r = await api.delete('/api/system/dhcp-hosts/' + encodeURIComponent(section));
+        const j = unwrap(r) || {};
+        const reloadMsg = (j.reload && j.reload.message) || '';
+        if (!j.reload || j.reload.ok === false) {
+          this.deviceInfo.dhcpFormError = '已删除，但' + (reloadMsg || '未重载 dnsmasq');
+        }
+        await this.loadDeviceInfo(true);
+      } catch (e) {
+        this.deviceInfo.dhcpFormError = e.message || '删除失败';
+      }
+    },
+
+    // ARP 表里的某个 IP 有没有对应的静态绑定名。
+    dhcpNameOf(ip) {
+      const hosts = (this.deviceInfo.data && this.deviceInfo.data.dhcp_hosts) || [];
+      for (const h of hosts) {
+        if (h && h.ip && h.ip === ip) return h.name || h.section || '';
+      }
+      return '';
     },
 
     // ── 设备信息的展示辅助 ──────────────────────────────────────

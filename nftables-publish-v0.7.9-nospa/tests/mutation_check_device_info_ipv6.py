@@ -125,7 +125,14 @@ MUTATIONS = [
      [('            if int(flags, 16) & 0x01:', '            if True:')]),
 
     ('D5  列数下限从 6 提到 7 —— 现代内核的 6 列格式整行被跳过',
-     [('        if len(parts) < 6:', '        if len(parts) < 7:')]),
+     # ⚠️ 锚点必须**唯一**：2026-11-12 系统信息页加了 collect_neighbors()，
+     #   它里面也有一行 `if len(parts) < 6:`（ARP 表同样是 6 列）⇒
+     #   只写那一行的话，锚点出现 2 次 ⇒ 这条变异**打不出去**
+     #   ⇒ 变成「锚点不唯一 ⇒ 算漏网」⇒ 覆盖漏洞。
+     #   ⇒ 带上上一行区分：IPv6 那边是 `parts = line.split()`，
+     #     ARP 那边是 `parts = ln.split()`。
+     [('        parts = line.split()\n        if len(parts) < 6:',
+       '        parts = line.split()\n        if len(parts) < 7:')]),
 ]
 
 

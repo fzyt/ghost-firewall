@@ -916,6 +916,26 @@ phase_verify() {
         warn "设备上还没有 cron 脚本（没配过阿里云 DDNS），跳过该项检查"
     fi
 
+    # ⚠️ 后端新增模块必须**真的到位**（2026-11-12 补）。
+    #   传输清单走 `git ls-files` ⇒ **新文件没 git add 就不会传过去**，
+    #   设备上 backend/dhcp_hosts.py 就不存在 ⇒ app.py 的 `import dhcp_hosts`
+    #   直接 ImportError ⇒ 整个面板起不来（不是「功能不好用」，是「打不开」）。
+    #
+    #   这和批 F 的教训是同一类：「改模板 ≠ 改设备上跑的那个东西」。
+    #   版本号对上了**证明不了**某个新文件到位 ⇒ 必须逐个比 md5。
+    local mod_real mod_md5_real mod_md5_local
+    mod_real="$APP_DIR/backend/dhcp_hosts.py"
+    mod_md5_local="$(md5sum "$SRC/backend/dhcp_hosts.py" 2>/dev/null | cut -d' ' -f1 || true)"
+    mod_md5_real="$(rssh "md5sum '$mod_real' 2>/dev/null | cut -d' ' -f1" || true)"
+    if [ -n "$mod_md5_local" ] && [ -n "$mod_md5_real" ]; then
+        check_eq "设备上的 dhcp_hosts.py 与本地一致（写操作模块确实到位）" \
+                 "$mod_md5_local" "$mod_md5_real"
+    else
+        err "取不到 dhcp_hosts.py 的 md5（本地或设备上缺这个文件）—— 新文件没 git add 就不会传过去"
+        FAILED_CHECKS=$((FAILED_CHECKS + 1))
+        CHECK_FAILURES+=("dhcp_hosts.py 没到位（本地或设备上缺这个文件）")
+    fi
+
     # 全新安装的初始状态：还没设密码（第一次打开面板时设置）
     if [ "$MODE" = "fresh" ]; then
         # ⚠️ password_set 在**面板**的 /api/auth/status 里（backend/app.py:9539），

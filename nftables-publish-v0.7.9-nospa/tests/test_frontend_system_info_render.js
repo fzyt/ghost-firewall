@@ -100,11 +100,38 @@ const REAL_DATA = {
   ],
   // v0.19.8 新增：包清单
   packages: { total: 257, world: ['busybox', 'dnsmasq', 'dropbear'] },
+  // v0.19.18 新增：设备概览与局域网设备
+  // （「设备服务」「软件包」两块已按用户要求从页面移除，
+  //   但后端仍在采集 ⇒ 数据保留在这里，页面不用而已。）
+  hostname: 'OpenWrt',
+  public_ip: '203.0.113.45',
+  connections: [
+    { ip: '10.0.0.10', port: 443, family: 'ipv4' },
+    { ip: '2400:cb00::1', port: 8443, family: 'ipv6' },
+  ],
+  neighbors: [
+    { ip: '192.168.100.1', mac: 'bc:24:11:48:32:5b', iface: 'br-lan', flags: '0x2' },
+    { ip: '192.168.100.126', mac: 'd6:77:f4:3d:9f:ad', iface: 'br-lan', flags: '0x2' },
+  ],
+  dhcp_hosts: [
+    { section: 'host_aabbccddee01', name: '我的NAS', mac: 'aa:bb:cc:dd:ee:01', ip: '192.168.100.50', leasetime: '12h' },
+    { section: 'host_112233445566', name: 'printer', mac: '11:22:33:44:55:66', ip: '192.168.100.60', leasetime: '' },
+  ],
 };
 
 /** 假的 Alpine data —— 只放页面用到的字段。 */
 function makeData(data) {
-  return { deviceInfo: { loading: false, loaded: true, error: '', data } };
+  return {
+    deviceInfo: {
+      loading: false, loaded: true, error: '', data,
+      // v0.19.18 新增：公网 IP 与静态绑定的表单状态
+      // （表单状态必须在**每次刷新**后保留 —— 5 秒一次的自动刷新
+      //   不能把用户正在填的表单冲掉）
+      publicIp: '', loadingPublicIp: false,
+      dhcpFormOpen: false, dhcpForm: { name: '', ip: '', mac: '' },
+      dhcpFormError: '', dhcpSaving: false,
+    },
+  };
 }
 
 /**
@@ -198,6 +225,15 @@ function makeScope(data) {
   scope.svc = services[0] || { name: '', enabled: false, running: false, priority: null };
   const world = (data && data.packages && data.packages.world) || [];
   scope.pkg = world[0] || '';
+
+  // v0.19.18 新增的三层 x-for 循环变量
+  // （连接 / ARP 在线表 / DHCP 静态绑定）
+  const conns = (data && data.connections) || [];
+  scope.c = conns[0] || { ip: '', port: 0, family: 'ipv4' };
+  const nbrs = (data && data.neighbors) || [];
+  scope.n = nbrs[0] || { ip: '', mac: '', iface: '', flags: '0x2' };
+  const dhcps = (data && data.dhcp_hosts) || [];
+  scope.h = dhcps[0] || { section: '', name: '', mac: '', ip: '', leasetime: '' };
 
   // 模板里用到的这些方法：从 app.js **真抽出来**跑，
   // 而不是随便塞个桩 —— 桩只能证明「不抛异常」，
@@ -440,12 +476,28 @@ for (const col of ['接口', '状态', 'IPv4', 'IPv6', '已收', '已发', '交�
   check('接口表有「' + col + '」列', INDEX_HTML.includes('>' + col + '<'));
 }
 
-// v0.19.8 新增的三块也要在页面上
+// v0.19.8 新增的「功能开关」板块还在
 check('页面有「功能开关」板块', INDEX_HTML.includes('>功能开关<'));
-check('页面有「设备服务」板块', INDEX_HTML.includes('>设备服务<'));
-check('页面有「软件包」板块', INDEX_HTML.includes('>软件包<'));
-check('设备服务表有「开机自启」列', INDEX_HTML.includes('>开机自启<'));
-check('设备服务表有「运行中」列', INDEX_HTML.includes('>运行中<'));
+
+// ⚠️ v0.19.18：**「设备服务」与「软件包」两块按用户要求从页面移除了**
+//   （用户原话：「一般不看，我还不如显示一下链接的 IP、设备名称、ARP 绑定」）
+//   ⇒ 判据方向要**反过来**：不是「有这块」，而是「这块没了」。
+//   后端仍在采集这两项（device_info.collect_all 不变），
+//   只是页面不再展示 ⇒ 这里只断言页面。
+check('页面**没有**「设备服务」板块（用户要求移除）',
+  !INDEX_HTML.includes('>设备服务<'));
+check('页面**没有**「软件包」板块（用户要求移除）',
+  !INDEX_HTML.includes('>软件包<'));
+check('设备服务表**没有**「开机自启」列',
+  !INDEX_HTML.includes('>开机自启<'));
+check('设备服务表**没有**「运行中」列',
+  !INDEX_HTML.includes('>运行中<'));
+
+// v0.19.18 新增的两块要在页面上
+check('页面有「设备概览」板块', INDEX_HTML.includes('>设备概览<'));
+check('页面有「局域网设备」板块', INDEX_HTML.includes('>局域网设备<'));
+check('页面有「静态绑定」说明',
+  INDEX_HTML.includes('静态绑定（DHCP 保留地址'));
 
 sec('第 4 组：坏数据不会让页面崩');
 

@@ -525,6 +525,29 @@ def main():
     check('自检项的文案点明「不是装机器时那份旧的」',
           '不是装机器时那份旧的' in deploy)
 
+    # ── 11a-2. 新增的后端模块必须在自检里比对 md5 ──────────────────
+    #
+    # 传输清单走 `git ls-files` ⇒ **新文件没 git add 就不会传过去**，
+    # 设备上 backend/dhcp_hosts.py 不存在 ⇒ app.py 的 import 直接炸
+    # ⇒ 面板整个打不开。
+    #
+    # 「版本号对上了」证明不了某个新文件到位 ⇒ 必须逐个比 md5。
+    check('自检里取了设备上 dhcp_hosts.py 的 md5',
+          re.search(r'mod_md5_real=.*md5sum', deploy) is not None)
+    check('自检里取了本地 dhcp_hosts.py 的 md5',
+          re.search(r'mod_md5_local=.*md5sum', deploy) is not None)
+    _mod_cmp = re.search(
+        r'check_eq\s+"[^"]*dhcp_hosts[^"]*"\s+"\$mod_md5_local"\s+"\$mod_md5_real"',
+        joined)
+    check('自检把 dhcp_hosts.py 的两个 md5 做了比对',
+          _mod_cmp is not None,
+          '两个变量都要出现在同一个 check_eq 里')
+    check('自检项的文案点明「写操作模块确实到位」',
+          '写操作模块确实到位' in deploy)
+    # 传输清单必须含 backend（dhcp_hosts.py 在 backend/ 下）
+    check('传输清单含 backend（新增的后端模块才会被传过去）',
+          re.search(r'ls-files\s+-z\s+--\s+backend', deploy) is not None)
+
     # ── 11b. deploy.sh 里用到的辅助函数必须真的存在 ────────────────
     #
     # 2026-11-11 首次真机部署就踩了：新写的阶段里用了 `info` ——

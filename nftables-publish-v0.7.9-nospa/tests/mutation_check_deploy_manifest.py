@@ -191,6 +191,28 @@ MUTATIONS = [
        '    rc=$?\n',
        '    out="$(rssh "cd \'$APP_DIR/backend\' && env -u NFTABLES_WEB_DDNS_SCRIPT python3 ./regen_ddns_script.py 2>&1" || true)"\n'
        '    rc=$?\n')]),
+
+    # ── 新增后端模块是否真的到位（2026-11-12 补）────────────────
+    #
+    # 传输清单走 `git ls-files` ⇒ **新文件没 git add 就不会传过去**，
+    # 设备上 backend/dhcp_hosts.py 不存在 ⇒ app.py 的 import 直接炸
+    # ⇒ 面板整个打不开。
+    # 「版本号对上了」证明不了新文件到位 ⇒ 必须逐个比 md5。
+    ('I1  自检里不比对 dhcp_hosts.py 的 md5（模块没传过去也不知道）',
+     [('        check_eq "设备上的 dhcp_hosts.py 与本地一致（写操作模块确实到位）" \\\n'
+       '                 "$mod_md5_local" "$mod_md5_real"\n',
+       '')]),
+
+    ('I2  自检里把本地 md5 换成设备上的（自己跟自己比，永远相等）',
+     [('        check_eq "设备上的 dhcp_hosts.py 与本地一致（写操作模块确实到位）" \\\n'
+       '                 "$mod_md5_local" "$mod_md5_real"\n',
+       '        check_eq "设备上的 dhcp_hosts.py 与本地一致（写操作模块确实到位）" \\\n'
+       '                 "$mod_md5_real" "$mod_md5_real"\n')]),
+
+    ('I3  传输清单去掉 backend（新增的后端模块永远传不过去）',
+     [(_UPGRADE_LIST,
+       '        git -C "$SRC" ls-files -z -- frontend tools '
+       'tests setup VERSION > "$track_list" 2>/dev/null \\\n')]),
 ]
 
 

@@ -57,7 +57,14 @@ const ONLY_PAGE = (process.argv.find(a => a.startsWith('--page=')) || '').split(
 // 后六个运行时不可见，但按钮所在 tab 一激活就会漏。
 // 所以这条现在**动作名和中文标签都写**。删数据类按钮靠中文「删除/清空」兜住，
 // 但「重启服务」这种没有关键词的必须靠英文动作名兜。
-const DESTRUCTIVE_PAT = /(删除|删|清空|删除规则|flush|应用防火墙|applyRules|removeDdns|deleteRp|deletePreset|恢复配置|restoreConfig|重置|restartDdns|重启服务|uploadRpCert|上传证书|pickRpReupload|重新上传|requestRpCert|申请证书|renewRpCert|续期证书|reloadNginx|重载 ?nginx|confirmSaveConfig|确认保存|applyPreset|应用预设)/i;
+//
+// 2026-11-12 新增（系统信息页的 DHCP 静态绑定）：
+//   saveDhcpHost()   标签「保存」 → 写设备的 /etc/config/dhcp 并重载 dnsmasq
+//   deleteDhcpHost() 标签「删除」 → 删一条静态绑定并重载 dnsmasq
+// ⚠️ saveDhcpHost 的中文标签就是「保存」，**不能**靠中文兜住
+//   （「保存」太泛，加进正则会把一堆普通保存按钮也误跳过）
+//   ⇒ 只能靠英文动作名兜。
+const DESTRUCTIVE_PAT = /(删除|删|清空|删除规则|flush|应用防火墙|applyRules|removeDdns|deleteRp|deletePreset|恢复配置|restoreConfig|重置|restartDdns|重启服务|uploadRpCert|上传证书|pickRpReupload|重新上传|requestRpCert|申请证书|renewRpCert|续期证书|reloadNginx|重载 ?nginx|confirmSaveConfig|确认保存|applyPreset|应用预设|saveDhcpHost|deleteDhcpHost)/i;
 
 // 基础设施级操作：会改网络/系统自身状态。
 //

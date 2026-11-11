@@ -3,6 +3,7 @@ from flask import Flask, jsonify, request, send_from_directory, send_file, sessi
 import os, subprocess, shutil, json, time, re, hmac, hashlib, base64, datetime, uuid, fcntl, io, zipfile, secrets, ssl, ipaddress, socket, threading, contextlib, sys
 from template_engine import load_template, generate_rules
 import device_info
+import dhcp_hosts
 
 # ======================= 认证配置 =======================
 AUTH_PASSWORD_FILE = os.environ.get(
@@ -14285,8 +14286,12 @@ def system_info():
     """
     if not _is_authenticated():
         return jsonify({'success': False, 'code': 'AUTH_REQUIRED', 'message': '未登录'}), 401
+    # 公网 IP 要发外部请求（最多 2 个源 × 5 秒超时）⇒ 默认**不采**，
+    # 由前端显式要（?public_ip=1）⇒ 页面首屏不会被它拖住。
+    want_public_ip = str(request.args.get('public_ip', '')).lower() in (
+        '1', 'true', 'yes')
     try:
-        data = device_info.collect_all()
+        data = device_info.collect_all(with_public_ip=want_public_ip)
     except Exception as e:
         # 采集器理论上不抛（它内部逐项吞异常），
         # 但真抛了也不能让页面整个挂掉 —— 返回一份空壳 + 错误说明。
@@ -14311,6 +14316,90 @@ def system_info():
         print(f'[WARN] 面板开关采集失败: {type(e).__name__}: {e}', flush=True)
         data['panel'] = None
     return jsonify({'success': True, 'data': data})
+
+
+# ══════════════════════════════════════════════════════════════
+# DHCP 静态绑定（用户口头说的「ARP 绑定」）
+#
+# ⚠️ 这是本项目**第一个会改系统配置**的接口 ⇒ 安全要求最高：
+#   · 写前文件级备份（uci 的 revert 对已提交内容无效，.232 实测过）
+#   · 写后语法校验，坏了自动回滚
+#   · 权限保持 0600 root
+#   · 改完重载 dnsmasq 才生效
+# 详见 backend/dhcp_hosts.py 的模块注释。
+# ══════════════════════════════════════════════════════════════
+
+
+@app.route('/api/system/dhcp-hosts', methods=['GET'])
+def system_dhcp_hosts():
+    """列出 DHCP 静态绑定（只读）。"""
+    if not _is_authenticated():
+        return jsonify({'success': False, 'code': 'AUTH_REQUIRED', 'message': '未登录'}), 401
+    try:
+        hosts = device_info.collect_dhcp_hosts()
+    except Exception as e:
+        print(f'[ERROR] 读取 DHCP 绑定失败: {type(e).__name__}: {e}', flush=True)
+        return jsonify({
+            'success': False,
+            'code': 'DHCP_HOSTS_READ_FAILED',
+            'message': '读取 DHCP 绑定失败，详情请查看面板日志',
+        }), 500
+    return jsonify({'success': True, 'data': {'hosts': hosts}})
+
+
+@app.route('/api/system/dhcp-hosts', methods=['POST'])
+def system_dhcp_hosts_add():
+    """新增一条 DHCP 静态绑定。"""
+    if not _is_authenticated():
+        return jsonify({'success': False, 'code': 'AUTH_REQUIRED', 'message': '未登录'}), 401
+    body = request.get_json(silent=True) or {}
+    name = body.get('name', '')
+    mac = body.get('mac', '')
+    ip = body.get('ip', '')
+    leasetime = body.get('leasetime', '12h')
+    try:
+        result = dhcp_hosts.add_dhcp_host(name, mac, ip, leasetime)
+    except dhcp_hosts.DhcpWriteError as e:
+        print(f'[ERROR] 新增 DHCP 绑定失败: {e}', flush=True)
+        return jsonify({
+            'success': False,
+            'code': 'DHCP_HOST_WRITE_FAILED',
+            'message': str(e),
+            'rolled_back': e.rolled_back,
+        }), 400
+    except Exception as e:
+        print(f'[ERROR] 新增 DHCP 绑定异常: {type(e).__name__}: {e}', flush=True)
+        return jsonify({
+            'success': False,
+            'code': 'DHCP_HOST_WRITE_FAILED',
+            'message': '新增 DHCP 绑定失败，详情请查看面板日志',
+        }), 500
+    return jsonify({'success': True, 'data': result})
+
+
+@app.route('/api/system/dhcp-hosts/<path:section>', methods=['DELETE'])
+def system_dhcp_hosts_delete(section):
+    """删除一条 DHCP 静态绑定。"""
+    if not _is_authenticated():
+        return jsonify({'success': False, 'code': 'AUTH_REQUIRED', 'message': '未登录'}), 401
+    try:
+        result = dhcp_hosts.delete_dhcp_host(section)
+    except dhcp_hosts.DhcpWriteError as e:
+        print(f'[ERROR] 删除 DHCP 绑定失败: {e}', flush=True)
+        return jsonify({
+            'success': False,
+            'code': 'DHCP_HOST_WRITE_FAILED',
+            'message': str(e),
+            'rolled_back': e.rolled_back,
+        }), 400
+    except Exception as e:
+        print(f'[ERROR] 删除 DHCP 绑定异常: {type(e).__name__}: {e}', flush=True)
+        return jsonify({
+            'success': False,
+            'code': 'DHCP_HOST_WRITE_FAILED',
+            'message': '删除 DHCP 绑定失败，详情请查看面板日志',
+        }), 500
+    return jsonify({'success': True, 'data': result})
 
 
 @app.route('/api/rules/health', methods=['GET'])

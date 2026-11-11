@@ -217,6 +217,17 @@ EXPECT = {
     # 系统信息页的加载（2026-11-08 新增）。
     # 它是**只读采集**，不改任何状态 ⇒ 归 normal 档（不是网络级/破坏性级）。
     'loadDeviceInfo':     ('normal', '刷新'),
+    # ── 系统信息页的 DHCP 静态绑定（2026-11-12 新增）──────────
+    # saveDhcpHost 会写设备的 /etc/config/dhcp 并重载 dnsmasq
+    # deleteDhcpHost 会删掉一条绑定
+    # ⇒ 两个都是破坏性档（默认档必须跳过，要显式 --destructive）。
+    # ⚠️ saveDhcpHost 的中文标签就是「保存」⇒ 判据靠**英文动作名**
+    #   才能把它归到破坏性档（中文「保存」太泛，加进正则会误伤普通保存按钮）。
+    'saveDhcpHost':       ('des', '保存'),
+    'deleteDhcpHost':     ('des', '删除'),
+    # 只读与开窗 ⇒ 普通档
+    'loadPublicIp':       ('normal', '查询'),
+    'openDhcpHostForm':   ('normal', '新增静态绑定'),
     'loadFirewallStatus': ('normal', '加载'),
     'loadGatewayStatus':  ('normal', '刷新状态'),
     'loadLists':          ('normal', '加载'),

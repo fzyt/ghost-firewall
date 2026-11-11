@@ -1035,15 +1035,265 @@ def collect_packages():
     return out
 
 
+# ── 局域网：连接 / 在线设备 / DHCP 静态绑定 ─────────────────────
+#
+# 2026-11-11 起加这三块，替掉原来的「设备服务清单」和「软件包」——
+# 那两块是**诊断信息**（要排障时才看），而用户日常关心的是
+# 「这台设备现在在跟谁通信」「局域网里有谁」「哪个 IP 绑给了哪个名字」。
+#
+# ⚠️ 仍然遵守本模块开头那几条硬约束：
+#   · 只读 /proc、/etc，不 fork、不发外部请求（公网 IP 除外，见下）
+#   · 不用 ubus/rpcd（ACL 会挡）
+#   · 读不到就是 None / 空列表，不猜
+
+
+def collect_hostname():
+    """本机名（用户在 OpenWrt 里设的那个 hostname）。
+
+    ⚠️ **不是** ubus 的 `system board` —— 那个走 rpcd 的 ACL，会被挡。
+    `/proc/sys/kernel/hostname` 是内核直接给的，ubus 返回的 hostname
+    其实就是它（.232 实测：两者都是 `OpenWrt`）。
+
+    ⚠️ OpenWrt **默认所有设备都叫 `OpenWrt`** ⇒ 光看名字区分不了设备。
+    页面上要和 IP、型号一起看才有意义。
+    """
+    name = _read_first_line('/proc/sys/kernel/hostname')
+    if name:
+        name = name.strip()
+        if name:
+            return name
+    # 兜底：/etc/openwrt_release 里没有，但 /etc/hostname 有些发行版有
+    name = _read_first_line('/etc/hostname')
+    if name:
+        name = name.strip()
+        if name:
+            return name
+    return None
+
+
+def collect_connections():
+    """当前**已建立**的 TCP 连接的对端地址。
+
+    只读 `/proc/net/tcp` 与 `/proc/net/tcp6`，不 fork、不调 ss/netstat。
+
+    为什么只取「已建立」的：
+      · LISTEN（状态 0A）没有对端，取了也是空的；
+      · 面板自己监听的端口也不该出现在「连接 IP」里。
+
+    返回 [{'ip': 对端IP, 'port': 对端端口, 'family': 'ipv4'|'ipv6'}, ...]，
+    按 IP 去重（同一对端多个端口只留一条），端口取最小的那个。
+    """
+    out = {}
+    for path, family in (('/proc/net/tcp', 'ipv4'),
+                          ('/proc/net/tcp6', 'ipv6')):
+        txt = _read_text(path, 512 * 1024)
+        if not txt:
+            continue
+        for ln in txt.splitlines()[1:]:
+            parts = ln.split()
+            if len(parts) < 4:
+                continue
+            # st 是第 4 列（0 起）：01=ESTABLISHED，0A=LISTEN
+            if parts[3] != '01':
+                continue
+            rem = parts[2]
+            if ':' not in rem:
+                continue
+            hex_ip, hex_port = rem.rsplit(':', 1)
+            try:
+                port = int(hex_port, 16)
+            except ValueError:
+                continue
+            try:
+                if family == 'ipv4':
+                    # ⚠️ /proc/net/tcp 的 IPv4 是**小端**字节序
+                    ip = socket_inet_ntoa(hex_ip, little=True)
+                else:
+                    ip = socket_inet_ntop6(hex_ip)
+            except (ValueError, OSError):
+                continue
+            if not ip or ip.startswith('0.') or ip == '::':
+                continue
+            key = ip
+            prev = out.get(key)
+            if prev is None or port < prev['port']:
+                out[key] = {'ip': ip, 'port': port, 'family': family}
+    return [out[k] for k in sorted(out)]
+
+
+def collect_neighbors():
+    """局域网在线设备（ARP/邻居表）。
+
+    数据源：`/proc/net/arp`（IPv4）。IPv6 邻居表在 `/proc/net/ip6_neigh`，
+    格式完全不同且字段含义不一致 ⇒ 这里只做 IPv4（IPv4 ARP 表才是用户
+    真正会看的「谁在线」）。
+
+    ⚠️ **不是静态绑定表** —— 这是**运行时**的邻居表，会随设备上下线变化。
+    静态绑定是另一件事，见 `collect_dhcp_hosts()`。
+
+    返回 [{'ip', 'mac', 'iface', 'flags'}, ...]，
+    flags 是 /proc/net/arp 的第 3 列（0x2 = 完整条目）。
+    """
+    txt = _read_text('/proc/net/arp', 256 * 1024)
+    if not txt:
+        return []
+    out = []
+    for ln in txt.splitlines()[1:]:
+        parts = ln.split()
+        if len(parts) < 6:
+            continue
+        ip, hw_type, flags, mac, _mask, iface = parts[:6]
+        # 0x2 = ARP 条目有效；其它值（0x0 = 未完成）跳过
+        if flags not in ('0x2', '0x1'):
+            continue
+        if hw_type != '0x1':
+            continue
+        if mac in ('00:00:00:00:00:00', ''):
+            continue
+        out.append({'ip': ip, 'mac': mac, 'iface': iface, 'flags': flags})
+    out.sort(key=lambda r: _ip_sort_key(r['ip']))
+    return out
+
+
+def _ip_sort_key(ip):
+    """把 IP 变成可排序的元组（IPv4 按数值，IPv6 按字符串）。
+
+    ⚠️ 不能直接用字符串排序 —— "192.168.100.9" 会排在 "192.168.100.100"
+    前面（因为 '9' > '1'）⇒ 列表顺序看着很怪。
+    """
+    parts = ip.split('.')
+    if len(parts) == 4:
+        try:
+            return (0, tuple(int(p) for p in parts))
+        except ValueError:
+            pass
+    return (1, ip)
+
+
+def _uci_unquote(raw):
+    """把 uci 配置文件里的值还原成原始字符串。
+
+    uci 写文件时用**单引号**包住值，值里的单引号转义成 `'\\''`
+    （.232 实测：`option name 'O'\\''Brien'` ⇒ 原值是 `O'Brien`）。
+
+    ⚠️ 只在首尾确实是引号时才拆 —— 免得把没引号的值拆坏。
+    ⚠️ 双引号风格只在**手写**配置里出现，uci 自己不这么写；
+       但拆一下也没坏处（顺手把 `\"` 还原）。
+    """
+    s = str(raw).strip()
+    if len(s) >= 2 and s[0] == "'" and s[-1] == "'":
+        # uci 的转义序列是「闭合引号 + 反斜杠 + 引号 + 开引号」
+        return s[1:-1].replace("'\\''", "'")
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        return s[1:-1].replace('\\"', '"')
+    return s
+
+
+def collect_dhcp_hosts():
+    """DHCP 静态绑定（`/etc/config/dhcp` 里的 `config host` 段）。
+
+    这就是 OpenWrt 上「ARP 绑定」的官方等价物 ——
+    OpenWrt **没有 arpd**（.232 实测：`which arpd` 无输出），
+    用户能做的是在 dhcp 配置里写 `config host`，由 dnsmasq 负责
+    把 IP ↔ MAC ↔ 主机名 绑定起来并应答主机名。
+
+    返回 [{'section': 段名, 'name', 'mac', 'ip', 'leasetime'}, ...]
+
+    ⚠️ `name` 是**显示名**（`option name`），`section` 是 uci 段名 ——
+       两者不是一回事（段名只允许 ASCII，见 backend/dhcp_hosts.py）。
+       段里没有 `option name` 时（手写配置常见）⇒ 回退用段名，
+       免得面板上出现一列空白。
+
+    ⚠️ 只读解析，**不调 uci** —— 采集阶段不该有副作用，
+    也不该依赖 uci 在不在。
+    """
+    txt = _read_text('/etc/config/dhcp', 1024 * 1024)
+    if not txt:
+        return []
+    out = []
+    cur = None
+    for ln in txt.splitlines():
+        s = ln.strip()
+        if not s or s.startswith('#'):
+            continue
+        if s.startswith('config '):
+            # config host 'name'  /  config host
+            parts = s.split()
+            cur = None
+            if len(parts) >= 2 and parts[1] == 'host':
+                cur = {'section': '', 'name': '', 'mac': '', 'ip': '',
+                       'leasetime': ''}
+                if len(parts) >= 3:
+                    cur['section'] = _uci_unquote(parts[2])
+                out.append(cur)
+            continue
+        if cur is None:
+            continue
+        if s.startswith('option '):
+            parts = s.split(None, 2)
+            if len(parts) < 3:
+                continue
+            key = parts[1]
+            val = _uci_unquote(parts[2])
+            if key in cur:
+                cur[key] = val
+    # 没有 option name 的段 ⇒ 用段名顶上（手写配置很常见）
+    for h in out:
+        if not h['name']:
+            h['name'] = h['section']
+    return out
+
+
+def collect_public_ip():
+    """本机当前的公网 IPv4。
+
+    ⚠️ **这是本模块唯一一个会发外部请求的采集器** ——
+    其余全部只读 /proc、/etc。
+
+    为什么要它：面板自己就在用公网 IP 做 DDNS（app.py 的 IPV4_SOURCES），
+    而用户最常问的问题之一就是「我现在对外是什么 IP」。
+    与 DDNS 用**同一批源** ⇒ 页面上显示的 IP 就是自动更新用的那个。
+
+    ⚠️ 三个源都试；全部失败就返回 None（页面显示「未知」），
+    绝不用编的数字。
+    ⚠️ 超时压到 5 秒：页面不该因为它卡住。
+    """
+    try:
+        import urllib.request
+    except Exception:
+        return None
+    for url in ('https://ipv4.icanhazip.com',
+                'https://api.ipify.org'):
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'curl/8'})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                txt = r.read(64).decode('ascii', 'replace').strip()
+        except Exception:
+            continue
+        # 只接受看起来像 IPv4 的
+        parts = txt.split('.')
+        if len(parts) == 4:
+            try:
+                if all(0 <= int(p) <= 255 for p in parts):
+                    return txt
+            except ValueError:
+                continue
+    return None
+
+
 # ── 汇总 ─────────────────────────────────────────────────────
 
 
-def collect_all():
+def collect_all(with_public_ip=False):
     """采全部信息，返回一个 dict。
 
     **任何一项采不到都不会抛异常** —— 缺项就是 None，
     由前端显示「未知」。这比让整个接口 500 要好得多：
     用户要看到的是「这台设备长什么样」，不是「采集器崩了」。
+
+    `with_public_ip=True` 才去问公网 IP —— 它是本模块唯一一个会
+    **发外部请求**的采集器（最多 2 个源 × 5 秒超时），
+    默认不采 ⇒ 页面首屏不会被它拖住。
     """
     try:
         os_info = collect_os_release()
@@ -1081,9 +1331,33 @@ def collect_all():
         packages = collect_packages()
     except Exception:
         packages = {'total': None, 'world': []}
+    try:
+        hostname = collect_hostname()
+    except Exception:
+        hostname = None
+    try:
+        connections = collect_connections()
+    except Exception:
+        connections = []
+    try:
+        neighbors = collect_neighbors()
+    except Exception:
+        neighbors = []
+    try:
+        dhcp_hosts = collect_dhcp_hosts()
+    except Exception:
+        dhcp_hosts = []
+    public_ip = None
+    if with_public_ip:
+        try:
+            public_ip = collect_public_ip()
+        except Exception:
+            public_ip = None
 
     return {
         'model': model,
+        'hostname': hostname,
+        'public_ip': public_ip,
         'os': os_info,
         'cpu': cpu,
         'memory': mem,
@@ -1092,4 +1366,7 @@ def collect_all():
         'interfaces': interfaces,
         'services': services,
         'packages': packages,
+        'connections': connections,
+        'neighbors': neighbors,
+        'dhcp_hosts': dhcp_hosts,
     }

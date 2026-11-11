@@ -163,7 +163,11 @@ const BACKEND_FIELDS = [
   'panel', 'panel.access_mode', 'panel.deploy_mode', 'panel.switches',
   'panel.counts', 'panel.ddns_configured', 'panel.cert_ready',
   // v0.19.8 新增：设备侧服务状态与包清单
+  // ⚠️ v0.19.18：这两项**后端仍在采集**，只是页面不再展示
+  //   （用户要求移除这两块）⇒ 字段清单里保留。
   'services', 'packages', 'packages.total', 'packages.world',
+  // v0.19.18 新增：设备概览与局域网设备
+  'hostname', 'public_ip', 'connections', 'neighbors', 'dhcp_hosts',
 ];
 
 // 模板里实际引用的字段路径
@@ -203,14 +207,32 @@ for (const f of IFACE_DETAIL_FIELDS) {
     new RegExp('iface\\.' + f + '\\b').test(APP_JS));
 }
 
-// 服务列表的字段
-const SVC_FIELDS = ['name', 'enabled', 'running'];
-for (const f of SVC_FIELDS) {
-  check('服务字段 ' + f + ' 在模板里被用到了',
-    new RegExp('svc\\.' + f + '\\b').test(INDEX_HTML));
+// ⚠️ v0.19.18：**「设备服务」与「软件包」两块按用户要求从页面移除了**
+//   ⇒ 原来「服务字段在模板里被用到了」这条要**反过来**写。
+//   后端仍采集 services/packages（字段清单里还在），
+//   但页面不再展示 ⇒ 模板里不该再引用 svc.* / pkg.*。
+check('页面**不再**引用服务列表字段（用户要求移除该板块）',
+  !/\bsvc\.[a-z_]/.test(INDEX_HTML),
+  '模板里还有 svc.* 引用');
+check('页面**不再**引用包清单字段（用户要求移除该板块）',
+  !/\bpkg\.[a-z_]/.test(INDEX_HTML),
+  '模板里还有 pkg.* 引用');
+// svcPriority 是 app.js 里的辅助方法；页面移除后它不再被调用，
+// 但方法本身留着（将来要恢复该板块时不用重写）。
+check('svcPriority 方法仍在 app.js 里（备用）',
+  /svcPriority\s*\(/.test(APP_JS));
+
+// v0.19.18 新增的五项：模板里必须真的用上（不然后端白采）
+const NEW_FIELDS = ['hostname', 'connections', 'neighbors', 'dhcp_hosts'];
+for (const f of NEW_FIELDS) {
+  check('新字段 ' + f + ' 在模板里被用到了',
+    new RegExp('deviceInfo\\.data\\.' + f + '\\b').test(INDEX_HTML));
 }
-check('服务字段 priority 在 app.js 里被用到了（svcPriority 方法内）',
-  /svc\.priority\b/.test(APP_JS));
+// ⚠️ 公网 IP 是**单独**的 deviceInfo 字段（不是 deviceInfo.data.public_ip）——
+//   它要发外部请求 ⇒ 不随 5 秒一次的刷新一起采，
+//   而是用户点「查询」才去问 ⇒ 页面读的是 deviceInfo.publicIp。
+check('公网 IP 在模板里用的是 deviceInfo.publicIp（单独的字段）',
+  /deviceInfo\.publicIp\b/.test(INDEX_HTML));
 
 // 开关徽章的字段
 for (const f of ['key', 'label', 'on']) {

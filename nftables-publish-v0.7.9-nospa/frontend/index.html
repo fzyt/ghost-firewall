@@ -497,78 +497,191 @@
               </template>
             </div>
 
-            <!-- ── 设备服务 ────────────────────────────────────── -->
+            <!-- ── 设备概览：名称 / 公网 IP / 连接 / 在线设备 ───── -->
+            <!--
+              2026-11-11：替掉原来的「设备服务清单」与「软件包」两块。
+              那两块是**诊断信息**（要排障时才看），而用户日常关心的是
+              「这台设备现在在跟谁通信」「局域网里有谁」「哪个 IP 绑给了谁」。
+            -->
             <div class="bg-gray-50 border rounded-lg p-5 mb-6">
-              <h2 class="font-semibold mb-4">设备服务</h2>
-              <div x-show="!deviceInfo.data.services || deviceInfo.data.services.length === 0"
-                   class="text-sm text-gray-500">没有采集到服务清单</div>
+              <h2 class="font-semibold mb-4">设备概览</h2>
 
-              <div class="overflow-x-auto">
-                <table class="w-full text-sm">
-                  <thead>
-                    <tr class="text-left text-gray-500 border-b">
-                      <th class="py-2 pr-4 font-normal">服务</th>
-                      <th class="py-2 pr-4 font-normal">开机自启</th>
-                      <th class="py-2 pr-4 font-normal">运行中</th>
-                      <th class="py-2 font-normal text-right">启动序号</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <template x-for="(svc, idx) in (deviceInfo.data.services || [])" :key="idx">
-                      <tr class="border-b last:border-0">
-                        <td class="py-2 pr-4 font-medium whitespace-nowrap" x-text="svc.name"></td>
-                        <td class="py-2 pr-4 whitespace-nowrap">
-                          <span class="inline-flex items-center gap-1">
-                            <span class="w-2 h-2 rounded-full inline-block"
-                              :class="svc.enabled ? 'bg-blue-500' : 'bg-gray-300'"></span>
-                            <span x-text="svc.enabled ? '是' : '否'"></span>
-                          </span>
-                        </td>
-                        <td class="py-2 pr-4 whitespace-nowrap">
-                          <span class="inline-flex items-center gap-1">
-                            <span class="w-2 h-2 rounded-full inline-block"
-                              :class="svc.running ? 'bg-green-500' : 'bg-gray-300'"></span>
-                            <span x-text="svc.running ? '是' : '否'"></span>
-                          </span>
-                        </td>
-                        <td class="py-2 text-right text-gray-600" x-text="svcPriority(svc)"></td>
-                      </tr>
-                    </template>
-                  </tbody>
-                </table>
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+                <div class="flex gap-2">
+                  <span class="text-gray-500 w-24 shrink-0">设备名称</span>
+                  <span class="font-medium" x-text="deviceInfo.data.hostname || '未知'"></span>
+                </div>
+                <div class="flex gap-2">
+                  <span class="text-gray-500 w-24 shrink-0">设备型号</span>
+                  <span class="font-medium" x-text="deviceInfo.data.model || '未知'"></span>
+                </div>
+                <div class="flex gap-2 items-center">
+                  <span class="text-gray-500 w-24 shrink-0">公网 IPv4</span>
+                  <span class="font-medium" x-text="deviceInfo.publicIp || '未知'"></span>
+                  <button type="button"
+                          class="text-xs px-2 py-0.5 border rounded hover:bg-white disabled:opacity-50"
+                          :disabled="deviceInfo.loadingPublicIp"
+                          @click="deviceInfo.loadPublicIp()"
+                          x-text="deviceInfo.loadingPublicIp ? '查询中…' : '查询'"></button>
+                </div>
+                <div class="flex gap-2">
+                  <span class="text-gray-500 w-24 shrink-0">在线设备</span>
+                  <span class="font-medium"
+                        x-text="(deviceInfo.data.neighbors || []).length + ' 台'"></span>
+                </div>
               </div>
-              <p class="text-xs text-gray-500 mt-3">
-                「开机自启」只看 /etc/rc.d 里有没有软链，**不代表一定起来** ——
-                uhttpd 就是软链还在、但 uhttpd.main.enabled=0 所以开机根本不启。
-                「运行中」才是现在真的在跑的判据。
-              </p>
-            </div>
 
-            <!-- ── 软件包 ──────────────────────────────────────── -->
-            <div class="bg-gray-50 border rounded-lg p-5 mb-6">
-              <h2 class="font-semibold mb-4">软件包</h2>
-              <div class="flex gap-2 text-sm">
-                <span class="text-gray-500 w-24 shrink-0">已安装</span>
-                <span class="font-medium"
-                      x-text="deviceInfo.data.packages?.total != null
-                                ? deviceInfo.data.packages.total + ' 个包'
-                                : '未知'"></span>
-              </div>
-              <div class="mt-3"
-                   x-show="deviceInfo.data.packages && (deviceInfo.data.packages?.world || []).length">
-                <div class="text-xs text-gray-500 mb-1">显式安装（world 清单，不含依赖）</div>
-                <div class="flex flex-wrap gap-1">
-                  <template x-for="(pkg, idx) in (deviceInfo.data.packages?.world || [])" :key="idx">
+              <!-- 当前活跃连接（已建立的对端） -->
+              <div class="mt-4">
+                <div class="text-xs text-gray-500 mb-1">当前连接（已建立的对端地址）</div>
+                <div x-show="!deviceInfo.data.connections || deviceInfo.data.connections.length === 0"
+                     class="text-sm text-gray-500">当前没有对外的已建立连接</div>
+                <div class="flex flex-wrap gap-1 mt-1" x-show="deviceInfo.data.connections && deviceInfo.data.connections.length">
+                  <template x-for="(c, idx) in (deviceInfo.data.connections || [])" :key="idx">
                     <span class="text-xs bg-white border rounded px-2 py-0.5 font-mono"
-                          x-text="pkg"></span>
+                          x-text="c.ip + ':' + c.port"></span>
                   </template>
                 </div>
+              </div>
+            </div>
+
+            <!-- ── 局域网设备（ARP 在线表 + DHCP 静态绑定）────── -->
+            <div class="bg-gray-50 border rounded-lg p-5 mb-6">
+              <div class="flex items-center justify-between mb-4">
+                <h2 class="font-semibold">局域网设备</h2>
+                <button type="button"
+                        class="text-xs px-2 py-1 border rounded hover:bg-white"
+                        @click="openDhcpHostForm()"
+                        x-text="'新增静态绑定'"></button>
+              </div>
+
+              <!-- ARP 在线表（只读） -->
+              <div class="mb-5">
+                <div class="text-xs text-gray-500 mb-1">
+                  在线设备（ARP 邻居表，只读）
+                </div>
+                <div x-show="!deviceInfo.data.neighbors || deviceInfo.data.neighbors.length === 0"
+                     class="text-sm text-gray-500">没有采集到在线设备</div>
+                <div class="overflow-x-auto" x-show="deviceInfo.data.neighbors && deviceInfo.data.neighbors.length">
+                  <table class="w-full text-sm">
+                    <thead>
+                      <tr class="text-left text-gray-500 border-b">
+                        <th class="py-2 pr-4 font-normal">IP</th>
+                        <th class="py-2 pr-4 font-normal">MAC</th>
+                        <th class="py-2 pr-4 font-normal">接口</th>
+                        <th class="py-2 font-normal text-right">绑定名</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <template x-for="(n, idx) in (deviceInfo.data.neighbors || [])" :key="idx">
+                        <tr class="border-b last:border-0">
+                          <td class="py-2 pr-4 font-mono whitespace-nowrap" x-text="n.ip"></td>
+                          <td class="py-2 pr-4 font-mono whitespace-nowrap text-gray-600" x-text="n.mac"></td>
+                          <td class="py-2 pr-4 whitespace-nowrap text-gray-600" x-text="n.iface"></td>
+                          <td class="py-2 text-right text-gray-600"
+                              x-text="dhcpNameOf(n.ip) || '—'"></td>
+                        </tr>
+                      </template>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <!-- DHCP 静态绑定（可增删） -->
+              <div>
+                <div class="text-xs text-gray-500 mb-1">
+                  静态绑定（DHCP 保留地址：IP ↔ MAC ↔ 设备名）
+                </div>
+                <div x-show="!deviceInfo.data.dhcp_hosts || deviceInfo.data.dhcp_hosts.length === 0"
+                     class="text-sm text-gray-500">还没有配置静态绑定</div>
+                <div class="overflow-x-auto" x-show="deviceInfo.data.dhcp_hosts && deviceInfo.data.dhcp_hosts.length">
+                  <table class="w-full text-sm">
+                    <thead>
+                      <tr class="text-left text-gray-500 border-b">
+                        <th class="py-2 pr-4 font-normal">设备名</th>
+                        <th class="py-2 pr-4 font-normal">IP</th>
+                        <th class="py-2 pr-4 font-normal">MAC</th>
+                        <th class="py-2 font-normal text-right">操作</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <template x-for="(h, idx) in (deviceInfo.data.dhcp_hosts || [])" :key="idx">
+                        <tr class="border-b last:border-0">
+                          <td class="py-2 pr-4 font-medium whitespace-nowrap" x-text="h.name || h.section"></td>
+                          <td class="py-2 pr-4 font-mono whitespace-nowrap" x-text="h.ip || '—'"></td>
+                          <td class="py-2 pr-4 font-mono whitespace-nowrap text-gray-600" x-text="h.mac || '—'"></td>
+                          <td class="py-2 text-right">
+                            <button type="button"
+                                    x-show="h.section"
+                                    class="text-xs px-2 py-0.5 border rounded text-red-600 hover:bg-white"
+                                    @click="deleteDhcpHost(h)"
+                                    x-text="'删除'"></button>
+                            <span x-show="!h.section"
+                                  class="text-xs text-gray-400">匿名段，手动改</span>
+                          </td>
+                        </tr>
+                      </template>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <!-- 提示条
+                   ⚠️ 必须放在表单**外面**：保存成功后表单会关闭，
+                      而「已保存，但未重载 dnsmasq」这类提示
+                      如果写在表单里 ⇒ 表单一关，提示也跟着没了，
+                      用户只看到「什么都没发生」。 -->
+              <div x-show="deviceInfo.dhcpFormError"
+                   class="mb-3 text-xs text-red-600"
+                   x-text="deviceInfo.dhcpFormError"></div>
+
+              <!-- 新增/编辑表单 -->
+              <div x-show="deviceInfo.dhcpFormOpen"
+                   x-transition
+                   class="mt-4 bg-white border rounded p-4">
+                <div class="text-sm font-medium mb-3">新增静态绑定</div>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
+                  <div>
+                    <label class="block text-xs text-gray-500 mb-1">设备名</label>
+                    <input type="text" x-model="deviceInfo.dhcpForm.name"
+                           placeholder="如 客厅电视（可用中文）"
+                           class="w-full border rounded px-2 py-1">
+                  </div>
+                  <div>
+                    <label class="block text-xs text-gray-500 mb-1">IP</label>
+                    <input type="text" x-model="deviceInfo.dhcpForm.ip"
+                           placeholder="192.168.100.50"
+                           class="w-full border rounded px-2 py-1 font-mono">
+                  </div>
+                  <div>
+                    <label class="block text-xs text-gray-500 mb-1">MAC</label>
+                    <input type="text" x-model="deviceInfo.dhcpForm.mac"
+                           placeholder="aa:bb:cc:dd:ee:ff"
+                           class="w-full border rounded px-2 py-1 font-mono">
+                  </div>
+                </div>
+                <div class="mt-3 flex gap-2">
+                  <button type="button"
+                          class="text-xs px-3 py-1 border rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+                          :disabled="deviceInfo.dhcpSaving"
+                          @click="saveDhcpHost()"
+                          x-text="deviceInfo.dhcpSaving ? '保存中…' : '保存'"></button>
+                  <button type="button"
+                          class="text-xs px-3 py-1 border rounded hover:bg-gray-50"
+                          @click="deviceInfo.dhcpFormOpen = false; deviceInfo.dhcpFormError = ''"
+                          x-text="'取消'"></button>
+                </div>
+                <p class="text-xs text-gray-500 mt-3">
+                  保存会改设备的 <span class="font-mono">/etc/config/dhcp</span>
+                  并重载 dnsmasq —— 改前会自动备份，失败会回滚。
+                </p>
               </div>
             </div>
 
             <p class="text-xs text-gray-500">
               数据来自设备的 /proc、/sys 与 /etc，只读采集，不做任何修改。
               读不到的项显示「未知」—— 面板不会用编出来的数字填补空缺。
+              （唯一例外：静态绑定是显式的写操作，见上面的说明。）
             </p>
           </div>
         </template>
