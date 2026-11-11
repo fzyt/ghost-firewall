@@ -1105,7 +1105,14 @@ function app() {
           rr: rr,
           type: rtype,
           ipv6_source: isAaaa ? (src || '') : '',
-          value: isAaaa ? '' : (rec.Value || rec.value || ''),
+          // A 记录**不传 value**：让后端自己去取「当前」公网 IPv4。
+          //
+          // ⚠️ 原来这里传的是阿里云上现存的旧值（rec.Value || rec.value）
+          // ⇒ 后端拿它和阿里云的值一比必然相等 ⇒ 永远返回「IP 未变化，无需更新」。
+          // 也就是说这个按钮结构上就测不出自动更新到底通不通，点一百次也是绿的。
+          // 现在 AAAA 传空值让后端读中转文件，A 记录同样传空值让后端取公网 IP ——
+          // 两条路径都与设备上的 cron 脚本一致，测的才是真正会跑的那条路。
+          value: '',
         });
         this.aliyunTest.result = { ok: true, rr: rr, message: r.message || '记录更新成功' };
         this.showToast(`测试成功：${rr} — ${this.aliyunTest.result.message}`, 'success');

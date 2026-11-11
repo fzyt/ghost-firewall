@@ -6149,18 +6149,90 @@ def _generate_ddns_update_script():
     """生成阿里云 DDNS 自动更新脚本"""
     script_path = "/opt/nftables-web-v2/aliyun-ddns-update.py"
     script_content = '''#!/usr/bin/env python3
-"""阿里云 DDNS 自动更新脚本（由 nftables-web 生成）"""
-import json, sys, os, urllib.request, urllib.parse, hmac, hashlib, base64, datetime, uuid
+"""阿里云 DDNS 自动更新脚本（由 nftables-web 生成）
 
-CONFIG_PATH = "/etc/nftables/aliyun-ddns-config.json"
-# DDNS IPv6 中转文件目录 —— 必须与面板写出去的位置一致，
-# 否则这个脚本读到的是一份永远不更新的旧路径。
-RELAY_DIR = os.environ.get("NFTW_RELAY_DIR", "/tmp")
+由 backend/app.py 的 _generate_ddns_update_script() 生成，不要手工编辑。
+改完 app.py 之后，需要在面板上点一次「保存配置并生成脚本」才会重新生成。
+
+这一版修掉的问题（每条都对应一条已确认的缺陷）：
+
+  · 改用 UpdateDomainRecord **原地更新**，RecordId 不变。
+    原来用「删除 + 新增」，控制台上每次都看到记录被删掉又重建，
+    记录 ID 每轮都变 —— 这就是「不断删除重新上传」的直接来源。（D1）
+  · 值没变就**一个写接口都不调**。（D1/D5）
+  · 匹配记录时带上 Line 判定，**只动 default 线路**。
+    原来只按 RR+Type 匹配，会把「电信/联通/移动」等多线路记录当成同一条
+    处理 —— 那是会改掉用户正常配置的数据破坏。（D2）
+  · 脚本**从不调用 DeleteDomainRecord**：改用 Update 后不再需要删除，
+    也就没有「删成功、加失败，域名解析直接断」的风险。（D3）
+  · 每条记录独立 try，单条失败不影响其余记录。（D3）
+  · 每轮写一行摘要到日志文件，正常路径不再悄无声息。（D4）
+  · 取不到公网 IPv4 时**跳过本轮**，不再拿配置里的旧值去覆盖阿里云。（D5）
+  · 查询带 PageSize=500，避免目标记录落在首屏之外。（D6）
+  · 配置路径读环境变量 NFTABLES_WEB_ALIYUN_CONFIG，与面板一致。（D7）
+  · 配置里的 rr/type 大小写两种键都认。（D8）
+"""
+import json, sys, os, urllib.request, urllib.parse, hmac, hashlib, base64, datetime, uuid, ipaddress
+
+# 配置路径 —— 必须与面板写出去的位置一致。
+# 原来这里写死 "/etc/nftables/aliyun-ddns-config.json"，而面板用
+# os.environ.get("NFTABLES_WEB_ALIYUN_CONFIG", ...) ⇒ 一旦用环境变量改了
+# 路径，脚本读的就是默认路径 ⇒ 读不到配置 ⇒ 静默退出 ⇒ DDNS 完全不工作。
+CONFIG_PATH = os.environ.get("NFTABLES_WEB_ALIYUN_CONFIG", "/etc/nftables/aliyun-ddns-config.json")
+
+# DDNS IPv6 中转文件目录 —— 必须与面板写出去的位置一致。
+# 原来脚本读 NFTW_RELAY_DIR，面板读 NFTABLES_WEB_DDNS_RELAY_DIR，
+# 两个名字不一样，改了面板那个环境变量，脚本这边不跟着变。
+RELAY_DIR = os.environ.get("NFTABLES_WEB_DDNS_RELAY_DIR",
+                           os.environ.get("NFTW_RELAY_DIR", "/tmp"))
+
+# 阿里云 API 端点。做成可注入是为了让测试能指向本地假服务端；
+# 生产环境不设这个环境变量就是官方端点。
+ALIYUN_ENDPOINT = os.environ.get("NFTW_ALIYUN_ENDPOINT", "https://alidns.aliyuncs.com/")
+
+# 摘要日志：每轮一行。写不进去也不能影响主流程。
+LOG_PATH = os.environ.get("NFTW_DDNS_LOG", "/var/log/nftables-web-ddns.log")
+
+# 公网 IPv4 探测源。只接受**合法 IPv4**：有些源在有 IPv6 的网络上会返回
+# IPv6 地址，那是另一个地址族，拿来填 A 记录就是错的。
+#
+# 源列表做成可注入（逗号分隔）是为了让测试能指向本地假源 ——
+# 测试若真出网，结果会随时间变，那样的测试等于没有。
+IPV4_SOURCES = [u.strip() for u in os.environ.get(
+    "NFTW_IPV4_SOURCES",
+    "https://ipv4.icanhazip.com,https://api.ipify.org").split(",") if u.strip()]
+
+# 摘要日志超过这个大小就裁剪，避免把设备存储写满
+LOG_MAX_BYTES = 512 * 1024
+LOG_KEEP_LINES = 1000
+
+
+def _log(msg):
+    """写一行摘要日志。失败绝不抛 —— 日志写不进去不该让 DDNS 停摆。"""
+    line = "%s | %s" % (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg)
+    try:
+        d = os.path.dirname(LOG_PATH)
+        if d and not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+        try:
+            if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > LOG_MAX_BYTES:
+                with open(LOG_PATH) as f:
+                    keep = f.readlines()[-LOG_KEEP_LINES:]
+                with open(LOG_PATH, "w") as f:
+                    f.writelines(keep)
+        except OSError:
+            pass
+        with open(LOG_PATH, "a") as f:
+            f.write(line + "\\n")
+    except Exception:
+        pass
+
 
 def _sign(params, secret):
     qs = "&".join(f"{urllib.parse.quote(str(k), safe='')}={urllib.parse.quote(str(v), safe='')}" for k, v in sorted(params.items()))
     sts = "GET&" + urllib.parse.quote("/", safe='') + "&" + urllib.parse.quote(qs, safe='')
     return base64.b64encode(hmac.new((secret + "&").encode(), sts.encode(), hashlib.sha1).digest()).decode()
+
 
 def _api(action, ak_id, ak_secret, region, extra={}):
     params = {"Action": action, "Format": "json", "Version": "2015-01-09", "AccessKeyId": ak_id,
@@ -6168,9 +6240,69 @@ def _api(action, ak_id, ak_secret, region, extra={}):
               "SignatureVersion": "1.0", "SignatureNonce": str(uuid.uuid4()), "RegionId": region}
     params.update(extra)
     params["Signature"] = _sign(params, ak_secret)
-    url = "https://alidns.aliyuncs.com/?" + "&".join(f"{k}={urllib.parse.quote(str(v), safe='')}" for k, v in params.items())
+    url = ALIYUN_ENDPOINT + "?" + "&".join(f"{k}={urllib.parse.quote(str(v), safe='')}" for k, v in params.items())
     with urllib.request.urlopen(urllib.request.Request(url), timeout=15) as resp:
         return json.loads(resp.read())
+
+
+def _norm_value(v):
+    """归一化记录值：去首尾空白；IPv6 统一成压缩小写形式。
+
+    不归一化的话，IPv6 的「同一地址的不同写法」会被判成「值变了」，
+    白白触发一次更新。
+    """
+    s = str(v or "").strip()
+    if not s:
+        return ""
+    try:
+        return ipaddress.ip_address(s).compressed.lower()
+    except ValueError:
+        return s
+
+
+def _is_ipv4(s):
+    try:
+        return isinstance(ipaddress.ip_address(str(s).strip()), ipaddress.IPv4Address)
+    except ValueError:
+        return False
+
+
+def _fetch_public_ipv4():
+    """取本机公网 IPv4；取不到返回 None。
+
+    调用方必须据此**跳过本轮**，不能拿配置里的旧值去覆盖阿里云 ——
+    那会把阿里云上正确的地址改回过期地址。
+    """
+    for url in IPV4_SOURCES:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/8"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                val = r.read().decode("utf-8", "replace").strip()
+            if _is_ipv4(val):
+                return val
+        except Exception:
+            continue
+    return None
+
+
+def _match_records(records, rr, rtype):
+    """挑出所有 (RR、Type、default 线路) 都相同的记录。
+
+    必须带 Line 判定：阿里云允许同一 RR+Type 按线路（电信/联通/移动…）
+    存在多条**合法**记录。只按 RR+Type 匹配会把多线路配置当成同一条，
+    更新时会把别的线路改掉 —— 那是数据破坏。
+    """
+    out = []
+    for r in records:
+        if str(r.get("RR", "")).lower() != str(rr or "").lower():
+            continue
+        if str(r.get("Type", "")).upper() != str(rtype or "").upper():
+            continue
+        if str(r.get("Line", "default") or "default").lower() != "default":
+            continue
+        out.append(r)
+    return out
+
 
 try:
     with open(CONFIG_PATH) as f:
@@ -6181,60 +6313,86 @@ try:
     region = config.get("region_id", "cn-hangzhou")
     domain = config.get("domain", "")
     if not ak_id or not ak_secret or not domain:
+        _log("退出：配置里缺 AccessKey 或域名")
         sys.exit(0)
-    
+
     source_map = {"router": "0"}
     for i in range(1, 10):
         source_map[f"rule_{i}"] = str(i)
-    
+
     for rec in records:
+        # 大小写两种键都认：存量/手工编辑的配置里可能只有大写键 RR/Type
+        rr = str(rec.get("rr") or rec.get("RR") or "").strip()
+        rtype = str(rec.get("type") or rec.get("Type") or "").strip()
+        if not rr or not rtype:
+            _log("跳过一条记录：配置里取不到 rr/type")
+            continue
         if not rec.get("enabled"):
             continue
-        rr = rec.get("rr", "")
-        rtype = rec.get("type", "")
-        ipv6_source = rec.get("ipv6_source", "")
-        value = rec.get("value", "").strip()
-        
-        if ipv6_source:
-            idx = source_map.get(ipv6_source)
-            if idx is not None:
-                try:
-                    with open(os.path.join(RELAY_DIR, "ddns-ipv6-%s" % idx)) as f:
-                        value = f.read().strip()
-                except:
-                    pass
+        try:
+            # ---- 取值 ----
+            # 先读配置里存的值：其它记录类型（CNAME/TXT…）靠它，
+            # A 记录下面会被「当前公网 IPv4」覆盖。
+            value = str(rec.get("value", "") or "").strip()
+            ipv6_source = str(rec.get("ipv6_source", "") or "")
+            if ipv6_source:
+                idx = source_map.get(ipv6_source)
+                if idx is not None:
+                    try:
+                        with open(os.path.join(RELAY_DIR, "ddns-ipv6-%s" % idx)) as f:
+                            value = f.read().strip()
+                    except Exception:
+                        pass
+            if rtype.upper() == "A":
+                # A 记录的权威值就是「当前公网 IPv4」
+                ip4 = _fetch_public_ipv4()
+                if not ip4:
+                    _log("跳过 %s.A：取不到公网 IPv4（本轮不动阿里云）" % rr)
+                    continue
+                value = ip4
             if not value:
+                _log("跳过 %s.%s：没有可用值" % (rr, rtype))
                 continue
-        # A 记录自动获取路由器公网 IPv4
-        if rtype == "A":
-            try:
-                import urllib.request as _ur
-                _req = _ur.Request("https://ipv4.icanhazip.com")
-                with _ur.urlopen(_req, timeout=5) as _r:
-                    value = _r.read().decode().strip()
-            except:
-                pass
-        if not value:
-            continue
-        
-        # 查询现有记录，值相同则跳过
-        result = _api("DescribeDomainRecords", ak_id, ak_secret, region, {"DomainName": domain, "RRKeyWord": rr, "Type": rtype})
-        found_same = False
-        for r in result.get("DomainRecords", {}).get("Record", []):
-            if r.get("RR") == rr and r.get("Type") == rtype:
-                if r.get("Value") == value:
-                    found_same = True
-                else:
-                    _api("DeleteDomainRecord", ak_id, ak_secret, region, {"RecordId": str(r["RecordId"])})
-                break
-        if not found_same:
-            _api("AddDomainRecord", ak_id, ak_secret, region, {"DomainName": domain, "RR": rr, "Type": rtype, "Value": value})
+
+            # ---- 查询 ----
+            result = _api("DescribeDomainRecords", ak_id, ak_secret, region,
+                          {"DomainName": domain, "RRKeyWord": rr, "Type": rtype, "PageSize": 500})
+            all_records = result.get("DomainRecords", {}).get("Record", [])
+            matched = _match_records(all_records, rr, rtype)
+
+            if not matched:
+                _api("AddDomainRecord", ak_id, ak_secret, region,
+                     {"DomainName": domain, "RR": rr, "Type": rtype, "Value": value})
+                _log("新增 %s.%s = %s" % (rr, rtype, value))
+                continue
+
+            norm_value = _norm_value(value)
+            same = [r for r in matched if _norm_value(r.get("Value")) == norm_value]
+
+            if same:
+                # 值没变 ⇒ 一个写接口都不调
+                _log("跳过 %s.%s = %s（值未变化，记录ID %s）"
+                     % (rr, rtype, value, same[0].get("RecordId")))
+            else:
+                target = matched[0]
+                # 原地更新，RecordId 不变
+                _api("UpdateDomainRecord", ak_id, ak_secret, region,
+                     {"RecordId": str(target.get("RecordId")), "RR": rr, "Type": rtype, "Value": value})
+                _log("更新 %s.%s = %s（记录ID %s，原值 %s）"
+                     % (rr, rtype, value, target.get("RecordId"), target.get("Value")))
+            if len(matched) > 1:
+                _log("注意 %s.%s 有 %d 条同线路记录，只处理了第一条，其余未动"
+                     % (rr, rtype, len(matched)))
+        except Exception as e:
+            # 单条失败不影响其余记录
+            _log("失败 %s.%s：%s: %s" % (rr, rtype, type(e).__name__, e))
 except Exception as e:
+    _log("整体失败：%s: %s" % (type(e).__name__, e))
     with open("/tmp/aliyun-ddns-error.log", "a") as f:
         f.write(f"{datetime.datetime.now().isoformat()}: {e}\\n")
     sys.exit(1)
 '''
-    os.makedirs(os.path.dirname(script_path), exist_ok=True)
+
     with open(script_path, 'w') as f:
         f.write(script_content)
     os.chmod(script_path, 0o755)
@@ -6327,39 +6485,115 @@ def _aliyun_api(action, access_key_id, access_key_secret, region_id, extra_param
         return json.loads(resp.read())
 
 
+def _ddns_norm_value(v):
+    """归一化 DNS 记录值：去首尾空白；IPv6 统一成压缩小写形式。
+
+    不归一化的话，IPv6 的「同一地址的不同写法」会被判成「值变了」，
+    白白触发一次更新。
+    """
+    s = str(v or "").strip()
+    if not s:
+        return ""
+    try:
+        import ipaddress
+        return ipaddress.ip_address(s).compressed.lower()
+    except ValueError:
+        return s
+
+
+def _ddns_match_records(records, rr, rtype):
+    """挑出所有 (RR、Type、default 线路) 都相同的记录。
+
+    必须带 Line 判定：阿里云允许同一 RR+Type 按线路（电信/联通/移动…）
+    存在多条**合法**记录。只按 RR+Type 匹配会把多线路配置当成同一条，
+    更新时会把别的线路改掉 —— 那是数据破坏。
+    """
+    out = []
+    for r in records:
+        if str(r.get('RR', '')).lower() != str(rr or '').lower():
+            continue
+        if str(r.get('Type', '')).upper() != str(rtype or '').upper():
+            continue
+        if str(r.get('Line', 'default') or 'default').lower() != 'default':
+            continue
+        out.append(r)
+    return out
+
+
+def _fetch_public_ipv4():
+    """取本机公网 IPv4；取不到返回 None。
+
+    调用方必须据此**跳过本轮**，不能拿配置里的旧值去覆盖阿里云 ——
+    那会把阿里云上正确的地址改回过期地址。
+    """
+    import ipaddress
+    import urllib.request
+    for url in ('https://ipv4.icanhazip.com', 'https://api.ipify.org'):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/8"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                val = r.read().decode('utf-8', 'replace').strip()
+            if isinstance(ipaddress.ip_address(val), ipaddress.IPv4Address):
+                return val
+        except Exception:
+            continue
+    return None
+
+
 def _aliyun_ddns_update(config, rr, rtype, value):
-    """通过阿里云 API 更新单条 DNS 记录（删除+添加，避免 RecordId 精度问题）"""
+    """通过阿里云 API 更新单条 DNS 记录（原地更新，RecordId 不变）
+
+    原来这里是「删除 + 添加」：控制台上每次都看到记录被删掉又重建，
+    记录 ID 每轮都变；而且删除成功、添加失败时记录就没了（域名直接解析不到）。
+    现在改成 UpdateDomainRecord 原地改值 —— 值没变就一个写接口都不调。
+    """
     domain = config['domain']
     ak_id = config['access_key_id']
     ak_secret = config['access_key_secret']
     region = config.get('region_id', 'cn-hangzhou')
 
-    # 查询现有记录
+    # 查询现有记录。PageSize 拉满，避免目标记录落在首屏之外。
     result = _aliyun_api("DescribeDomainRecords", ak_id, ak_secret, region, {
         "DomainName": domain,
         "RRKeyWord": rr,
         "Type": rtype,
+        "PageSize": 500,
     })
     records = result.get('DomainRecords', {}).get('Record', [])
+    matched = _ddns_match_records(records, rr, rtype)
 
-    for r in records:
-        if r.get('RR') == rr and r.get('Type') == rtype:
-            if r.get('Value') == value:
-                return {"success": True, "message": "IP 未变化，无需更新"}
-            # 删除旧记录
-            _aliyun_api("DeleteDomainRecord", ak_id, ak_secret, region, {
-                "RecordId": r['RecordId'],
-            })
-            break
+    if not matched:
+        # 记录不存在才新增
+        _aliyun_api("AddDomainRecord", ak_id, ak_secret, region, {
+            "DomainName": domain,
+            "RR": rr,
+            "Type": rtype,
+            "Value": value,
+        })
+        return {"success": True, "message": f"记录 {rr}.{rtype} 不存在，已新增为 {value}"}
 
-    # 添加新记录
-    _aliyun_api("AddDomainRecord", ak_id, ak_secret, region, {
-        "DomainName": domain,
+    norm_value = _ddns_norm_value(value)
+    if any(_ddns_norm_value(r.get('Value')) == norm_value for r in matched):
+        return {"success": True, "message": "IP 未变化，无需更新"}
+
+    # 原地更新：RecordId 不变，控制台上看到的是同一条记录改了值。
+    #
+    # ⚠️ 这里不再走「删除 + 新增」的老路 —— 那条路一旦删除成功、
+    # 新增失败，用户的域名就解析不到了。RecordId 缺失时**直接报错**，
+    # 绝不退回到删+增（那正是当初引入删+增想绕开的问题）。
+    record_id = matched[0].get('RecordId')
+    if not record_id:
+        raise ValueError(f"阿里云返回的记录缺少 RecordId，无法原地更新：{rr}.{rtype}")
+    _aliyun_api("UpdateDomainRecord", ak_id, ak_secret, region, {
+        "RecordId": str(record_id),
         "RR": rr,
         "Type": rtype,
         "Value": value,
     })
-    return {"success": True, "message": f"记录 {rr}.{rtype} 已更新为 {value}"}
+    message = f"记录 {rr}.{rtype} 已更新为 {value}（记录 ID 不变）"
+    if len(matched) > 1:
+        message += f"；同线路有 {len(matched)} 条记录，只更新了第一条"
+    return {"success": True, "message": message}
 
 
 @app.route('/api/aliyun-ddns/status', methods=['GET'])
@@ -6558,6 +6792,21 @@ def aliyun_ddns_test():
                     value = f.read().strip()
             except (IOError, OSError):
                 pass
+
+    # A 记录不传值时，自己去取**当前**公网 IPv4。
+    #
+    # ⚠️ 原来前端给测试按钮传的是阿里云上**现存的旧值**
+    # （app.js 里 `value: rec.Value || rec.value`）⇒ 后端一比必然相等
+    # ⇒ 永远返回「IP 未变化，无需更新」。
+    # 也就是说：这个按钮结构上**不可能**测出自动更新到底通不通，
+    # 点一百次也是绿的。现在改成与设备上的 cron 脚本同一条取值路径。
+    if not value and rtype.upper() == "A":
+        value = _fetch_public_ipv4() or ""
+        if not value:
+            return jsonify({
+                "success": False,
+                "message": "取不到本机公网 IPv4，无法测试 A 记录（设备需要能出网）",
+            }), 400
 
     if not all([rr, rtype, value]):
         return jsonify({"success": False, "message": "rr, type, value 都不能为空" + ("（IPv6 来源文件不存在或为空）" if ipv6_source and not value else "")}), 400

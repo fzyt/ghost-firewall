@@ -617,8 +617,9 @@ check('nginx 预览读的是 config_content 字段',
       'config_content' in _JS)
 check('阿里云测试按行取记录自身的 RR/Type/Value',
       'rec.RR || rec.rr' in _JS and 'rec.Type || rec.type' in _JS)
-check('阿里云 AAAA 测试传 ipv6_source 不传 value（让后端读 /tmp/ddns-ipv6-N）',
-      'ipv6_source: isAaaa' in _JS and "value: isAaaa ? ''" in _JS)
+check('阿里云测试一律不传 value（AAAA 让后端读中转文件、A 让后端取公网 IP）',
+      'ipv6_source: isAaaa' in _JS and "value: isAaaa ? ''" not in _JS
+      and "value: ''" in _JS)
 check('阿里云表格补了表头（加了一列就得分表头跟着改）',
       '>IPv6 来源<' in _FE_HTML)
 
