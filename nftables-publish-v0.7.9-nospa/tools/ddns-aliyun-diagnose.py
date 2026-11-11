@@ -99,13 +99,20 @@ def _section(title):
 
 
 def _mask(secret):
-    """脱敏：只留首 4 尾 4，中间用固定长度遮盖。绝不打印明文。"""
+    """脱敏：只留首 2 尾 2，中间用固定长度遮盖。绝不打印明文。
+
+    为什么只露 2+2 而不是 4+4：取证脚本的输出会被贴进工单、聊天记录、
+    截图 —— 传播范围不受控。AccessKey secret 是 30 位，露 8 位等于
+    少掉两个字符的搜索空间，而这个脚本本来就是为了**验证**而写的，
+    没有理由比面板侧（_mask_password，2+2）更宽松。
+    ⇒ 与面板侧保持同一强度：露 4/30。
+    """
     s = str(secret or "")
     if not s:
         return "(空)"
-    if len(s) <= 8:
+    if len(s) <= 4:
         return "(长度 %d，已隐藏)" % len(s)
-    return s[:4] + "****" + s[-4:]
+    return s[:2] + "****" + s[-2:]
 
 
 def _read_text(path, limit=200000):
@@ -295,7 +302,10 @@ def aliyun_describe(ak_id, ak_secret, region, domain):
         "Version": ALIYUN_API_VERSION,
         "AccessKeyId": ak_id,
         "SignatureMethod": "HMAC-SHA1",
-        "Timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        # 用 now(timezone.utc) 而不是已弃用的 utcnow()：
+        # utcnow() 返回的是**无时区的 naive** datetime，将来若再调 .astimezone()
+        # 会被当成系统本地时间而算错时差。阿里云签名要求 UTC，这里显式带上时区。
+        "Timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "SignatureVersion": "1.0",
         "SignatureNonce": str(uuid.uuid4()),
         "RegionId": region,
@@ -327,9 +337,38 @@ def load_snapshots():
 
 
 def save_snapshot(snap):
+    """把观测快照追加到 SNAPSHOT_PATH。
+
+    权限必须是 0600：快照里有**明文 AccessKeyId**、域名和解析记录 ——
+    AccessKeyId 虽不是 secret，但它和域名一起泄露，等于告诉攻击者
+    「去这个阿里云账号的哪个域名上动手」。
+
+    为什么不能光靠 umask：默认 umask 022 下 `open(path,'a')` 建出来是
+    0644（所有本地用户可读）；而这个脚本经常是 root 跑的 ⇒
+    快照对设备上任何用户都可见。
+
+    ⇒ 用 os.open(..., mode) 显式带 0600 建文件（umask 再宽也只会更严），
+      已有文件则先 chmod 收紧 —— 之前用 open() 建出来的 0644 文件
+      不会因为这次追加而自动变窄。
+    """
     try:
-        with open(SNAPSHOT_PATH, "a") as f:
-            f.write(json.dumps(snap, ensure_ascii=False) + "\n")
+        fd = os.open(SNAPSHOT_PATH,
+                     os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            # 已有文件：open(O_APPEND) 不会改权限 ⇒ 这里补一次收紧。
+            try:
+                os.chmod(SNAPSHOT_PATH, 0o600)
+            except OSError:
+                pass
+            with os.fdopen(fd, "a") as f:
+                f.write(json.dumps(snap, ensure_ascii=False) + "\n")
+        except Exception:
+            # fdopen 失败时 fd 可能没被接管 ⇒ 手动关掉，别泄漏描述符。
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
     except Exception as e:
         print("[WARN] 快照写不进去（不影响诊断）：%s: %s" % (type(e).__name__, e))
 

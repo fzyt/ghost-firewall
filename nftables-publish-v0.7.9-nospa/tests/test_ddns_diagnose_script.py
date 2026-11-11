@@ -389,6 +389,99 @@ def main():
     check("access_key_secret']" not in src.replace('"access_key_secret"', ''),
           "没有把 access_key_secret 直接拼进输出")
 
+    # ── 6. 加固项：掩码强度 / 快照权限 / 时区 ──────────────────
+    #
+    # 这三条不是「功能对不对」，而是「这个脚本被拷到用户设备上跑的时候，
+    # 会不会顺手泄露或留下隐患」—— 它的输出会被贴进工单、截图、聊天记录。
+    print("--- 6. 加固项：掩码强度 / 快照权限 / 时区 ---")
+
+    # 6a. 掩码强度：必须与面板侧 (_mask_password，2+2) 同级。
+    #     早先取证脚本是 4+4 ⇒ 一个 30 位的 AK secret 露 8 位，
+    #     比面板侧宽一倍 ⇒ 输出传播出去时泄露面大一倍。
+    masked_long = mod._mask("ABCDEFGHIJKLMNOPQRSTUVWXYZ012345")
+    check(len(masked_long) == 8 and masked_long.count("*") == 4,
+          "长 secret 的掩码是 2+2（长度 %d）" % len(masked_long))
+    check(masked_long[:2] == "AB" and masked_long[-2:] == "45",
+          "长 secret 的掩码只露首 2 尾 2（实际 %r）" % masked_long)
+    check(mod._mask("").startswith("(空)"), "空 secret 显示为「(空)」")
+    short_masked = mod._mask("abc")
+    check("abc" not in short_masked and "已隐藏" in short_masked,
+          "短 secret 完全不露（实际 %r）" % short_masked)
+
+    # 6b. 快照文件权限：内容含明文 AccessKeyId 与域名 ⇒ 必须 0600。
+    #     实跑一次 save_snapshot，看落在磁盘上的真实权限。
+    #
+    # ⚠️ 必须把 umask 设成 0：否则「建出来的权限」取决于运行环境的 umask
+    #   （本机是 0002，某些 CI 是 0022）⇒ 同一条代码在不同机器上断言结果不同
+    #   ⇒ 判据不稳定。umask=0 时「代码要了 0644」就一定是 0644，一眼红。
+    snap_dir = tempfile.mkdtemp(prefix="ddns-diag-perm-")
+    snap_path = os.path.join(snap_dir, "snap.jsonl")
+    old_snap_path = getattr(mod, "SNAPSHOT_PATH", None)
+    old_umask = os.umask(0o000)
+    try:
+        mod.SNAPSHOT_PATH = snap_path
+        mod.save_snapshot({"ts": "t", "records": [], "ip": {}})
+        mode_new = os.stat(snap_path).st_mode & 0o777
+    except Exception as e:
+        mode_new = None
+        print("  [FAIL] save_snapshot 抛异常：%s" % e)
+    finally:
+        os.umask(old_umask)
+        if old_snap_path is not None:
+            mod.SNAPSHOT_PATH = old_snap_path
+    check(mode_new == 0o600,
+          "新建的快照文件权限就是 0600（实际 %s）"
+          % (oct(mode_new) if mode_new is not None else "没建出来"))
+
+    # 6b-2. 已有文件被写宽了（老版本留下的 0644）⇒ 追加时必须收紧。
+    #      os.open(O_APPEND) 对**已存在**文件不改权限 ⇒ 只测新建是不够的。
+    wide_path = os.path.join(snap_dir, "wide.jsonl")
+    with open(wide_path, "w", encoding="utf-8") as f:
+        f.write("{}\n")
+    os.chmod(wide_path, 0o644)
+    old_snap_path = getattr(mod, "SNAPSHOT_PATH", None)
+    old_umask = os.umask(0o000)
+    try:
+        mod.SNAPSHOT_PATH = wide_path
+        mod.save_snapshot({"ts": "t2", "records": [], "ip": {}})
+        mode_wide = os.stat(wide_path).st_mode & 0o777
+    except Exception as e:
+        mode_wide = None
+        print("  [FAIL] save_snapshot 抛异常：%s" % e)
+    finally:
+        os.umask(old_umask)
+        if old_snap_path is not None:
+            mod.SNAPSHOT_PATH = old_snap_path
+    check(mode_wide == 0o600,
+          "已存在但权限是 0644 的快照文件，追加后被收紧到 0600（实际 %s）"
+          % (oct(mode_wide) if mode_wide is not None else "读不到"))
+
+    # 6c. 时间戳：阿里云签名要 UTC，但不能用已弃用的 naive utcnow()。
+    #     naive datetime 一旦被当成本地时间做时区换算就会错。
+    #
+    # ⚠️ 必须查 **AST 调用节点**，不能查源码文本 ——
+    #   注释里写着「不要再用 utcnow()」也会被文本匹配命中 ⇒ 假红。
+    #   （这正是 M6 定下的规矩：判据要 AST 化。）
+    try:
+        tree2 = ast.parse(src)
+        utcnow_calls = []
+        ts_calls = []
+        for node in ast.walk(tree2):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            attr = getattr(fn, "attr", None)
+            if attr == "utcnow":
+                utcnow_calls.append(node.lineno)
+            if attr == "now" and node.args:
+                ts_calls.append(ast.unparse(node.args[0]))
+        check(not utcnow_calls,
+              "脚本不再调用已弃用的 datetime.utcnow()（命中行：%s）" % utcnow_calls)
+        check(any("timezone" in a for a in ts_calls),
+              "取 UTC 时间戳时显式带 timezone（实际参数：%s）" % ts_calls)
+    except SyntaxError as e:
+        check(False, "脚本能被 AST 解析（语法错误：%s）" % e)
+
     print("  合计: [PASS] %d   [FAIL] %d" % (PASS, FAIL))
     return 1 if FAIL else 0
 
