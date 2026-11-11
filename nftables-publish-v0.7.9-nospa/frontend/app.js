@@ -1096,6 +1096,9 @@ function app() {
       const rtype = rec.Type || rec.type;
       const src = this.getAliyunRecordIpv6Source(index);
       const isAaaa = rtype === 'AAAA';
+      // 类型统一大写比较：阿里云返回的是大写（A / AAAA / CNAME / TXT），
+      // 但本地配置里可能是小写 ⇒ 只判 'A' 的话小写的 'a' 会漏进兜底分支。
+      const rtypeU = String(rtype || '').toUpperCase();
 
       this.aliyunTest.running = true;
       this.aliyunTest.index = index;
@@ -1116,7 +1119,18 @@ function app() {
           // 也就是说这个按钮结构上就测不出自动更新到底通不通，点一百次也是绿的。
           // 现在 AAAA 传空值让后端读中转文件，A 记录同样传空值让后端取公网 IP ——
           // 两条路径都与设备上的 cron 脚本一致，测的才是真正会跑的那条路。
-          value: '',
+          //
+          // ⚠️ CNAME / TXT **不能**传空值（2026-11-11 修，这是本轮引入的回归）：
+          //   这两种类型没有「自动取值」的来源 —— 后端只在 A 时取公网 IP、
+          //   AAAA 读中转文件，CNAME/TXT 两条路都取不到 ⇒
+          //   后端 `if not all([rr, rtype, value])` ⇒ **恒 400**
+          //   「rr, type, value 都不能为空」⇒ 按钮对 CNAME/TXT 完全不可用。
+          //   ⇒ 传阿里云上**现存的**值：归一化后判为「没变」⇒ 不写，
+          //     但 Describe 接口照样调了 ⇒ 凭据/权限/网络都验证到了
+          //     （这本来就是这个按钮的目的）。
+          value: (rtypeU === 'A' || rtypeU === 'AAAA')
+            ? ''
+            : (rec.Value || rec.value || ''),
         });
         this.aliyunTest.result = { ok: true, rr: rr, message: r.message || '记录更新成功' };
         this.showToast(`测试成功：${rr} — ${this.aliyunTest.result.message}`, 'success');
@@ -1268,7 +1282,17 @@ function app() {
     try {
       const data = await api.get('/api/aliyun-ddns/records');
       this.aliyun.records = data.records || [];
-      this.aliyun.localRecords = data.localRecords || [];
+      // localRecords 是**本地配置**里的记录（带 enabled / ipv6_source），
+      // 后端现在会一起返回。
+      //
+      // ⚠ 原来这里是 `data.localRecords || []` —— 而后端**从来没返回过**
+      // localRecords ⇒ 每点一次「获取记录」本地配置就被清空 ⇒
+      // 随后的保存把 enabled / ipv6_source 全丢掉 ⇒
+      // 用户配的记录全变成未启用、自动更新静默不生效。
+      // ⇒ 后端没给就**保留原来那份**，绝不主动清空。
+      if (Array.isArray(data.localRecords)) {
+        this.aliyun.localRecords = data.localRecords;
+      }
       // 复用 IPv6 来源
       if (!this.ddns.loaded) await this.loadDdns();
       this.aliyun.ipv6Sources = this.ddns.ipv6Sources;

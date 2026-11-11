@@ -6249,18 +6249,31 @@ def _api(action, ak_id, ak_secret, region, extra={}):
 
 
 def _norm_value(v):
-    """归一化记录值：去首尾空白；IPv6 统一成压缩小写形式。
+    """归一化记录值：去首尾空白；TXT 去外层引号；IPv6 统一成压缩小写形式；
+    CNAME 去末尾的点。
 
-    不归一化的话，IPv6 的「同一地址的不同写法」会被判成「值变了」，
-    白白触发一次更新。
+    不归一化的话，同一个值会被判成「值变了」，白白触发一次更新：
+      · IPv6 的「同一地址的不同写法」；
+      · TXT —— 阿里云把 TXT 的值存成**带外层双引号**的形式
+        （`"v=spf1 include:..."`），引号是存储形式、不是值的一部分；
+      · CNAME —— FQDN 末尾那个点是同一个域名的另一种写法。
+
+    ⚠ 这段逻辑与面板侧 `_ddns_norm_value()` **必须完全一致** ——
+      两边归一化规则不一样 ⇒ 面板判「没变」而 cron 判「变了」（或反过来）
+      ⇒ 自动更新要么不触发、要么每轮都触发。
     """
     s = str(v or "").strip()
     if not s:
         return ""
+    if len(s) >= 2 and s.startswith('"') and s.endswith('"'):
+        s = s[1:-1].strip()
     try:
         return ipaddress.ip_address(s).compressed.lower()
     except ValueError:
-        return s
+        pass
+    if s.endswith("."):
+        s = s[:-1]
+    return s
 
 
 def _is_ipv4(s):
@@ -6575,19 +6588,34 @@ def _aliyun_api(action, access_key_id, access_key_secret, region_id, extra_param
 
 
 def _ddns_norm_value(v):
-    """归一化 DNS 记录值：去首尾空白；IPv6 统一成压缩小写形式。
+    """归一化 DNS 记录值：去首尾空白；TXT 去外层引号；IPv6 统一成压缩小写形式；
+    CNAME 去末尾的点。
 
-    不归一化的话，IPv6 的「同一地址的不同写法」会被判成「值变了」，
-    白白触发一次更新。
+    不归一化的话，同一个值会被判成「值变了」，白白触发一次更新：
+      · IPv6 的「同一地址的不同写法」；
+      · TXT —— 阿里云把 TXT 的值存成**带外层双引号**的形式
+        （`"v=spf1 include:..."`），引号是存储形式、不是值的一部分；
+      · CNAME —— FQDN 末尾那个点是同一个域名的另一种写法。
+
+    ⚠ 这段逻辑与 cron 脚本里的 `_norm_value()` **必须完全一致** ——
+      两边归一化规则不一样 ⇒ 面板判「没变」而 cron 判「变了」（或反过来）
+      ⇒ 自动更新要么不触发、要么每轮都触发。
     """
     s = str(v or "").strip()
     if not s:
         return ""
+    # TXT：去掉外层双引号。len >= 2 保证不会把单个引号也剥掉。
+    if len(s) >= 2 and s.startswith('"') and s.endswith('"'):
+        s = s[1:-1].strip()
     try:
         import ipaddress
         return ipaddress.ip_address(s).compressed.lower()
     except ValueError:
-        return s
+        pass
+    # CNAME：去掉末尾的点
+    if s.endswith('.'):
+        s = s[:-1]
+    return s
 
 
 def _ddns_match_records(records, rr, rtype):
@@ -6630,6 +6658,18 @@ def _ddns_pick_target(matched):
     return matched[0]
 
 
+# 面板侧取公网 IPv4 的探测源。与 cron 脚本里的 `IPV4_SOURCES` **保持一致**。
+#
+# 为什么做成可注入（逗号分隔的环境变量）：
+#   ① 运维改了源，两侧必须一起改 —— 否则面板测的和 cron 跑的不是同一条路，
+#      「面板上测试通过」完全不能代表 cron 那边也通；
+#   ② 测试若真出网，结果会随时间变、网络不通就假失败 —— 那样的测试等于没有。
+#      注入本地假源后，测试能真的跑「取 IP → 比对 → 更新」整条链路。
+IPV4_SOURCES = [u.strip() for u in os.environ.get(
+    "NFTW_IPV4_SOURCES",
+    "https://ipv4.icanhazip.com,https://api.ipify.org").split(",") if u.strip()]
+
+
 def _fetch_public_ipv4():
     """取本机公网 IPv4；取不到返回 None。
 
@@ -6638,7 +6678,7 @@ def _fetch_public_ipv4():
     """
     import ipaddress
     import urllib.request
-    for url in ('https://ipv4.icanhazip.com', 'https://api.ipify.org'):
+    for url in IPV4_SOURCES:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "curl/8"})
             with urllib.request.urlopen(req, timeout=8) as r:
@@ -6806,7 +6846,10 @@ def aliyun_ddns_records():
         output = _aliyun_api("DescribeDomainRecords",
                              config['access_key_id'], config['access_key_secret'],
                              config.get('region_id', 'cn-hangzhou'),
-                             {"DomainName": domain})
+                             # ⚠ 必须显式给 PageSize：阿里云**默认只回前 20 条**。
+                             #   记录多的时候后面那些根本取不到 ⇒ 面板上看不全，
+                             #   而随后的保存会用这份残缺的列表覆盖本地配置。
+                             {"DomainName": domain, "PageSize": 500})
 
         records = []
         for r in output.get('DomainRecords', {}).get('Record', []):
@@ -6831,6 +6874,25 @@ def aliyun_ddns_records():
             r['enabled'] = local.get('enabled', False)
             r['ipv6_source'] = local.get('ipv6_source', '')
 
+        # 本地配置里的记录（前端要靠它保留 enabled / ipv6_source）
+        #
+        # ⚠ 原来这个接口**不返回** localRecords，而前端写的是
+        #   `this.aliyun.localRecords = data.localRecords || []`
+        #   ⇒ 每点一次「获取记录」就把本地配置清空 ⇒ 随后的保存把
+        #   enabled / ipv6_source 全丢掉 ⇒ 用户配的记录全变成未启用，
+        #   自动更新静默不生效。
+        # ⇒ 这里把本地配置里的记录**原样**带回去（含阿里云上已经没有的那些）。
+        local_records = []
+        for lr in config.get('records', []):
+            local_records.append({
+                'record_id': lr.get('record_id', '') or lr.get('RecordId', ''),
+                'rr': lr.get('rr', '') or lr.get('RR', ''),
+                'type': lr.get('type', '') or lr.get('Type', ''),
+                'value': lr.get('value', '') or lr.get('Value', ''),
+                'enabled': bool(lr.get('enabled', False)),
+                'ipv6_source': lr.get('ipv6_source', ''),
+            })
+
         # 返回配置（掩码）
         safe_config = dict(config)
         safe_config['access_key_secret'] = _aliyun_mask_secret(safe_config.get('access_key_secret', ''))
@@ -6838,6 +6900,7 @@ def aliyun_ddns_records():
         return jsonify({
             "success": True,
             "records": records,
+            "localRecords": local_records,
             "config": safe_config,
         })
     except Exception as e:
@@ -6982,6 +7045,45 @@ def aliyun_ddns_test():
                 "success": False,
                 "message": "取不到本机公网 IPv4，无法测试 A 记录（设备需要能出网）",
             }), 400
+
+    # CNAME / TXT：没有值可用时，去阿里云查这条记录**现在的值**。
+    #
+    # ⚠ 2026-11-11 修（这是本轮自己引入的回归）：
+    #   前端原来对**所有**类型都传 `value: ''`，而这里只在 A 时取公网 IP、
+    #   AAAA 读中转文件 —— CNAME/TXT 两条路都取不到值 ⇒
+    #   落到 `if not all([rr, rtype, value])` ⇒ **恒 400**
+    #   「rr, type, value 都不能为空」⇒ 测试按钮对 CNAME/TXT 完全不可用。
+    #
+    # 这一段是**后端兜底**：前端已经改成传阿里云现值，
+    # 但 app.js 是带缓存的静态文件（浏览器可能还在用旧版）⇒
+    # 后端自己也能取到值 ⇒ 两边都不依赖对方。
+    #
+    # 取到的是**现值** ⇒ 与阿里云上的值相同 ⇒ 归一化后判为「没变」⇒ 不写，
+    # 但 Describe 接口照样调了 ⇒ 凭据/权限/网络都验证到了（这正是测试的目的）。
+    if not value and rtype.upper() in ("CNAME", "TXT"):
+        try:
+            cfg = _load_aliyun_ddns_config() or {}
+            if cfg.get('domain'):
+                result = _aliyun_api("DescribeDomainRecords",
+                                     cfg['access_key_id'],
+                                     cfg['access_key_secret'],
+                                     cfg.get('region_id', 'cn-hangzhou'),
+                                     {"DomainName": cfg['domain'],
+                                      "RRKeyWord": rr, "Type": rtype,
+                                      "PageSize": 500})
+                for r in (result.get('DomainRecords', {}) or {}).get('Record', []) or []:
+                    # 有 record_id 就精确匹配；没有就按 (RR, Type) 找第一条
+                    if record_id and str(r.get('RecordId', '')) != record_id:
+                        continue
+                    if str(r.get('RR', '')).lower() != str(rr or '').lower():
+                        continue
+                    if str(r.get('Type', '')).upper() != rtype.upper():
+                        continue
+                    value = str(r.get('Value', '') or '').strip()
+                    break
+        except Exception:
+            # 取不到就取不到 —— 下面会按「值为空」如实回 400，不假装成功
+            pass
 
     if not all([rr, rtype, value]):
         return jsonify({"success": False, "message": "rr, type, value 都不能为空" + ("（IPv6 来源文件不存在或为空）" if ipv6_source and not value else "")}), 400

@@ -926,10 +926,19 @@ def test_frontend():
     if m is None:
         return
     body = m.group(1)
-    check("rec.Value || rec.value" not in body,
-          "测试按钮不再把阿里云上现存的旧值当作待更新值传回去")
-    check(re.search(r"value\s*:\s*''", body) is not None,
-          "测试按钮传的 value 为空（交给后端按 cron 脚本同一条路径取真实值）")
+    # ⚠ 2026-11-11（批 C）改了这条规则：
+    #   A / AAAA 传空值（后端自己去取，和 cron 脚本同一条路径），
+    #   但 CNAME / TXT **必须**传阿里云上现存的值 ——
+    #   这两种类型没有「自动取值」的来源（后端只在 A 时取公网 IP、
+    #   AAAA 读中转文件），不传值就恒 400「rr, type, value 都不能为空」。
+    #   ⇒ 断言从「整体不传旧值」改成「A/AAAA 分支不传旧值」。
+    #
+    # ⚠ 这里只是**文本烟测**；真正的行为判据在
+    #   tests/test_frontend_aliyun_batch_c.js（看真的发出去的请求体）。
+    check("rtypeU === 'A' || rtypeU === 'AAAA'" in body,
+          "测试按钮对 A/AAAA 走「传空值」的分支")
+    check("rec.Value || rec.value || ''" in body,
+          "测试按钮对 CNAME/TXT 传阿里云上现存的值（否则后端恒 400）")
 
 
 def main():

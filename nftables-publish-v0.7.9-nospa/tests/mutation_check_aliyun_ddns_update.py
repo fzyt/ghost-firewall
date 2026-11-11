@@ -261,7 +261,9 @@ MUTATIONS = [
     # ── M15：前端把阿里云上现存的旧值又传了回去 ──────────────────
     ('M15 前端：测试按钮又把阿里云上现存的旧值传了回去（永远显示「未变化」）',
      APP_JS,
-     [('''          value: '',
+     [('''          value: (rtypeU === 'A' || rtypeU === 'AAAA')
+            ? ''
+            : (rec.Value || rec.value || ''),
         });''',
        '''          value: (rec.Value || rec.value || ''),
         });''')]),
