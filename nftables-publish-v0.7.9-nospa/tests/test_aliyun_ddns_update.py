@@ -321,6 +321,21 @@ def test_cron_script(srv):
     check(p is not None and p.get("Value") == "203.0.113.7",
           "电信线路的旧值 192.0.2.55 没有被写回 default 线路")
 
+    # ── C2 组：只有一条非 default 线路的记录时，更新它而不是新增一条 ──
+    # 用户把 DDNS 配在「电信」等线路上是合法的。这时候若因为
+    # 「没有 default 那条」而去 Add，会凭空多出一条 default 记录，
+    # 原来那条还指着旧 IP ⇒ 解析变成两条轮询。
+    fake.calls = []
+    fake.records = [rec(value="198.51.100.9", rid="2002", line="telecom")]
+    fake.ip_body = "203.0.113.7"
+    rc, out, log, _ = run_script(srv, script, [cfg_record()])
+    seq = fake.action_seq()
+    check(seq == ["DescribeDomainRecords", "UpdateDomainRecord"],
+          "只有一条（电信线路）记录时更新它，不新增 default（实际：%s）" % seq)
+    p = fake.params_of("UpdateDomainRecord")
+    check(p is not None and p.get("RecordId") == "2002",
+          "被更新的是那条电信线路的记录（RecordId=2002）")
+
     # ── D 组：取不到公网 IPv4 ⇒ 不动阿里云 ─────────────────
     fake.calls = []
     fake.records = [rec(value="198.51.100.9")]
@@ -549,14 +564,30 @@ def test_panel_side():
         {"RR": "other", "Type": "A", "Value": "3.3.3.3", "RecordId": "4", "Line": "default"},
     ]
     m = app._ddns_match_records(records, "www", "A")
-    check(len(m) == 1 and m[0]["RecordId"] == "1",
-          "只匹配到 default 线路的那条（电信那条不匹配）")
+    check(len(m) == 2,
+          "同 RR+Type 的 default 与电信两条都匹配上（匹配阶段不分线路）")
+    check(sorted(r["RecordId"] for r in m) == ["1", "2"],
+          "匹配到的是 RecordId 1 与 2（default + telecom）")
     m2 = app._ddns_match_records(records, "www", "AAAA")
     check(len(m2) == 1 and m2[0]["RecordId"] == "3", "按类型精确匹配 AAAA")
     m3 = app._ddns_match_records(records, "WWW", "a")
-    check(len(m3) == 1 and m3[0]["RecordId"] == "1", "RR/Type 大小写不敏感")
+    check(len(m3) == 2, "RR/Type 大小写不敏感")
     m4 = app._ddns_match_records(records, "none", "A")
     check(m4 == [], "RR 不匹配时返回空")
+
+    # ── 目标选择：单条就它 / 多条只 default ──────────────────
+    only_telecom = [{"RR": "www", "Type": "A", "Value": "1.1.1.1",
+                     "RecordId": "77", "Line": "telecom"}]
+    check(app._ddns_pick_target(only_telecom)["RecordId"] == "77",
+          "只有一条记录时选它（哪怕在电信线路）—— 否则会凭空多出一条 default")
+    check(app._ddns_pick_target(m)["RecordId"] == "1",
+          "有多条时选 default 线路那条")
+    no_default = [
+        {"RR": "www", "Type": "A", "Value": "1.1.1.1", "RecordId": "7", "Line": "telecom"},
+        {"RR": "www", "Type": "A", "Value": "2.2.2.2", "RecordId": "8", "Line": "unicom"},
+    ]
+    check(app._ddns_pick_target(no_default)["RecordId"] == "7",
+          "多条且没有 default 时取第一条（与旧行为一致，不新增记录）")
 
     # ── _aliyun_ddns_update 的调用序列 ────────────────────
     calls = []
@@ -600,7 +631,8 @@ def test_panel_side():
           "面板侧：记录不存在才新增（实际：%s）" % seq)
 
     # 多线路 ⇒ 只改 default
-    # ⚠️ 电信那条排在**前面**：去掉 Line 判定时 matched[0] 就会变成它
+    # ⚠️ 电信那条排在**前面**：取目标时若忽略「只有一条就选它」的特例、
+    #   一律去找 default，就会挑错或新增
     calls.clear()
     fake_records = [
         {"RR": "www", "Type": "A", "Value": "9.9.9.9", "RecordId": "2002", "Line": "telecom"},
@@ -610,6 +642,17 @@ def test_panel_side():
     check(calls[-1][0] == "UpdateDomainRecord"
           and calls[-1][1].get("RecordId") == "1001",
           "面板侧：多线路时只更新 default 那条，电信那条不动")
+
+    # 只有一条非 default 线路的记录 ⇒ 更新它，不新增 default
+    calls.clear()
+    fake_records = [{"RR": "www", "Type": "A", "Value": "1.2.3.4",
+                     "RecordId": "2002", "Line": "telecom"}]
+    r = app._aliyun_ddns_update(cfg, "www", "A", "5.6.7.8")
+    check(calls[-1][0] == "UpdateDomainRecord"
+          and calls[-1][1].get("RecordId") == "2002",
+          "面板侧：只有一条（电信线路）记录时更新它，不新增 default")
+    check("AddDomainRecord" not in [a for a, _ in calls],
+          "面板侧：这种情况下不调用 AddDomainRecord（不凭空多出一条记录）")
 
     # 归一化要在**调用链上**也生效：只测纯函数不够 ——
     # 纯函数对了、调用处没用它，照样会把同一地址判成「值变了」。

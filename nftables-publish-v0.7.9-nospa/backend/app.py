@@ -6160,9 +6160,12 @@ def _generate_ddns_update_script():
     原来用「删除 + 新增」，控制台上每次都看到记录被删掉又重建，
     记录 ID 每轮都变 —— 这就是「不断删除重新上传」的直接来源。（D1）
   · 值没变就**一个写接口都不调**。（D1/D5）
-  · 匹配记录时带上 Line 判定，**只动 default 线路**。
-    原来只按 RR+Type 匹配，会把「电信/联通/移动」等多线路记录当成同一条
-    处理 —— 那是会改掉用户正常配置的数据破坏。（D2）
+  · 同 RR+Type 有**多条**记录时，只更新 default 线路那条。
+    多线路配置里的其它线路往往指向别的机器，改它们是数据破坏。（D2）
+  · 同 RR+Type 只有**一条**时，就更新那一条 —— 哪怕它在「电信」等
+    非 default 线路。配置里没有线路字段，脚本本来也分不清用户要更新
+    哪条；这时候若因为「没有 default 那条」而去 Add，会**凭空多出一条
+    default 记录**，原来那条还指着旧 IP ⇒ 解析变成两条轮询。
   · 脚本**从不调用 DeleteDomainRecord**：改用 Update 后不再需要删除，
     也就没有「删成功、加失败，域名解析直接断」的风险。（D3）
   · 每条记录独立 try，单条失败不影响其余记录。（D3）
@@ -6286,11 +6289,16 @@ def _fetch_public_ipv4():
 
 
 def _match_records(records, rr, rtype):
-    """挑出所有 (RR、Type、default 线路) 都相同的记录。
+    """挑出所有同 RR、Type 的记录（**不按线路过滤**）。
 
-    必须带 Line 判定：阿里云允许同一 RR+Type 按线路（电信/联通/移动…）
-    存在多条**合法**记录。只按 RR+Type 匹配会把多线路配置当成同一条，
-    更新时会把别的线路改掉 —— 那是数据破坏。
+    线路怎么处理由调用方决定，见 _pick_target。
+
+    ⚠️ 这里刻意**不**按 Line 过滤：阿里云允许同一 RR+Type 按线路
+    （电信/联通/移动…）存在多条**合法**记录，而配置里**没有线路字段**
+    （面板只存 rr/type/value）⇒ 脚本本来就分不清用户要更新哪条。
+    过滤掉非 default 的那些，等于把用户配在某个线路上的那条记录
+    当成「不存在」⇒ 反而去 Add 一条 default ⇒ 凭空多出一条记录，
+    原来的那条还指着旧 IP ⇒ 解析变成两条轮询。
     """
     out = []
     for r in records:
@@ -6298,10 +6306,26 @@ def _match_records(records, rr, rtype):
             continue
         if str(r.get("Type", "")).upper() != str(rtype or "").upper():
             continue
-        if str(r.get("Line", "default") or "default").lower() != "default":
-            continue
         out.append(r)
     return out
+
+
+def _pick_target(matched):
+    """在多条同 RR+Type 的记录里，挑该更新的那一条。
+
+    · **只有一条** ⇒ 就它。哪怕它在「电信」等非 default 线路 ——
+      用户把 DDNS 配在某个线路上是合法的，这时候不能因为「没有
+      default 那条」就凭空去 Add 一条新的。
+    · **有多条** ⇒ 只动 default 线路那条。多线路配置里的其它线路
+      往往指向别的机器（NAS 等），改它们是数据破坏。
+    · 有多条但没有 default ⇒ 取第一条（与旧行为一致，不新增记录）。
+    """
+    if len(matched) == 1:
+        return matched[0]
+    for r in matched:
+        if str(r.get("Line", "default") or "default").lower() == "default":
+            return r
+    return matched[0]
 
 
 try:
@@ -6374,23 +6398,21 @@ try:
                 _log("新增 %s.%s = %s" % (rr, rtype, value))
                 continue
 
+            target = _pick_target(matched)
             norm_value = _norm_value(value)
-            same = [r for r in matched if _norm_value(r.get("Value")) == norm_value]
-
-            if same:
+            if _norm_value(target.get("Value")) == norm_value:
                 # 值没变 ⇒ 一个写接口都不调
                 _log("跳过 %s.%s = %s（值未变化，记录ID %s）"
-                     % (rr, rtype, value, same[0].get("RecordId")))
+                     % (rr, rtype, value, target.get("RecordId")))
             else:
-                target = matched[0]
                 # 原地更新，RecordId 不变
                 _api("UpdateDomainRecord", ak_id, ak_secret, region,
                      {"RecordId": str(target.get("RecordId")), "RR": rr, "Type": rtype, "Value": value})
                 _log("更新 %s.%s = %s（记录ID %s，原值 %s）"
                      % (rr, rtype, value, target.get("RecordId"), target.get("Value")))
             if len(matched) > 1:
-                _log("注意 %s.%s 有 %d 条同线路记录，只处理了第一条，其余未动"
-                     % (rr, rtype, len(matched)))
+                _log("注意 %s.%s 有 %d 条同 RR+Type 记录，只更新了 %s 线路那条，其余未动"
+                     % (rr, rtype, len(matched), target.get("Line", "default")))
         except Exception as e:
             # 单条失败不影响其余记录
             _log("失败 %s.%s：%s: %s" % (rr, rtype, type(e).__name__, e))
@@ -6510,11 +6532,16 @@ def _ddns_norm_value(v):
 
 
 def _ddns_match_records(records, rr, rtype):
-    """挑出所有 (RR、Type、default 线路) 都相同的记录。
+    """挑出所有同 RR、Type 的记录（**不按线路过滤**）。
 
-    必须带 Line 判定：阿里云允许同一 RR+Type 按线路（电信/联通/移动…）
-    存在多条**合法**记录。只按 RR+Type 匹配会把多线路配置当成同一条，
-    更新时会把别的线路改掉 —— 那是数据破坏。
+    线路怎么处理由调用方决定，见 _ddns_pick_target。
+
+    ⚠️ 这里刻意**不**按 Line 过滤：阿里云允许同一 RR+Type 按线路
+    （电信/联通/移动…）存在多条**合法**记录，而配置里**没有线路字段**
+    （面板只存 rr/type/value）⇒ 脚本本来就分不清用户要更新哪条。
+    过滤掉非 default 的那些，等于把用户配在某个线路上的那条记录
+    当成「不存在」⇒ 反而去 Add 一条 default ⇒ 凭空多出一条记录，
+    原来的那条还指着旧 IP ⇒ 解析变成两条轮询。
     """
     out = []
     for r in records:
@@ -6522,10 +6549,26 @@ def _ddns_match_records(records, rr, rtype):
             continue
         if str(r.get('Type', '')).upper() != str(rtype or '').upper():
             continue
-        if str(r.get('Line', 'default') or 'default').lower() != 'default':
-            continue
         out.append(r)
     return out
+
+
+def _ddns_pick_target(matched):
+    """在多条同 RR+Type 的记录里，挑该更新的那一条。
+
+    · **只有一条** ⇒ 就它。哪怕它在「电信」等非 default 线路 ——
+      用户把 DDNS 配在某个线路上是合法的，这时候不能因为「没有
+      default 那条」就凭空去 Add 一条新的。
+    · **有多条** ⇒ 只动 default 线路那条。多线路配置里的其它线路
+      往往指向别的机器（NAS 等），改它们是数据破坏。
+    · 有多条但没有 default ⇒ 取第一条（与旧行为一致，不新增记录）。
+    """
+    if len(matched) == 1:
+        return matched[0]
+    for r in matched:
+        if str(r.get('Line', 'default') or 'default').lower() == 'default':
+            return r
+    return matched[0]
 
 
 def _fetch_public_ipv4():
@@ -6581,7 +6624,8 @@ def _aliyun_ddns_update(config, rr, rtype, value):
         return {"success": True, "message": f"记录 {rr}.{rtype} 不存在，已新增为 {value}"}
 
     norm_value = _ddns_norm_value(value)
-    if any(_ddns_norm_value(r.get('Value')) == norm_value for r in matched):
+    target = _ddns_pick_target(matched)
+    if _ddns_norm_value(target.get('Value')) == norm_value:
         return {"success": True, "message": "IP 未变化，无需更新"}
 
     # 原地更新：RecordId 不变，控制台上看到的是同一条记录改了值。
@@ -6589,7 +6633,7 @@ def _aliyun_ddns_update(config, rr, rtype, value):
     # ⚠️ 这里不再走「删除 + 新增」的老路 —— 那条路一旦删除成功、
     # 新增失败，用户的域名就解析不到了。RecordId 缺失时**直接报错**，
     # 绝不退回到删+增（那正是当初引入删+增想绕开的问题）。
-    record_id = matched[0].get('RecordId')
+    record_id = target.get('RecordId')
     if not record_id:
         raise ValueError(f"阿里云返回的记录缺少 RecordId，无法原地更新：{rr}.{rtype}")
     _aliyun_api("UpdateDomainRecord", ak_id, ak_secret, region, {
@@ -6600,7 +6644,8 @@ def _aliyun_ddns_update(config, rr, rtype, value):
     })
     message = f"记录 {rr}.{rtype} 已更新为 {value}（记录 ID 不变）"
     if len(matched) > 1:
-        message += f"；同线路有 {len(matched)} 条记录，只更新了第一条"
+        message += (f"；同 RR+Type 有 {len(matched)} 条记录，"
+                    f"只更新了 {target.get('Line', 'default')} 线路那条")
     return {"success": True, "message": message}
 
 

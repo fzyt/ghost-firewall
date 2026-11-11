@@ -19,7 +19,7 @@
 --------------------------
   M1  原地更新改回「删除 + 新增」（回到 2026-11-11 之前的实现）
   M2  不再判断「值是否相同」（值没变也更新）
-  M3  匹配记录时不看 Line（多线路配置会被当成同一条）
+  M3  目标只找 default 线路（只有一条非 default 时挑错/新增）
   M4  取不到公网 IPv4 时沿用配置里的旧值（把正确地址改回过期地址）
   M5  配置里的 rr/type 只认小写键（存量配置取不到）
   M6  配置路径写死（改了环境变量就读不到配置）
@@ -29,10 +29,12 @@
   M10 不写摘要日志（又变成悄无声息）
   M11 没有可用值也不跳过（拿空值去写）
   M12 面板侧改回「删除 + 新增」
-  M13 面板侧匹配记录时不看 Line
+  M13 面板侧目标只找 default 线路
   M14 面板侧值比较用裸字符串（IPv6 的不同写法被判成「变了」）
   M15 前端把阿里云上现存的旧值又传了回去（测试按钮永远绿）
   M16 cron 侧不做值归一化
+  M19 cron 侧匹配时又按线路过滤（用户在非 default 线路的记录被当成不存在）
+  M20 面板侧匹配时又按线路过滤
 
 ⚠️ 「锚点未命中」必须当失败
 --------------------------
@@ -133,19 +135,25 @@ MUTATIONS = [
     # ── M2：不再判断「值是否相同」────────────────────────────────
     ('M2  cron 侧：不再判断值是否相同（值没变也照样更新）',
      APP_PY,
-     [('''            if same:
+     [('''            if _norm_value(target.get("Value")) == norm_value:
                 # 值没变 ⇒ 一个写接口都不调''',
        '''            if False:
                 # 【变异】不再判断值是否相同''')]),
 
     # ── M3：匹配记录时不看 Line（多线路配置被当成同一条）─────────
-    ('M3  cron 侧：匹配记录时不看 Line（多线路会被改掉）',
+    ('M3  cron 侧：目标只找 default 线路（只有一条非 default 时挑错/新增）',
      APP_PY,
-     [('''        if str(r.get("Line", "default") or "default").lower() != "default":
-            continue
-''',
-       '''        # 【变异】不看 Line
-''')]),
+     [('''    if len(matched) == 1:
+        return matched[0]
+    for r in matched:
+        if str(r.get("Line", "default") or "default").lower() == "default":
+            return r
+    return matched[0]''',
+       '''    # 【变异】只找 default 线路
+    for r in matched:
+        if str(r.get("Line", "default") or "default").lower() == "default":
+            return r
+    return None''')]),
 
     # ── M4：取不到公网 IPv4 时沿用旧值 ───────────────────────────
     ('M4  cron 侧：取不到公网 IPv4 时沿用配置里的旧值',
@@ -232,21 +240,29 @@ MUTATIONS = [
     })''')]),
 
     # ── M13：面板侧匹配记录时不看 Line ────────────────────────────
-    ('M13 面板侧：匹配记录时不看 Line（多线路会被改掉）',
+    ('M13 面板侧：目标只找 default 线路（只有一条非 default 时挑错/新增）',
      APP_PY,
-     [('''        if str(r.get('Line', 'default') or 'default').lower() != 'default':
-            continue
-''',
-       '''        # 【变异】不看 Line
-''')]),
+     [('''    if len(matched) == 1:
+        return matched[0]
+    for r in matched:
+        if str(r.get('Line', 'default') or 'default').lower() == 'default':
+            return r
+    return matched[0]''',
+       '''    # 【变异】只找 default 线路
+    for r in matched:
+        if str(r.get('Line', 'default') or 'default').lower() == 'default':
+            return r
+    return None''')]),
 
     # ── M14：面板侧值比较用裸字符串 ───────────────────────────────
     ('M14 面板侧：值比较用裸字符串（IPv6 的不同写法被判成「变了」）',
      APP_PY,
      [('''    norm_value = _ddns_norm_value(value)
-    if any(_ddns_norm_value(r.get('Value')) == norm_value for r in matched):''',
+    target = _ddns_pick_target(matched)
+    if _ddns_norm_value(target.get('Value')) == norm_value:''',
        '''    norm_value = value
-    if any(r.get('Value') == norm_value for r in matched):''')]),
+    target = _ddns_pick_target(matched)
+    if target.get('Value') == norm_value:''')]),
 
     # ── M15：前端把阿里云上现存的旧值又传了回去 ──────────────────
     ('M15 前端：测试按钮又把阿里云上现存的旧值传了回去（永远显示「未变化」）',
@@ -260,9 +276,9 @@ MUTATIONS = [
     ('M16 cron 侧：值比较不做归一化（IPv6 的不同写法被判成「变了」）',
      APP_PY,
      [('''            norm_value = _norm_value(value)
-            same = [r for r in matched if _norm_value(r.get("Value")) == norm_value]''',
+            if _norm_value(target.get("Value")) == norm_value:''',
        '''            norm_value = value
-            same = [r for r in matched if r.get("Value") == norm_value''')]),
+            if target.get("Value") == norm_value:''')]),
 
     # ── M17：不检查配置文件是否存在 ─────────────────────────────
     ('M17 cron 侧：配置文件不存在时不检查（用户看到的是 FileNotFoundError）',
@@ -279,6 +295,50 @@ MUTATIONS = [
      APP_PY,
      [('''              "SignatureMethod": "HMAC-SHA1", "Timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),''',
        '''              "SignatureMethod": "HMAC-SHA1", "Timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),''')]),
+
+    # ── M19：匹配时又按线路过滤 ─────────────────────────────────
+    ('M19 cron 侧：匹配时又按线路过滤（用户在非 default 线路的记录被当成不存在）',
+     APP_PY,
+     [('''    out = []
+    for r in records:
+        if str(r.get("RR", "")).lower() != str(rr or "").lower():
+            continue
+        if str(r.get("Type", "")).upper() != str(rtype or "").upper():
+            continue
+        out.append(r)
+    return out''',
+       '''    out = []
+    for r in records:
+        if str(r.get("RR", "")).lower() != str(rr or "").lower():
+            continue
+        if str(r.get("Type", "")).upper() != str(rtype or "").upper():
+            continue
+        if str(r.get("Line", "default") or "default").lower() != "default":
+            continue
+        out.append(r)
+    return out''')]),
+
+    # ── M20：面板侧匹配时又按线路过滤 ───────────────────────────
+    ('M20 面板侧：匹配时又按线路过滤（用户在非 default 线路的记录被当成不存在）',
+     APP_PY,
+     [('''    out = []
+    for r in records:
+        if str(r.get('RR', '')).lower() != str(rr or '').lower():
+            continue
+        if str(r.get('Type', '')).upper() != str(rtype or '').upper():
+            continue
+        out.append(r)
+    return out''',
+       '''    out = []
+    for r in records:
+        if str(r.get('RR', '')).lower() != str(rr or '').lower():
+            continue
+        if str(r.get('Type', '')).upper() != str(rtype or '').upper():
+            continue
+        if str(r.get('Line', 'default') or 'default').lower() != 'default':
+            continue
+        out.append(r)
+    return out''')]),
 ]
 
 
