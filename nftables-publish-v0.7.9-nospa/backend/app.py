@@ -6467,9 +6467,24 @@ except Exception as e:
     sys.exit(1)
 '''
 
-    with open(script_path, 'w') as f:
+    # ⚠ 原子写：先写同目录临时文件，再用 os.replace 覆盖。
+    #
+    # 直接 open(script_path,'w') 覆盖有一个真实的坏结局：
+    # 写到一半进程被杀 / 磁盘满 / 写超时 ⇒ 设备上留下**半截脚本**，
+    # 而原来的好版本已经被截断、没法回退 ⇒ 下一次 cron 跑它直接报错，
+    # DDNS 从此彻底不动，而且现场被毁。
+    #
+    # os.replace 是同目录内的原子 rename ⇒ 落盘后要么是旧的完整版，
+    # 要么是新的完整版，不存在中间态。
+    #
+    # 目标路径若是软链，先解引用到真实文件再写 ——
+    # 替换软链本身会把内容写到别处去（regen_ddns_script.py 同此处理）。
+    real_path = os.path.realpath(script_path)
+    tmp_path = real_path + ".tmp"
+    with open(tmp_path, 'w') as f:
         f.write(script_content)
-    os.chmod(script_path, 0o755)
+    os.chmod(tmp_path, 0o755)
+    os.replace(tmp_path, real_path)
 
 
 def _manage_ddns_cron(config):
@@ -6886,13 +6901,37 @@ def aliyun_ddns_save():
         }), 500
 
     # 生成自动更新脚本
-    _generate_ddns_update_script()
+    #
+    # ⚠ 生成失败**不能**让整个保存失败：配置已经落盘了，再说「保存失败」
+    #   会让人以为配置没存上、反复重存（还可能覆盖掉别的字段）。
+    #
+    # ⚠ 但也**不能**假装成功 —— 自动更新没生效这件事必须说出来，
+    #   否则用户以为 DDNS 已经在跑，实际 cron 跑的是旧脚本。
+    #   ⇒ 记日志 + 接口明确回报「配置已保存，但脚本生成失败」。
+    script_ok = True
+    script_error = ""
+    try:
+        _generate_ddns_update_script()
+    except Exception as e:
+        script_ok = False
+        script_error = f"{type(e).__name__}: {e}"
+        print(f'[ERROR] 阿里云 DDNS 自动更新脚本生成失败: {script_error}', flush=True)
 
     # 管理 cron 条目（失败要如实告知，否则自动更新静默不生效）
     cron_ok, cron_msg = _manage_ddns_cron(existing)
     if not cron_ok:
         return jsonify({"success": False,
                         "message": f"配置已保存，但自动更新 cron 配置失败：{cron_msg}"}), 500
+
+    if not script_ok:
+        return jsonify({
+            "success": False,
+            "code": "ALIYUN_SCRIPT_GENERATE_FAILED",
+            "message": ("配置已保存，但自动更新脚本生成失败，自动更新暂时不会生效"
+                        "（配置本身没问题）。请查看面板日志里的具体原因，"
+                        "或在设备上执行 "
+                        "/opt/nftables-web-v2/backend/regen_ddns_script.py 重新生成。"),
+        }), 500
 
     return jsonify({"success": True, "message": "配置已保存"})
 

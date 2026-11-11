@@ -101,16 +101,36 @@ def sec(title):
     print(f'\n=== {title} ===')
 
 
-def make_sandbox(app_py_src=APP_PY, with_regen=True):
+def make_sandbox(app_py_src=APP_PY, with_regen=True, script_path=None):
     """搭一个「设备安装目录」的沙箱。
 
     返回 (沙箱根, INSTALL_DIR 路径)
+
+    ⚠ 必须改掉 app.py **副本**里的 script_path
+    ----------------------------------------
+    新机制下 app.py 的 `script_path` 是**输出路径的唯一真源**
+    （regen_ddns_script.py 用 AST 把它取出来当目标路径）。
+    不改的话，regen 会照着副本里的 `/opt/nftables-web-v2/aliyun-ddns-update.py`
+    去写真实路径 —— 那就**测试污染生产目录**了。
+
+    这里只改**副本**里的那一行常量，被测代码一个字节都没动
+    （不给生产脚本加测试专用开关 —— 那会让生产代码多出一条分支）。
     """
     d = tempfile.mkdtemp(prefix='regen-ddns-')
     inst = os.path.join(d, 'opt-nftables-web-v2')
     backend = os.path.join(inst, 'backend')
     os.makedirs(backend)
-    shutil.copy(app_py_src, os.path.join(backend, 'app.py'))
+
+    src = open(app_py_src, encoding='utf-8').read()
+    old = 'script_path = "/opt/nftables-web-v2/aliyun-ddns-update.py"'
+    assert src.count(old) == 1, (
+        'app.py 副本里找不到唯一的 script_path 行（出现 %d 次）—— '
+        '生产代码变了，本沙箱的前提不成立' % src.count(old))
+    target = script_path or os.path.join(inst, 'aliyun-ddns-update.py')
+    src = src.replace(old, 'script_path = "%s"' % target)
+    with open(os.path.join(backend, 'app.py'), 'w', encoding='utf-8') as f:
+        f.write(src)
+
     if with_regen:
         shutil.copy(REGEN, os.path.join(backend, 'regen_ddns_script.py'))
     return d, inst
@@ -202,6 +222,7 @@ fake_app = os.path.join(tempfile.mkdtemp(), 'app.py')
 with open(fake_app, 'w', encoding='utf-8') as f:
     f.write(
         'def _generate_ddns_update_script():\n'
+        '    script_path = "/opt/nftables-web-v2/aliyun-ddns-update.py"\n'
         '    script_content = """#!/usr/bin/env python3\n'
         'MARKER = "%s"\n'
         'print(MARKER)\n'
@@ -224,6 +245,75 @@ check('生成物内容来自**设备上那份 app.py** 的模板',
       marker in body2, body2[:200])
 check('旧脚本内容被覆盖掉了（不是新写了一份别处的）',
       'OLD-STALE-CONTENT' not in body2)
+
+
+# ============================================================
+# 第 2.5 组：输出路径的**唯一真源**是 app.py 里的 script_path
+# ============================================================
+#
+# 为什么要有这一组
+# --------------
+# 2026-11-11 修 L1 之前，regen_ddns_script.py 按**目录层级推导**输出路径
+# （regen 脚本自己所在目录的上一级），而面板侧
+# `_generate_ddns_update_script()` 是**硬编码**
+# `/opt/nftables-web-v2/aliyun-ddns-update.py`。
+# 两套机制今天相等**只是布局巧合** —— 哪天 INSTALL_DIR 改名、或者 Docker 变体
+# 把 app.py 放在别处，重新生成就写到别处去了，而 cron 跑的还是旧文件
+# ⇒ **修复静默失效**，regen 还报「已重新生成」。
+#
+# ⇒ 真源必须是 app.py 里的 script_path（面板写盘用的那个路径）。
+sec('第 2.5 组：输出路径来自 app.py 的 script_path（不是目录推导）')
+
+# 先把「自定义位置」建好 —— 它刻意**不在**安装目录里，
+# 这样「写到了 app.py 指定的地方」才是确凿的证据。
+d25 = tempfile.mkdtemp(prefix='regen-ddns-custom-')
+custom_dir = os.path.join(d25, 'custom-place')
+os.makedirs(custom_dir)
+custom_out = os.path.join(custom_dir, 'ddns.py')
+
+d25, inst25 = make_sandbox(script_path=custom_out)
+gen25 = os.path.join(inst25, 'backend', 'regen_ddns_script.py')
+r25 = subprocess.run([sys.executable, gen25], capture_output=True, text=True,
+                     timeout=120, cwd=ROOT,
+                     env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
+out25 = r25.stdout + r25.stderr
+check('regen 执行成功（rc=0）', r25.returncode == 0, out25[-300:])
+check('生成物写到了 **app.py 里指定的路径**', os.path.isfile(custom_out),
+      custom_out)
+# 「按目录推导」的那个位置 = regen 脚本所在目录的上一级
+default_guess25 = os.path.join(inst25, 'aliyun-ddns-update.py')
+check('生成物**没有**落到「按目录推导」的位置',
+      not os.path.exists(default_guess25), default_guess25)
+
+# 走 setup.sh 一遍（部署时的真实路径）也必须落在同一个地方
+script25 = make_setup_script(inst25)
+rc25, out25s = run_sh(script25)
+check('setup.sh 走一遍后退出码为 0', rc25 == 0, out25s[-300:])
+check('setup.sh 走一遍后，生成物仍在 app.py 指定的路径',
+      os.path.isfile(custom_out))
+check('setup.sh 走一遍后，也没有落到目录推导的位置',
+      not os.path.exists(default_guess25))
+
+# 环境变量优先（**只给测试用**）
+d25c, inst25c = make_sandbox()
+trap25c = os.path.join(d25c, 'trap25c.py')
+rc25c, out25c = run_regen(app_py=os.path.join(inst25c, 'backend', 'app.py'),
+                          out=trap25c)
+check('环境变量指定的路径被写入了（测试专用入口仍可用）',
+      os.path.isfile(trap25c), out25c[-200:])
+check('环境变量优先于 app.py 的 script_path（app.py 的位置没被写）',
+      not os.path.exists(os.path.join(inst25c, 'aliyun-ddns-update.py')))
+
+# setup.sh 必须把这个「只给测试用」的环境变量**清掉**
+d25d, inst25d = make_sandbox()
+trap25d = os.path.join(d25d, 'trap25d.py')
+script25d = make_setup_script(inst25d)
+rc25d, out25d = run_sh(script25d, env={'NFTABLES_WEB_DDNS_SCRIPT': trap25d})
+check('setup.sh 跑完退出码为 0', rc25d == 0, out25d[-300:])
+check('setup.sh **清掉了**测试用环境变量（没写到 trap 路径）',
+      not os.path.exists(trap25d), trap25d)
+check('setup.sh 写到了 app.py 指定的路径（真源生效）',
+      os.path.isfile(os.path.join(inst25d, 'aliyun-ddns-update.py')))
 
 
 # ============================================================
@@ -274,6 +364,7 @@ d34, inst34 = make_sandbox()
 broken_app = os.path.join(d34, 'broken_app.py')
 with open(broken_app, 'w', encoding='utf-8') as f:
     f.write('def _generate_ddns_update_script():\n'
+            '    script_path = "/opt/nftables-web-v2/aliyun-ddns-update.py"\n'
             '    script_content = """def broken(:\n"""\n'
             '    write(script_content)\n')
 keep = os.path.join(inst34, 'aliyun-ddns-update.py')
@@ -334,8 +425,9 @@ d4d, inst4d = make_sandbox()
 bad_app = os.path.join(d4d, 'broken.py')
 with open(bad_app, 'w', encoding='utf-8') as f:
     f.write('def _generate_ddns_update_script():\n'
+            '    script_path = "%s"\n'
             '    script_content = """def broken(:\n"""\n'
-            '    write(script_content)\n')
+            '    write(script_content)\n' % os.path.join(inst4d, 'aliyun-ddns-update.py'))
 shutil.copy(bad_app, os.path.join(inst4d, 'backend', 'app.py'))
 script4d = make_setup_script(inst4d)
 rc4d, out4d = run_sh(script4d)

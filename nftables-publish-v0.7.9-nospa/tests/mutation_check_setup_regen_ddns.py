@@ -30,6 +30,9 @@
   B4  去掉「app.py 不存在」守卫（崩溃 + traceback）
   B5  异常类型收窄（traceback 泄到终端）
   B6  提取函数名写错（模板提取不到，静默什么都不做）
+  C1  输出路径忽略 app.py 的真源（退回按目录推导，写到别处去）
+  C2  AST 取不到 script_path（真源提取失败，静默写到别处去）
+  C3  setup.sh 不清掉测试用环境变量（设备上会被环境变量带偏）
 
 ⚠️ 「锚点未命中」必须当失败
 --------------------------
@@ -142,8 +145,8 @@ MUTATIONS = [
 
     ('A5  丢掉 python3 的退出码（失败当成功）',
      SETUP_SH,
-     [('    out="$(python3 "$gen" 2>&1)" || rc=$?',
-       '    out="$(python3 "$gen" 2>&1)"')]),
+     [('    out="$(env -u NFTABLES_WEB_DDNS_SCRIPT python3 "$gen" 2>&1)" || rc=$?',
+       '    out="$(env -u NFTABLES_WEB_DDNS_SCRIPT python3 "$gen" 2>&1)"')]),
 
     # ⚠ 这条专门盯「调用点被挪进**别的顶层函数**」——
     #   别的顶层函数体也是 4 空格缩进，只看缩进抓不住它；
@@ -167,7 +170,7 @@ MUTATIONS = [
 
     ('B3  写入前不编译（坏模板覆盖旧脚本，留半截文件）',
      REGEN_PY,
-     [('        compile(script, OUT, "exec")\n', '')]),
+     [('        compile(script, out_path, "exec")\n', '')]),
 
     ('B4  去掉「app.py 不存在」守卫（崩溃 + traceback）',
      REGEN_PY,
@@ -184,6 +187,21 @@ MUTATIONS = [
      REGEN_PY,
      [('and node.name == "_generate_ddns_update_script"',
        'and node.name == "_generate_ddns_update_script_XXX"')]),
+
+    # ── L1：输出路径的单一真源 ───────────────────────────
+    ('C1  resolve_out 忽略 app.py 的真源（退回按目录推导）',
+     REGEN_PY,
+     [('    return script_path or DEFAULT_OUT', '    return DEFAULT_OUT')]),
+
+    ('C2  AST 取不到 script_path（真源提取失败，静默写到别处）',
+     REGEN_PY,
+     [('                elif target == "script_path":',
+       '                elif target == "script_path_XXX":')]),
+
+    ('C3  setup.sh 不清掉测试用环境变量（设备上会被环境变量带偏）',
+     SETUP_SH,
+     [('    out="$(env -u NFTABLES_WEB_DDNS_SCRIPT python3 "$gen" 2>&1)" || rc=$?',
+       '    out="$(python3 "$gen" 2>&1)" || rc=$?')]),
 ]
 
 

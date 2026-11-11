@@ -1981,7 +1981,10 @@ regen_ddns_script() {
     # ⚠ 失败**不能**中断安装：面板上点一次「保存配置并生成脚本」是等价的
     #   兜底路径，脚本本体此刻还没被 cron 用到（首次保存配置时才装 cron）。
     local out rc=0
-    out="$(python3 "$gen" 2>&1)" || rc=$?
+    # ⚠ `env -u` 清掉 NFTABLES_WEB_DDNS_SCRIPT：那个环境变量**只给测试用**，
+    #   设备上必须走 app.py 里的真源路径（否则会写到别处去，
+    #   而 cron 跑的还是旧文件 ⇒ 修复静默失效、regen 还报「已重新生成」）。
+    out="$(env -u NFTABLES_WEB_DDNS_SCRIPT python3 "$gen" 2>&1)" || rc=$?
     if [ -n "$out" ]; then
         info "${out}"
     fi
@@ -1997,6 +2000,53 @@ regen_ddns_script() {
         *"[SKIP]"*) warn "阿里云 DDNS 自动更新脚本未重新生成；面板上点一次「保存配置并生成脚本」即可" ;;
         *) ok "阿里云 DDNS 自动更新脚本已重新生成" ;;
     esac
+    return 0
+}
+
+# ============================================================
+# 重启面板服务（部署之后）
+# ============================================================
+#
+# 为什么部署完必须重启
+# --------------------
+# 部署只换文件，**不换正在跑的进程**。Python 进程启动时就把 app.py
+# 读进内存了 ⇒ 部署新版本后，设备上跑的还是**旧代码**。
+#
+# ⚠ 2026-11-11 在 .232 真机上踩的就是这个坑（连续两次部署）：
+#   app.py 落盘时刻 12:54，面板进程启动时刻 12:34 —— 进程比文件还早 20 分钟，
+#   也就是说**新代码根本没进到运行中的进程里**。
+#   面板侧改的东西（record_id 精确定位、TTL/Line 回传）在真机上一样没生效，
+#   现象照旧，很容易被误判成「没修好」。
+#
+# 为什么不能挂在服务阶段
+# --------------------
+# 服务阶段的判据是「端口在听」—— 旧进程也在听 ⇒ 判定成「已完成」⇒ 跳过
+#   ⇒ 不重启。**端口在听证明不了跑的是新代码。**
+#
+# ⇒ 挂在部署侧：只要这次真的替换了文件，就无条件重启一次。
+#   （部署被跳过时不需要重启 —— 代码没变，重启也只是白折腾。）
+#
+# 为什么只重启面板、不重启认证服务
+# ------------------------------
+# 本次改动全在 app.py 与 frontend/ 里，二者都由**面板进程**提供
+# （app.py 的 send_from_directory('../frontend', ...)）。
+# 认证服务（进程 B）只提供 backend/static/ 下的门户静态文件，
+# 本次没动它 ⇒ 不必重启（少动一个进程少一个风险）。
+restart_panel_service() {
+    if [ ! -f "$INITD_SCRIPT" ]; then
+        # 首次安装：init 脚本这时还没装（服务阶段才装）⇒ 没得重启。
+        # 服务阶段本来就会启动它，所以这里跳过**不算漏**。
+        return 0
+    fi
+    # 用 ${INITD_SCRIPT} 而不是写死 /etc/init.d/nftables-web ——
+    # 常量值本来就是它，行为不变，但沙箱测试才能替换成假 init 脚本。
+    if "${INITD_SCRIPT}" restart >/dev/null 2>&1; then
+        ok "面板服务已重启（已加载本次部署的新代码）"
+        return 0
+    fi
+    # ⚠ 重启失败不能中断安装：装完了就是装完了，
+    #   但必须明确提示「新代码可能没生效」，否则等于白部署。
+    warn "❌ 面板服务重启失败，本次部署的新代码可能未生效，请检查 /var/log/nftables-web.log"
     return 0
 }
 
@@ -2044,6 +2094,7 @@ deploy_project() {
         fi
         ok "✅ 本地部署完成"
         remove_obsolete_files
+        restart_panel_service
         return
     fi
 
@@ -2090,6 +2141,7 @@ deploy_project() {
         printf '%s\n' "$VERSION" > "${INSTALL_DIR}/VERSION"
         ok "✅ 项目部署完成 (${tag})"
         remove_obsolete_files
+        restart_panel_service
     else
         rm -rf "$tmp_dir"
         error "从 GitHub 下载失败（仓库可能尚未公开或版本不存在）"
