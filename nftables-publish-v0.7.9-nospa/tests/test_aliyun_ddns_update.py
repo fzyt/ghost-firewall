@@ -118,6 +118,10 @@ class FakeAliyun:
         self.action_counts = {}
         self.ip_body = "203.0.113.7"
         self.ip_status = 200
+        # TotalCount 覆盖：用来模拟「阿里云还有更多记录、这页没取全」的分页截断。
+        # ⚠️ 不覆盖时必须等于 len(records)，否则「分页截断 ⇒ 中止」那条判据
+        #   会在正常场景下误报，测试就失去意义了。
+        self.total_count_override = None
 
     def action_seq(self):
         return [a for a, _ in self.calls]
@@ -162,8 +166,11 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(400, json.dumps({"Code": "FakeError", "Message": "boom"}))
             return
         if action == "DescribeDomainRecords":
+            total = fake.total_count_override
+            if total is None:
+                total = len(fake.records)
             self._send(200, json.dumps({
-                "TotalCount": len(fake.records),
+                "TotalCount": total,
                 "PageSize": 500,
                 "DomainRecords": {"Record": fake.records},
             }))
@@ -226,9 +233,9 @@ def run_script(srv, script_text, records, extra_records=None,
     return proc.returncode, proc.stdout + proc.stderr, log_text, tmp
 
 
-def rec(rr="www", rtype="A", value="1.2.3.4", rid="1001", line="default"):
+def rec(rr="www", rtype="A", value="1.2.3.4", rid="1001", line="default", ttl=600):
     return {"RR": rr, "Type": rtype, "Value": value, "RecordId": rid,
-            "Line": line, "TTL": 600, "Status": "Enable"}
+            "Line": line, "TTL": ttl, "Status": "Enable"}
 
 
 def cfg_record(rr="www", rtype="A", enabled=True, value="", extra=None):
@@ -484,6 +491,111 @@ def test_cron_script(srv):
           "AAAA 记录从 NFTABLES_WEB_DDNS_RELAY_DIR 指向的目录读到中转值（实际 %s）"
           % (p or {}).get("Value"))
 
+    # ══════════════════════════════════════════════════════
+    # 批 A 组：2026-11-11 完整代码审查新增的 6 条判据
+    # ══════════════════════════════════════════════════════
+
+    # ── A1 组（S1）：IPv6 中转文件读不到 ⇒ 不许拿配置里的旧值去覆盖 ──
+    # ⚠️ 这是**会写坏阿里云数据**的一条：
+    #   OpenWrt 的 /tmp 是 tmpfs，重启即清空 ⇒ 中转文件经常不存在。
+    #   原来读不到就 `pass`（沿用配置里的旧值）⇒ 把过期 IPv6 写回阿里云，
+    #   而写回后每轮比较都相等 ⇒ **永远停在过期地址，不会自愈**。
+    #   （A 记录的「取不到就跳过」规则在 AAAA 上一直没实现 —— D5 只做了一半。）
+    fake.calls = []
+    fake.records = [rec(rr="ipv6", rtype="AAAA", value="2001:db8::1", rid="3001")]
+    rc, out, log, _ = run_script(
+        srv, script,
+        [cfg_record(rr="ipv6", rtype="AAAA", value="2001:db8::99",
+                    extra={"ipv6_source": "router"})])
+    seq = fake.action_seq()
+    check("UpdateDomainRecord" not in seq,
+          "读不到 IPv6 中转文件时不更新阿里云（实际：%s）" % seq)
+    p_upd = fake.params_of("UpdateDomainRecord")
+    check(p_upd is None or p_upd.get("Value") != "2001:db8::99",
+          "没有把配置里的旧 IPv6（2001:db8::99）写回阿里云")
+    check("读不到 IPv6 中转文件" in log,
+          "日志写明了「读不到 IPv6 中转文件」")
+    # 反例：中转文件**在**的时候确实要更新（否则上面的跳过断言没意义）
+    relay_ok = tempfile.mkdtemp(prefix="ddns-relay-ok-")
+    with open(os.path.join(relay_ok, "ddns-ipv6-0"), "w") as f:
+        f.write("2001:db8::5555")
+    fake.calls = []
+    fake.records = [rec(rr="ipv6", rtype="AAAA", value="2001:db8::1", rid="3001")]
+    rc, out, log, _ = run_script(
+        srv, script,
+        [cfg_record(rr="ipv6", rtype="AAAA", value="2001:db8::99",
+                    extra={"ipv6_source": "router"})],
+        env_extra={"NFTABLES_WEB_DDNS_RELAY_DIR": relay_ok})
+    p_upd = fake.params_of("UpdateDomainRecord")
+    check(p_upd is not None and p_upd.get("Value") == "2001:db8::5555",
+          "中转文件在时确实会用它的值更新（反例：否则上一条断言可能是空转）")
+
+    # ── A2 组（M1）：更新时沿用原记录的 TTL ──────────────────
+    # 阿里云官方文档：TTL 非必填，「默认为 600 秒」⇒ 不传就把用户设的 TTL 改回 600。
+    fake.calls = []
+    fake.records = [rec(value="198.51.100.9", ttl=3600)]
+    fake.ip_body = "203.0.113.7"
+    rc, out, log, _ = run_script(srv, script, [cfg_record()])
+    p = fake.params_of("UpdateDomainRecord")
+    check(p is not None and p.get("TTL") == "3600",
+          "更新时沿用原记录的 TTL=3600（不传会被阿里云重置成 600），实际 %s"
+          % (p or {}).get("TTL"))
+
+    # ── A3 组（M2）：更新时沿用原记录的 Line ──────────────────
+    # 阿里云官方文档：Line 非必填，「默认为 default」
+    # ⇒ 不传有把「电信」等线路的记录搬到 default 的风险。
+    fake.calls = []
+    fake.records = [rec(value="198.51.100.9", rid="2002", line="telecom")]
+    fake.ip_body = "203.0.113.7"
+    rc, out, log, _ = run_script(srv, script, [cfg_record()])
+    p = fake.params_of("UpdateDomainRecord")
+    check(p is not None and p.get("Line") == "telecom",
+          "更新时沿用原记录的线路 Line=telecom（不传可能被搬到 default），实际 %s"
+          % (p or {}).get("Line"))
+
+    # ── A4 组（M3）：配置里的 record_id 优先定位 ──────────────
+    # 配置里存了精确的 RecordId（面板从阿里云读到后回填的），
+    # 靠 (RR, Type, Line) 猜会改到用户没配的那条。
+    fake.calls = []
+    fake.records = [
+        rec(value="192.0.2.55", rid="2002", line="telecom"),
+        rec(value="198.51.100.9", rid="1001", line="default"),
+    ]
+    fake.ip_body = "203.0.113.7"
+    rc, out, log, _ = run_script(
+        srv, script, [cfg_record(extra={"record_id": "2002"})])
+    p = fake.params_of("UpdateDomainRecord")
+    check(p is not None and p.get("RecordId") == "2002",
+          "配置里指定 record_id=2002 时更新的是那一条（不是猜出来的 default），实际 %s"
+          % (p or {}).get("RecordId"))
+
+    # ── A5 组（M4）：分页截断 ⇒ 中止，不新增 ──────────────────
+    # PageSize 上限 500。目标记录落在第 501 条之后时，「没查到」会被
+    # 误当成「记录不存在」⇒ 去 Add ⇒ 凭空多出一条重复记录 ⇒ 解析轮询。
+    fake.calls = []
+    fake.records = []
+    fake.total_count_override = 1200
+    rc, out, log, _ = run_script(srv, script, [cfg_record()])
+    seq = fake.action_seq()
+    check("AddDomainRecord" not in seq,
+          "阿里云记录数超出取回条数时不新增（实际：%s）" % seq)
+    check("分页截断" in log, "日志写明了「分页截断」")
+    fake.total_count_override = None
+
+    # ── A6 组（L10）：目标缺 RecordId ⇒ 跳过，不发 RecordId=None ──
+    fake.calls = []
+    fake.records = [{"RR": "www", "Type": "A", "Value": "198.51.100.9",
+                     "Line": "default", "TTL": 600}]
+    fake.ip_body = "203.0.113.7"
+    rc, out, log, _ = run_script(srv, script, [cfg_record()])
+    seq = fake.action_seq()
+    check("UpdateDomainRecord" not in seq,
+          "目标记录缺 RecordId 时不发起更新（实际：%s）" % seq)
+    p = fake.params_of("UpdateDomainRecord")
+    check(p is None or p.get("RecordId") != "None",
+          "没有把字符串 \"None\" 当 RecordId 发给阿里云")
+    check("缺少 RecordId" in log, "日志写明了「缺少 RecordId」")
+
     # ── L 组：没有可用值就跳过 ────────────────────────────
     fake.calls = []
     fake.records = [rec(rr="cn", rtype="CNAME", value="mail.example.com", rid="4001")]
@@ -591,11 +703,15 @@ def test_panel_side():
 
     # ── _aliyun_ddns_update 的调用序列 ────────────────────
     calls = []
+    fake_total = None      # 分页截断模拟用；None = 按实际条数返回
 
     def fake_api(action, ak, secret, region, extra=None):
         calls.append((action, extra or {}))
         if action == "DescribeDomainRecords":
-            return {"TotalCount": len(fake_records),
+            # fake_total 用来模拟「阿里云还有更多记录、这页没取全」的分页截断。
+            # None 表示按实际条数返回（正常场景必须如此，否则截断判据会误报）。
+            total = fake_total if fake_total is not None else len(fake_records)
+            return {"TotalCount": total,
                     "DomainRecords": {"Record": list(fake_records)}}
         return {"RecordId": "999"}
 
@@ -653,6 +769,62 @@ def test_panel_side():
           "面板侧：只有一条（电信线路）记录时更新它，不新增 default")
     check("AddDomainRecord" not in [a for a, _ in calls],
           "面板侧：这种情况下不调用 AddDomainRecord（不凭空多出一条记录）")
+
+    # ══════════════════════════════════════════════════════
+    # 批 A 组（面板侧）：2026-11-11 完整代码审查新增
+    # ══════════════════════════════════════════════════════
+
+    # ── 更新时沿用原记录的 TTL 与 Line ─────────────────────
+    # 阿里云官方文档：TTL 非必填「默认为 600 秒」；Line 非必填「默认为 default」。
+    # 不传 ⇒ 用户设的 TTL 被改回 600 / 非 default 线路的记录被搬到 default。
+    calls.clear()
+    fake_records = [{"RR": "www", "Type": "A", "Value": "1.2.3.4",
+                     "RecordId": "2002", "Line": "telecom", "TTL": 3600}]
+    app._aliyun_ddns_update(cfg, "www", "A", "5.6.7.8")
+    check(calls[-1][1].get("TTL") == "3600",
+          "面板侧：更新沿用原记录 TTL=3600（实际 %s）" % calls[-1][1].get("TTL"))
+    check(calls[-1][1].get("Line") == "telecom",
+          "面板侧：更新沿用原记录 Line=telecom（实际 %s）" % calls[-1][1].get("Line"))
+
+    # ── 指定 record_id 时精确定位 ─────────────────────────
+    calls.clear()
+    fake_records = [
+        {"RR": "www", "Type": "A", "Value": "9.9.9.9", "RecordId": "2002", "Line": "telecom"},
+        {"RR": "www", "Type": "A", "Value": "1.2.3.4", "RecordId": "1001", "Line": "default"},
+    ]
+    app._aliyun_ddns_update(cfg, "www", "A", "5.6.7.8", record_id="2002")
+    check(calls[-1][0] == "UpdateDomainRecord"
+          and calls[-1][1].get("RecordId") == "2002",
+          "面板侧：指定 record_id=2002 时更新的是那一条（实际 %s）"
+          % calls[-1][1].get("RecordId"))
+
+    # ── 分页截断 ⇒ 报错，不新增 ───────────────────────────
+    calls.clear()
+    fake_records = []
+    fake_total = 1200
+    err = None
+    try:
+        app._aliyun_ddns_update(cfg, "www", "A", "5.6.7.8")
+    except Exception as e:
+        err = e
+    fake_total = None
+    check("AddDomainRecord" not in [a for a, _ in calls],
+          "面板侧：分页截断时不新增记录（实际：%s）" % [a for a, _ in calls])
+    check(err is not None and "分页截断" in str(err),
+          "面板侧：分页截断时如实报错（实际 %r）" % (err,))
+
+    # ── 目标缺 RecordId ⇒ 报错，不退回删+增 ───────────────
+    calls.clear()
+    fake_records = [{"RR": "www", "Type": "A", "Value": "1.2.3.4", "Line": "default"}]
+    err = None
+    try:
+        app._aliyun_ddns_update(cfg, "www", "A", "5.6.7.8")
+    except Exception as e:
+        err = e
+    check("UpdateDomainRecord" not in [a for a, _ in calls],
+          "面板侧：目标缺 RecordId 时不发起更新（实际：%s）" % [a for a, _ in calls])
+    check(err is not None and "RecordId" in str(err),
+          "面板侧：目标缺 RecordId 时如实报错（实际 %r）" % (err,))
 
     # 归一化要在**调用链上**也生效：只测纯函数不够 ——
     # 纯函数对了、调用处没用它，照样会把同一地址判成「值变了」。

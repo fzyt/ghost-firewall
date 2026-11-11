@@ -6368,13 +6368,23 @@ try:
             value = str(rec.get("value", "") or "").strip()
             ipv6_source = str(rec.get("ipv6_source", "") or "")
             if ipv6_source:
+                # ⚠ 配了 IPv6 来源 ⇒ 权威值**只能**来自中转文件。
+                #   原来读不到就 `pass`（沿用配置里存的旧值）⇒ 把过期地址写回阿里云，
+                #   而写回后每轮比较都相等 ⇒ 永远停在过期地址，**不会自愈**。
+                #   OpenWrt 的 /tmp 是 tmpfs，重启即清空 ⇒ 这个分支很常见。
+                #   （A 记录的「取不到就跳过」规则在 AAAA 上一直没实现 —— D5 只做了一半。）
                 idx = source_map.get(ipv6_source)
+                value = ""
                 if idx is not None:
                     try:
                         with open(os.path.join(RELAY_DIR, "ddns-ipv6-%s" % idx)) as f:
                             value = f.read().strip()
                     except Exception:
                         pass
+                if not value:
+                    _log("跳过 %s.%s：读不到 IPv6 中转文件（%s），本轮不动阿里云"
+                         % (rr, rtype, ipv6_source))
+                    continue
             if rtype.upper() == "A":
                 # A 记录的权威值就是「当前公网 IPv4」
                 ip4 = _fetch_public_ipv4()
@@ -6389,8 +6399,27 @@ try:
             # ---- 查询 ----
             result = _api("DescribeDomainRecords", ak_id, ak_secret, region,
                           {"DomainName": domain, "RRKeyWord": rr, "Type": rtype, "PageSize": 500})
-            all_records = result.get("DomainRecords", {}).get("Record", [])
+            dd = result.get("DomainRecords", {}) or {}
+            all_records = dd.get("Record", []) or []
+            # ⚠ PageSize 上限是 500。目标记录若落在第 501 条之后，
+            #   「没查到」会被误当成「记录不存在」⇒ 去 Add ⇒ **凭空多出一条重复记录**
+            #   ⇒ 解析变成两条轮询 —— 正是这次修复要消灭的现象。
+            #   ⇒ 宁可本轮不动，也不要猜。
+            #   ⚠ TotalCount 是响应的**顶层**字段（与 DomainRecords 平级），
+            #     不是 DomainRecords 里的 —— 读错层级会让这道判据永远不生效。
+            total = int(result.get("TotalCount") or 0)
+            if total > len(all_records):
+                _log("跳过 %s.%s：阿里云共 %d 条记录但只取到 %d 条（分页截断），本轮不动阿里云"
+                     % (rr, rtype, total, len(all_records)))
+                continue
             matched = _match_records(all_records, rr, rtype)
+            # ⚠ 配置里存了这条记录的 record_id（面板从阿里云读到后回填的），
+            #   用它**精确定位** —— 靠 (RR, Type, Line) 猜会改到用户没配的那条。
+            rid = str(rec.get("record_id") or rec.get("RecordId") or "").strip()
+            if rid:
+                by_id = [r for r in matched if str(r.get("RecordId")) == rid]
+                if by_id:
+                    matched = by_id
 
             if not matched:
                 _api("AddDomainRecord", ak_id, ak_secret, region,
@@ -6406,8 +6435,23 @@ try:
                      % (rr, rtype, value, target.get("RecordId")))
             else:
                 # 原地更新，RecordId 不变
-                _api("UpdateDomainRecord", ak_id, ak_secret, region,
-                     {"RecordId": str(target.get("RecordId")), "RR": rr, "Type": rtype, "Value": value})
+                record_id = target.get("RecordId")
+                if not record_id:
+                    # 缺 RecordId 就没有「原地更新」这回事 —— 明确报出来，
+                    # 绝不退回到删+增（那正是当初引入删+增想绕开的问题）。
+                    _log("跳过 %s.%s：阿里云返回的记录缺少 RecordId，无法原地更新"
+                         % (rr, rtype))
+                    continue
+                params = {"RecordId": str(record_id), "RR": rr, "Type": rtype, "Value": value}
+                # ⚠ TTL / Line 必须**沿用原记录的值**（阿里云官方文档）：
+                #     TTL 非必填，「默认为 600 秒」⇒ 不传就把用户设的 TTL 改回 600；
+                #     Line 非必填，「默认为 default」⇒ 不传有把「电信」等线路的记录
+                #     搬到 default 的风险（那正是这次要消灭的现象）。
+                if target.get("TTL"):
+                    params["TTL"] = str(target.get("TTL"))
+                if target.get("Line"):
+                    params["Line"] = str(target.get("Line"))
+                _api("UpdateDomainRecord", ak_id, ak_secret, region, params)
                 _log("更新 %s.%s = %s（记录ID %s，原值 %s）"
                      % (rr, rtype, value, target.get("RecordId"), target.get("Value")))
             if len(matched) > 1:
@@ -6591,12 +6635,15 @@ def _fetch_public_ipv4():
     return None
 
 
-def _aliyun_ddns_update(config, rr, rtype, value):
+def _aliyun_ddns_update(config, rr, rtype, value, record_id=None):
     """通过阿里云 API 更新单条 DNS 记录（原地更新，RecordId 不变）
 
     原来这里是「删除 + 添加」：控制台上每次都看到记录被删掉又重建，
     记录 ID 每轮都变；而且删除成功、添加失败时记录就没了（域名直接解析不到）。
     现在改成 UpdateDomainRecord 原地改值 —— 值没变就一个写接口都不调。
+
+    record_id: 配置里存的那条记录的精确 ID（面板从阿里云读到后回填）。
+    给了就用它**精确定位** —— 靠 (RR, Type, Line) 猜会改到用户没配的那条。
     """
     domain = config['domain']
     ak_id = config['access_key_id']
@@ -6610,8 +6657,28 @@ def _aliyun_ddns_update(config, rr, rtype, value):
         "Type": rtype,
         "PageSize": 500,
     })
-    records = result.get('DomainRecords', {}).get('Record', [])
+    dd = result.get('DomainRecords', {}) or {}
+    records = dd.get('Record', []) or []
+    # ⚠ PageSize 上限是 500。目标记录若落在第 501 条之后，
+    #   「没查到」会被误当成「记录不存在」⇒ 去 Add ⇒ **凭空多出一条重复记录**
+    #   ⇒ 解析变成两条轮询 —— 正是这次修复要消灭的现象。
+    #   ⇒ 宁可报错让用户看见，也不要猜。
+    #   ⚠ TotalCount 是响应的**顶层**字段（与 DomainRecords 平级），
+    #     不是 DomainRecords 里的 —— 读错层级会让这道判据永远不生效。
+    total = int(result.get('TotalCount') or 0)
+    if total > len(records):
+        raise ValueError(
+            f"阿里云共 {total} 条记录但只取到 {len(records)} 条（分页截断），"
+            f"目标记录可能不在本页，已中止本轮以免重复新增：{rr}.{rtype}")
     matched = _ddns_match_records(records, rr, rtype)
+
+    # ⚠ 配置里存了精确的 record_id ⇒ 优先用它定位，
+    #   免得在多线路场景下改到用户没配的那条（例如指向 NAS 的电信线路）。
+    rid = str(record_id or '').strip()
+    if rid:
+        by_id = [r for r in matched if str(r.get('RecordId')) == rid]
+        if by_id:
+            matched = by_id
 
     if not matched:
         # 记录不存在才新增
@@ -6636,12 +6703,21 @@ def _aliyun_ddns_update(config, rr, rtype, value):
     record_id = target.get('RecordId')
     if not record_id:
         raise ValueError(f"阿里云返回的记录缺少 RecordId，无法原地更新：{rr}.{rtype}")
-    _aliyun_api("UpdateDomainRecord", ak_id, ak_secret, region, {
+    params = {
         "RecordId": str(record_id),
         "RR": rr,
         "Type": rtype,
         "Value": value,
-    })
+    }
+    # ⚠ TTL / Line 必须**沿用原记录的值**（阿里云官方文档）：
+    #     TTL 非必填，「默认为 600 秒」⇒ 不传就把用户设的 TTL 改回 600；
+    #     Line 非必填，「默认为 default」⇒ 不传有把「电信」等线路的记录
+    #     搬到 default 的风险（那正是这次要消灭的现象）。
+    if target.get('TTL'):
+        params["TTL"] = str(target.get('TTL'))
+    if target.get('Line'):
+        params["Line"] = str(target.get('Line'))
+    _aliyun_api("UpdateDomainRecord", ak_id, ak_secret, region, params)
     message = f"记录 {rr}.{rtype} 已更新为 {value}（记录 ID 不变）"
     if len(matched) > 1:
         message += (f"；同 RR+Type 有 {len(matched)} 条记录，"
@@ -6832,6 +6908,9 @@ def aliyun_ddns_test():
     rtype = data.get('type', '')
     ipv6_source = data.get('ipv6_source', '')
     value = data.get('value', '').strip()
+    # 配置里那条记录的精确 ID —— 给了就用它定位，
+    # 免得多线路场景下改到用户没配的那条（与 cron 脚本同一条规则）。
+    record_id = str(data.get('record_id') or data.get('RecordId') or '').strip()
 
     # 如果选择了 IPv6 来源且未手动输入值，从文件读取实际 IP
     if ipv6_source and not value:
@@ -6844,6 +6923,10 @@ def aliyun_ddns_test():
                 with open(_ddns_relay_path(idx)) as f:
                     value = f.read().strip()
             except (IOError, OSError):
+                # ⚠ 读不到 ⇒ **没有权威值**。
+                #   面板侧在这里就拒写（400），与 cron 脚本的行为一致 ——
+                #   cron 侧原来会回退到配置里的旧值并写回阿里云，
+                #   那是「把过期地址写回去且不会自愈」，2026-11-11 已修掉。
                 pass
 
     # A 记录不传值时，自己去取**当前**公网 IPv4。
@@ -6869,7 +6952,7 @@ def aliyun_ddns_test():
         return jsonify({"success": False, "message": "请先配置域名"}), 400
 
     try:
-        result = _aliyun_ddns_update(config, rr, rtype, value)
+        result = _aliyun_ddns_update(config, rr, rtype, value, record_id=record_id)
         return jsonify(result)
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500

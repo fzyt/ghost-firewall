@@ -125,10 +125,9 @@ MUTATIONS = [
     # ── M1：cron 侧原地更新改回「删除 + 新增」────────────────────
     ('M1  cron 侧：原地更新改回「删除+新增」（RecordId 又要每次变）',
      APP_PY,
-     [('''                _api("UpdateDomainRecord", ak_id, ak_secret, region,
-                     {"RecordId": str(target.get("RecordId")), "RR": rr, "Type": rtype, "Value": value})''',
+     [('''                _api("UpdateDomainRecord", ak_id, ak_secret, region, params)''',
        '''                _api("DeleteDomainRecord", ak_id, ak_secret, region,
-                     {"RecordId": str(target.get("RecordId"))})
+                     {"RecordId": str(record_id)})
                 _api("AddDomainRecord", ak_id, ak_secret, region,
                      {"DomainName": domain, "RR": rr, "Type": rtype, "Value": value})''')]),
 
@@ -226,12 +225,7 @@ MUTATIONS = [
     # ── M12：面板侧改回「删除 + 新增」─────────────────────────────
     ('M12 面板侧：改回「删除+新增」',
      APP_PY,
-     [('''    _aliyun_api("UpdateDomainRecord", ak_id, ak_secret, region, {
-        "RecordId": str(record_id),
-        "RR": rr,
-        "Type": rtype,
-        "Value": value,
-    })''',
+     [('''    _aliyun_api("UpdateDomainRecord", ak_id, ak_secret, region, params)''',
        '''    _aliyun_api("DeleteDomainRecord", ak_id, ak_secret, region, {
         "RecordId": str(record_id),
     })
@@ -339,6 +333,98 @@ MUTATIONS = [
             continue
         out.append(r)
     return out''')]),
+
+    # ══════════════════════════════════════════════════════
+    # 批 A（2026-11-11 完整代码审查）：6 处新修的退化方向
+    # ══════════════════════════════════════════════════════
+
+    # ── M21：IPv6 中转文件读不到时回退到配置里的旧值 ──────────
+    # ⚠️ 这条**会把过期地址写回阿里云**，而且写回后每轮比较都相等 ⇒ 永不自愈。
+    ('M21 cron 侧：IPv6 中转文件读不到时回退到配置里的旧值（把过期地址写回阿里云）',
+     APP_PY,
+     [('''                idx = source_map.get(ipv6_source)
+                value = ""
+                if idx is not None:''',
+       '''                idx = source_map.get(ipv6_source)
+                if idx is not None:''')]),
+
+    # ── M22：更新时不回传 TTL ────────────────────────────────
+    # 阿里云文档：TTL 非必填，「默认为 600 秒」⇒ 不传就把用户设的 TTL 改回 600。
+    ('M22 cron 侧：更新时不回传 TTL（用户设的 TTL 被阿里云重置成 600）',
+     APP_PY,
+     [('''                if target.get("TTL"):
+                    params["TTL"] = str(target.get("TTL"))
+                if target.get("Line"):''',
+       '''                if target.get("Line"):''')]),
+
+    # ── M23：更新时不回传 Line ───────────────────────────────
+    # 阿里云文档：Line 非必填，「默认为 default」⇒ 非 default 线路的记录可能被搬走。
+    ('M23 cron 侧：更新时不回传 Line（非 default 线路的记录可能被搬到 default）',
+     APP_PY,
+     [('''                if target.get("Line"):
+                    params["Line"] = str(target.get("Line"))
+                _api("UpdateDomainRecord", ak_id, ak_secret, region, params)''',
+       '''                _api("UpdateDomainRecord", ak_id, ak_secret, region, params)''')]),
+
+    # ── M24：不用配置里存的 record_id 定位 ────────────────────
+    # 靠 (RR, Type, Line) 猜 ⇒ 多线路时会改到用户没配的那条。
+    ('M24 cron 侧：不用配置里的 record_id 定位（改到用户没配的那条）',
+     APP_PY,
+     [('''            rid = str(rec.get("record_id") or rec.get("RecordId") or "").strip()
+            if rid:
+                by_id = [r for r in matched if str(r.get("RecordId")) == rid]
+                if by_id:
+                    matched = by_id''',
+       '''            # 【变异】不使用配置里的 record_id''')]),
+
+    # ── M25：不检查 TotalCount（分页截断 ⇒ 凭空多出一条重复记录）──
+    ('M25 cron 侧：不检查 TotalCount（分页截断被当成「不存在」⇒ 凭空多一条记录）',
+     APP_PY,
+     [('''            total = int(result.get("TotalCount") or 0)
+            if total > len(all_records):''',
+       '''            total = int(result.get("TotalCount") or 0)
+            if False:''')]),
+
+    # ── M26：目标缺 RecordId 时仍发起更新 ────────────────────
+    # 会把字符串 "None" 当 RecordId 发给阿里云。
+    ('M26 cron 侧：目标缺 RecordId 时仍发起更新（发出 RecordId=None）',
+     APP_PY,
+     [('''                record_id = target.get("RecordId")
+                if not record_id:
+                    # 缺 RecordId 就没有「原地更新」这回事 —— 明确报出来，
+                    # 绝不退回到删+增（那正是当初引入删+增想绕开的问题）。
+                    _log("跳过 %s.%s：阿里云返回的记录缺少 RecordId，无法原地更新"
+                         % (rr, rtype))
+                    continue''',
+       '''                record_id = target.get("RecordId")''')]),
+
+    # ── M27：面板侧不回传 TTL / Line ─────────────────────────
+    ('M27 面板侧：更新时不回传 TTL 与 Line（TTL 被重置、线路可能被搬走）',
+     APP_PY,
+     [('''    if target.get('TTL'):
+        params["TTL"] = str(target.get('TTL'))
+    if target.get('Line'):
+        params["Line"] = str(target.get('Line'))
+    _aliyun_api("UpdateDomainRecord", ak_id, ak_secret, region, params)''',
+       '''    _aliyun_api("UpdateDomainRecord", ak_id, ak_secret, region, params)''')]),
+
+    # ── M28：面板侧不检查 TotalCount ──────────────────────────
+    ('M28 面板侧：不检查 TotalCount（分页截断被当成「不存在」⇒ 凭空多一条记录）',
+     APP_PY,
+     [('''    total = int(result.get('TotalCount') or 0)
+    if total > len(records):''',
+       '''    total = int(result.get('TotalCount') or 0)
+    if False:''')]),
+
+    # ── M29：面板侧不用 record_id 定位 ───────────────────────
+    ('M29 面板侧：不用 record_id 定位（改到用户没配的那条）',
+     APP_PY,
+     [('''    rid = str(record_id or '').strip()
+    if rid:
+        by_id = [r for r in matched if str(r.get('RecordId')) == rid]
+        if by_id:
+            matched = by_id''',
+       '''    # 【变异】不使用 record_id''')]),
 ]
 
 

@@ -1105,6 +1105,10 @@ function app() {
           rr: rr,
           type: rtype,
           ipv6_source: isAaaa ? (src || '') : '',
+          // 这条记录的**精确 ID** —— 面板用它定位要改哪一条。
+          // 不给的话后端只能靠 (RR, Type, Line) 猜 ⇒ 多线路场景下
+          // 有可能改到用户没配的那条（例如指向 NAS 的电信线路）。
+          record_id: rec.RecordId || rec.record_id || '',
           // A 记录**不传 value**：让后端自己去取「当前」公网 IPv4。
           //
           // ⚠️ 原来这里传的是阿里云上现存的旧值（rec.Value || rec.value）
