@@ -263,7 +263,7 @@ precheck_local() {
 
 # ── 阶段 1：连通 + 身份确认 ──────────────────────────────────────────
 phase_connect() {
-    say "阶段 1/9　连通性与身份确认"
+    say "阶段 1/10　连通性与身份确认"
     SSH_TARGET="${SSH_USER}@${HOST}"
     build_ssh_opts
 
@@ -296,7 +296,7 @@ phase_connect() {
 
 # ── 阶段 2：判定路径 ────────────────────────────────────────────────
 phase_detect_mode() {
-    say "阶段 2/9　判定部署路径"
+    say "阶段 2/10　判定部署路径"
     if [ "$FRESH" = 1 ]; then
         MODE="fresh"
     elif [ "$HAS_INSTALL" = 1 ]; then
@@ -315,11 +315,11 @@ phase_detect_mode() {
 # ── 阶段 3：备份（升级路径）─────────────────────────────────────────
 phase_backup() {
     if [ "$MODE" != "upgrade" ]; then
-        say "阶段 3/9　备份"
+        say "阶段 3/10　备份"
         step "全新安装，无既有状态可备份"
         return 0
     fi
-    say "阶段 3/9　备份"
+    say "阶段 3/10　备份"
 
     TS="$(date +%Y%m%d-%H%M%S)"
     BACKUP_DIR="${BACKUP_ROOT}/${TS}"
@@ -445,7 +445,7 @@ EOS
 
 # ── 阶段 4：传输 ─────────────────────────────────────────────────────
 phase_transfer() {
-    say "阶段 4/9　传输文件"
+    say "阶段 4/10　传输文件"
 
     # ------------------------------------------------------------
     # 只传 **git 跟踪的文件**（清单驱动），不是整个目录
@@ -469,8 +469,20 @@ phase_transfer() {
         git -C "$SRC" ls-files -z -- . > "$track_list" 2>/dev/null \
             || { mv -f "$track_list" /tmp/ 2>/dev/null || true; die "读取 git 跟踪文件清单失败"; }
     else
-        # 升级路径只覆盖这几处（跟之前一致），但仍然只取其中**被 git 跟踪**的
-        git -C "$SRC" ls-files -z -- backend frontend tools tests VERSION > "$track_list" 2>/dev/null \
+        # 升级路径覆盖这几处，但仍然只取其中**被 git 跟踪**的。
+        #
+        # ⚠️ `setup` 必须在清单里（2026-11-11 补）。
+        #   之前升级路径只传 backend frontend tools tests VERSION ⇒
+        #   设备上 `/opt/nftables-web-v2/setup/setup.sh` 永远是**装机器时那份旧的**。
+        #   ⇒ 批 B 的 S2 修复（部署后无条件重启面板）到不了设备：
+        #   用户在设备上跑 `setup.sh --local` 二次部署时，跑的是没有
+        #   `restart_panel_service` 的旧脚本 ⇒ 部署完不重启 ⇒
+        #   新代码不生效 —— 正是 S2 要修的那个 bug 原样复发。
+        #   （2026-11-11 在 .232 实测发现：设备上 setup.sh 缺 restart_panel_service。）
+        #
+        #   setup/ 里的 setup-lib.sh **不在 git 跟踪清单里** ⇒ 不会传、
+        #   设备上那份保留 —— 它是历史遗留文件，setup.sh 本身也不引用它。
+        git -C "$SRC" ls-files -z -- backend frontend tools tests setup VERSION > "$track_list" 2>/dev/null \
             || { mv -f "$track_list" /tmp/ 2>/dev/null || true; die "读取 git 跟踪文件清单失败"; }
     fi
     local nfiles
@@ -574,7 +586,7 @@ phase_transfer() {
 
 # ── 阶段 5：权限与密钥 ──────────────────────────────────────────────
 phase_permissions() {
-    say "阶段 5/9　权限与密钥"
+    say "阶段 5/10　权限与密钥"
     if [ "$DRY_RUN" = 1 ]; then
         step "[dry-run] 校正 /etc/nftables 下各文件的权限"
         return 0
@@ -630,7 +642,7 @@ EOS
 
 # ── 阶段 6：语法预检 ────────────────────────────────────────────────
 phase_precheck() {
-    say "阶段 6/9　语法预检（动服务之前）"
+    say "阶段 6/10　语法预检（动服务之前）"
     if [ "$DRY_RUN" = 1 ]; then
         step "[dry-run] sh -n init 脚本 / python import / nft -c -f 规则集"
         return 0
@@ -667,8 +679,52 @@ EOS
 }
 
 # ── 阶段 7：重启服务 ────────────────────────────────────────────────
+# ── 阶段 7：重新生成阿里云 DDNS 脚本 ────────────────────────────────
+#
+# ⚠️ 这一步是 2026-11-11 真机部署时才发现的（.232 实测）：
+#   设备上的 `aliyun-ddns-update.py` 是**装机器时生成的那一份**，
+#   它不随 backend/app.py 的模板更新而更新 ⇒
+#   模板里修好的东西（Line/TTL 回传、TXT/CNAME 归一化、RecordId 处理…）
+#   **在真正被 cron 执行的那份脚本里根本没有**。
+#
+#   ⇒ 部署完自检照样全过、版本号照样更新，但**cron 跑的还是旧逻辑**
+#   ⇒ 面板上看到的「已修复」与 cron 实际做的事不是一回事。
+#
+# 为什么不能用 `import app` 调函数：app.py 顶层可能起后台线程
+# ⇒ 在设备上 import 有触发防火墙规则切换的风险（= 失联风险）。
+# ⇒ 用 backend/regen_ddns_script.py：它用 AST 提取模板，零副作用。
+#
+# 失败**不中断部署**：面板上点一次「保存配置并生成脚本」是等价的兜底路径。
+phase_regen_ddns() {
+    say "阶段 7/10　重新生成阿里云 DDNS 自动更新脚本"
+    if [ "$DRY_RUN" = 1 ]; then
+        step "[dry-run] python3 $APP_DIR/backend/regen_ddns_script.py"
+        return 0
+    fi
+    local out rc=0
+    # ⚠ `env -u` 清掉 NFTABLES_WEB_DDNS_SCRIPT：那个环境变量**只给测试用**，
+    #   设备上必须走 app.py 里的真源路径（否则写到别处去，
+    #   而 cron 跑的还是旧文件 ⇒ 修复静默失效、这里还报「已重新生成」）。
+    #
+    # ⚠ 退出码必须**直接从命令里取**，不能写成
+    #   `out="$(cmd || true)"; rc=$?` —— 那样 $? 取到的是 `true` 的退出码，
+    #   永远是 0 ⇒ regen 失败会被当成成功（2026-11-11 首次真机部署就踩了）。
+    #   正确写法：让 rssh 自己带退出码出来。
+    out="$(rssh "cd '$APP_DIR/backend' && env -u NFTABLES_WEB_DDNS_SCRIPT python3 ./regen_ddns_script.py 2>&1")"
+    rc=$?
+    # ⚠ 这里用 step（deploy.sh 的辅助函数是 step）——
+    #   setup.sh 里叫 info，两边名字不同，照抄会直接「未找到命令」而中断部署。
+    [ -n "$out" ] && step "${out}"
+    if [ "$rc" -ne 0 ]; then
+        warn "阿里云 DDNS 自动更新脚本重新生成失败（退出码 ${rc}）；面板上点一次「保存配置并生成脚本」即可"
+        return 0
+    fi
+    ok "阿里云 DDNS 自动更新脚本已重新生成"
+}
+
+# ── 阶段 8：重启服务 ────────────────────────────────────────────────
 phase_restart() {
-    say "阶段 7/9　重启服务"
+    say "阶段 8/10　重启服务"
     if [ "$DRY_RUN" = 1 ]; then
         step "[dry-run] $PANEL_INIT restart; $GW_INIT restart"
         return 0
@@ -689,7 +745,7 @@ phase_restart() {
 
 # ── 阶段 8：应用（可选）─────────────────────────────────────────────
 phase_apply() {
-    say "阶段 8/9　应用规则集 + 重新生成 nginx 网关配置"
+    say "阶段 9/10　应用规则集 + 重新生成 nginx 网关配置"
     if [ "$DRY_RUN" = 1 ]; then
         step "[dry-run] python3 -c 'app._deploy_all_rules(); app._deploy_gateway_nginx()'"
         return 0
@@ -715,7 +771,7 @@ EOS
 
 # ── 阶段 9：自检 ────────────────────────────────────────────────────
 phase_verify() {
-    say "阶段 9/9　部署后自检"
+    say "阶段 10/10　部署后自检"
     if [ "$NO_VERIFY" = 1 ]; then
         warn "已按要求跳过自检"
         return 0
@@ -831,6 +887,34 @@ phase_verify() {
     local rver
     rver="$(rssh "tr -d ' \t\n\r' < '$APP_DIR/VERSION' 2>/dev/null" || true)"
     check_eq "设备上的版本 = 本地版本 v$LOCAL_VERSION" "$LOCAL_VERSION" "$rver"
+
+    # ⚠️ cron 脚本必须与**当前模板**一致（2026-11-11 真机实测发现的缺口）。
+    #   设备上的 aliyun-ddns-update.py 是「装机器时生成的那一份」，
+    #   它不随 app.py 模板更新 ⇒ 模板里修好的东西在 cron 实际跑的那份里没有。
+    #   ⇒ 判据不能只查「版本号对上了」—— 那查不出「某个文件是旧的」。
+    #
+    #   比对方式：把当前模板 regen 到**临时路径**，与设备上那份比 md5。
+    #   ⇒ 一次性、零副作用（不动设备上正在被 cron 用的那份）。
+    local cron_real cron_gen cron_md5_real cron_md5_gen
+    cron_real="$APP_DIR/aliyun-ddns-update.py"
+    if rssh "test -f '$cron_real'" 2>/dev/null; then
+        cron_md5_real="$(rssh "md5sum '$cron_real' 2>/dev/null | cut -d' ' -f1" || true)"
+        # 在设备上生成一份到**临时路径**（regen 脚本支持 NFTABLES_WEB_DDNS_SCRIPT
+        # 指定输出路径）⇒ 一次性、零副作用，不动 cron 正在用的那份。
+        # ⚠ 这里**要**设 NFTABLES_WEB_DDNS_SCRIPT（指向临时路径），
+        #   不能像 phase_regen_ddns 那样 env -u（那是让 regen 走 app.py 真源路径）。
+        cron_gen="/tmp/nftables-web-cron-check.py"
+        cron_md5_gen="$(rssh "cd '$APP_DIR/backend' && NFTABLES_WEB_DDNS_SCRIPT='$cron_gen' python3 ./regen_ddns_script.py >/dev/null 2>&1 && md5sum '$cron_gen' 2>/dev/null | cut -d' ' -f1" || true)"
+        rssh "rm -f '$cron_gen'" 2>/dev/null || true
+        if [ -n "$cron_md5_real" ] && [ -n "$cron_md5_gen" ]; then
+            check_eq "cron 脚本与当前模板一致（不是装机器时那份旧的）" \
+                     "$cron_md5_gen" "$cron_md5_real"
+        else
+            warn "取不到 cron 脚本的 md5（脚本不存在或生成失败），跳过该项检查"
+        fi
+    else
+        warn "设备上还没有 cron 脚本（没配过阿里云 DDNS），跳过该项检查"
+    fi
 
     # 全新安装的初始状态：还没设密码（第一次打开面板时设置）
     if [ "$MODE" = "fresh" ]; then
@@ -982,6 +1066,10 @@ main() {
     phase_transfer
     phase_permissions
     phase_precheck
+    # ⚠ 顺序要紧：脚本要先重新生成，再重启面板 ——
+    #   重启后如果用户立刻点「保存配置」，面板会拿新模板生成一份，
+    #   而 regen 已经先生成好了 ⇒ 两边一致，不会互相覆盖。
+    phase_regen_ddns
     phase_restart
     if [ "$APPLY" = 1 ]; then
         phase_apply

@@ -63,6 +63,18 @@ def read(path):
         return f.read()
 
 
+def _regen_body_of(deploy_src):
+    """抠出 phase_regen_ddns 的函数体。
+
+    ⚠️ 必须**只**看这个函数体 ——
+      deploy.sh 别处（phase_precheck 的语法预检、phase_apply 的应用规则集）
+      故意要 `import app`，那两处是 --apply 场景，与生成 cron 脚本无关。
+      拿整个文件去搜 `import app` 会把那两个正当用法也算进来 ⇒ 假红。
+    """
+    m = re.search(r'phase_regen_ddns\(\)\s*\{(.*?)\n\}', deploy_src, re.S)
+    return m.group(1) if m else ''
+
+
 def main():
     deploy = read(DEPLOY)
     setup = read(SETUP)
@@ -319,6 +331,236 @@ def main():
           'stale="$(device_stale_files' in deploy)
     check('源码目录必须在 git 仓库里（否则拿不到跟踪清单）',
           '不在 git 仓库里' in deploy)
+
+    # ── 10. 升级路径必须把 setup/ 一起更新 ──────────────────────────
+    #
+    # 2026-11-11 在 .232 真机部署时发现（不是推理，是实测）：
+    #   deploy.sh 的**升级路径**传输清单只有 backend frontend tools tests VERSION
+    #   ⇒ 设备上 `/opt/nftables-web-v2/setup/setup.sh` 永远是**装机器时那份旧的**。
+    #   ⇒ 批 B 的 S2 修复（部署后无条件重启面板服务）到不了设备：
+    #      那份旧 setup.sh 里没有 `restart_panel_service` ⇒
+    #      用户在设备上跑 `setup.sh --local` 二次部署 ⇒ 部署完**不重启** ⇒
+    #      新代码不生效 —— 正是 S2 要修的那个 bug 原样复发。
+    #
+    # 判据不能只查「文本里有没有 setup」——
+    #   那太弱：注释里写一句「setup 也要传」就假绿了。
+    # ⇒ 这里**解析出脚本里真正用的那组路径参数**，再用它跑 git ls-files，
+    #   验证结果里真的有 setup/setup.sh。
+    #   将来清单的写法变了（换顺序、加目录），判据照样有效。
+    sec('10. 升级路径的传输清单必须含 setup/（否则 S2 修复到不了设备）')
+
+    # 从 deploy.sh 里抠出「升级路径」那一支的 ls-files 路径参数。
+    # 认的是 `ls-files -z -- <路径...>` 这一行里 `--` 后面的部分。
+    # ⚠️ 必须把 shell 的重定向/续行符切掉（`> "$track_list"` / `2>/dev/null` / `\`）
+    #   —— 它们不是路径参数，混进来会让「清单包含 X」的判断看错位置。
+    upgrade_paths = []
+    for ln in deploy.splitlines():
+        s = ln.strip()
+        if s.startswith('#'):
+            continue
+        m = re.search(r'ls-files\s+-z\s+--\s+(.+)$', s)
+        if not m:
+            continue
+        # 只取到第一个重定向/续行符之前
+        tail = re.split(r'[>|]', m.group(1))[0]
+        args = [a for a in tail.split() if a and a != '\\']
+        # 升级路径那一支必然含 VERSION（全新安装那一支是 `ls-files -z -- .`）
+        if 'VERSION' in args:
+            upgrade_paths = args
+            break
+
+    check('deploy.sh 里找得到升级路径的 ls-files 清单（判据不能空转）',
+          bool(upgrade_paths),
+          '实际：%s' % (upgrade_paths or '没解析到'))
+
+    if upgrade_paths:
+        # 清单必须**逐个目录**都在 —— 不能只查 setup。
+        #   只查 setup 的话，去掉 tools 或 tests 的退化就漏过去了
+        #   （而那意味着设备上的工具脚本/测试永远停在旧版）。
+        for d in ('backend', 'frontend', 'tools', 'tests', 'setup'):
+            check('升级路径的清单包含 %s/' % d,
+                  d in upgrade_paths,
+                  '实际清单：%s' % ' '.join(upgrade_paths))
+        check('升级路径的清单包含 VERSION',
+              'VERSION' in upgrade_paths,
+              '实际清单：%s' % ' '.join(upgrade_paths))
+
+        # 清单必须**只含**这几个（多出来的会把本机的东西泄到设备）
+        extra = [p for p in upgrade_paths
+                 if p not in ('backend', 'frontend', 'tools', 'tests',
+                              'setup', 'VERSION')]
+        check('升级路径的清单没有多余的目录（不能整个仓库都传）',
+              not extra,
+              '多出来的：%s' % extra)
+
+        # 真实跑一遍 git ls-files，用的就是脚本里那组参数。
+        try:
+            import subprocess
+            r = subprocess.run(
+                ['git', '-C', ROOT, 'ls-files', '-z', '--'] + upgrade_paths,
+                capture_output=True, text=True, timeout=120)
+            tracked = [x for x in r.stdout.split('\0') if x]
+        except Exception as e:
+            tracked = []
+            print('  [x] git ls-files 执行失败：%s' % e)
+
+        check('清单能真的列出文件（判据不能空转）',
+              len(tracked) > 0,
+              '列出 %d 个' % len(tracked))
+        check('清单里确实有 setup/setup.sh',
+              'setup/setup.sh' in tracked,
+              'setup 相关：%s' % [t for t in tracked if t.startswith('setup/')][:5])
+        check('清单里确实有 setup/vendor/（第三方插件也得更新）',
+              any(t.startswith('setup/vendor/') for t in tracked),
+              'vendor 文件数：%d' % len([t for t in tracked if t.startswith('setup/vendor/')]))
+        check('清单里确实有 tools/deploy.sh 本身（工具脚本也要更新）',
+              'tools/deploy.sh' in tracked)
+        check('清单里确实有 tests/ 下的测试（设备上跑的是新测试）',
+              any(t.startswith('tests/') for t in tracked),
+              'tests 文件数：%d' % len([t for t in tracked if t.startswith('tests/')]))
+
+        # 反向：清单里不能混进**未跟踪**的文件（那会把本机的东西泄到设备）
+        check('清单里没有未跟踪的文件（setup-lib.sh 之类的不该被带上去）',
+              'setup/setup-lib.sh' not in tracked,
+              'setup-lib.sh 不在 git 跟踪清单里 ⇒ 不会传、设备上那份保留')
+
+    # ── 11. 部署必须重新生成 cron 脚本 ──────────────────────────────
+    #
+    # 2026-11-11 在 .232 真机部署时实测发现：
+    #   设备上的 `aliyun-ddns-update.py` 是**装机器时生成的那一份**，
+    #   它不随 backend/app.py 的模板更新 ⇒ 模板里修好的东西
+    #   （Line/TTL 回传、TXT/CNAME 归一化、RecordId 处理…）
+    #   **在真正被 cron 执行的那份脚本里根本没有**。
+    #
+    #   ⇒ 部署完自检照样全过、版本号照样更新，但 cron 跑的还是旧逻辑
+    #   ⇒ 面板上看到的「已修复」与 cron 实际做的事不是一回事。
+    #   （实测：设备上那份 `_norm_value` 只有 IPv6 归一化，
+    #     而模板里已经有 TXT 去引号 + CNAME 去尾点 —— 两侧不一致。）
+    #
+    # 判据必须落在**行为**上：deploy.sh 得**真的调** regen，
+    # 而且自检里得**真的验** cron 脚本与模板一致。
+    sec('11. 部署必须重新生成 cron 脚本（否则 cron 跑的是旧逻辑）')
+
+    check('deploy.sh 里有重新生成 DDNS 脚本的阶段',
+          'phase_regen_ddns' in deploy)
+    check('该阶段调用的是 backend/regen_ddns_script.py',
+          'regen_ddns_script.py' in deploy)
+    check('regen 用的是零副作用的 AST 提取版（不 import app.py）',
+          'regen_ddns_script.py' in deploy
+          and not re.search(r'import\s+app\b', _regen_body_of(deploy)),
+          '不能 import app.py（顶层可能起后台线程 ⇒ 有失联风险）')
+
+    # ⚠️ 生成失败**不能中断部署**：面板上点一次「保存配置并生成脚本」是等价兜底。
+    regen_body = ''
+    if 'phase_regen_ddns()' in deploy:
+        m = re.search(r'phase_regen_ddns\(\)\s*\{(.*?)\n\}', deploy, re.S)
+        if m:
+            regen_body = m.group(1)
+    check('能抠出 phase_regen_ddns 的函数体（判据不能空转）',
+          bool(regen_body), '长度 %d' % len(regen_body))
+    if regen_body:
+        check('生成失败只 warn 不 die（不能中断部署）',
+              re.search(r'warn\s+".*失败', regen_body) is not None
+              and not re.search(r'\bdie\b', regen_body),
+              'die 会中断整个部署')
+        check('生成时清掉测试专用环境变量（设备上要走 app.py 真源路径）',
+              'env -u NFTABLES_WEB_DDNS_SCRIPT' in regen_body)
+
+    # 顺序：regen 必须在**重启之前** ——
+    #   否则重启后用户点「保存配置」，面板会用新模板再生成一份，
+    #   而 regen 生成的是另一处 ⇒ 两边不一致。
+    main_body = ''
+    m = re.search(r'\nmain\(\)\s*\{(.*?)\n\}', deploy, re.S)
+    if m:
+        main_body = m.group(1)
+    check('能抠出 main() 的函数体（判据不能空转）',
+          bool(main_body), '长度 %d' % len(main_body))
+    if main_body:
+        i_regen = main_body.find('phase_regen_ddns')
+        i_restart = main_body.find('phase_restart')
+        check('main() 里调用了重新生成阶段',
+              i_regen >= 0, '位置 %d' % i_regen)
+        check('main() 里调用了重启阶段',
+              i_restart >= 0, '位置 %d' % i_restart)
+        check('重新生成在**重启之前**（顺序不能反）',
+              i_regen >= 0 and i_restart >= 0 and i_regen < i_restart,
+              'regen 位置 %d / restart 位置 %d' % (i_regen, i_restart))
+
+    # 自检必须**真的比对** cron 脚本与模板一致 ——
+    #   只调 regen 不够：regen 失败时（warn 不 die）部署照样「成功」，
+    #   而 cron 还是旧的 ⇒ 必须在自检里抓出来。
+    check('自检里取了设备上 cron 脚本的 md5',
+          re.search(r'cron_md5_real=.*md5sum', deploy) is not None)
+    check('自检里取了重新生成那份的 md5',
+          re.search(r'cron_md5_gen=.*md5sum', deploy) is not None)
+    # 自检把两个 md5 做了比对。
+    # ⚠️ 不能靠「两个变量各出现两次」来判 —— 那分不清是「取值 + 比对」
+    #   还是「取了两次值、从没比对」。必须确认它们出现在**同一个 check_eq** 里。
+    #   check_eq 的实参可能跨行续写（行尾是 `\` + 换行）⇒ 先把续行拼起来再匹配。
+    joined = re.sub(r'\\\n\s*', ' ', deploy)
+    # ⚠️ 实参是带引号的 "$cron_md5_gen"（shell 里展开变量的标准写法）
+    #   —— 匹配时必须把那对引号算进去，否则永远匹配不上。
+    _md5_cmp = re.search(
+        r'check_eq\s+"[^"]*cron[^"]*"\s+"\$cron_md5_gen"\s+"\$cron_md5_real"',
+        joined)
+    check('自检把两个 md5 做了比对',
+          _md5_cmp is not None,
+          '两个变量都要出现在同一个 check_eq 里')
+    check('自检项的文案点明「不是装机器时那份旧的」',
+          '不是装机器时那份旧的' in deploy)
+
+    # ── 11b. deploy.sh 里用到的辅助函数必须真的存在 ────────────────
+    #
+    # 2026-11-11 首次真机部署就踩了：新写的阶段里用了 `info` ——
+    # 但 deploy.sh 的辅助函数叫 `step`（`info` 是 setup.sh 里的那个）。
+    # ⇒ 「info: 未找到命令」⇒ **整个部署中断并回滚**（设备停在半路）。
+    #
+    # 判据口径（**只能窄**，否则全是误报）：
+    #   只看「辅助函数调用」这种形态 —— `名字 "字符串"`（名字后面紧跟引号）。
+    #   这种形态在 shell 里几乎只可能是本脚本定义的辅助函数在用
+    #   （外部命令不会带中文说明字符串）。
+    #   ⚠ 不能扫「所有裸命令名」：那会把变量赋值、heredoc 正文、
+    #     python 代码、中文注释全算进来 ⇒ 几百条误报 ⇒ 判据等于没有。
+    defined = set(re.findall(r'^(\w+)\(\)\s*\{', deploy, re.M))
+    # 本脚本里已知合法的「带字符串参数」调用（外部命令 / 特殊形态）
+    known_callers = {
+        'say', 'step', 'ok', 'warn', 'err', 'die', 'info', 'check_eq',
+        'printf', 'echo', 'local', 'return', 'exit', 'read', 'export',
+        'command', 'set', 'trap', 'source', 'eval', 'declare',
+        'case', 'esac', 'else', 'elif', 'then', 'do', 'done', 'fi',
+        'for', 'while', 'if', 'function',
+        # 外部命令（OpenWrt busybox 自带）：不是本脚本的辅助函数
+        'chgrp', 'chmod', 'chown', 'find', 'sed', 'awk', 'grep', 'cut',
+        'tr', 'sort', 'uniq', 'head', 'tail', 'wc', 'md5sum', 'tar',
+        'gzip', 'ssh', 'curl', 'wget', 'git', 'python3', 'python', 'sh',
+        'bash', 'seq', 'sleep', 'date', 'cp', 'mv', 'rm', 'mkdir', 'cat',
+        'ls', 'test', 'true', 'false', 'env', 'id', 'uname', 'kill',
+        'netstat', 'jsonfilter', 'nft', 'uci', 'opkg', 'apk',
+    }
+    callers = set()
+    for ln in deploy.splitlines():
+        s = ln.strip()
+        if not s or s.startswith('#'):
+            continue
+        # 命令位置：行首，或 ; && || 后
+        for m in re.finditer(r'(?:^|[;|&]\s*)(\w+)\s+"', s):
+            callers.add(m.group(1))
+    undefined_callers = sorted(c for c in callers
+                               if c not in defined
+                               and c not in known_callers)
+    check('deploy.sh 里用到的辅助函数都定义了（不存在「未找到命令」）',
+          not undefined_callers,
+          '疑似未定义：%s' % undefined_callers)
+
+    # 退出码必须**直接从命令取**，不能写成 `out="$(cmd || true)"; rc=$?`
+    #   —— 那样 $? 取到的是 true 的退出码，永远是 0 ⇒ 失败被当成成功。
+    check('重新生成阶段的退出码是直接从命令取的（没被 || true 吃掉）',
+          not re.search(r'out="\$\(rssh[^)]*\|\|\s*true\)"\s*\n\s*rc=\$\?',
+                        regen_body),
+          '`|| true` 会让 rc 永远是 0')
+    check('重新生成阶段没有用不存在的 info（deploy.sh 里叫 step）',
+          not re.search(r'(^|[^.\w])info\s+"', regen_body),
+          'info 是 setup.sh 的辅助函数，deploy.sh 里没有')
 
     print('\n' + '=' * 60)
     print(f' 合计: ✅ {len(PASS)}   ❌ {len(FAIL)}')

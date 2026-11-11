@@ -2,6 +2,171 @@
 
 所有重要更改均记录在此文件中。
 
+## [v0.19.17] - 2026-11-11
+
+**批 F（真机部署验证发现的缺口）：让批 B 的 S2 修复真的到设备上。**
+
+这一条是**在 .232 真机部署时实测发现的**，不是审查推理出来的。
+它让批 B 的 S2 修复（部署后无条件重启面板服务）在设备上**完全失效**。
+
+---
+
+## 一、缺口：升级路径的传输清单不含 setup/
+
+`tools/deploy.sh` 的**升级路径**传输清单只有
+`backend frontend tools tests VERSION` —— **不含 `setup/`**。
+
+后果链条（实测）：
+
+1. 设备上 `/opt/nftables-web-v2/setup/setup.sh` 永远是**装机器时那份旧的**；
+2. 批 B 的 S2 修复写在 `setup/setup.sh` 的 `deploy_project()` 里
+   ⇒ 那份旧脚本里**没有** `restart_panel_service`；
+3. 用户在设备上跑 `setup.sh --local` 二次部署 ⇒ 部署完**不重启**；
+4. ⇒ **新代码不生效** —— 正是 S2 要修的那个 bug 原样复发。
+
+⚠️ 这条缺口**骗过了所有已有检查**：
+部署照样成功、版本号照样更新到 v0.19.16、自检「设备上的版本 = 本地版本」
+照样全过 —— 自检只看**版本号**，看不出「某个文件是旧的」。
+
+实测证据（.232）：
+- 部署前：设备 `setup/setup.sh` md5 = `593a813f...`（v0.19.12 那份），
+  `grep -c restart_panel_service` = **0**；
+- 修完重新部署：md5 = `83c7e73c...`（与本地一致），grep 计数 = **3**；
+- 设备上跑沙箱版 `deploy_project`（假 init 脚本 + 临时安装目录，
+  一点都碰不到真机的 `/opt/nftables-web-v2` 与 `/etc/init.d/`）：
+  假 init 脚本的调用记录 = `restart`，
+  输出含「面板服务已重启（已加载本次部署的新代码）」⇒ **S2 在真机上生效**。
+
+## 二、修法
+
+升级路径的传输清单加上 `setup`：
+
+    git -C "$SRC" ls-files -z -- backend frontend tools tests setup VERSION
+
+`setup/` 里只有 **git 跟踪**的文件会被传（`setup-lib.sh` 不在跟踪清单里
+⇒ 不会传、设备上那份保留 —— 它是历史遗留文件，setup.sh 本身也不引用它）。
+
+⚠️ `setup/` 仍然**不在「受管目录」里**（不做陈旧文件清理）——
+那是另一件事，本次不动它。
+
+## 三、判据与变异
+
+- `tests/test_deploy_script.py` —— 新增第 10 组，**74 项**（+8）。
+  判据**不是**查「文本里有没有 setup」—— 那太弱，注释里写一句就假绿。
+  ⇒ 它**解析出 deploy.sh 里真正用的那组 `git ls-files` 参数**，
+  再**真的跑一遍 git ls-files**，验证结果里确实有 `setup/setup.sh`；
+  同时逐个目录查（backend/frontend/tools/tests/setup/VERSION 都在），
+  并查清单里**没有多余目录**（不能整个仓库都传）。
+- `tests/mutation_check_deploy_manifest.py` —— **新增**，5 条变异
+  （去掉 setup / tools / tests、退回 tar 整个目录、清单不限定目录）。
+  变异 5 条，捕获 5 条，漏网 0。
+
+## [v0.19.17] - 2026-11-11
+
+**批 F（真机部署验证发现的两个缺口）：让修复真的在设备上生效。**
+
+这一批是**在 .232 真机部署时实测发现的**，不是审查推理出来的。
+两条缺口都**骗过了所有已有检查** —— 部署照样成功、版本号照样更新、
+自检照样全过。
+
+---
+
+## 一、缺口 1：升级路径的传输清单不含 setup/ ⇒ 批 B 的 S2 修复到不了设备
+
+`tools/deploy.sh` 的**升级路径**传输清单只有
+`backend frontend tools tests VERSION` —— **不含 `setup/`**。
+
+后果链条（实测）：
+
+1. 设备上 `/opt/nftables-web-v2/setup/setup.sh` 永远是**装机器时那份旧的**；
+2. 批 B 的 S2 修复写在 `setup/setup.sh` 的 `deploy_project()` 里
+   ⇒ 那份旧脚本里**没有** `restart_panel_service`；
+3. 用户在设备上跑 `setup.sh --local` 二次部署 ⇒ 部署完**不重启**；
+4. ⇒ **新代码不生效** —— 正是 S2 要修的那个 bug 原样复发。
+
+修法：升级路径的清单加上 `setup`。
+
+`setup/` 里只有 **git 跟踪**的文件会被传（`setup-lib.sh` 不在跟踪清单里
+⇒ 不会传、设备上那份保留 —— 它是历史遗留文件，setup.sh 本身也不引用它）。
+
+⚠️ `setup/` 仍然**不在「受管目录」里**（不做陈旧文件清理）——
+那是另一件事，本次不动它。
+
+实测证据（.232）：
+
+| | 修之前 | 修之后 |
+|---|---|---|
+| 设备 `setup/setup.sh` 的 md5 | `593a813f…`（v0.19.12 那份） | `83c7e73c…`（与本地一致） |
+| `grep -c restart_panel_service` | **0** | **3** |
+
+设备上跑沙箱版 `deploy_project`（假 init 脚本 + 临时安装目录，
+一点都碰不到真机的 `/opt/nftables-web-v2` 与 `/etc/init.d/`）：
+假 init 脚本的调用记录 = `restart`，
+输出含「面板服务已重启（已加载本次部署的新代码）」⇒ **S2 在真机上生效**。
+
+## 二、缺口 2：部署不重新生成 cron 脚本 ⇒ cron 跑的是旧逻辑
+
+设备上的 `aliyun-ddns-update.py` 是**装机器时生成的那一份**，
+它不随 `backend/app.py` 的模板更新 ⇒ 模板里修好的东西
+（Line/TTL 回传、TXT/CNAME 归一化、RecordId 处理…）
+**在真正被 cron 执行的那份脚本里根本没有**。
+
+实测（.232）：设备上那份 `_norm_value` 只有 IPv6 归一化，
+而模板里已经有 TXT 去引号 + CNAME 去尾点 —— **两侧不一致**
+⇒ 面板判「没变」而 cron 判「变了」⇒ 每轮都触发更新。
+
+这正是批 C 的 L12 想根治的那个症状 —— 而 L12 只改了**模板**，
+没让**设备上那份**跟着更新。
+
+修法：`deploy.sh` 新增阶段 7/10「重新生成阿里云 DDNS 自动更新脚本」：
+
+- 跑 `backend/regen_ddns_script.py`（AST 提取模板，零副作用 ——
+  **不能** `import app`：app.py 顶层可能起后台线程 ⇒ 有失联风险）；
+- `env -u NFTABLES_WEB_DDNS_SCRIPT`：那个环境变量**只给测试用**，
+  设备上必须走 app.py 里的真源路径；
+- 失败只 `warn` 不 `die`：面板上点一次「保存配置并生成脚本」是等价兜底；
+- **排在重启之前**：先重新生成，再重启面板。
+
+自检里新增一条硬检查：**cron 脚本的 md5 必须与「用当前模板重新生成的那份」一致**
+⇒ 设备上再出现「装机器时那份旧的」会被当场抓住。
+
+⚠️ 这条检查第一版写成「查特征串」，太弱；改成 md5 比对。
+
+## 三、这次部署还暴露了两个**我自己写出来的** bug
+
+都是首次真机部署时当场暴露的：
+
+1. **用了 `info`** —— 那是 `setup.sh` 的辅助函数名，`deploy.sh` 里叫 `step`
+   ⇒ 「info: 未找到命令」⇒ **整个部署中断并自动回滚**（设备停在半路）。
+2. **退出码被 `|| true` 吃掉** —— 写成
+   `out="$(cmd || true)"; rc=$?` ⇒ `$?` 取到的是 `true` 的退出码，
+   永远是 0 ⇒ regen 失败会被当成成功。
+
+⇒ 两条都补了判据：辅助函数必须**真的定义过**、
+退出码必须**直接从命令取**。
+
+## 四、判据与变异
+
+- `tests/test_deploy_script.py` —— 新增第 10、11 组，**91 项**（+25）。
+  - 第 10 组：**解析出** deploy.sh 里真正用的那组 `git ls-files` 参数，
+    再**真的跑一遍 git ls-files**，验证结果里确实有 `setup/setup.sh`。
+    ⚠️ 不能只查「文本里有没有 setup」—— 注释里写一句就假绿。
+  - 第 11 组：regen 阶段必须存在、必须排在重启之前、
+    自检里必须**真的比对** cron 脚本的 md5。
+- `tests/mutation_check_deploy_manifest.py` —— **新增**，11 条变异
+  （传输清单 5 条 + regen 阶段 6 条）。
+  变异 11 条，捕获 11 条，漏网 0。
+
+## 五、真机核实结果（.232，v0.19.17）
+
+- 部署自检全部通过，含新增的「cron 脚本与当前模板一致」；
+- 面板进程确实是新代码（部署后 12 秒内重启，PID 变化）；
+- 面板侧与 cron 侧的归一化**逐样本一致**
+  （6 个样本：TXT / CNAME / A / IPv6 / 带空白 / 空串）；
+- 批 A 的 RecordId / Line / TTL / TotalCount 全在；
+- 批 B 的 ALIYUN_SCRIPT_GENERATE_FAILED 在；
+- 批 C 的 PageSize=500 / localRecords / IPV4_SOURCES 在。
+
 ## [v0.19.16] - 2026-11-11
 
 **批 E（取证脚本加固）：把「拷到用户设备上跑」这个场景下的泄露面收掉。**
