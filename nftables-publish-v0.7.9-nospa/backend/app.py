@@ -6236,7 +6236,7 @@ def _sign(params, secret):
 
 def _api(action, ak_id, ak_secret, region, extra={}):
     params = {"Action": action, "Format": "json", "Version": "2015-01-09", "AccessKeyId": ak_id,
-              "SignatureMethod": "HMAC-SHA1", "Timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "SignatureMethod": "HMAC-SHA1", "Timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "SignatureVersion": "1.0", "SignatureNonce": str(uuid.uuid4()), "RegionId": region}
     params.update(extra)
     params["Signature"] = _sign(params, ak_secret)
@@ -6305,6 +6305,14 @@ def _match_records(records, rr, rtype):
 
 
 try:
+    # 配置没保存过就安静退出。
+    #
+    # 原来直接 open() ⇒ 抛 FileNotFoundError ⇒ 用户在面板日志里看到的是
+    # 一句「整体失败：FileNotFoundError ...」—— 看不出是「还没配置」
+    # 还是「配置坏了」。这两种要分开说。
+    if not os.path.exists(CONFIG_PATH):
+        _log("退出：配置文件不存在（%s）—— 面板上还没保存过阿里云 DDNS 配置" % CONFIG_PATH)
+        sys.exit(0)
     with open(CONFIG_PATH) as f:
         config = json.load(f)
     records = config.get("records", [])
@@ -6472,7 +6480,7 @@ def _aliyun_api(action, access_key_id, access_key_secret, region_id, extra_param
         "Version": "2015-01-09",
         "AccessKeyId": access_key_id,
         "SignatureMethod": "HMAC-SHA1",
-        "Timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "Timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "SignatureVersion": "1.0",
         "SignatureNonce": str(uuid.uuid4()),
         "RegionId": region_id,

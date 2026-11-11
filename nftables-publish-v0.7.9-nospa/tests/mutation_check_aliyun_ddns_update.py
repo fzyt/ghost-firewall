@@ -263,6 +263,22 @@ MUTATIONS = [
             same = [r for r in matched if _norm_value(r.get("Value")) == norm_value]''',
        '''            norm_value = value
             same = [r for r in matched if r.get("Value") == norm_value''')]),
+
+    # ── M17：不检查配置文件是否存在 ─────────────────────────────
+    ('M17 cron 侧：配置文件不存在时不检查（用户看到的是 FileNotFoundError）',
+     APP_PY,
+     [('''    if not os.path.exists(CONFIG_PATH):
+        _log("退出：配置文件不存在（%s）—— 面板上还没保存过阿里云 DDNS 配置" % CONFIG_PATH)
+        sys.exit(0)
+''',
+       '''    # 【变异】不检查配置文件是否存在
+''')]),
+
+    # ── M18：Timestamp 改回已弃用的 utcnow ───────────────────────
+    ('M18 cron 侧：Timestamp 用已弃用的 datetime.utcnow()（3.13 打 DeprecationWarning）',
+     APP_PY,
+     [('''              "SignatureMethod": "HMAC-SHA1", "Timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),''',
+       '''              "SignatureMethod": "HMAC-SHA1", "Timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),''')]),
 ]
 
 

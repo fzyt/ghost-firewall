@@ -409,14 +409,39 @@ def test_cron_script(srv):
           "未启用的记录不发起任何请求（实际：%s）" % fake.action_seq())
 
     # ── I 组：配置路径读环境变量 ──────────────────────────
+    # ⚠️ 必须让环境变量指向一份**存在**且内容独特的配置：
+    #   指向不存在的路径时，「读了指定路径」和「读了默认路径」的表现一样
+    #   （都是文件不存在）⇒ 区分不开。
+    #   用一个独有的 RR 名做判据：只有真读到这份配置，才会带着它去查阿里云。
     fake.calls = []
-    fake.records = [rec(value="198.51.100.9")]
+    fake.records = [rec(rr="envpath-test", value="198.51.100.9", rid="7001")]
     fake.ip_body = "203.0.113.7"
-    rc, out, log, _ = run_script(srv, script, [cfg_record()],
-                                 env_extra={"NFTABLES_WEB_ALIYUN_CONFIG":
-                                            "/nonexistent/should-not-be-read.json"})
+    rc, out, log, _ = run_script(
+        srv, script,
+        [cfg_record(rr="envpath-test")])
+    p = fake.params_of("DescribeDomainRecords")
+    check(p is not None and p.get("RRKeyWord") == "envpath-test",
+          "环境变量指定的配置路径生效（查的是那份独有配置里的记录）")
+
+    # ── I2 组：配置文件不存在时安静退出 ────────────────────
+    fake.calls = []
+    rc, out, log, _ = run_script(
+        srv, script, [cfg_record()],
+        env_extra={"NFTABLES_WEB_ALIYUN_CONFIG":
+                   "/nonexistent/should-not-be-read.json"})
+    check(rc == 0,
+          "配置文件不存在时脚本退出码为 0（安静退出，不是异常退出），实际 %d" % rc)
+    check("配置文件不存在" in log,
+          "日志写明「配置文件不存在」，而不是让人看不懂的 FileNotFoundError")
+    check("FileNotFoundError" not in log,
+          "日志里不出现 FileNotFoundError 这种对用户无意义的字样")
     check(fake.action_seq() == [],
-          "环境变量指定的配置路径生效（指向不存在的文件时读的是那个路径，不是默认路径）")
+          "配置文件不存在时不发起任何阿里云请求")
+
+    # ── O 组：不用已弃用的 datetime.utcnow() ───────────────
+    # Python 3.13 起 utcnow() 已弃用，cron 每次跑都会往 stderr 打警告。
+    check("utcnow()" not in script,
+          "脚本里没有已弃用的 datetime.utcnow()（3.13 会打 DeprecationWarning）")
 
     # ── J 组：查询拉全量 ──────────────────────────────────
     fake.calls = []
