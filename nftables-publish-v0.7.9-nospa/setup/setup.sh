@@ -1934,6 +1934,72 @@ remove_obsolete_files() {
     done
 }
 
+# ============================================================
+# 重新生成阿里云 DDNS 自动更新脚本
+# ============================================================
+#
+# 为什么部署完必须重新生成
+# ----------------------
+# `${INSTALL_DIR}/aliyun-ddns-update.py` 是**生成物**：它由
+# `backend/app.py` 里的 `_generate_ddns_update_script()` 写出来。
+#
+# 部署只换 app.py ⇒ 设备上那份脚本**不会自动更新** ⇒ 跑的仍是旧逻辑。
+#
+# ⚠ 这不是纸上担心：2026-11-11 在 .232 真机实测过 —— 改了「只有一条
+#   记录时就更新它」的规则并部署了新版本，设备上那份脚本还是旧的，
+#   于是真机跑出来仍是旧行为（同一个场景本地过、真机挂）。
+#   重新生成后才符合预期。
+#   ⇒ 不重新生成 ⇒ 修复等于没修，而且**现象照旧**，
+#   很容易被误判成「没修好」。
+#
+# 为什么放在 deploy_project **外面**、单独走一步
+# -------------------------------------------
+# 放进 deploy_project 只能覆盖「这次真的部署了」的情况。
+# 而「上一版 setup.sh 装好的（那时还没有这一步）+ 这一版重跑、
+# 部署阶段被判定成已完成而跳过」⇒ 设备上的脚本还是旧的，坑照旧。
+# ⇒ 这一步**无条件**执行：设备上的 app.py 是哪一版，就重新生成哪一版。
+#
+# 为什么不用 `import app` 再调那个函数
+# -----------------------------------
+# app.py 顶层可能起后台线程（watchdog 之类）。在设备上 import 它，
+# 有可能触发防火墙规则切换 ⇒ **有失联风险**。
+# ⇒ 改用 backend/regen_ddns_script.py：它用 AST 提取模板，零副作用。
+regen_ddns_script() {
+    local gen="${INSTALL_DIR}/backend/regen_ddns_script.py"
+
+    if [ ! -f "$gen" ]; then
+        # 装的是不含这个文件的旧版本 ⇒ 没有可重新生成的逻辑
+        warn "缺少 ${gen}，无法自动重新生成 DDNS 脚本；面板上点一次「保存配置并生成脚本」即可"
+        return 0
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn "没有 python3，跳过 DDNS 脚本重新生成；面板上点一次「保存配置并生成脚本」即可"
+        return 0
+    fi
+
+    # ⚠ 失败**不能**中断安装：面板上点一次「保存配置并生成脚本」是等价的
+    #   兜底路径，脚本本体此刻还没被 cron 用到（首次保存配置时才装 cron）。
+    local out rc=0
+    out="$(python3 "$gen" 2>&1)" || rc=$?
+    if [ -n "$out" ]; then
+        info "${out}"
+    fi
+
+    if [ "$rc" -ne 0 ]; then
+        warn "阿里云 DDNS 自动更新脚本重新生成失败（退出码 ${rc}）；面板上点一次「保存配置并生成脚本」即可"
+        return 0
+    fi
+
+    # ⚠ 脚本自己会打 [SKIP]（app.py 不在 / 模板提取不到）——
+    #   那不是「已重新生成」，别报成功。
+    case "$out" in
+        *"[SKIP]"*) warn "阿里云 DDNS 自动更新脚本未重新生成；面板上点一次「保存配置并生成脚本」即可" ;;
+        *) ok "阿里云 DDNS 自动更新脚本已重新生成" ;;
+    esac
+    return 0
+}
+
 deploy_project() {
     info "========== 部署项目 =========="
 
@@ -2602,6 +2668,11 @@ main() {
     run_stage "acme.sh 证书组件" stage_acme_done    install_acme
     run_stage "nginx 配置"      stage_nginx_done   setup_nginx
     run_stage "项目文件部署"     stage_deploy_done  deploy_project
+    # ⚠ 这一步**不进 run_stage**：必须无条件执行。
+    #   「部署阶段被跳过」（装好了再跑一次）时，设备上的 DDNS 脚本也得跟
+    #   app.py 对齐 —— 放进 deploy_project 就覆盖不到这种情况。
+    #   放在这里（而不是最后）还能保证：后续阶段失败中止时，脚本已经对齐。
+    regen_ddns_script
     run_stage "配置初始化"       stage_config_done  init_config
     run_stage "ubus 服务"        stage_ubus_done    ensure_ubus
     run_stage "服务注册与启动"   stage_service_done setup_service
