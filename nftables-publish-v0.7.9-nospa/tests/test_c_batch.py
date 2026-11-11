@@ -242,23 +242,43 @@ def _reset_gw_cache():
     gw._SECRET_CACHE.update(_cache_defaults_from_src())
 
 
+def _load_secret_safe():
+    """调 _load_secret()，把异常接住，返回 (值, 错误信息)。
+
+    ⚠ 为什么必须接住（2026-11-11 审查 M8）
+    -----------------------------------
+    这条链路的两个变异都会让它**抛异常**：
+      · D-06（缓存键名改了）⇒ `_SECRET_CACHE["key"]` 抛 KeyError；
+      · D-02（读盘失败时覆盖原文件）⇒ 错误处理分支里那次写又抛 PermissionError。
+    异常直接冒到测试脚本 ⇒ **脚本崩溃** ⇒ 变异被误记成「没抓住」
+    ⇒ 判据必须**断言**「这条路径不得抛异常」，而不是崩掉。
+    """
+    try:
+        return gw._load_secret(), None
+    except Exception as e:
+        return None, "%s: %s" % (type(e).__name__, e)
+
+
 _reset_gw_cache()
 
-k1 = gw._load_secret()
-k2 = gw._load_secret()
+k1, e1 = _load_secret_safe()
+k2, e2 = _load_secret_safe()
+check('取密钥**不得抛异常**（错误路径也要能返回临时密钥）', e1 is None, str(e1))
 check('连续两次取到的密钥**相同**（原来每次都是一把新的随机密钥）',
-      k1 == k2 and len(k1) >= 16)
-check('文件不存在时也不抛异常', isinstance(k1, bytes))
+      e1 is None and e2 is None and k1 == k2 and len(k1) >= 16,
+      'err=%s/%s' % (e1, e2))
+check('文件不存在时也不抛异常', e1 is None and isinstance(k1, bytes))
 
 # 文件存在 → 读它
 _reset_gw_cache()
 with open(gw.SECRET_FILE, 'w', encoding='utf-8') as f:
     f.write('a-fixed-secret-value')
-k3 = gw._load_secret()
+k3, e3 = _load_secret_safe()
 check('文件存在时用文件里的密钥',
-      k3 == b'a-fixed-secret-value', repr(k3))
+      e3 is None and k3 == b'a-fixed-secret-value', 'err=%s val=%r' % (e3, k3))
+k3b, e3b = _load_secret_safe()
 check('读到的密钥也被缓存（第二次不再读盘）',
-      gw._load_secret() == k3)
+      e3b is None and k3b == k3, 'err=%s' % e3b)
 
 # 读不到（权限坏）⇒ 用临时密钥 + 告警 + **不覆盖原文件**
 _reset_gw_cache()
@@ -270,9 +290,13 @@ try:
 except OSError:
     _read_failed = True
 if _read_failed:
-    k4 = gw._load_secret()
-    check('文件读不到时退回临时密钥（而不是崩溃）', isinstance(k4, bytes) and len(k4) >= 16)
-    check('读不到时进程内仍然自洽（前后两次一致）', gw._load_secret() == k4)
+    k4, e4 = _load_secret_safe()
+    check('读盘失败时**不得抛异常**（错误处理分支自己不能再炸）', e4 is None, str(e4))
+    check('文件读不到时退回临时密钥（而不是崩溃）',
+          e4 is None and isinstance(k4, bytes) and len(k4) >= 16, 'err=%s' % e4)
+    k4b, e4b = _load_secret_safe()
+    check('读不到时进程内仍然自洽（前后两次一致）',
+          e4b is None and k4b == k4, 'err=%s' % e4b)
     # ⚠️ 000 权限下连 root 之外的用户都读不了 ⇒ 先恢复权限再核对内容
     os.chmod(gw.SECRET_FILE, 0o600)
     with open(gw.SECRET_FILE, 'r') as f:

@@ -237,13 +237,22 @@ def main():
             with open(target, 'w', encoding='utf-8') as f:
                 f.write(mutated)
             rc, out = run_tests()
-            if rc != 0:
-                first = next((l.strip() for l in out.splitlines()
-                              if '[FAIL]' in l and '[PASS]' not in l), '')
+            # ⚠ 2026-11-11 修（审查 M8）：**只有断言失败**才算「变异被捕获」。
+            #   原来判定条件只有 `rc != 0`，分不清「断言失败」和「测试脚本自己崩了」。
+            #   ⇒ 现在要求输出里真的有 [FAIL] 行；
+            #   只有崩溃、没有失败行的 ⇒ 单独记成「崩溃（不算捕获）」⇒ 算漏网。
+            fail_lines = [l.strip() for l in out.splitlines()
+                          if '[FAIL]' in l and '[PASS]' not in l]
+            if rc != 0 and fail_lines:
                 print('  [PASS] %s  —— 被捕获' % name)
-                if first:
-                    print('      ↓ %s' % first)
+                print('      ↓ %s' % fail_lines[0])
                 caught += 1
+            elif rc != 0:
+                tail = (out.strip().splitlines()[-1][:100]
+                        if out.strip() else '（无输出）')
+                print('  [FAIL] %s  —— 测试脚本崩溃（不是断言失败）⇒ 不算捕获' % name)
+                print('      末尾输出: %s' % tail)
+                missed += 1
             else:
                 print('  [FAIL] %s  —— 漏网！测试没抓住' % name)
                 missed += 1

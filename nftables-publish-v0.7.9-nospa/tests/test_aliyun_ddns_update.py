@@ -90,6 +90,30 @@ def extract_cron_script():
     return None
 
 
+def panel_delete_verbs(src_path, fn_name="_aliyun_ddns_update"):
+    """返回指定函数体里出现的、**含 Delete 字样**的字符串常量。
+
+    为什么用 AST 而不是字符串查找：
+      · 文本查找 `"DeleteDomainRecord" not in open(...).read()` 会被
+        **函数外面**的注释/文档串命中，也会漏掉 `"Delete" + "DomainRecord"`；
+      · AST 只看**真正被执行的代码**，且能逐个常量比对。
+
+    ⚠ 只看字符串常量 ⇒ 能抓住「直接把 DeleteDomainRecord 写上去」和
+      「把它拼出来」两种写法；抓不住从变量间接取值的写法 ——
+      但那种写法在面板侧根本不存在（`_aliyun_api` 的 Action 全部是字面量）。
+    """
+    tree = ast.parse(open(src_path, encoding="utf-8").read())
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == fn_name:
+            return sorted({
+                sub.value for sub in ast.walk(node)
+                if isinstance(sub, ast.Constant)
+                and isinstance(sub.value, str)
+                and "Delete" in sub.value
+            })
+    return None
+
+
 def script_actions(script):
     """取出脚本**实际调用**的阿里云 Action 集合（AST 层面，不看注释/文档字符串）"""
     actions = set()
@@ -688,17 +712,28 @@ def test_panel_side():
     check(m4 == [], "RR 不匹配时返回空")
 
     # ── 目标选择：单条就它 / 多条只 default ──────────────────
+    #
+    # ⚠ 不能直接 `app._ddns_pick_target(x)["RecordId"]` —— 那等于**默认**
+    #   它一定返回一个字典。变异 M13（只找 default 线路）会让它返回 None
+    #   ⇒ 下标 None 直接 TypeError ⇒ **测试脚本自己崩掉**，
+    #   而崩掉不是「断言失败」⇒ 变异会被误记成「没抓住」（2026-11-11 审查 M8）。
+    # ⇒ 一律先接住返回值，再断言它是什么。
+    def picked_id(records):
+        """返回选中的记录 ID；选不出（None）时返回 None 而不是崩掉。"""
+        t = app._ddns_pick_target(records)
+        return None if t is None else t.get("RecordId")
+
     only_telecom = [{"RR": "www", "Type": "A", "Value": "1.1.1.1",
                      "RecordId": "77", "Line": "telecom"}]
-    check(app._ddns_pick_target(only_telecom)["RecordId"] == "77",
+    check(picked_id(only_telecom) == "77",
           "只有一条记录时选它（哪怕在电信线路）—— 否则会凭空多出一条 default")
-    check(app._ddns_pick_target(m)["RecordId"] == "1",
+    check(picked_id(m) == "1",
           "有多条时选 default 线路那条")
     no_default = [
         {"RR": "www", "Type": "A", "Value": "1.1.1.1", "RecordId": "7", "Line": "telecom"},
         {"RR": "www", "Type": "A", "Value": "2.2.2.2", "RecordId": "8", "Line": "unicom"},
     ]
-    check(app._ddns_pick_target(no_default)["RecordId"] == "7",
+    check(picked_id(no_default) == "7",
           "多条且没有 default 时取第一条（与旧行为一致，不新增记录）")
 
     # ── _aliyun_ddns_update 的调用序列 ────────────────────
@@ -837,10 +872,32 @@ def test_panel_side():
           % [a for a, _ in calls])
 
     # 面板侧永远不调 Delete
-    check("DeleteDomainRecord" not in os.path.join(APP_PATH) or
-          "DeleteDomainRecord" not in open(APP_PATH, encoding="utf-8").read().split(
-              "def _aliyun_ddns_update")[1].split("\ndef ")[0],
-          "面板侧更新函数里没有 DeleteDomainRecord")
+    #
+    # ⚠ 2026-11-11 修：这条原来是**恒真断言**（审查 M7）。
+    #   `os.path.join(APP_PATH)` 只传了一个参数 ⇒ 返回**路径本身** ⇒
+    #   第一操作数恒为 True ⇒ `or` 短路 ⇒ 第二操作数**永远不被求值**
+    #   ⇒ 就算函数里真的写了 DeleteDomainRecord，这条断言照样绿。
+    # ⇒ 改成 AST 级：把函数体里出现的**字符串常量**全捞出来比对。
+    verbs = panel_delete_verbs(APP_PATH)
+    check(verbs == [],
+          "面板侧更新函数里没有含 Delete 的字符串常量（实际：%s）" % verbs)
+
+    # ↓ 判据自证：往函数里塞一个 Delete 调用，这条判据**必须**能抓到 ——
+    #   否则「恒真」只是换了个写法，捕获力还是零。
+    _evil_dir = tempfile.mkdtemp(prefix="ddns-m7-evil-")
+    _evil_path = os.path.join(_evil_dir, "app_evil.py")
+    with open(APP_PATH, encoding="utf-8") as _f:
+        _evil_src = _f.read()
+    _evil_src = _evil_src.replace(
+        "    norm_value = _ddns_norm_value(value)",
+        '    _aliyun_api("DeleteDomainRecord", ak_id, ak_secret, region, {})\n'
+        "    norm_value = _ddns_norm_value(value)", 1)
+    with open(_evil_path, "w", encoding="utf-8") as f:
+        f.write(_evil_src)
+    _evil_verbs = panel_delete_verbs(_evil_path)
+    check(_evil_verbs == ["DeleteDomainRecord"],
+          "判据自证：函数里塞进 Delete 调用后，这条判据能抓到（实际：%s）"
+          % _evil_verbs)
 
     # ── A 记录自动取公网 IPv4（测试接口）─────────────────
     saved = app._fetch_public_ipv4

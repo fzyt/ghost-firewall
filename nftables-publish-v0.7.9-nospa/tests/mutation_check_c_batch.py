@@ -69,6 +69,26 @@ for rel in REL_FILES:
         ORIG[os.path.join(ROOT, rel)] = f.read()
 
 
+def _judge_capture(rc, out):
+    """判定这次变异算不算「被捕获」。
+
+    ⚠ 不能只看 rc != 0 —— 那分不清「断言失败」和「测试脚本自己崩了」
+      （2026-11-11 审查 M8：崩了也被记成「捕获」⇒ 那个捕获是假的）。
+    ⇒ 只有输出里真的出现**断言失败**的标记行才算捕获；
+      只有崩溃、没有失败行的 ⇒ 算漏网（宁可漏判，不可假捕获）。
+    """
+    if rc == 0:
+        return False
+    for line in out.splitlines():
+        s = line.strip()
+        # 失败标记用 Unicode 转义写：源码里不出现符号本身（AGENTS.md 禁 emoji）
+        if ('[FAIL]' in s and '[PASS]' not in s) or \
+                ('\u274c' in s and '\u2705' not in s):
+            return True
+    print('      [注意] 测试脚本崩溃（输出里没有断言失败行）=> 不算捕获')
+    return False
+
+
 def restore():
     """把文件还原成脚本启动时的内容。幂等，可反复调用。"""
     for path, content in ORIG.items():
@@ -131,9 +151,16 @@ C_MUTATIONS = [
        '        _sync_msg = ""\n')],
      'c'),
 
+    # ⚠️ 2026-11-11 修：原来这条变异**把 try: 结构改坏了** ——
+    #   锚点从 `_sync_msg = ...` 那一行开始，把前面的 `try:` 留在原地
+    #   ⇒ 变异后的 app.py **语法错误** ⇒ 测试 import 就崩
+    #   ⇒ 崩掉不是「断言失败」⇒ 这条变异从来没真正验证过顺序。
+    # ⇒ 现在整块（try + except）一起搬，变异后的代码**语法合法**，
+    #   顺序真的反了 ⇒ 顺序断言会真的红。
     ('C-02  同步挪到生成证书之后（顺序反了，证书还是旧 IP）',
      APP_PY,
-     [('        _sync_msg = _sync_router_ip4(_bind)\n'
+     [('    try:\n'
+       '        _sync_msg = _sync_router_ip4(_bind)\n'
        '        if _sync_msg:\n'
        '            print(f\'[INFO] {_sync_msg}\', flush=True)\n'
        '    except Exception as e:\n'
@@ -487,7 +514,7 @@ def main():
     print('=== 基线：未变异时测试必须全绿 ===')
     restore()
     rc, out = run_tests('both')
-    if rc != 0:
+    if _judge_capture(rc, out):
         print('原始状态下测试就是红的，先修测试再跑变异：')
         print(out[-3000:])
         return 2
@@ -506,7 +533,7 @@ def main():
             missed.append(f'{name}（变异脚本自身的错）')
             continue
         rc, out = run_tests(which)
-        if rc != 0:
+        if _judge_capture(rc, out):
             caught += 1
             first = ''
             for line in out.splitlines():

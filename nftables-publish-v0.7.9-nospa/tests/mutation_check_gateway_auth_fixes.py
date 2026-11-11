@@ -37,6 +37,26 @@ with open(TARGET, "r", encoding="utf-8") as f:
 _state = {"restored": True}
 
 
+def _judge_capture(rc, out):
+    """判定这次变异算不算「被捕获」。
+
+    ⚠ 不能只看 rc != 0 —— 那分不清「断言失败」和「测试脚本自己崩了」
+      （2026-11-11 审查 M8：崩了也被记成「捕获」⇒ 那个捕获是假的）。
+    ⇒ 只有输出里真的出现**断言失败**的标记行才算捕获；
+      只有崩溃、没有失败行的 ⇒ 算漏网（宁可漏判，不可假捕获）。
+    """
+    if rc == 0:
+        return False
+    for line in out.splitlines():
+        s = line.strip()
+        # 失败标记用 Unicode 转义写：源码里不出现符号本身（AGENTS.md 禁 emoji）
+        if ('[FAIL]' in s and '[PASS]' not in s) or \
+                ('\u274c' in s and '\u2705' not in s):
+            return True
+    print('      [注意] 测试脚本崩溃（输出里没有断言失败行）=> 不算捕获')
+    return False
+
+
 def _restore():
     if _state["restored"]:
         return
@@ -183,7 +203,7 @@ def main():
             rc, out = run_tests()
         finally:
             _restore()
-        if rc != 0:
+        if _judge_capture(rc, out):
             caught.append((tag, desc))
             print(f"✅ 被捕获  {tag}  {desc}")
         else:

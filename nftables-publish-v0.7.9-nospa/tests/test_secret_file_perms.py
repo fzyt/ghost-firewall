@@ -337,11 +337,30 @@ def main():
         sec('4b. 配置备份（.backup）与配置恢复')
 
         # 第二次保存：这次 CONFIG_PATH 已存在 ⇒ 会生成 .backup
+        #
+        # ⚠️ 测「.backup 落盘那一刻的权限」之前，必须先把已有的 .backup 删掉。
+        #
+        # 为什么：`.backup` 是在**第一次** save_config（上面 4. 那次）里生成的 ——
+        # 那次 CONFIG_PATH 已经存在 ⇒ 走了备份分支。等 4b 再存一次时，
+        # .backup **早就存在**了 ⇒ shutil.copy 对已存在文件走的是
+        # 「open(dst,'wb') 截断 + copystat」：
+        #   · POSIX 下 open 对**已存在**文件只截断、**不改权限**
+        #     ⇒ 文件权限还是上一轮留下的 0640 ⇒ 探针记到 0640 ⇒ 断言恒过；
+        #   · 也就是说「.backup 是按 umask 新建的（0644/0666）」这个退化
+        #     **根本不会被观测到** —— 样本没落在判据真正生效的那条路径上。
+        #
+        # 删掉之后再存 ⇒ 这一次 save 才真的是 .backup 的**创建者**，
+        # 此时才有「按 umask 建 ⇒ 先 0644/0666」的窗口可观测。
+        backup_real = cfg_real + '.backup'
+        if os.path.exists(backup_real):
+            os.unlink(backup_real)
         with moment_perms() as probe:
             app.save_config({'lan_subnet4': '192.168.100.0/24', 'wan_if': 'eth0',
                              'lan_if': 'br-lan', 'router_ip4': '192.168.100.1',
                              'trusted_ip4': '192.168.100.9'})
-        backup_real = cfg_real + '.backup'
+        check('本次保存确实重新打开了 .backup（样本落在「写 .backup」这条路径上）',
+              backup_real in probe.open_perms,
+              '本次保存没有打开过 .backup')
         got = moment_of(probe.open_perms, backup_real)
         check('配置 .backup 落盘那一刻权限就是 0640'
               '（shutil.copy 按 umask 建 ⇒ 先 0644/0666 再 copystat）',

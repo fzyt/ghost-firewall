@@ -21,8 +21,10 @@
 
 import ast
 import importlib.util
+import json
 import os
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -30,6 +32,167 @@ SCRIPT_PATH = os.path.join(ROOT, "tools", "ddns-aliyun-diagnose.py")
 
 PASS = 0
 FAIL = 0
+
+
+# ============================================================
+# 只读判据：AST 级 + 运行时级
+# ============================================================
+#
+# 为什么不能只做文本匹配
+# ----------------------
+# 原来的判据是「源码里有没有 `"Action": "DeleteDomainRecord"`」这种**固定字面量**
+# 匹配 ⇒ 下面 4 种恶意改法**全部**能溜过去：
+#   ① "Action" : "DeleteDomainRecord"   （多一个空格）
+#   ② "Delete" + "DomainRecord"         （拼接）
+#   ③ 去掉 _mask，直接把明文 secret 存进快照
+#   ④ subprocess.run(["curl", url])       （换个壳发写请求）
+# ⇒ 判据改成 AST 级（把常量表达式**求值**再比对），
+#   并且每条判据都用「恶意变体」**自证**能拦住。
+
+WRITE_ACTIONS = ("DeleteDomainRecord", "AddDomainRecord", "UpdateDomainRecord",
+                 "Delete", "Add", "Update")
+
+# 允许发起外发请求的函数（其余函数里出现 URL 请求就是违规）
+ALLOWED_REQUEST_FUNCS = {"probe_public_ip", "aliyun_describe"}
+
+# 能发 HTTP 请求的命令（用 shell 绕出去也算写操作）
+HTTP_CAPABLE_CMDS = {"curl", "wget", "http", "httpie", "nc", "ncat", "telnet"}
+
+# 发起 URL 请求的调用名
+URL_CALLS = {"urlopen", "urlretrieve", "Request", "HTTPConnection",
+             "HTTPSConnection"}
+
+
+def _const_str(node):
+    """把「常量表达式」求成字符串；求不出来返回 None。
+
+    为什么不用 ast.literal_eval：它不支持字符串拼接（BinOp），
+    而 `"Delete" + "DomainRecord"` 正是要防的写法之一。
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _const_str(node.left)
+        right = _const_str(node.right)
+        if left is not None and right is not None:
+            return left + right
+    if isinstance(node, ast.JoinedStr):
+        parts = []
+        for v in node.values:
+            if isinstance(v, ast.Constant) and isinstance(v.value, str):
+                parts.append(v.value)
+            else:
+                parts.append("?")
+        return "".join(parts)
+    return None
+
+
+def readonly_violations(src):
+    """AST 级只读检查，返回违规原因列表（空 = 通过）。"""
+    out = []
+    try:
+        tree = ast.parse(src)
+    except SyntaxError as e:
+        return ["源码无法解析：%s" % e]
+
+    # ① Action 的取值 —— 空格、拼接、f-string 都躲不掉
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        for k, v in zip(node.keys, node.values):
+            if isinstance(k, ast.Constant) and k.value == "Action":
+                s = _const_str(v)
+                if s is not None and s in WRITE_ACTIONS:
+                    out.append("第 %d 行：Action=%s（写操作）" % (node.lineno, s))
+
+    # ② 外发请求只允许落在两个函数里
+    for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+        for sub in ast.walk(fn):
+            if not isinstance(sub, ast.Call):
+                continue
+            name = getattr(sub.func, "id", None) or getattr(sub.func, "attr", None)
+            if name in URL_CALLS and fn.name not in ALLOWED_REQUEST_FUNCS:
+                out.append("第 %d 行：%s() 在 %s() 里（外发请求只允许在 %s）"
+                           % (sub.lineno, name, fn.name,
+                              "/".join(sorted(ALLOWED_REQUEST_FUNCS))))
+
+    # ③ shell 出去发 HTTP 请求
+    for sub in ast.walk(tree):
+        if not isinstance(sub, ast.Call):
+            continue
+        name = getattr(sub.func, "id", None) or getattr(sub.func, "attr", None)
+        if name not in ("run", "call", "Popen", "check_output", "check_call"):
+            continue
+        if not sub.args:
+            continue
+        first = sub.args[0]
+        cmds = []
+        if isinstance(first, (ast.List, ast.Tuple)):
+            for el in first.elts:
+                s = _const_str(el)
+                if s:
+                    cmds.append(s)
+        else:
+            s = _const_str(first)
+            if s:
+                cmds.append(s)
+        for c in cmds:
+            head = c.split()[0].lower() if c.split() else ""
+            if head in HTTP_CAPABLE_CMDS:
+                out.append("第 %d 行：subprocess 调用了 %s（能发 HTTP 请求）"
+                           % (sub.lineno, head))
+    return out
+
+
+def masking_violations(mod, tmpdir):
+    """运行时检查：快照里不能出现明文 secret。
+
+    真的跑一遍 probe_config()，喂一个**已知**口令，看返回的快照里是明文还是掩码。
+    ⇒ 纯 AST 做不到这件事：「从配置里读 secret」和「从快照里读已遮过的 secret」
+    在语法上一模一样，只能靠实跑区分。
+    """
+    cfg_path = os.path.join(tmpdir, "probe-config.json")
+    secret = "SECRETPROBE0123456789"
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "domain": "example.com", "region_id": "cn-hangzhou",
+            "access_key_id": "AKPROBE", "access_key_secret": secret,
+            "records": [],
+        }, f)
+    old = getattr(mod, "CONFIG_PATH", None)
+    try:
+        mod.CONFIG_PATH = cfg_path
+        snap = mod.probe_config()
+    finally:
+        if old is not None:
+            mod.CONFIG_PATH = old
+    dumped = json.dumps(snap, ensure_ascii=False, default=str)
+    if secret in dumped:
+        return True, "快照里出现了明文 secret（%r）" % snap.get("access_key_secret")
+    masked = str(snap.get("access_key_secret", ""))
+    if "****" not in masked:
+        return True, "快照里的 secret 不是掩码形式（%r）" % masked
+    return False, "快照里的 secret 是掩码（%r）" % masked
+
+
+def evil_variants(src):
+    """构造 4 种恶意改写 —— 每种都必须被只读判据拦下。"""
+    return [
+        ('Action 多一个空格',
+         src.replace('"Action": "DescribeDomainRecords",',
+                     '"Action" : "DeleteDomainRecord",')),
+        ('Action 拼接',
+         src.replace('"Action": "DescribeDomainRecords",',
+                     '"Action": "Delete" + "DomainRecord",')),
+        ('去掉 _mask 直接存明文 secret',
+         src.replace('res["access_key_secret"] = _mask(cfg.get("access_key_secret", ""))',
+                     'res["access_key_secret"] = cfg.get("access_key_secret", "")')),
+        ('用 curl 发写请求',
+         src.replace('def aliyun_describe(ak_id, ak_secret, region, domain):',
+                     'def aliyun_describe(ak_id, ak_secret, region, domain):\n'
+                     '    import subprocess as _sp\n'
+                     '    _sp.run(["curl", "-X", "POST", "https://example.invalid/x"])')),
+    ]
 
 
 def check(cond, msg):
@@ -43,8 +206,9 @@ def check(cond, msg):
         print("[FAIL] " + msg)
 
 
-def load_module():
-    spec = importlib.util.spec_from_file_location("ddns_diag", SCRIPT_PATH)
+def load_module(path=None):
+    spec = importlib.util.spec_from_file_location(
+        "ddns_diag", path or SCRIPT_PATH)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -166,10 +330,37 @@ def main():
     check("def aliyun_describe(" in src, "脚本存在只读查询入口 aliyun_describe")
     check("def _api(" not in src and "def _aliyun_api(" not in src,
           "脚本里不存在通用 API 调用入口（杜绝随手加写操作）")
-    for verb in ("DeleteDomainRecord", "AddDomainRecord", "UpdateDomainRecord"):
-        hit = ("\"Action\": \"%s\"" % verb) in src or ("'Action': '%s'" % verb) in src
-        check(not hit, "脚本没有以 Action=%s 发起写操作" % verb)
     check("DescribeDomainRecords" in src, "脚本只调用 DescribeDomainRecords（读）")
+
+    # AST 级只读判据（取代原来的「固定字面量」文本匹配）
+    violations = readonly_violations(src)
+    check(not violations,
+          "AST 级只读判据通过（实际违规：%s）" % (violations or "无"))
+
+    # 运行时级：secret 真的被遮住了吗
+    tmpdir = tempfile.mkdtemp(prefix="ddns-diag-judge-")
+    leaked, mask_detail = masking_violations(mod, tmpdir)
+    check(not leaked, "快照里的 secret 是掩码（%s）" % mask_detail)
+
+    # ↓ 判据自证：4 种恶意改法**每一种**都必须被拦下。
+    #   原来的判据在下面 4 种改法下**全部 11/11 通过** ——
+    #   也就是说「只读」这条硬红线当时根本没被守住。
+    for name, evil in evil_variants(src):
+        v_ast = readonly_violations(evil)
+        if v_ast:
+            check(True, "恶意变体「%s」被 AST 判据拦下（%s）" % (name, v_ast))
+            continue
+        # AST 没抓到 ⇒ 运行时判据必须抓到（③ 就是这种）
+        evil_path = os.path.join(tmpdir, "evil.py")
+        with open(evil_path, "w", encoding="utf-8") as f:
+            f.write(evil)
+        try:
+            evil_mod = load_module(evil_path)
+            evil_leaked, evil_detail = masking_violations(evil_mod, tmpdir)
+        except Exception as e:
+            evil_leaked, evil_detail = True, "变体加载失败（也算拦下）：%s" % e
+        check(evil_leaked,
+              "恶意变体「%s」被运行时判据拦下（%s）" % (name, evil_detail))
 
     # 用 AST 再核一遍：所有对 alidns 的请求都收在 aliyun_describe 里
     try:
