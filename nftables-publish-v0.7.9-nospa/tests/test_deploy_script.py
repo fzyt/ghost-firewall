@@ -394,35 +394,51 @@ def main():
               '多出来的：%s' % extra)
 
         # 真实跑一遍 git ls-files，用的就是脚本里那组参数。
+        #
+        # ⚠️ 拿不到跟踪清单时**如实跳过**，不能判红 ——
+        #   隔离变异扫描的副本里**没有 .git**（它只复制项目子目录，
+        #   而 git 根在上一层）⇒ `git ls-files` 必然失败。
+        #   ⇒ 若在这里判红，那个副本的基线就永远红着
+        #   ⇒ 整个变异脚本秒退 ⇒ 那 11 条变异一条都跑不到
+        #   ⇒ 扫描表上显示成 [BAD]（四列全 0），看着像「脚本坏了」。
+        #
+        #   ⇒ 拿不到就跳过，并把「跳过」写在输出里（不静默）。
         try:
             import subprocess
             r = subprocess.run(
                 ['git', '-C', ROOT, 'ls-files', '-z', '--'] + upgrade_paths,
                 capture_output=True, text=True, timeout=120)
             tracked = [x for x in r.stdout.split('\0') if x]
+            git_ok = r.returncode == 0
         except Exception as e:
             tracked = []
-            print('  [x] git ls-files 执行失败：%s' % e)
+            git_ok = False
+            print('  [跳过] git ls-files 执行失败：%s' % e)
 
-        check('清单能真的列出文件（判据不能空转）',
-              len(tracked) > 0,
-              '列出 %d 个' % len(tracked))
-        check('清单里确实有 setup/setup.sh',
-              'setup/setup.sh' in tracked,
-              'setup 相关：%s' % [t for t in tracked if t.startswith('setup/')][:5])
-        check('清单里确实有 setup/vendor/（第三方插件也得更新）',
-              any(t.startswith('setup/vendor/') for t in tracked),
-              'vendor 文件数：%d' % len([t for t in tracked if t.startswith('setup/vendor/')]))
-        check('清单里确实有 tools/deploy.sh 本身（工具脚本也要更新）',
-              'tools/deploy.sh' in tracked)
-        check('清单里确实有 tests/ 下的测试（设备上跑的是新测试）',
-              any(t.startswith('tests/') for t in tracked),
-              'tests 文件数：%d' % len([t for t in tracked if t.startswith('tests/')]))
+        if not git_ok:
+            print('  [跳过] 当前环境没有 git 仓库（隔离副本不带 .git）'
+                  '⇒ 以下 5 条「清单里确实有 X」不适用；'
+                  '「清单参数含 X」那几条仍然有效。')
+        else:
+            check('清单能真的列出文件（判据不能空转）',
+                  len(tracked) > 0,
+                  '列出 %d 个' % len(tracked))
+            check('清单里确实有 setup/setup.sh',
+                  'setup/setup.sh' in tracked,
+                  'setup 相关：%s' % [t for t in tracked if t.startswith('setup/')][:5])
+            check('清单里确实有 setup/vendor/（第三方插件也得更新）',
+                  any(t.startswith('setup/vendor/') for t in tracked),
+                  'vendor 文件数：%d' % len([t for t in tracked if t.startswith('setup/vendor/')]))
+            check('清单里确实有 tools/deploy.sh 本身（工具脚本也要更新）',
+                  'tools/deploy.sh' in tracked)
+            check('清单里确实有 tests/ 下的测试（设备上跑的是新测试）',
+                  any(t.startswith('tests/') for t in tracked),
+                  'tests 文件数：%d' % len([t for t in tracked if t.startswith('tests/')]))
 
-        # 反向：清单里不能混进**未跟踪**的文件（那会把本机的东西泄到设备）
-        check('清单里没有未跟踪的文件（setup-lib.sh 之类的不该被带上去）',
-              'setup/setup-lib.sh' not in tracked,
-              'setup-lib.sh 不在 git 跟踪清单里 ⇒ 不会传、设备上那份保留')
+            # 反向：清单里不能混进**未跟踪**的文件（那会把本机的东西泄到设备）
+            check('清单里没有未跟踪的文件（setup-lib.sh 之类的不该被带上去）',
+                  'setup/setup-lib.sh' not in tracked,
+                  'setup-lib.sh 不在 git 跟踪清单里 ⇒ 不会传、设备上那份保留')
 
     # ── 11. 部署必须重新生成 cron 脚本 ──────────────────────────────
     #
