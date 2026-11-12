@@ -31,12 +31,14 @@
   2. uci **允许**值里有空格/等号/中文/单引号（自己转义成 `'\''`）；
   3. uci **会把值里的换行原样写进文件** ⇒ 显示名必须拒绝控制字符。
 """
+import fcntl
 import importlib.util
 import os
 import shutil
 import stat
 import sys
 import tempfile
+import threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BACKEND = os.path.join(os.path.dirname(HERE), 'backend')
@@ -154,9 +156,15 @@ def cfg_text():
 
 
 def backups():
+    """备份文件列表。
+
+    ⚠️ **排除写锁文件** —— 锁文件也放在备份目录里（那儿是部署脚本保证存在的
+       目录），但它不是备份 ⇒ 统计备份个数时不能把它算进去。
+    """
     if not os.path.isdir(BACKUP_DIR):
         return []
-    return sorted(os.listdir(BACKUP_DIR))
+    return sorted(n for n in os.listdir(BACKUP_DIR)
+                  if n != dhcp_hosts._LOCK_FILE_NAME)
 
 
 def perm_of(path):
@@ -516,6 +524,397 @@ check('配置文件不存在 ⇒ 被拒绝', isinstance(e, dhcp_hosts.DhcpWriteE
 check('配置文件不存在 ⇒ 没有被凭空创建',
       os.path.exists(CFG) == before_exists)
 
+
+# ══════════════════════════════════════════════════════════════
+# 10. 并发写保护（写锁）
+#
+# 面板是 `python3 app.py` 起的 ⇒ Flask 内建服务器 **threaded=True**
+# ⇒ 两个写请求真的可能同时进来。
+#
+# 这一节测四件事：
+#   10a 写操作期间**写锁确实被持有**（不是「代码里写了锁」，是「锁真的在」）；
+#   10b 锁被别人占着 ⇒ **拒绝写入**且文件一个字节都不动；
+#   10c 同一时刻的两次写 ⇒ **备份文件不互相覆盖**；
+#   10d A 写失败回滚 与 B 写成功 交错时 ⇒ **B 的记录不会被 A 抹掉**。
+#
+# ⚠️ 10d 是**故障注入**：靠 monkeypatch `_run_uci` 让 A 的 commit 失败。
+#    没有它就造不出「A 回滚抹掉 B」的时序 —— 那种交错在正常跑时几乎碰不到，
+#    但它正是「两个写请求同时来」时最坏的结果。
+# ══════════════════════════════════════════════════════════════
+sec('10. 并发写保护（写锁）')
+
+
+def lock_path():
+    """写锁文件路径（跟着 BACKUP_DIR 走 —— 测试里它被改过）。"""
+    return os.path.join(dhcp_hosts.BACKUP_DIR, dhcp_hosts._LOCK_FILE_NAME)
+
+
+def lock_held_by_other_fd():
+    """本进程用**另一个 fd** 试着拿非阻塞排他锁 ⇒ 拿不到就说明有人占着。
+
+    ⚠️ flock 的锁挂在「打开的文件描述」上，不是挂在进程上 ⇒
+       同一进程用两次 open 得到的两个 fd 之间**照样互斥**
+       （开发机实测：errno=11 EAGAIN）。
+       ⇒ 这就是判据能「看见」面板自己持有的锁的原因。
+    """
+    fd = os.open(lock_path(), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+# ── 10a. 写操作期间写锁确实被持有 ───────────────────────────
+PROBE_LOG = []
+_o_run_uci = dhcp_hosts._run_uci
+_o_make_backup = dhcp_hosts._make_backup
+_o_restore = dhcp_hosts._restore
+
+
+def _p_run_uci(args, config_dir=None):
+    PROBE_LOG.append(('uci ' + ' '.join(str(a) for a in args),
+                      lock_held_by_other_fd()))
+    return _o_run_uci(args, config_dir)
+
+
+def _p_make_backup(tag):
+    PROBE_LOG.append(('backup', lock_held_by_other_fd()))
+    return _o_make_backup(tag)
+
+
+def _p_restore(backup):
+    PROBE_LOG.append(('restore', lock_held_by_other_fd()))
+    return _o_restore(backup)
+
+
+def _install_probes():
+    dhcp_hosts._run_uci = _p_run_uci
+    dhcp_hosts._make_backup = _p_make_backup
+    dhcp_hosts._restore = _p_restore
+
+
+def _remove_probes():
+    dhcp_hosts._run_uci = _o_run_uci
+    dhcp_hosts._make_backup = _o_make_backup
+    dhcp_hosts._restore = _o_restore
+
+
+reset_cfg()
+PROBE_LOG.clear()
+_install_probes()
+try:
+    dhcp_hosts.add_dhcp_host('锁内写入', 'aa:bb:cc:dd:ee:20', '192.168.100.30')
+finally:
+    _remove_probes()
+check('写配置期间确实有观测点（别让判据空跑）', len(PROBE_LOG) >= 4,
+      '观测到 %d 次' % len(PROBE_LOG))
+not_locked = [n for n, held in PROBE_LOG if not held]
+check('成功路径：备份与每一次 uci 调用都在写锁内', not not_locked,
+      '不在锁内的: %s' % not_locked)
+
+# 失败路径：回滚也必须在锁内
+reset_cfg()
+PROBE_LOG.clear()
+_install_probes()
+try:
+    expect_error(dhcp_hosts.add_dhcp_host, '__CORRUPT__',
+                 'aa:bb:cc:dd:ee:25', '192.168.100.35')
+finally:
+    _remove_probes()
+restored = [n for n, held in PROBE_LOG if n == 'restore']
+check('失败路径：回滚确实发生过', len(restored) == 1,
+      'restore 观测 %d 次' % len(restored))
+not_locked2 = [n for n, held in PROBE_LOG if not held]
+check('失败路径：备份、uci 调用与回滚都在写锁内', not not_locked2,
+      '不在锁内的: %s' % not_locked2)
+
+
+# ── 10b. 锁被别人占着 ⇒ 拒绝写入 ────────────────────────────
+reset_cfg()
+before = cfg_bytes()
+_saved_timeout = dhcp_hosts._LOCK_WAIT_TIMEOUT
+dhcp_hosts._LOCK_WAIT_TIMEOUT = 0.3
+hold_fd = os.open(lock_path(), os.O_CREAT | os.O_RDWR, 0o600)
+try:
+    fcntl.flock(hold_fd, fcntl.LOCK_EX)
+    e = expect_error(dhcp_hosts.add_dhcp_host, '抢不到锁',
+                     'aa:bb:cc:dd:ee:21', '192.168.100.31')
+finally:
+    try:
+        fcntl.flock(hold_fd, fcntl.LOCK_UN)
+    finally:
+        os.close(hold_fd)
+        dhcp_hosts._LOCK_WAIT_TIMEOUT = _saved_timeout
+check('锁被别人占着 ⇒ 被拒绝写入', isinstance(e, dhcp_hosts.DhcpWriteError),
+      str(e) if e else '没抛异常')
+check('锁被别人占着 ⇒ 错误信息说明了是写锁的问题',
+      isinstance(e, dhcp_hosts.DhcpWriteError) and '锁' in str(e),
+      str(e) if e else '没抛异常')
+check('锁被别人占着 ⇒ 文件一个字节都没动', cfg_bytes() == before)
+check('锁被别人占着 ⇒ 连备份都没生成', not backups(),
+      '备份目录里有: %s' % backups())
+
+
+# ── 10c. 备份名唯一（冻结时钟 ⇒ 逼出「撞名」） ───────────────
+reset_cfg()
+_saved_now = dhcp_hosts._now
+dhcp_hosts._now = lambda: 1700000000.0
+try:
+    dhcp_hosts.add_dhcp_host('备份一', 'aa:bb:cc:dd:ee:22', '192.168.100.32')
+    dhcp_hosts.add_dhcp_host('备份二', 'aa:bb:cc:dd:ee:23', '192.168.100.33')
+finally:
+    dhcp_hosts._now = _saved_now
+bk = backups()
+check('同一时刻的两次写 ⇒ 两个备份文件都在（没互相覆盖）', len(bk) == 2,
+      '备份目录: %s' % bk)
+
+
+# ── 10d. 并发写不丢写（A 失败回滚 不会抹掉 B 的记录） ─────────
+reset_cfg()
+a_backed_up = threading.Event()
+b_finished = threading.Event()
+a_out = []
+b_out = []
+
+_o_run_uci2 = dhcp_hosts._run_uci
+_o_make_backup2 = dhcp_hosts._make_backup
+
+
+def _p2_run_uci(args, config_dir=None):
+    """给 A 的 commit 注入失败，并让它等 B 跑完。
+
+    ⚠️ 这是**故障注入**用的接缝：没有它造不出「A 回滚抹掉 B」的时序。
+    """
+    if (threading.current_thread().name == '写A'
+            and args and args[0] == 'commit'):
+        # 等 B 跑完（最多 1.5 秒）⇒ 让 B 的提交落在 A 的回滚之前。
+        # 有写锁时 B 拿不到锁 ⇒ 这一步必然等满 ⇒ 这就是「锁起作用」的代价。
+        b_finished.wait(timeout=1.5)
+        return 1, '模拟 commit 失败'
+    return _o_run_uci2(args, config_dir)
+
+
+def _p2_make_backup(tag):
+    r = _o_make_backup2(tag)
+    if threading.current_thread().name == '写A':
+        # A 的备份先于 B 的整条链 ⇒ A 回滚时回滚到的一定是「B 还没写」的状态
+        a_backed_up.set()
+    return r
+
+
+def _thread_a():
+    try:
+        dhcp_hosts.add_dhcp_host('写A', 'aa:bb:cc:dd:ee:24', '192.168.100.40')
+        a_out.append('ok')
+    except dhcp_hosts.DhcpWriteError as e:
+        a_out.append('err:%s' % e)
+    except Exception as e:  # 抛别的异常也要记下来，不能让它静默
+        a_out.append('unexpected:%s:%s' % (type(e).__name__, e))
+
+
+def _thread_b():
+    a_backed_up.wait(timeout=10)
+    try:
+        dhcp_hosts.add_dhcp_host('写B', 'bb:cc:dd:ee:ff:01', '192.168.100.41')
+        b_out.append('ok')
+    except dhcp_hosts.DhcpWriteError as e:
+        b_out.append('err:%s' % e)
+    except Exception as e:
+        b_out.append('unexpected:%s:%s' % (type(e).__name__, e))
+    finally:
+        b_finished.set()
+
+
+dhcp_hosts._run_uci = _p2_run_uci
+dhcp_hosts._make_backup = _p2_make_backup
+try:
+    ta = threading.Thread(target=_thread_a, name='写A')
+    tb = threading.Thread(target=_thread_b, name='写B')
+    ta.start()
+    tb.start()
+    ta.join(timeout=30)
+    tb.join(timeout=30)
+finally:
+    dhcp_hosts._run_uci = _o_run_uci2
+    dhcp_hosts._make_backup = _o_make_backup2
+
+check('A 的写失败了（故障注入生效）',
+      bool(a_out) and a_out[0].startswith('err'), str(a_out))
+check('B 的写成功了', bool(b_out) and b_out[0] == 'ok', str(b_out))
+check('B 的记录还在（B 报了成功就必须真的在）',
+      "config host 'host_bbccddeeff01'" in cfg_text(),
+      '当前配置: %r' % cfg_text()[-200:])
+check('A 的记录不在（A 失败后已回滚）',
+      "config host 'host_aabbccddee24'" not in cfg_text(),
+      '当前配置: %r' % cfg_text()[-200:])
+
+
+# ══════════════════════════════════════════════════════════════
+# 11. 独立评审发现的缺陷（2026-11-12，逐条补判据）
+#
+#   11a 删除非 host 段必须被拒（B1：能删掉 LAN 的 DHCP 服务配置）
+#   11b 租期必须校验（I1：换行注入配置文件）
+#   11c 同 IP 绑第二个 MAC 必须被拒（M4）
+#   11d 回滚必须清掉 uci 的未提交变更（B2：回滚是假的）
+# ══════════════════════════════════════════════════════════════
+sec('11. 评审缺陷的判据')
+
+
+# ── 11a. 删除只允许 host 段（B1）────────────────────────────
+# ⚠️ OpenWrt 默认的 /etc/config/dhcp 里就有**有名字**的非 host 段：
+#    `config dhcp 'lan'` / `config odhcpd 'odhcpd'` ——
+#    它们同样满足 ASCII 标识 ⇒ 只查段名**形态**就能把
+#    **LAN 的 DHCP 服务配置**删掉 ⇒ dnsmasq 重载后路由器不再发 IPv4 地址。
+BASE_MIXED = BASE.replace(
+    "config dnsmasq\n",
+    "config odhcpd 'odhcpd'\n\toption maindhcp '0'\n\nconfig dnsmasq\n")
+reset_cfg(BASE_MIXED)
+before = cfg_bytes()
+for bad_section in ('lan', 'odhcpd'):
+    e = expect_error(dhcp_hosts.delete_dhcp_host, bad_section)
+    check('删非静态绑定段 %r ⇒ 被拒绝' % bad_section,
+          isinstance(e, dhcp_hosts.DhcpWriteError), str(e) if e else '没抛异常')
+    check('删非静态绑定段 %r ⇒ 错误信息说明了段类型' % bad_section,
+          isinstance(e, dhcp_hosts.DhcpWriteError) and '不是 DHCP 静态绑定' in str(e),
+          str(e) if e else '没抛异常')
+    check('删非静态绑定段 %r ⇒ 文件没变' % bad_section, cfg_bytes() == before)
+    check('删非静态绑定段 %r ⇒ 连备份都没生成' % bad_section, not backups(),
+          '备份目录里有: %s' % backups())
+
+# 反过来：真正的 host 段还是能删（别把功能一起堵死）
+reset_cfg(BASE_MIXED)
+dhcp_hosts.add_dhcp_host('能删的', 'aa:bb:cc:dd:ee:30', '192.168.100.50')
+res = dhcp_hosts.delete_dhcp_host('host_aabbccddee30')
+check('host 段仍然删得掉（别把功能一起堵死）',
+      res.get('section') == 'host_aabbccddee30', str(res))
+check('host 段删掉后文件里没有了',
+      "config host 'host_aabbccddee30'" not in cfg_text())
+
+
+# ── 11b. 租期必须校验（I1）─────────────────────────────────
+BAD_LEASES = [
+    ('带换行', "12h\noption evil '1'"),
+    ('带回车', '12h\r'),
+    ('带制表符', '12h\t'),
+    ('带单引号', "12h'"),
+    ('带双引号', '12h"'),
+    ('纯字母', 'abc'),
+    ('带空格', '12 h'),
+    ('带分号', '12h;rm -rf /'),
+    ('带逗号', '12h,1'),
+    ('超长', '1' * 40),
+]
+for label, lt in BAD_LEASES:
+    reset_cfg()
+    before = cfg_bytes()
+    e = expect_error(dhcp_hosts.add_dhcp_host, '租期设备',
+                     'aa:bb:cc:dd:ee:31', '192.168.100.51', lt)
+    check('租期%s ⇒ 被拒绝' % label, isinstance(e, dhcp_hosts.DhcpWriteError),
+          str(e) if e else '没抛异常')
+    check('租期%s ⇒ 文件一个字节都没动' % label, cfg_bytes() == before)
+    check('租期%s ⇒ 连备份都没生成' % label, not backups(),
+          '备份目录里有: %s' % backups())
+
+for good in ('12h', '30m', '2h30m', '1d', '3600s', 'infinite'):
+    reset_cfg()
+    res = dhcp_hosts.add_dhcp_host('租期设备', 'aa:bb:cc:dd:ee:32',
+                                   '192.168.100.52', good)
+    check('合法租期 %r ⇒ 写进去了' % good, res.get('leasetime') == good,
+          str(res.get('leasetime')))
+    check('合法租期 %r ⇒ 配置里是原值' % good,
+          "option leasetime '%s'" % good in cfg_text(),
+          '当前配置: %r' % cfg_text()[-160:])
+
+
+# ── 11c. 同 IP 绑第二个 MAC 必须被拒（M4）───────────────────
+reset_cfg()
+dhcp_hosts.add_dhcp_host('设备一', 'aa:bb:cc:dd:ee:33', '192.168.100.53')
+before = cfg_bytes()
+e = expect_error(dhcp_hosts.add_dhcp_host, '设备二', 'aa:bb:cc:dd:ee:34',
+                 '192.168.100.53')
+check('同 IP 绑第二个 MAC ⇒ 被拒绝', isinstance(e, dhcp_hosts.DhcpWriteError),
+      str(e) if e else '没抛异常')
+check('同 IP 绑第二个 MAC ⇒ 错误信息点明了是 IP 冲突',
+      isinstance(e, dhcp_hosts.DhcpWriteError) and 'IP' in str(e),
+      str(e) if e else '没抛异常')
+check('同 IP 绑第二个 MAC ⇒ 文件没变', cfg_bytes() == before)
+
+
+# ── 11d. 回滚必须清掉 uci 的未提交变更（B2）──────────────────
+# ⚠️ 这是「回滚是假的」那条缺陷的判据：
+#    uci 的 commit 失败时，**未提交的变更还留在 delta 里**（.232 实测：
+#    失败后 `uci changes dhcp` 仍列着那一段）。
+#    只还原文件是不够的 ⇒ 下一次 commit 会把「已回滚」的那条写回去。
+DELTA = os.environ['FAKE_UCI_DELTA']
+
+
+def _delta_left():
+    if not os.path.exists(DELTA):
+        return ''
+    with open(DELTA, encoding='utf-8') as f:
+        return f.read()
+
+
+reset_cfg()
+before = cfg_bytes()
+os.environ['FAKE_UCI_FAIL_COMMIT'] = '1'
+try:
+    e = expect_error(dhcp_hosts.add_dhcp_host, 'commit 失败设备',
+                     'aa:bb:cc:dd:ee:35', '192.168.100.54')
+finally:
+    os.environ.pop('FAKE_UCI_FAIL_COMMIT', None)
+check('commit 失败 ⇒ 被拒绝', isinstance(e, dhcp_hosts.DhcpWriteError),
+      str(e) if e else '没抛异常')
+check('commit 失败 ⇒ 文件恢复成写前内容', cfg_bytes() == before)
+check('commit 失败 ⇒ uci 的未提交变更已清空（回滚必须真的回滚）',
+      _delta_left() == '', 'delta 残留: %r' % _delta_left())
+
+# 决定性的一条：下一次成功的写**不能**把「已回滚」的那条带出来
+res = dhcp_hosts.add_dhcp_host('后来的设备', 'aa:bb:cc:dd:ee:36',
+                               '192.168.100.55')
+check('失败后再写 ⇒ 「已回滚」的那条没有复活',
+      "config host 'host_aabbccddee35'" not in cfg_text(),
+      '当前配置: %r' % cfg_text()[-300:])
+check('失败后再写 ⇒ 新的一条正常写入',
+      "config host 'host_aabbccddee36'" in cfg_text(),
+      '当前配置: %r' % cfg_text()[-300:])
+
+
+# ── 11e. 文件没被改过时不要报「回滚失败」（假警报）────────────
+#
+# ⚠️ 场景：磁盘满 / 只读文件系统 ⇒ `uci commit` 失败 ⇒ **文件根本没被改过**
+#    ⇒ 回滚其实什么都不用做。但旧实现无条件去「把备份拷回去」
+#    ⇒ 拷贝也失败（同一个只读文件系统！）⇒ 报「回滚失败，请手工从
+#    /etc/nftables/backup/... 恢复」⇒ **假警报**。
+#    ⇒ 用户照着做 = 用一份旧备份覆盖掉本来完好的配置。
+#
+# ⇒ 修法：文件已经和备份一模一样时，**跳过拷贝**（直接算回滚成功）。
+reset_cfg()
+before = cfg_bytes()
+# 把配置文件改成只读 ⇒ 假 uci 的 commit 写不进去 ⇒ commit 失败
+os.chmod(CFG, 0o444)
+try:
+    os.environ['FAKE_UCI_FAIL_COMMIT'] = '1'
+    try:
+        e = expect_error(dhcp_hosts.add_dhcp_host, '只读磁盘设备',
+                         'aa:bb:cc:dd:ee:38', '192.168.100.58')
+    finally:
+        os.environ.pop('FAKE_UCI_FAIL_COMMIT', None)
+finally:
+    os.chmod(CFG, 0o600)
+check('commit 失败（文件没被改过）⇒ 被拒绝',
+      isinstance(e, dhcp_hosts.DhcpWriteError), str(e) if e else '没抛异常')
+check('commit 失败（文件没被改过）⇒ 文件与写前一致', cfg_bytes() == before)
+check('commit 失败（文件没被改过）⇒ **不报**「回滚失败」（那是假警报）',
+      isinstance(e, dhcp_hosts.DhcpWriteError) and '回滚失败' not in str(e),
+      str(e) if e else '没抛异常')
+check('commit 失败（文件没被改过）⇒ rolled_back 仍为 True',
+      getattr(e, 'rolled_back', None) is True, str(e))
 
 # ── 收尾 ─────────────────────────────────────────────────────
 shutil.rmtree(SANDBOX, ignore_errors=True)

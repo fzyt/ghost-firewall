@@ -825,11 +825,31 @@ def socket_inet_ntoa(hex_addr, little=False):
     return '%d.%d.%d.%d' % (b[0], b[1], b[2], b[3])
 
 
-def socket_inet_ntop6(hex_addr):
-    """把 /sys 里的十六进制 IPv6 转成压缩写法。"""
+def socket_inet_ntop6(hex_addr, word_swap=False):
+    """把十六进制 IPv6 转成压缩写法。
+
+    ⚠️ **两种字节序，不能混用**（.232 实测 2026-11-12）：
+
+    | 来源 | 字节序 | 用法 |
+    |---|---|---|
+    | `/proc/net/if_inet6` | **网络序**（逐字节原样） | 默认 |
+    | `/proc/net/tcp6` | **每 4 字节一组是主机序** | `word_swap=True` |
+
+    `/proc/net/tcp6` 的内核代码是
+    `seq_printf("%08X%08X%08X%08X", s6_addr32[0..3])` ——
+    每个 `s6_addr32[i]` 是**主机序**的 32 位整数 ⇒ x86（小端）上
+    每一组 4 字节都要**反转**才能还原成网络序的字节。
+
+    .232 实测：dnsmasq 监听 `::1:53`，tcp6 里打印成
+    `00000000000000000000000001000000` ⇒ 不反转会解析成 `::100:0`
+    ⇒ 面板上显示一个根本不存在的地址。
+    """
     if len(hex_addr) != 32:
         raise ValueError('bad hex addr')
     b = bytes.fromhex(hex_addr)
+    if word_swap:
+        # 每 4 字节一组反转（内核按主机序打印 s6_addr32[]）
+        b = b''.join(b[i:i + 4][::-1] for i in range(0, 16, 4))
     import socket
     return socket.inet_ntop(socket.AF_INET6, b)
 
@@ -1109,7 +1129,9 @@ def collect_connections():
                     # ⚠️ /proc/net/tcp 的 IPv4 是**小端**字节序
                     ip = socket_inet_ntoa(hex_ip, little=True)
                 else:
-                    ip = socket_inet_ntop6(hex_ip)
+                    # ⚠️ tcp6 是**每 4 字节一组主机序** ⇒ 必须反转
+                    #    （.232 实测：::1 打印成 ...01000000）
+                    ip = socket_inet_ntop6(hex_ip, word_swap=True)
             except (ValueError, OSError):
                 continue
             if not ip or ip.startswith('0.') or ip == '::':
@@ -1118,7 +1140,10 @@ def collect_connections():
             prev = out.get(key)
             if prev is None or port < prev['port']:
                 out[key] = {'ip': ip, 'port': port, 'family': family}
-    return [out[k] for k in sorted(out)]
+    # ⚠️ 排序必须和 ARP 表用同一套（`_ip_sort_key`）——
+    #    字符串排序会让 "10.0.0.9" 排在 "10.0.0.10" 前面，
+    #    同一页里两张表的顺序对不上，看着像数据错乱。
+    return sorted(out.values(), key=lambda r: _ip_sort_key(r['ip']))
 
 
 def collect_neighbors():

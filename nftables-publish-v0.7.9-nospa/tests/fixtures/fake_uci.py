@@ -291,12 +291,40 @@ def main(argv):
 
     if cmd == 'commit':
         if os.environ.get('FAKE_UCI_FAIL_COMMIT') == '1':
+            # ⚠️ 失败时**不清 delta** —— 真 uci 就是这样（.232 实测 2026-11-12：
+            #    commit 失败后 `uci changes dhcp` 仍然列着那一段）。
+            #    这条语义是「回滚必须清 delta」那条判据的地基。
             die('uci: I/O error', 1)
         sections, err = state()
         if err:
             die(err, 1)
         dump(sections)
         clear_delta()
+        return 0
+
+    if cmd == 'revert':
+        # ⚠️ 丢弃**未提交**的变更（.232 实测 2026-11-12：
+        #    `uci revert dhcp` 之后 `uci changes dhcp` 变空，
+        #    而且**已提交**的内容不受影响 —— 文件仍要靠备份还原）。
+        #    对**空** delta 调用也是 rc=0（.232 实测）。
+        if rest and rest[0] != PKG:
+            die('uci: Entry not found')
+        clear_delta()
+        return 0
+
+    if cmd == 'changes':
+        # 列出未提交的变更（真 uci 的格式：pkg.sec='type' 等）
+        ops = load_delta()
+        lines = []
+        for op in ops:
+            if op.get('op') == 'newsec':
+                lines.append("%s.%s='%s'" % (PKG, op['name'], op['type']))
+            elif op.get('op') == 'setopt':
+                lines.append("%s.%s.%s='%s'" % (PKG, op['name'], op['key'],
+                                               op['value']))
+            elif op.get('op') == 'del':
+                lines.append("%s.%s='del'" % (PKG, op['name']))
+        sys.stdout.write('\n'.join(lines) + ('\n' if lines else ''))
         return 0
 
     # ── 读类子命令：看的是「文件 + delta」的合并结果 ───────────

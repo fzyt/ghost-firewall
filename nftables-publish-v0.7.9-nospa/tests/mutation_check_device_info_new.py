@@ -194,6 +194,23 @@ MUTATIONS = [
     ('C13 ARP 的列数下限从 6 提到 7（整行被跳过，表全空）',
      [('        parts = ln.split()\n        if len(parts) < 6:',
        '        parts = ln.split()\n        if len(parts) < 7:')]),
+    # ── 七、IPv6 对端字节序（2026-11-12 新增）─────────────────
+    #
+    # ⚠️ /proc/net/tcp6 的内核打印是
+    #    `seq_printf("%08X%08X%08X%08X", s6_addr32[0..3])`
+    #    ⇒ 每组 4 字节是**主机序**（x86 小端）⇒ 必须每组反转。
+    #    不反转的话 ::1 会显示成 ::100:0（.232 实测过内核的输出）。
+    ('C14 tcp6 不按每 4 字节组反转（::1 显示成 ::100:0）',
+     [('                    ip = socket_inet_ntop6(hex_ip, word_swap=True)',
+       '                    ip = socket_inet_ntop6(hex_ip)')]),
+
+    # ── 八、连接表排序（2026-11-12 新增）─────────────────────
+    #
+    # ⚠️ 字符串排序会让 "10.0.0.10" 排在 "10.0.0.9" 前面
+    #    ⇒ 与 ARP 表（按数值）不一致 ⇒ 同一页里两张表顺序对不上。
+    ('C15 连接表按字符串排序（10.0.0.10 排到 10.0.0.9 前面）',
+     [("    return sorted(out.values(), key=lambda r: _ip_sort_key(r['ip']))",
+       "    return sorted(out.values(), key=lambda r: r['ip'])")]),
 ]
 
 

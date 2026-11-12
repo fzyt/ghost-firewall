@@ -319,6 +319,33 @@ def main():
     check('缺私钥时 cert_ready 为 False',
           (p10 or {}).get('cert_ready') is False)
 
+    # ══════════════════════════════════════════════════════════
+    sec('第 8 组：DHCP 绑定接口的请求体校验')
+    # ⚠️ body 是数组/字符串时，`body.get(...)` 会抛 AttributeError
+    #    ⇒ 变成 500（服务端错误）。但这是**客户端发错了** ⇒ 应该是 400。
+    # ⚠️ 这几条**不会碰任何文件** —— 请求体在进模块之前就被拒了。
+    for label, payload in (('数组', ['a', 'b']),
+                            ('字符串', '不是对象'),
+                            ('数字', 123),
+                            ('null', None)):
+        r = client.post('/api/system/dhcp-hosts', json=payload)
+        check('POST body 是%s ⇒ 返回 400（不是 500）' % label,
+              r.status_code == 400, '状态码 %d' % r.status_code)
+        b = r.get_json() or {}
+        check('POST body 是%s ⇒ code=BAD_REQUEST' % label,
+              b.get('code') == 'BAD_REQUEST', '实际 %r' % b.get('code'))
+        check('POST body 是%s ⇒ 不把异常原文回显给请求方' % label,
+              'Traceback' not in json.dumps(b, ensure_ascii=False))
+
+    # 未登录时同样不能因为 body 形状而泄露别的信息
+    c2 = appmod.app.test_client()
+    r = c2.post('/api/system/dhcp-hosts', json=['a'])
+    check('未登录 + 非法 body ⇒ 仍然是 401（认证优先）',
+          r.status_code == 401, '状态码 %d' % r.status_code)
+    r = c2.delete('/api/system/dhcp-hosts/host_aabbccddee01')
+    check('未登录删除绑定 ⇒ 401（删除能改路由器配置，门控不能漏）',
+          r.status_code == 401, '状态码 %d' % r.status_code)
+
     print('\n' + '=' * 60)
     print('  通过 %d / 失败 %d' % (len(PASS), len(FAIL)))
     if FAIL:

@@ -14352,7 +14352,16 @@ def system_dhcp_hosts_add():
     """新增一条 DHCP 静态绑定。"""
     if not _is_authenticated():
         return jsonify({'success': False, 'code': 'AUTH_REQUIRED', 'message': '未登录'}), 401
-    body = request.get_json(silent=True) or {}
+    body = request.get_json(silent=True)
+    # ⚠️ 必须是**对象**。`request.get_json()` 在 body 是数组/字符串时
+    #    会返回 list/str ⇒ 后面 `body.get(...)` 抛 AttributeError
+    #    ⇒ 变成 500（服务端错误），而这明明是客户端发错了 ⇒ 应该是 400。
+    if not isinstance(body, dict):
+        return jsonify({
+            'success': False,
+            'code': 'BAD_REQUEST',
+            'message': '请求体必须是 JSON 对象（含 name / mac / ip 字段）',
+        }), 400
     name = body.get('name', '')
     mac = body.get('mac', '')
     ip = body.get('ip', '')

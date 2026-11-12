@@ -140,76 +140,32 @@ def apply_edits(src, edits):
 MUTATIONS = [
     # ── 一、安全网 ────────────────────────────────────────────
     ('W1  写前不备份（出问题没得恢复）',
-     [('    backup = _make_backup(\'add\')\n',
-       '    backup = os.path.join(BACKUP_DIR, \'no-backup-was-made\')\n')]),
+     [('        backup = _make_backup(\'add\')\n',
+       '        backup = os.path.join(BACKUP_DIR, \'no-backup-was-made\')\n')]),
 
     ('W2  写坏了不回滚（坏配置留在设备上）',
-     [('        rolled = _restore(backup)\n'
-       '        if not rolled:\n'
-       '            raise DhcpWriteError(\'%s；**且回滚失败**，请手工从 %s 恢复\'\n'
-       '                                 % (e, backup), rolled_back=False)\n'
-       '        raise DhcpWriteError(\'%s（已回滚）\' % e, rolled_back=True)\n'
-       '\n'
-       '    reload_result = reload_dnsmasq()\n'
-       '    return {\n'
-       '        \'section\': section,\n',
-       '        rolled = True\n'
-       '        if not rolled:\n'
-       '            raise DhcpWriteError(\'%s；**且回滚失败**，请手工从 %s 恢复\'\n'
-       '                                 % (e, backup), rolled_back=False)\n'
-       '        raise DhcpWriteError(\'%s（已回滚）\' % e, rolled_back=True)\n'
-       '\n'
-       '    reload_result = reload_dnsmasq()\n'
-       '    return {\n'
-       '        \'section\': section,\n')]),
+     # ⚠️ 直接改 `_restore` 里「把备份拷回去」那一步。
+     #   原来这条挂在 add/delete 的回滚块上 —— 两处一模一样 ⇒ 锚点不唯一。
+     [('        shutil.copy2(backup, DHCP_CONFIG_PATH)\n'
+       '        os.chmod(DHCP_CONFIG_PATH, 0o600)\n'
+       '        return True',
+       '        os.chmod(DHCP_CONFIG_PATH, 0o600)\n'
+       '        return True')]),
 
     ('W3  回滚失败不上报（用户以为恢复了，其实没恢复）',
-     # ⚠️ 锚点必须**唯一**：add_dhcp_host 与 delete_dhcp_host 的回滚块
-     #   长得一模一样 ⇒ 只能靠后面「返回结构不同」来区分。
-     [('            raise DhcpWriteError(\'%s；**且回滚失败**，请手工从 %s 恢复\'\n'
-       '                                 % (e, backup), rolled_back=False)\n'
-       '        raise DhcpWriteError(\'%s（已回滚）\' % e, rolled_back=True)\n'
-       '\n'
-       '    reload_result = reload_dnsmasq()\n'
-       '    return {\n'
-       '        \'section\': section,\n'
-       '        \'name\': name,',
-       '            raise DhcpWriteError(\'%s；**且回滚失败**，请手工从 %s 恢复\'\n'
-       '                                 % (e, backup), rolled_back=True)\n'
-       '        raise DhcpWriteError(\'%s（已回滚）\' % e, rolled_back=True)\n'
-       '\n'
-       '    reload_result = reload_dnsmasq()\n'
-       '    return {\n'
-       '        \'section\': section,\n'
-       '        \'name\': name,')]),
+     [('    def __init__(self, message, rolled_back=True):\n'
+       '        super().__init__(message)\n'
+       '        self.rolled_back = rolled_back',
+       '    def __init__(self, message, rolled_back=True):\n'
+       '        super().__init__(message)\n'
+       '        self.rolled_back = True')]),
 
     ('W4  写完不校验语法（坏配置直接生效）',
-     [('        ok, detail = _check_syntax()\n'
-       '        if not ok:\n'
-       '            raise DhcpWriteError(\'改完的配置解析不了（已回滚）: %s\' % detail)\n'
-       '    except DhcpWriteError as e:\n'
-       '        rolled = _restore(backup)\n'
-       '        if not rolled:\n'
-       '            raise DhcpWriteError(\'%s；**且回滚失败**，请手工从 %s 恢复\'\n'
-       '                                 % (e, backup), rolled_back=False)\n'
-       '        raise DhcpWriteError(\'%s（已回滚）\' % e, rolled_back=True)\n'
-       '\n'
-       '    reload_result = reload_dnsmasq()\n'
-       '    return {\n'
-       '        \'section\': section,\n',
-       '        ok, detail = _check_syntax()\n'
-       '        if not ok:\n'
-       '            pass\n'
-       '    except DhcpWriteError as e:\n'
-       '        rolled = _restore(backup)\n'
-       '        if not rolled:\n'
-       '            raise DhcpWriteError(\'%s；**且回滚失败**，请手工从 %s 恢复\'\n'
-       '                                 % (e, backup), rolled_back=False)\n'
-       '        raise DhcpWriteError(\'%s（已回滚）\' % e, rolled_back=True)\n'
-       '\n'
-       '    reload_result = reload_dnsmasq()\n'
-       '    return {\n'
-       '        \'section\': section,\n')]),
+     [('    rc, out = _run_uci([\'show\', \'dhcp\'])\n'
+       '    if rc != 0:\n'
+       '        return False, out.strip()\n'
+       '    return True, \'\'',
+       '    return True, \'\'')]),
 
     ('W5  备份文件不收紧权限（配置全设备可读）',
      [('        shutil.copy2(DHCP_CONFIG_PATH, dst)\n'
@@ -253,36 +209,52 @@ MUTATIONS = [
        '    if False:\n'
        '        return False, \'设备名太长（最多 63 个字符）\'')]),
 
+    ('W13 租期不校验（换行能进配置文件）',
+     [('    ok, why = _validate_leasetime(leasetime)',
+       '    ok, why = (True, \'\')')]),
+
     # ── 三、查重与重载 ────────────────────────────────────────
-    ('W13 同 MAC 不拦（dnsmasq 行为未定义）',
-     [('    dup = _host_with_same_mac(mac)\n'
-       '    if dup:\n'
-       '        raise DhcpWriteError(\'MAC %s 已经绑在「%s」上了，不能绑两次\' % (mac, dup))',
-       '    dup = None\n'
-       '    if dup:\n'
-       '        raise DhcpWriteError(\'MAC %s 已经绑在「%s」上了，不能绑两次\' % (mac, dup))')]),
+    ('W14 同 MAC 不拦（dnsmasq 行为未定义）',
+     [('        dup = _host_with_same(\'mac\', mac)\n'
+       '        if dup:\n'
+       '            raise DhcpWriteError(\'MAC %s 已经绑在「%s」上了，不能绑两次\' % (mac, dup))',
+       '        dup = None\n'
+       '        if dup:\n'
+       '            raise DhcpWriteError(\'MAC %s 已经绑在「%s」上了，不能绑两次\' % (mac, dup))')]),
 
-    ('W14 重载失败当写失败（文件其实是对的，用户被误导）',
-     [('    reload_result = reload_dnsmasq()\n'
-       '    return {\n'
-       '        \'section\': section,\n'
-       '        \'name\': name,',
-       '    reload_result = reload_dnsmasq()\n'
-       '    if not reload_result.get(\'ok\'):\n'
-       '        raise DhcpWriteError(reload_result.get(\'message\', \'重载失败\'))\n'
-       '    return {\n'
-       '        \'section\': section,\n'
-       '        \'name\': name,')]),
+    ('W15 同 IP 不拦（同一个 IP 只能绑一个 MAC）',
+     [('        dup_ip = _host_with_same(\'ip\', ip)\n'
+       '        if dup_ip:\n'
+       '            raise DhcpWriteError(\'IP %s 已经绑在「%s」上了，不能绑两次\' % (ip, dup_ip))',
+       '        dup_ip = None\n'
+       '        if dup_ip:\n'
+       '            raise DhcpWriteError(\'IP %s 已经绑在「%s」上了，不能绑两次\' % (ip, dup_ip))')]),
 
-    ('W15 MAC 查重不区分大小写（手写配置里 MAC 可能带大写）',
-     [('            if cur_mac.lower() == mac.lower() and cur_section != exclude_section:',
-       '            if cur_mac == mac and cur_section != exclude_section:')]),
+    ('W16 重载失败当写失败（文件其实是对的，用户被误导）',
+     [('    if r.returncode != 0:\n'
+       '        return {\'ok\': False,\n'
+       '                \'message\': \'重载 dnsmasq 返回非零（绑定已写入，可能未生效）\'}',
+       '    if r.returncode != 0:\n'
+       '        raise DhcpWriteError(\'重载 dnsmasq 返回非零\')')]),
 
-    ('W16 备份目录建不出来也继续写（没有备份就不许改）',
-     # ⚠️ 必须**同时**放开两处：目录建不出来 与 拷贝失败。
-     #   只放开拷贝失败的话，makedirs 早就抛了 ⇒ 行为完全不变
-     #   ⇒ 那是等价变异，测不出任何东西。
-     [('    try:\n'
+    ('W17 MAC 查重不区分大小写（手写配置里 MAC 可能带大写）',
+     [('            if cur_val.lower() == value.lower() and cur_section != exclude_section:',
+       '            if cur_val == value and cur_section != exclude_section:')]),
+
+    ('W18 备份目录建不出来也继续写（没有备份就不许改）',
+     # ⚠️ 必须**同时**放开三处（2026-11-12 实测踩过）：
+     #   · 写锁的 makedirs（不放开的话，锁先抛 ⇒ 行为完全不变）
+     #   · 写锁的锁文件路径（否则锁文件也建不出来，一样抛）
+     #   · `_make_backup` 的建目录 与 拷贝
+     #   只放开一处 ⇒ 等价变异，测不出任何东西。
+     [('    lock_path = os.path.join(BACKUP_DIR, _LOCK_FILE_NAME)\n'
+       '    try:\n'
+       '        os.makedirs(BACKUP_DIR, mode=0o700, exist_ok=True)\n'
+       '        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)',
+       '    lock_path = \'/tmp/dhcp-mutation.lock\'\n'
+       '    try:\n'
+       '        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)'),
+      ('    try:\n'
        '        os.makedirs(BACKUP_DIR, mode=0o700, exist_ok=True)\n'
        '    except OSError as e:\n'
        '        raise DhcpWriteError(\'备份目录建不出来: %s\' % e)',
@@ -300,6 +272,52 @@ MUTATIONS = [
        '        os.chmod(dst, 0o600)\n'
        '    except OSError as e:\n'
        '        pass')]),
+
+    # ── 四、并发写保护（2026-11-12 新增）─────────────────────
+    ('W19 写操作不加锁（两个写请求会丢写 / 互相覆盖备份）',
+     # ⚠️ 把真正的加锁换成 LOCK_UN（对没上锁的 fd 是空操作）⇒
+     #    代码照样跑，但**锁从头到尾没被持有**。
+     [('                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)',
+       '                fcntl.flock(lock_fd, fcntl.LOCK_UN)')]),
+
+    ('W20 备份名不唯一（同一秒的两个写会互相覆盖备份）',
+     [('        BACKUP_DIR, \'dhcp.%s.%d.%d.%s\' % (ts, os.getpid(), seq, tag))',
+       '        BACKUP_DIR, \'dhcp.%s.%d.%s\' % (ts, os.getpid(), tag))')]),
+
+    ('W21 备份在锁外做（备份的是哪一版就没保证了）',
+     # ⚠️ 把 `_make_backup` 挪到 `with` 之前 —— 与 app.py 的 P1-30 同款错误。
+     [('    with _write_lock():\n'
+       '        if _section_exists(section):',
+       '    backup = _make_backup(\'add\')\n'
+       '    with _write_lock():\n'
+       '        if _section_exists(section):'),
+      ('        backup = _make_backup(\'add\')\n'
+       '        try:\n'
+       '            rc, out = _run_uci([\'set\', \'dhcp.%s=host\' % section])',
+       '        try:\n'
+       '            rc, out = _run_uci([\'set\', \'dhcp.%s=host\' % section])')]),
+
+    ('W22 回滚不清 uci 的未提交变更（回滚是假的）',
+     # ⚠️ .232 实测：commit 失败后 delta 还在 ⇒ 下一次 commit 会把
+     #    「已回滚」的那条写回去 ⇒ 「已回滚」这句话就是假的。
+     [('    rc, out = _run_uci([\'revert\', \'dhcp\'])\n'
+       '    return rc == 0, out.strip()',
+       '    return True, \'\'')]),
+
+    ('W23 删除不查段类型（能删掉 LAN 的 DHCP 服务配置）',
+     [('        if stype != \'host\':',
+       '        if False:')]),
+
+    ('W24 文件没被改过也要拿备份去覆盖（只读磁盘上报假警报）',
+     # ⚠️ 回滚时若文件**根本没被改过**（commit 失败时就是这么），
+     #   就不应该再去拿备份去覆盖 —— 只读文件系统上那次拷贝必然失败
+     #   ⇒ 报「回滚失败」是假警报 ⇒ 用户照着做 = 用旧备份覆盖好配置。
+     [('    try:\n'
+       '        if _same_file(backup, DHCP_CONFIG_PATH):\n'
+       '            return True\n'
+       '        shutil.copy2(backup, DHCP_CONFIG_PATH)',
+       '    try:\n'
+       '        shutil.copy2(backup, DHCP_CONFIG_PATH)')]),
 ]
 
 
