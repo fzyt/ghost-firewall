@@ -37,6 +37,13 @@ AUTH_INITD_SCRIPT="/etc/init.d/nftables-web-auth"
 UHTTPd_CONF="/etc/config/uhttpd"
 NGINX_UCI_CONF="/etc/config/nginx"
 LOG_FILE="/var/log/nftables-web-setup.log"
+# 接口名钉定的四个产物（钉名脚本 + 映射表生成器 + init 兜底 + 映射表）。
+# 作用：按 MAC 把网卡钉成固定名字，治「重启后 ethN 对应的物理口会漂」。
+# 详见 setup/iface-pin.sh 的注释与 stage_iface_pin_done。
+IFACE_PIN_SCRIPT="${INSTALL_DIR}/setup/iface-pin.sh"
+IFACE_PIN_MAPGEN="${INSTALL_DIR}/setup/iface-pin-map.sh"
+IFACE_PIN_INITD="/etc/init.d/nftables-iface-pin"
+IFACE_PIN_MAP="/etc/nftables/iface-pin.json"
 GITHUB_REPO="fzyt/ghost-firewall"
 ACME_EMAIL="admin@example.com"
 
@@ -1071,6 +1078,25 @@ stage_service_done() {
 stage_nftables_done() {
     [ -f "$NFTABLES_CONF" ] || return 1
     grep -q "nftables-web-v2 引导配置" "$NFTABLES_CONF" 2>/dev/null || return 1
+    return 0
+}
+
+# 接口名钉定：钉名脚本 + 映射表生成器 + init 兜底脚本 + 映射表都在位。
+#
+# 为什么需要（2026-11-15 在 .232 实测）：
+#   Linux 给网卡编号（eth0/eth1/...）的规则是**按驱动上报设备的顺序**，
+#   不是按 PCI 槽位，也不是按 MAC。.232 上第三张 vNIC 是开机 5.9 天后
+#   才被内核 enable 的（dmesg: "virtio-pci 0000:06:14.0: enabling device"），
+#   于是它拿到 eth2 ⇒ 下次开机的编号顺序可能变。
+#   而 /etc/config/network 里绑的是**名字**（list ports 'eth0'），
+#   名字一漂，配置就指向了错误的物理口。
+#
+# 判据要求四样都在位：钉名脚本、映射表生成器、init 兜底、映射表。
+stage_iface_pin_done() {
+    [ -f "$IFACE_PIN_SCRIPT" ] || return 1
+    [ -f "$IFACE_PIN_MAPGEN" ] || return 1
+    [ -f "$IFACE_PIN_INITD" ] || return 1
+    [ -f "$IFACE_PIN_MAP" ] || return 1
     return 0
 }
 
@@ -2441,6 +2467,105 @@ relocate_initd_backups() {
 }
 
 # ============================================================
+# 8.5 接口名钉定（按 MAC 把网卡钉成固定名字）
+# ============================================================
+#
+# 治的是「重启后 ethN 对应的物理口会漂」：
+#   Linux 按**驱动上报顺序**给网卡编号，不是按 PCI 槽位也不是按 MAC。
+#   .232 实测：第三张 vNIC 开机 5.9 天后才被内核 enable，于是拿到 eth2；
+#   下次开机顺序变了，eth0/eth1/eth2 就重新洗牌。
+#   而 /etc/config/network 里绑的是**名字** ⇒ 名字一漂，配置就指错口了。
+#
+# 做法：记一张「MAC → 固定名」表，开机时按 MAC 找回接口并改名。
+#   固定名 = **首次见到时的名字**，也就是当前 /etc/config/network 里绑的那个 ——
+#   这样不用改任何现有配置，只是把「名字」和「物理口」的绑定固定下来。
+install_iface_pin() {
+    info "========== 接口名钉定 =========="
+
+    if [ ! -f "$IFACE_PIN_SCRIPT" ]; then
+        warn "⚠ 找不到 ${IFACE_PIN_SCRIPT}，跳过接口名钉定"
+        return 0
+    fi
+    if [ ! -f "$IFACE_PIN_MAPGEN" ]; then
+        warn "⚠ 找不到 ${IFACE_PIN_MAPGEN}，跳过接口名钉定"
+        return 0
+    fi
+    chmod 755 "$IFACE_PIN_SCRIPT" "$IFACE_PIN_MAPGEN" 2>/dev/null || true
+
+    # ── 1. 生成/刷新映射表：MAC → 固定名 ──
+    #
+    # 固定名 = 每块卡**第一次被看到时**的名字。
+    # 好处：现有 /etc/config/network 一个字都不用改 ——
+    #       配置里绑的就是这些名字，钉住之后名字不再漂，配置就一直指对卡。
+    #
+    # ⚠ 刷新必须在「名字还正确」的时刻做（见 setup/iface-pin-map.sh 的注释）：
+    #   漂移已经发生之后再刷新 ⇒ 会把错名字固化成"正确名字"，比不刷更糟。
+    mkdir -p "$(dirname "$IFACE_PIN_MAP")" 2>/dev/null || true
+    chmod 750 "$(dirname "$IFACE_PIN_MAP")" 2>/dev/null || true
+    if ! "$IFACE_PIN_MAPGEN" "$IFACE_PIN_MAP"; then
+        warn "⚠ 映射表生成失败，接口名钉定降级为不生效"
+    fi
+
+    # ── 2. 装 init 兜底（START=15，卡在 boot S10 与 network S20 之间）──
+    #
+    # 为什么必须 START=15：
+    #   netifd 读 /etc/config/network 时，里面绑的 'eth0'/'eth1' 必须已经
+    #   对应到正确的物理卡 ⇒ 钉名必须发生在 netifd 起来**之前**。
+    #   boot(S10) 之后网卡已出现，network(S20) 之前 netifd 还没起
+    #   ⇒ 那时系统里没有任何桥，改名绝对安全。
+    #   运行期改名会拆桥 ⇒ 桥变空桥 ⇒ 桥上的 IP 掉 ⇒ 整机断网（.232 实测）。
+    #
+    # 为什么挂 procd 的 reload 触发器：
+    #   用户在 LuCI 里往 br-lan 加/减成员口 ⇒ /etc/config/network 变了
+    #   ⇒ 新加入的口必须立刻记进映射表，否则下次重启它照样漂。
+    #   procd_add_reload_trigger "network" 就是为此挂的
+    #   （/etc/init.d/network 自己也是这么用的）。
+    #
+    # ⚠ 为什么**不**用 hotplug 钩子（2026-11-15 实测后改的设计）：
+    #   hotplug 的 add 事件是**逐个网卡**触发的 ⇒ 网卡还没全部出现时
+    #   就开始改名 ⇒ 一半网卡在、一半不在，改名结果不确定。
+    #   init 脚本在 S15 跑，那时所有网卡都已出现 ⇒ 结果确定。
+    cat > "$IFACE_PIN_INITD" <<'INITD_EOF'
+#!/bin/sh /etc/rc.common
+# 接口名钉定 —— 开机时按 MAC 把网卡改名成固定名字。
+#
+# 必须在 network(S20) **之前**跑完：netifd 读 /etc/config/network 时，
+# 里面绑的 'eth0'/'eth1' 必须已经对应到正确的物理卡。
+#
+# 用 START=15：晚于 boot(S10，网卡已出现)，早于 network(S20)。
+# 那时 netifd 还没起 ⇒ 系统里没有任何桥 ⇒ 改名绝对安全。
+# 运行期改名会拆桥 ⇒ 桥变空桥 ⇒ 桥上的 IP 掉 ⇒ 整机断网（.232 实测）。
+USE_PROCD=1
+START=15
+
+start_service() {
+    /opt/nftables-web-v2/setup/iface-pin.sh /etc/nftables/iface-pin.json
+}
+
+reload_service() {
+    /opt/nftables-web-v2/setup/iface-pin-map.sh /etc/nftables/iface-pin.json
+}
+
+service_triggers() {
+    # /etc/config/network 一变（用户改了 LAN 成员口）就刷新映射表。
+    # ⚠ 只刷新映射表，**不**改名 —— 运行期改名会拆桥。
+    procd_add_reload_trigger "network"
+}
+INITD_EOF
+    chmod 755 "$IFACE_PIN_INITD" 2>/dev/null || true
+    mkdir -p /etc/rc.d 2>/dev/null || true
+    ln -sf "$IFACE_PIN_INITD" /etc/rc.d/S15nftables-iface-pin 2>/dev/null || true
+    # procd 服务要先 enable，注册时才会挂上 reload 触发器
+    /etc/init.d/nftables-iface-pin enable 2>/dev/null || true
+
+    ok "接口名钉定已就位"
+    ok "  映射表: ${IFACE_PIN_MAP}"
+    ok "  钉名脚本: ${IFACE_PIN_SCRIPT}"
+    ok "  init 兜底: ${IFACE_PIN_INITD} (S15)"
+    return 0
+}
+
+# ============================================================
 # 8. nftables 基础配置（自动检测接口）
 # ============================================================
 setup_nftables() {
@@ -2746,6 +2871,11 @@ main() {
     regen_ddns_script
     run_stage "配置初始化"       stage_config_done  init_config
     run_stage "ubus 服务"        stage_ubus_done    ensure_ubus
+    # 接口名钉定：必须排在「项目文件部署」之后（脚本在位）、
+    # 「服务注册」之前（不影响服务启动）。
+    # 这一阶段**只做安装不改网络** —— 真正的改名发生在下次开机时
+    # （init S15，卡在 netifd 起来之前），不会当场打断现有连接。
+    run_stage "接口名钉定"       stage_iface_pin_done install_iface_pin
     run_stage "服务注册与启动"   stage_service_done setup_service
     # 遗留备份的归位**不进 run_stage**：
     #   它必须**每次都跑** —— 「已完成就跳过」对它没有意义，
