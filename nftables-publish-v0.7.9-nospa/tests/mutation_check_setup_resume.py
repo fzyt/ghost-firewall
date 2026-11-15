@@ -166,9 +166,17 @@ MUTATIONS = [
        '    wait "$pid" 2>/dev/null || true\n    return 0')]),
 
     # ── 换源 ─────────────────────────────────────────────────
+    # ⚠️ 锚点 2026-11-16 修：原来写的是**旧版**单行 sed
+    #   （`sed "s#://[^/]*/#://${host}/#" "$repo" > "$tmp" ...`），
+    #   但 .120 实测后 switch_apk_mirror 已改成两行、带 openwrt/releases/ 路径处理
+    #   ⇒ 锚点在源码里 0 次命中 ⇒ 这条变异一直被「跳过」而不是「被捕获」
+    #   ⇒ 脚本 rc=1（锚点未命中必须当失败）⇒ 全量回归一直不是全绿。
+    #   ⇒ 这里把锚点更新成当前源码的确切文本（仍是唯一命中）。
     ('M15 switch_apk_mirror 把整个 URL 都换掉（路径也变了 = 索引全空）',
-     [('    sed "s#://[^/]*/#://${host}/#" "$repo" > "$tmp" 2>/dev/null || return 1',
-       '    sed "s#.*#https://${host}/#g" "$repo" > "$tmp" 2>/dev/null || return 1')]),
+     [('    sed "s#^\\(https\\{0,1\\}://\\)[^/]*/\\(openwrt/\\)\\?releases/#\\1${host}/openwrt/releases/#" \\\n'
+       '        "$repo" > "$tmp" 2>/dev/null || return 1',
+       '    sed "s#.*#https://${host}/#g" \\\n'
+       '        "$repo" > "$tmp" 2>/dev/null || return 1')]),
 
     ('M16 switch_apk_mirror 不留 .orig 备份（失败后还原不回去）',
      [('    if [ ! -f "${repo}.orig" ]; then\n        cp "$repo" "${repo}.orig" 2>/dev/null || true\n    fi',
