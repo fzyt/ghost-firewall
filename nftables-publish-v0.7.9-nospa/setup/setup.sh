@@ -521,11 +521,20 @@ run_with_timeout() {
 #   而 apk update / apk add 走的正是大文件路径。
 #   切到国内镜像后实测：apk update 3 秒完成，可见包数 7654 → 11252。
 #
-# 切换方式：**只替换 URL 里的主机部分**，路径原样保留：
-#   https://mirror.nju.edu.cn/openwrt/releases/25.12.5/...
-#   https://mirrors.ustc.edu.cn/openwrt/releases/25.12.5/...
-# 这样不用知道 OpenWrt 的仓库布局（每个版本/架构的路径都不一样），
-# 也不用解析 uci 的 distfeeds —— 只换 host，路径照旧。
+# 切换方式：换主机，**并把路径前缀 /releases/ 改成 /openwrt/releases/**：
+#   官方   https://downloads.openwrt.org/releases/25.12.5/...
+#   镜像   https://mirrors.ustc.edu.cn/openwrt/releases/25.12.5/...
+# 国内镜像的 OpenWrt 仓库挂在 /openwrt/ 下面（不带 s），和官方源差一层。
+#
+# ⚠️ 2026-11-15 在 .120（OpenWrt 25.12.5）实测踩到：原实现只换 host、
+#   路径原样保留，于是切过去的 URL 变成
+#       https://mirrors.ustc.edu.cn/releases/25.12.5/...
+#   三个国内镜像上**全是 404**（实测 curl 三个 host × 两种前缀都验过）：
+#       404  https://mirrors.ustc.edu.cn/releases/25.12.5/packages/x86_64/base/packages.adb
+#       200  https://mirrors.ustc.edu.cn/openwrt/releases/25.12.5/packages/x86_64/base/packages.adb
+#   ⇒ 切镜像这个「救急」动作反而把能用的官方源弄坏了（apk update 报
+#   "unexpected end of file"，因为 404 的响应体不是索引文件）。
+#   症状和「官方源被截断」一模一样，但根因完全不同 —— 排查时极易误判。
 #
 # 顺序按实测速度排：中科大（.230 上 apk update 3 秒）→ 南大（.232 设备自带）
 # → 清华。官方源留作最后手段（它在本网络会卡死，不该排在前面）。
@@ -554,9 +563,19 @@ switch_apk_mirror() {
         cp "$repo" "${repo}.orig" 2>/dev/null || true
     fi
     local tmp="${repo}.nftweb.tmp"
-    # 只替换每行里第一个 "://<host>/" 的主机部分。
+    # 一条 sed 搞定：换主机 + 把路径前缀统一成 /openwrt/releases/。
+    #
+    # ⚠️ 为什么不能只换主机：国内镜像的 OpenWrt 仓库挂在 /openwrt/ 下面，
+    #   官方源是 /releases/ 直挂（见上面注释里的实测）。
+    # ⚠️ 为什么 \(openwrt/\)\? 是可选的：apk_update_with_failover 会依次试
+    #   多个镜像，每次都调本函数，第二次调用时文件里**已经带 openwrt/ 了**。
+    #   可选组让「已带」和「没带」两种输入都收敛到同一个结果
+    #   （实测连切三次：ustc → nju → tuna，路径形态始终是 openwrt/releases/）。
     # ⚠️ 分隔符用 # 而不是 / —— 主机名里没有 #，但 URL 路径里全是 /。
-    sed "s#://[^/]*/#://${host}/#" "$repo" > "$tmp" 2>/dev/null || return 1
+    # ⚠️ 用 \{0,1\} 而不是 \?：busybox sed 对 \? 的支持随版本不同，
+    #   \{0,1\} 是 BRE 里到处都支持的那种写法。
+    sed "s#^\(https\{0,1\}://\)[^/]*/\(openwrt/\)\?releases/#\1${host}/openwrt/releases/#" \
+        "$repo" > "$tmp" 2>/dev/null || return 1
     if [ ! -s "$tmp" ] || ! grep -q "${host}" "$tmp" 2>/dev/null; then
         rm -f "$tmp"
         return 1

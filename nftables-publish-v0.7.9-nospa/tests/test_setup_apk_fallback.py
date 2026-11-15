@@ -395,6 +395,122 @@ if _probe.returncode == 0 and _probe.stdout.strip() == '3':
 else:
     print('  [跳过] 本机 bash 的 read -n 不可用 ⇒ 无法验证 shell 内建兜底层')
 
+# ─────────────────────────────────────────────────────────────
+sec('5  镜像路径前缀（2026-11-15 在 .120 实测踩到）')
+
+# 现象：.120（OpenWrt 25.12.5）全新安装卡在【依赖安装】阶段，
+#   所有镜像源都报 "unexpected end of file"，最后 nginx 装不上。
+#
+# 根因：**国内镜像的 OpenWrt 仓库挂在 /openwrt/ 下面，比官方源多一层**。
+#   官方源：https://downloads.openwrt.org/releases/25.12.5/...
+#   国内源：https://mirrors.ustc.edu.cn/openwrt/releases/25.12.5/...
+# 而 switch_apk_mirror 原来只换主机、路径原样保留 ⇒ 切过去的 URL 变成
+#   https://mirrors.ustc.edu.cn/releases/25.12.5/...
+# 三个国内镜像上**全是 404**（实测 curl 逐个验过）：
+#   404  https://mirrors.ustc.edu.cn/releases/25.12.5/packages/x86_64/base/packages.adb
+#   200  https://mirrors.ustc.edu.cn/openwrt/releases/25.12.5/packages/x86_64/base/packages.adb
+#
+# 为什么这个 bug 特别难查：**症状和「官方源被截断」一模一样**。
+# setup.sh 的注释里写着「官方源在国内网络大文件会截断」，所以看到
+# "unexpected end of file" 会自然地往截断方向想 ⇒ 而真实原因是 404，
+# 404 的响应体不是索引文件，apk 也报成 end of file。排查方向整个被带偏。
+#
+# 而且它是**救急动作本身把能用的源弄坏了**：官方源本来是好的
+# （.120 上首次 apk update 成功，11258 个包），切镜像之后反而全挂。
+
+_mirror_fn = sh_func('switch_apk_mirror')
+check('setup.sh 里 switch_apk_mirror 存在', bool(_mirror_fn))
+
+# ---- 真跑：抽函数出来，实际切一次源，检查产物路径形态 ----
+#
+# 为什么必须真跑：静态文本断言只能证明「代码里写了 openwrt」，
+# 钉不住「切出来的 URL 到底长什么样」——
+# 而这个 bug 恰恰是「代码看着对、产物全 404」。
+#
+# 沙箱里造一份假的 distfeeds.list（内容与 .120 真机一致），
+# 跑真函数，然后检查每一行是不是 <host>/openwrt/releases/ 形态。
+_MIRROR_CASE = r'''
+%s
+
+# 桩：apk_repo_file 返回沙箱里的假清单
+apk_repo_file() { echo "$REPO"; }
+
+REPO=%s
+switch_apk_mirror "%s" || echo "SWITCH_FAILED"
+cat "$REPO"
+''' % (_mirror_fn, '$REPO', '${HOST}')
+
+# 用真实的 .120 distfeeds 内容做输入
+_120_DISTFEEDS = """https://downloads.openwrt.org/releases/25.12.5/targets/x86/64/packages/packages.adb
+https://downloads.openwrt.org/releases/25.12.5/packages/x86_64/base/packages.adb
+https://downloads.openwrt.org/releases/25.12.5/packages/x86_64/kmods/6.12.94-1-a7bc15f451f9652701ba04af9cfb0b95/packages.adb
+https://downloads.openwrt.org/releases/25.12.5/packages/x86_64/luci/packages.adb
+https://downloads.openwrt.org/releases/25.12.5/packages/x86_64/packages/packages.adb
+https://downloads.openwrt.org/releases/25.12.5/packages/x86_64/routing/packages.adb
+https://downloads.openwrt.org/releases/25.12.5/packages/x86_64/telephony/packages.adb
+https://downloads.openwrt.org/releases/25.12.5/packages/x86_64/video/packages.adb
+"""
+
+# 沙箱版：apk_repo_file 桩成固定路径，函数体照抄
+_mirror_sandbox = _MIRROR_CASE.replace('"$REPO"', '"$SANDBOX_REPO"')
+_mirror_sandbox = _mirror_sandbox.replace('REPO=$REPO', 'REPO=$SANDBOX_REPO')
+_mirror_sandbox = _mirror_sandbox.replace('switch_apk_mirror "%s"' % '${HOST}',
+                                          'switch_apk_mirror "$TEST_HOST"')
+_mirror_sandbox = _mirror_sandbox.replace("'%s'" % '${HOST}', '"$TEST_HOST"')
+
+
+def shlex_quote(s):
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def _run_mirror(host, feeds=_120_DISTFEEDS):
+    """在沙箱里真跑一次 switch_apk_mirror，返回切完之后的清单内容。"""
+    d = tempfile.mkdtemp(prefix='apkmirror-')
+    try:
+        repo = os.path.join(d, 'distfeeds.list')
+        with open(repo, 'w', encoding='utf-8') as f:
+            f.write(feeds)
+        script = ('SANDBOX_REPO=%s\nTEST_HOST=%s\n%s\n'
+                  % (shlex_quote(repo), shlex_quote(host), _mirror_sandbox))
+        rc, out = run_sh(script, 'mirror')
+        return rc, out
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+rc, out = _run_mirror('mirrors.ustc.edu.cn')
+_lines = [ln for ln in out.splitlines() if ln.startswith('http')]
+check('切镜像后清单非空（switch_apk_mirror 真的干了活）',
+      len(_lines) > 0, '输出=%s' % out.strip()[:200])
+
+if _lines:
+    # 核心断言：每行都得是 <host>/openwrt/releases/ 形态
+    # （少了 openwrt/ 这一层就是 .120 上踩的那个坑 ⇒ 必然 404）
+    _bad = [ln for ln in _lines
+            if not re.match(r'^https://mirrors\.ustc\.edu\.cn/openwrt/releases/', ln)]
+    check('切到国内镜像后路径带 openwrt/ 这一层（.120 上少了就是全 404）',
+          not _bad,
+          '不合格的行: %s' % (_bad[:2] if _bad else '无'))
+
+    _no_layer = [ln for ln in _lines if '/openwrt/' not in ln]
+    check('没有漏掉 openwrt/ 层的行',
+          not _no_layer,
+          '漏掉的行: %s' % (_no_layer[:2] if _no_layer else '无'))
+
+    _double = [ln for ln in _lines if 'openwrt/openwrt' in ln]
+    check('没有出现 openwrt/openwrt/ 双层（重复切源时的坑）',
+          not _double,
+          '双层的行: %s' % (_double[:2] if _double else '无'))
+
+    # 幂等：连切两次，路径形态必须不变
+    rc2, out2 = _run_mirror('mirror.nju.edu.cn', feeds='\n'.join(_lines) + '\n')
+    _lines2 = [ln for ln in out2.splitlines() if ln.startswith('http')]
+    _bad2 = [ln for ln in _lines2
+             if not re.match(r'^https://mirror\.nju\.edu\.cn/openwrt/releases/', ln)]
+    check('连切两次后路径形态仍然正确（幂等）',
+          bool(_lines2) and not _bad2,
+          '不合格的行: %s' % (_bad2[:2] if _bad2 else '无'))
+
 print()
 if FAIL:
     print(f'❌ 失败 {len(FAIL)} 项：')

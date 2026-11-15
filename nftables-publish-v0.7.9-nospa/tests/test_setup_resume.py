@@ -295,9 +295,23 @@ def main():
                   ('mirrors.ustc.edu.cn', 'mirror.nju.edu.cn',
                    'mirrors.tuna.tsinghua.edu.cn')))
         sw = fn_body(setup, 'switch_apk_mirror')
-        check('换源只替换 URL 的主机部分（路径不动）',
-              re.search(r'sed\s+"s#://\[\^/\]\*/#://\$\{host\}/#"', sw) is not None,
-              '只换 host ⇒ 不依赖 OpenWrt 的仓库布局')
+        # ⚠️ 2026-11-15：这条断言原来写的是「换源只替换 URL 的主机部分（路径不动）」，
+        #   理由是「只换 host ⇒ 不依赖 OpenWrt 的仓库布局」。
+        #   那个假设在 .120（OpenWrt 25.12.5）上被实测证伪：
+        #   国内镜像的 OpenWrt 仓库挂在 /openwrt/ 下面，比官方源**多一层**：
+        #       官方源  https://downloads.openwrt.org/releases/25.12.5/...
+        #       国内源  https://mirrors.ustc.edu.cn/openwrt/releases/25.12.5/...
+        #   只换主机 ⇒ 切过去的 URL 变成 .../releases/... ⇒ 三个国内镜像**全是 404**
+        #   ⇒ 装机卡在依赖阶段，报的还是 "unexpected end of file"（404 的响应体
+        #   不是索引文件，apk 就报成 end of file）—— 症状和「官方源被截断」一模一样。
+        #   ⇒ 断言改成钉住真实事实：路径前缀必须被换成 /openwrt/releases/。
+        #
+        #   ⚠️ 这里**只**做静态兜底，不重复验幂等（可选组 / 可选层的写法太刁钻，
+        #      静态正则极容易写错反而误报）。幂等 + 产物形态的真跑断言在
+        #      test_setup_apk_fallback.py 第 5 节 —— 那才是能真正抓住这个 bug 的。
+        check('换源会把路径前缀也改成 /openwrt/releases/（国内镜像比官方源多一层）',
+              re.search(r'sed\s+"s#[^"]*openwrt/releases/', sw) is not None,
+              '只换 host ⇒ 国内镜像全 404（.120 实测：装机卡在依赖阶段）')
         check('换源前先备份原始仓库清单',
               '.orig' in sw)
         fo = fn_body(setup, 'apk_update_with_failover')
