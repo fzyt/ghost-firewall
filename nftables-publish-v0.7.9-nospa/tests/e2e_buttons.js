@@ -90,7 +90,7 @@ const DESTRUCTIVE_PAT = /(删除|删|清空|删除规则|flush|应用防火墙|a
 // （几百 MB 的下载 + 写盘），归网络级。
 //
 // 所以现在动作名和中文标签都写全。
-const NETWORK_PAT = /(restartNetwork|重启网络|saveNetworkConfig|保存网络配置|togglePppoe|PPPoE\s*拨号|installChinaIps|安装中国IP|updateChinaIps|立即刷新中国IP|installIpv6Cron|安装定时更新|repairInitScript|修复 init|install_ipv6|updateIpv6\s*\(\)|reboot|重启路由器)/i;
+const NETWORK_PAT = /(restartNetwork|重启网络|saveNetworkConfig|保存网络配置|togglePppoe|PPPoE\s*拨号|installChinaIps|安装中国IP|updateChinaIps|立即刷新中国IP|installIpv6Cron|安装定时更新|repairInitScript|修复 init|install_ipv6|updateIpv6\s*\(\)|reboot|重启路由器|saveLanMembers|保存 LAN 成员口)/i;
 
 // 侧边栏 14 个导航按钮是"测试的搬运工"而不是被测对象：点了会改 currentNav，
 // 把当前页的元素全换掉，后续 nth() 就指错位置了。probe 阶段已经逐个点过

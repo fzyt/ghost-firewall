@@ -157,6 +157,7 @@ EXPECT = {
     # ── 网络/系统级：会改网络或系统自身状态 ─────────────────────
     'restartNetwork':     ('net', '重启网络'),
     'saveNetworkConfig':  ('net', '保存网络配置'),
+    'saveLanMembers':     ('net', '保存 LAN 成员口'),
     'togglePppoe':        ('net', 'PPPoE 拨号'),
     'installIpv6Cron':    ('net', '安装定时更新'),
     'installChinaIps':    ('net', '安装中国IP'),

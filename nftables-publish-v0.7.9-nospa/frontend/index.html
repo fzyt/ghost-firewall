@@ -786,6 +786,37 @@
                   class="w-full border rounded px-3 py-2 text-sm bg-gray-100 text-gray-500">
                 <p class="text-xs text-gray-400 mt-1">如需修改请编辑 /etc/config/network</p>
               </div>
+              <!-- LAN 桥成员口（多 LAN 口） -->
+              <div x-show="lanBridge" x-transition>
+                <div class="flex items-center justify-between mb-2">
+                  <label class="block text-sm font-medium">LAN 桥成员口</label>
+                  <span class="text-xs text-gray-400" x-text="lanBridge"></span>
+                </div>
+                <div class="space-y-1">
+                  <template x-for="c in lanCandidates" :key="c.key">
+                    <label class="flex items-center gap-2 text-sm px-2 py-1.5 border rounded cursor-pointer"
+                      :class="isLanMemberDraft(c.name) ? 'border-black bg-gray-50' : 'border-gray-200'">
+                      <input type="checkbox" :checked="isLanMemberDraft(c.name)"
+                        @change="toggleLanMember(c.name)"
+                        :disabled="c.role === 'wan' || c.role === 'reserved'">
+                      <span class="font-mono" x-text="c.name"></span>
+                      <span class="text-xs text-gray-400" x-text="c.mac"></span>
+                      <span class="ml-auto text-xs"
+                        :class="c.role === 'lan' ? 'text-green-600' : (c.role === 'free' ? 'text-gray-400' : 'text-red-600')"
+                        x-text="c.role === 'lan' ? '已在 LAN' : (c.role === 'wan' ? 'WAN 口' : (c.role === 'reserved' ? '已被占用' : '空闲'))"></span>
+                    </label>
+                  </template>
+                </div>
+                <div class="flex items-center gap-3 mt-3">
+                  <button @click="saveLanMembers()" :disabled="lanMembersSaving"
+                    class="px-3 py-1.5 border rounded text-sm hover:bg-gray-50 disabled:opacity-50">
+                    <span x-text="lanMembersSaving ? '保存中…' : '保存成员口'"></span>
+                  </button>
+                  <span class="text-xs text-amber-600">保存后需重启网络才生效，期间会断网</span>
+                </div>
+              </div>
+              <!-- 本机 LAN 不是桥配置时说明原因（不留一片空白让人猜） -->
+              <div x-show="lanMembersError" class="text-xs text-red-600" x-text="lanMembersError"></div>
             </div>
           </div>
 

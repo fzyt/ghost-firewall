@@ -130,6 +130,13 @@ function app() {
     autoDetectedMessage: '',
     networkSaving: false,
     networkRestarting: false,
+    // LAN 桥成员口（多 LAN 口）
+    lanBridge: '',
+    lanMembers: [],
+    lanCandidates: [],
+    lanMembersDraft: [],
+    lanMembersSaving: false,
+    lanMembersError: '',
     rules: '',
     rulesLoading: false,
     chinaIpsInstalling: false,
@@ -365,6 +372,7 @@ function app() {
       await this.loadFirewallStatus();
       await this.loadConfig();
       await this.loadNetworkConfig();
+      await this.loadLanMembers();
       await this.loadInterfaces();
       await this.loadLogdConfig();
       await this.loadDdns();
@@ -840,6 +848,65 @@ function app() {
         this.autoDetectedMessage = '已从 OpenWrt 网络配置自动填入';
       } catch (e) {
         console.error('加载网络配置失败:', e);
+      }
+    },
+
+    async loadLanMembers() {
+      // LAN 桥成员口（多 LAN 口）。
+      //
+      // 失败时**不静默**：本机 LAN 不是桥配置（老式 swconfig 的 option ifname）
+      // 时这块功能用不了，得让用户知道原因，而不是看到一片空白。
+      try {
+        const data = await api.get('/api/network/lan-members');
+        this.lanBridge = data.bridge || '';
+        this.lanMembers = data.members || [];
+        this.lanCandidates = data.candidates || [];
+        this.lanMembersDraft = [...this.lanMembers];
+        this.lanMembersError = '';
+      } catch (e) {
+        this.lanBridge = '';
+        this.lanMembers = [];
+        this.lanCandidates = [];
+        this.lanMembersDraft = [];
+        this.lanMembersError = e.message || '读取 LAN 成员口失败';
+      }
+    },
+
+    isLanMemberDraft(name) {
+      return this.lanMembersDraft.includes(name);
+    },
+
+    toggleLanMember(name) {
+      const idx = this.lanMembersDraft.indexOf(name);
+      if (idx >= 0) {
+        this.lanMembersDraft.splice(idx, 1);
+      } else {
+        this.lanMembersDraft.push(name);
+      }
+    },
+
+    async saveLanMembers() {
+      if (!this.lanMembersDraft.length) {
+        this.showToast('至少要保留一个 LAN 成员口（清空 LAN 桥会让路由器失联）', 'error');
+        return;
+      }
+      const added = this.lanMembersDraft.filter(n => !this.lanMembers.includes(n));
+      const removed = this.lanMembers.filter(n => !this.lanMembersDraft.includes(n));
+      const summary = [...added.map(n => '+' + n), ...removed.map(n => '-' + n)].join('  ');
+      // 保存后必须重启网络才生效，而重启网络期间面板会断 ——
+      // 先说清楚，别让用户以为点完就生效了。
+      if (!confirm(`确认修改 LAN 成员口？\n${summary}\n\n保存后需重启网络才生效，期间会断网。`)) {
+        return;
+      }
+      this.lanMembersSaving = true;
+      try {
+        await api.post('/api/network/lan-members', { members: this.lanMembersDraft });
+        this.lanMembers = [...this.lanMembersDraft];
+        this.showToast('LAN 成员口已保存，请重启网络生效', 'success');
+      } catch (e) {
+        this.showToast('保存失败: ' + e.message, 'error');
+      } finally {
+        this.lanMembersSaving = false;
       }
     },
 

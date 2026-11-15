@@ -3754,6 +3754,9 @@ def _atomic_write_network_config(path, content):
 # 物理网卡的 sysfs 根目录。做成模块常量是为了让测试能指向假目录
 # （测试里 monkeypatch 这个常量，走的是和真机完全相同的代码路径）。
 SYSFS_NET_ROOT = '/sys/class/net'
+# OpenWrt 网络配置文件的路径。做成模块常量是为了让测试能指向临时文件
+# （走的是和真机完全相同的代码路径）。
+NETWORK_CONF_PATH = '/etc/config/network'
 
 # UCI 段头：`config interface 'lan'` / `config device` / `config globals 'globals'`
 _UCI_SECTION_RE = re.compile(r"^config\s+(\S+)\s*(.*)$")
@@ -3838,6 +3841,227 @@ def _uci_lan_ifname_ports(text):
                 if p:
                     out.add(p)
     return out
+
+
+# ─────────────────────────────────────────────────────────────
+# LAN 桥成员口（多 LAN 口）的读写
+#
+# 为什么这块的失败模式是「整机失联」，不是「配置不对」：
+#   · 把 WAN 口划进 LAN 桥 ⇒ WAN 没口了 ⇒ 断网；
+#   · 把 LAN 桥的成员清空 ⇒ 桥没 IP ⇒ 管理口失联，路由器变砖。
+#
+# ⇒ 这里的校验必须比「看起来对」更严，而且要有回滚。
+# ─────────────────────────────────────────────────────────────
+
+
+def _uci_body_option(body, key):
+    """某一段里的某个 option 值（找不到返回 ''）。
+
+    body 是该段的行列表（不含段头）。
+    """
+    for line in body:
+        s = line.strip()
+        if not s.startswith('option '):
+            continue
+        parts = s.split(None, 2)
+        if len(parts) >= 3 and parts[1] == key:
+            return extract_uci_value(s)
+    return ''
+
+
+def _device_sections(text):
+    """全部 config device 段：[(option name, 段内行)]。
+
+    段头 `config device` 本身没有名字，真正的名字在 `option name 'br-lan'`。
+    """
+    out = []
+    for stype, _name, body in _uci_sections(text):
+        if stype != 'device':
+            continue
+        out.append((_uci_body_option(body, 'name'), body))
+    return out
+
+
+def _lan_bridge_device(text):
+    """LAN 用的桥设备名（br-lan），认不出来返回 ''。
+
+    两种形态都认：
+      · config interface 'lan' / option device 'br-lan'  ← DSA 形态
+      · 唯一那个 option type 'bridge' 的 config device 段 ← 退化路径
+    """
+    for stype, name, body in _uci_sections(text):
+        if stype == 'interface' and name == 'lan':
+            dev = _uci_body_option(body, 'device')
+            if dev:
+                return dev
+    bridges = [nm for nm, body in _device_sections(text)
+               if nm and _uci_body_option(body, 'type') == 'bridge']
+    return bridges[0] if len(bridges) == 1 else ''
+
+
+def _bridge_ports_from_body(body):
+    """桥段里声明的成员口（有序、去重）。"""
+    ports = []
+    for line in body:
+        m = _UCI_PORTS_RE.match(line.strip())
+        if not m:
+            continue
+        val = m.group(1).strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+            val = val[1:-1]
+        for p in val.split():
+            if p and p not in ports:
+                ports.append(p)
+    return ports
+
+
+def _lan_bridge_ports(text, bridge):
+    """LAN 桥当前声明的成员口（按配置里的顺序）。"""
+    for nm, body in _device_sections(text):
+        if nm == bridge:
+            return _bridge_ports_from_body(body)
+    return []
+
+
+def _wan_config_device(text):
+    """配置里 WAN 接口用的设备名（没有则返回 ''）。
+
+    比「挑一个空闲物理口当 WAN」的启发式准：
+    配置里写了什么就是什么（用户自己在 OpenWrt 里指定的口）。
+    """
+    for stype, name, body in _uci_sections(text):
+        if stype == 'interface' and name in ('wan', 'wan6'):
+            dev = _uci_body_option(body, 'device')
+            if dev:
+                return dev
+    return ''
+
+
+def _default_route_dev(route_output=None):
+    """默认路由走的那个接口名（取不到返回 ''）。
+
+    为什么需要它：**有些设备的 wan 段根本不写 option device**，
+    靠 netifd 自动挑一块空闲物理口 ⇒ 配置里压根没有「WAN 口」这个名字。
+    只看配置 ⇒ 这种机器上 WAN 口是认不出来的 ⇒ 用户在面板里把它划进
+    LAN 桥 ⇒ WAN 没口了 ⇒ 断网。
+
+    「默认路由从哪块卡出去」是内核给的**硬证据** —— 那块卡就是 WAN。
+
+    ⚠ 默认路由走 LAN 桥（br-lan）的机器（纯管理机/旁路网关）不算 WAN ——
+      那种机器上 WAN 口本来就不存在，不该被保护。
+    """
+    if route_output is None:
+        try:
+            r = subprocess.run(['ip', 'route', 'show', 'default'],
+                               capture_output=True, text=True, timeout=5)
+            route_output = r.stdout or ''
+        except Exception:
+            return ''
+    for line in route_output.splitlines():
+        parts = line.split()
+        if 'dev' in parts:
+            i = parts.index('dev')
+            if i + 1 < len(parts):
+                return parts[i + 1]
+    return ''
+
+
+def _reserved_lan_devices(text, bridge):
+    """**不能**划进 LAN 桥的口。
+
+    三类证据的**并集**（宁可多排除，也绝不能少排除）：
+      1. 非 LAN 接口引用的口（wan / wan6 / guest…）—— 划走就是断网；
+      2. 其它桥段里的成员口 —— 那个桥还要用；
+      3. 内核实况：已经挂在别的桥/设备上的口（master 指向的不是 LAN 桥）。
+         这是**比文本解析更硬的证据**：文本可能漏写，而「这个口挂在哪个桥上」
+         是内核说了算。
+    """
+    out = set()
+    for stype, name, body in _uci_sections(text):
+        if stype != 'interface' or name == 'lan':
+            continue
+        dev = _uci_body_option(body, 'device')
+        if dev:
+            out.add(dev)
+        for p in _uci_body_option(body, 'ifname').split():
+            out.add(p)
+    lan_ports = set(_lan_bridge_ports(text, bridge))
+    out |= (_uci_declared_ports(text) - lan_ports)
+    # 内核实况：默认路由走的那块**物理口**就是 WAN。
+    # （配置里可能根本没写 wan 口的名字 —— netifd 自动挑的）
+    route_dev = _default_route_dev()
+    if route_dev and route_dev != bridge and _is_physical_iface(route_dev):
+        out.add(route_dev)
+    try:
+        names = sorted(os.listdir(SYSFS_NET_ROOT))
+    except OSError:
+        names = []
+    for n in names:
+        master = os.path.join(SYSFS_NET_ROOT, n, 'master')
+        if not os.path.islink(master):
+            continue
+        if os.path.basename(os.readlink(master)) != bridge:
+            out.add(n)
+    out.discard('')
+    out.discard(bridge)
+    return out
+
+
+def _rewrite_bridge_ports(text, bridge, ports):
+    """把 LAN 桥段的成员口改成给定列表，返回新文本；找不到桥段返回 None。
+
+    做法：删掉该段里所有 list/option ports 行，再按 UCI 规范补成
+          `list ports 'eth0'` 一行一条（UCI 的 list 就是一行一个值）。
+    注：段尾的空行只是空行 —— UCI 的段是由**下一个 config 行**结束的，
+    空行不会截断段。所以 ports 放在空行前还是后，对 uci 解析没有区别。
+    这里仍然放在空行之前，只是为了和 uci 自己写出来的排版一致（改动最小）。
+    """
+    lines = text.splitlines()
+    start = None
+    end = len(lines)
+    for idx, line in enumerate(lines):
+        m = _UCI_SECTION_RE.match(line.strip())
+        if not m:
+            continue
+        if start is not None:
+            end = idx
+            break
+        if m.group(1) != 'device':
+            continue
+        j = idx + 1
+        body = []
+        while j < len(lines) and not _UCI_SECTION_RE.match(lines[j].strip()):
+            body.append(lines[j])
+            j += 1
+        if _uci_body_option(body, 'name') == bridge:
+            start = idx
+    if start is None:
+        return None
+    body = lines[start + 1:end]
+    kept = [l for l in body if not _UCI_PORTS_RE.match(l.strip())]
+    tail = []
+    while kept and not kept[-1].strip():
+        tail.insert(0, kept.pop())
+    new_ports = ["\tlist ports '%s'" % p for p in ports]
+    out = lines[:start + 1] + kept + new_ports + tail + lines[end:]
+    return '\n'.join(out) + '\n'
+
+
+def _refresh_iface_pin_map():
+    """刷新接口名钉定映射表（把新加入 LAN 的口钉住）。
+
+    为什么要刷：映射表记的是「哪块卡（MAC）该叫哪个名字」。
+    新加的成员口如果不在表里，下次重启它照样会漂 ⇒ 绑定又白改了。
+    """
+    script = '/opt/nftables-web-v2/setup/iface-pin-map.sh'
+    if not os.path.exists(script):
+        return False
+    try:
+        r = subprocess.run(['sh', script, '/etc/nftables/iface-pin.json'],
+                           capture_output=True, text=True, timeout=30)
+        return r.returncode == 0
+    except Exception:
+        return False
 
 
 def _detect_wan_device(network_text, sysfs_root=None):
@@ -4161,6 +4385,212 @@ def save_network_config():
         return jsonify({"success": False, "code": "INVALID_NETWORK", "message": str(e)}), 400
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route('/api/network/lan-members', methods=['GET'])
+def get_lan_members():
+    """读 LAN 桥的成员口 + 本机可加入的物理口。
+
+    为什么单独一个接口：LAN 成员口是「桥的成员」，
+    和「LAN 接口的 IP / WAN 拨号」是两回事 ——
+    混在 /api/network/config 里会让前端把两种东西搅在一起。
+    """
+    path = NETWORK_CONF_PATH
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError as e:
+        return jsonify({"success": False, "message": f"读取网络配置失败: {e}"}), 500
+
+    bridge = _lan_bridge_device(text)
+    if not bridge:
+        return jsonify({
+            "success": False,
+            "code": "NO_LAN_BRIDGE",
+            "message": ("本机 LAN 不是桥配置（找不到 br-lan 之类的桥设备），"
+                        "无法在面板里增删成员口，请到 OpenWrt 里手工配置。"),
+        }), 400
+
+    members = _lan_bridge_ports(text, bridge)
+    reserved = _reserved_lan_devices(text, bridge)
+    wan_dev = _wan_config_device(text)
+    if not wan_dev:
+        # wan 段没写 option device（netifd 自动挑）⇒ 看内核的默认路由
+        route_dev = _default_route_dev()
+        if route_dev and _is_physical_iface(route_dev):
+            wan_dev = route_dev
+    try:
+        names = sorted(os.listdir(SYSFS_NET_ROOT))
+    except OSError:
+        names = []
+
+    candidates = []
+    for n in names:
+        if n == 'lo' or n == bridge:
+            continue
+        if not _is_physical_iface(n):
+            continue
+        mac = ''
+        state = ''
+        try:
+            with open(os.path.join(SYSFS_NET_ROOT, n, 'address')) as f:
+                mac = f.read().strip()
+        except OSError:
+            pass
+        try:
+            with open(os.path.join(SYSFS_NET_ROOT, n, 'operstate')) as f:
+                state = f.read().strip()
+        except OSError:
+            pass
+        if n in members:
+            role = 'lan'
+        elif n == wan_dev:
+            role = 'wan'
+        elif n in reserved:
+            role = 'reserved'
+        else:
+            role = 'free'
+        # key 用 MAC：接口名会变、角色会变，MAC 不会 ⇒ 天然唯一
+        # （前端 x-for 的 :key 只认 id/key/ip 这类唯一字段，见
+        #  tests/test_frontend_xfor_keys.js）
+        candidates.append({'name': n, 'key': mac, 'mac': mac,
+                            'state': state, 'role': role})
+
+    return jsonify({
+        "success": True,
+        "bridge": bridge,
+        "members": members,
+        "candidates": candidates,
+    })
+
+
+@app.route('/api/network/lan-members', methods=['POST'])
+def save_lan_members():
+    """改 LAN 桥的成员口。
+
+    ⚠ 这里的失败模式是「整机失联」：
+      · 把 WAN 口划进 LAN 桥 ⇒ WAN 没口了 ⇒ 断网；
+      · 把 LAN 桥的成员清空 ⇒ 桥没 IP ⇒ 管理口失联，路由器变砖。
+    ⇒ 校验必须比「看起来对」更严，而且要能回滚：
+      1. 成员必须都是本机**真实存在**的物理网卡；
+      2. 成员不得包含任何被非 LAN 接口占用的口（WAN 等）；
+      3. 成员不得为空（空桥 = 没有 IP = 失联）；
+      4. 写完**回读**校验，对不上立刻回滚。
+    """
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"success": False, "message": "请求体不能为空"}), 400
+    raw = data.get('members')
+    if not isinstance(raw, list) or not raw:
+        return jsonify({
+            "success": False,
+            "code": "INVALID_MEMBERS",
+            "message": "成员口列表不能为空（清空 LAN 桥会让路由器失联）",
+        }), 400
+
+    path = NETWORK_CONF_PATH
+    try:
+        with open(path) as f:
+            old = f.read()
+    except OSError as e:
+        return jsonify({"success": False, "message": f"读取网络配置失败: {e}"}), 500
+
+    bridge = _lan_bridge_device(old)
+    if not bridge:
+        return jsonify({
+            "success": False,
+            "code": "NO_LAN_BRIDGE",
+            "message": ("本机 LAN 不是桥配置（找不到 br-lan 之类的桥设备），"
+                        "无法在面板里增删成员口，请到 OpenWrt 里手工配置。"),
+        }), 400
+
+    reserved = _reserved_lan_devices(old, bridge)
+    members = []
+    for m in raw:
+        if not isinstance(m, str):
+            return jsonify({"success": False, "code": "INVALID_MEMBERS",
+                            "message": "成员口必须是接口名"}), 400
+        m = m.strip()
+        if not m or m in members:
+            continue
+        if not _is_physical_iface(m):
+            return jsonify({
+                "success": False,
+                "code": "INVALID_MEMBERS",
+                "message": f"{m} 不是物理网卡，不能加进 LAN 桥",
+            }), 400
+        if not os.path.exists(os.path.join(SYSFS_NET_ROOT, m)):
+            return jsonify({
+                "success": False,
+                "code": "INVALID_MEMBERS",
+                "message": f"{m} 在本机不存在",
+            }), 400
+        if m in reserved:
+            return jsonify({
+                "success": False,
+                "code": "PORT_RESERVED",
+                "message": (f"{m} 已被 WAN 或其它接口占用，不能划进 LAN 桥"
+                            f"（划走会让路由器断网）"),
+            }), 400
+        members.append(m)
+    if not members:
+        return jsonify({"success": False, "code": "INVALID_MEMBERS",
+                        "message": "成员口列表不能为空"}), 400
+
+    new = _rewrite_bridge_ports(old, bridge, members)
+    if new is None:
+        return jsonify({"success": False,
+                        "message": f"在网络配置里找不到 {bridge} 的桥段"}), 500
+    ok, err = _validate_network_config_content(old, new)
+    if not ok:
+        return jsonify({"success": False, "code": "INVALID_NETWORK",
+                        "message": err}), 400
+
+    # 备份必须留着（出事了要靠它回滚），而且**权限要跟原文件一致** ——
+    # 里面有 PPPoE 拨号口令（见 update_uci_wan_config 里的同一段说明）。
+    _ensure_file_mode(path + '.backup', _network_config_mode(path))
+    shutil.copy(path, path + '.backup')
+    try:
+        os.chmod(path + '.backup', _network_config_mode(path))
+    except OSError:
+        pass
+
+    try:
+        _atomic_write_network_config(path, new)
+    except Exception as e:
+        # 原子写失败 ⇒ 原文件原封不动（tmp 只是垃圾），不用回滚
+        return jsonify({"success": False,
+                        "message": f"写入网络配置失败，原配置未改动: {e}"}), 500
+
+    # 回读校验：写进去的必须真的生效，对不上就回滚。
+    try:
+        with open(path) as f:
+            written = f.read()
+    except OSError:
+        written = ''
+    got = _lan_bridge_ports(written, bridge)
+    if sorted(got) != sorted(members):
+        try:
+            _atomic_write_network_config(path, old)
+        except Exception as e:
+            print(f'[ERROR] LAN 成员口回滚失败（{e}），'
+                  f'备份在 {path}.backup', flush=True)
+            return jsonify({"success": False,
+                            "message": (f"写入后校验不一致且回滚失败，"
+                                        f"请用 {path}.backup 手动恢复")}), 500
+        return jsonify({"success": False,
+                        "message": "写入后校验不一致，已回滚到原配置"}), 500
+
+    # 刷新接口名钉定映射表：新加入的口必须被钉住，
+    # 否则下次重启它照样会漂（接口名漂了，这个绑定又白改）。
+    _refresh_iface_pin_map()
+
+    return jsonify({
+        "success": True,
+        "bridge": bridge,
+        "members": members,
+        "message": "LAN 成员口已保存（需重启网络生效，期间会断网）",
+    })
 
 
 @app.route('/api/network/restart', methods=['POST'])
