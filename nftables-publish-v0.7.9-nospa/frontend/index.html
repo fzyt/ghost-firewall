@@ -792,6 +792,11 @@
                   <label class="block text-sm font-medium">LAN 桥成员口</label>
                   <span class="text-xs text-gray-400" x-text="lanBridge"></span>
                 </div>
+                <!-- 二层环路前提：桥成员口之间的物理连线要求，写入校验判断不了，只能提示 -->
+                <p class="text-xs text-amber-600 mb-2">
+                  注意：新口必须与现有成员口在不同的二层域，否则会形成二层环路。
+                  Proxmox 上 vNIC 默认都挂在同一个 vmbr —— 新口要单独一个 vmbr，或走 VLAN 子接口。
+                </p>
                 <div class="space-y-1">
                   <template x-for="c in lanCandidates" :key="c.key">
                     <label class="flex items-center gap-2 text-sm px-2 py-1.5 border rounded cursor-pointer"
