@@ -4622,6 +4622,16 @@ def restart_network():
                        capture_output=True, text=True, timeout=30)
         # 等待网络接口恢复（阻塞 5s 是可接受的，后续要加载 nft 规则）
         time.sleep(5)
+        # 网络重启可能换掉本机 LAN 地址（LAN 走 DHCP 时会换租）
+        # ⇒ 本地解析那条记录得跟着改成新的地址，否则域名还指向旧 IP。
+        try:
+            _dns_msg = _sync_local_domain_resolution(config)
+            if not _dns_msg.get('ok'):
+                print('[WARN] 网络重启后本地解析同步失败: %s'
+                      % _dns_msg.get('message'), flush=True)
+        except Exception as e:      # noqa: BLE001
+            print('[WARN] 网络重启后本地解析同步异常: %s: %s'
+                  % (type(e).__name__, e), flush=True)
         ok, message = _apply_ruleset(config)
         if not ok:
             return jsonify({"success": False, "message":
@@ -10046,6 +10056,44 @@ def _get_rp_config():
     return config, rp
 
 
+def _sync_local_domain_resolution(config, lan_ip=None):
+    """把「证书的基础域名」写成本机 dnsmasq 的本地解析。
+
+    为什么需要（2026-11-17）：
+      host 分发入口挂的是**域名**（如 siyuan.fzyto.top）。
+      内网客户端用域名访问时，公网 DNS 把它指到公网 IP（或别的机器），
+      要么绕不出去（NAT 回环不通），要么落到不对的机器上。
+      ⇒ 让本机 dnsmasq 把这个域名（及其所有子域）直接答成本机 LAN IP。
+
+    ⚠️ 目标 IP 取**内核此刻实际持有**的 LAN 地址，不取配置里的旧值 ——
+       机器换过 IP（DHCP 换租）时，写进去的旧 IP 就是一条骗人的解析。
+
+    返回 {'ok': bool, 'message': str}。失败**不影响**其它功能 ——
+      DNS 解析写不进去，不该让整个保存动作失败。
+    """
+    domain = _rp_base_domain(config)
+    if not lan_ip:
+        lan_if = str(config.get('lan_if') or 'br-lan').strip() or 'br-lan'
+        lan_ip = _lan_bind_address(lan_if, retries=1, wait=0)
+    if domain and not lan_ip:
+        return {'ok': False, 'message': '探测不到本机 LAN 地址，未写本地解析'}
+    try:
+        result = dhcp_hosts.set_local_domain_resolution(domain, lan_ip or '')
+    except dhcp_hosts.DhcpWriteError as e:
+        print('[WARN] 本地解析同步失败（不影响其它功能）: %s' % e, flush=True)
+        return {'ok': False, 'message': str(e)}
+    except Exception as e:          # noqa: BLE001
+        print('[WARN] 本地解析同步异常（不影响其它功能）: '
+              '%s: %s' % (type(e).__name__, e), flush=True)
+        return {'ok': False, 'message': '%s: %s' % (type(e).__name__, e)}
+    if result.get('changed'):
+        print('[INFO] 本地解析已同步: %s → %s（%s）'
+              % (result.get('domain') or '(已清空)', result.get('ip'),
+                 (result.get('reload') or {}).get('message', '')), flush=True)
+    return {'ok': True,
+            'message': (result.get('reload') or {}).get('message', '')}
+
+
 def _save_rp_config(config):
     """保存包含 reverse_proxy 的完整配置"""
     # 落盘前把 host 分发的派生值物化（base_domain / cookie_domain）。
@@ -10062,6 +10110,9 @@ def _save_rp_config(config):
     # 只做一次：_rp_sync_base_domain 只在 settings 里**没有**这两个键时补，
     # 用户手动清空之后就不会被改回来。
     _rp_sync_base_domain(config)
+    # 证书/基础域名变了 ⇒ 本地解析跟着变（内网客户端按域名访问时才能落到本机）。
+    # 失败只记日志，不让整个保存失败 —— 解析写不进去不该挡住其它配置落盘。
+    _sync_local_domain_resolution(config)
     # ── P1-20：凭据不写进共享配置 ──────────────────────────────────
     #
     # 共享配置是 0640 root:nftweb，网关（降权到 nftweb）读得到。
@@ -15041,6 +15092,24 @@ def _start_servers():
     # （面板只绑 LAN IP，127.0.0.1 连不上）。
     global PANEL_BIND_ADDR
     PANEL_BIND_ADDR = _bind
+
+    # 本地解析同步（2026-11-17）：机器换过 IP（DHCP 换租）时，
+    # 之前写进 dnsmasq 的那条解析指向的是旧 IP ⇒ 域名解析到一台不存在的机器。
+    # 这里用**刚探测到的** LAN 地址重写一遍。
+    #
+    # ⚠️ 为什么排在 router_ip4 自愈**之前**（不是有依赖，是位置约束）：
+    #   下面「router_ip4 自愈」必须**紧挨** _ensure_https_cert() ——
+    #   证书 CN 用的是 router_ip4，顺序反了证书就停在旧 IP 上，
+    #   而这条相邻关系被 tests/mutation_check_c_batch.py 的 C-02 守着。
+    #   往这两块中间插东西 ⇒ 那条变异失去锚点 ⇒ 守门失效（2026-11-17 实测踩过）。
+    try:
+        _dns_msg = _sync_local_domain_resolution(_cfg, lan_ip=_bind)
+        if not _dns_msg.get('ok'):
+            print(f'[WARN] 本地解析同步失败（不影响启动）: '
+                  f'{_dns_msg.get("message")}', flush=True)
+    except Exception as e:
+        print(f'[WARN] 本地解析同步异常（不影响启动）: '
+              f'{type(e).__name__}: {e}', flush=True)
 
     # router_ip4 自愈（2026-11-04）：机器换过 IP 就把配置里的旧地址纠正过来。
     # 只写配置，不触发防火墙重下发（启动阶段重下发风险太大）。

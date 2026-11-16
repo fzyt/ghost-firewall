@@ -638,6 +638,196 @@ def delete_dhcp_host(section):
     return {'section': section, 'reload': reload_result}
 
 
+# ── 本地解析（域名 → 本机 IP）────────────────────────────────
+#
+# 用途：host 分发入口挂的是**域名**（如 siyuan.fzyto.top）。
+# 内网客户端用域名访问时，公网 DNS 把它指到公网 IP（或别的机器），
+# 要么绕不出去（NAT 回环不通），要么落到不对的机器上。
+# ⇒ 让本机 dnsmasq 把这个域名（及其所有子域）直接答成本机 LAN IP。
+#
+# 机制（.193 实测 2026-11-17）：
+#   在 /etc/config/dhcp 的**默认 dnsmasq 实例**段里加一条
+#     list address '/<域名>/<本机IP>'
+#   ⇒ dnsmasq 的 init 脚本生成 `--address=/<域名>/<IP>`
+#   ⇒ 该域名**及其所有子域**都答成本机 IP
+#     （.193 实测：siyuan.fzyto.top 与 abc.siyuan.fzyto.top 都答 192.168.100.193）。
+#
+# ⚠️ **不能新建一个 `config dnsmasq` 段** —— dnsmasq 的 init 脚本是
+#   「**每个 config dnsmasq 段起一个独立实例**」（配置落在
+#   /var/etc/dnsmasq.conf.<段名>），新建段会变成**第二个实例**
+#   （端口 53 冲突、起不来），而不是给默认实例加参数。.193 实测踩过。
+#
+# ⚠️ 写坏这类配置的失败模式是「DHCP/DNS 整个瘫掉」——
+#   客户端拿不到地址、解析不了域名。
+#   ⇒ 流程与 add_dhcp_host 同构：备份 → 写 → 校验 → 失败回滚 → 重载。
+
+# 标记「这条 address 是本面板写的」。dnsmasq 不认识这个 option（实测会被忽略），
+# 但它让我们能认出「哪条该删、哪条是用户自己的」——
+# **绝不能把用户自己写的 list address 删掉**。
+LOCAL_DOMAIN_OPTION = 'nftweb_local_domain'
+
+
+def _dnsmasq_section():
+    """默认 dnsmasq 实例段的寻址串（'@dnsmasq[0]' 或具名段）。
+
+    .193 实测：`uci show dhcp` 把默认实例显示成 `dhcp.@dnsmasq[0]=dnsmasq`
+    ⇒ 直接拿这个串去 set/get 就行（uci 认 `@type[idx]`）。
+    """
+    rc, out = _run_uci(['show', 'dhcp'])
+    if rc != 0:
+        raise DhcpWriteError('读 DHCP 配置失败: %s' % out.strip())
+    for line in out.splitlines():
+        key, sep, val = line.partition('=')
+        if not sep:
+            continue
+        parts = key.split('.')
+        # 'dhcp.<段>' 才是段行；'dhcp.<段>.<选项>' 是选项行 ⇒ 不能混
+        if len(parts) != 2:
+            continue
+        if val.strip().strip("'\"") != 'dnsmasq':
+            continue
+        return parts[1]
+    raise DhcpWriteError('配置里找不到 dnsmasq 段，无法写本地解析')
+
+
+def _address_domain(entry):
+    """从 dnsmasq 的 address 条目里取域名部分。
+
+    条目格式是 '/<域名>/<IP>'（.193 实测）⇒ '/example.com/1.2.3.4' → 'example.com'
+    """
+    e = (entry or '').strip()
+    if not e.startswith('/'):
+        return ''
+    parts = e.split('/')
+    return parts[1].lower() if len(parts) >= 3 else ''
+
+
+def _uci_list(section, key):
+    """读 uci 列表选项的全部值。
+
+    ⚠️ .193 实测：`uci get` 对列表选项返回的是**空格分隔的一行**，
+       不是每行一个 ⇒ 必须按空格切。
+    """
+    rc, out = _run_uci(['get', 'dhcp.%s.%s' % (section, key)])
+    if rc != 0:
+        return []
+    return [v for v in out.strip().split() if v]
+
+
+def _validate_local_domain(domain):
+    """本地解析用的域名校验。返回 (ok, 错误说明)。
+
+    ⚠️ 域名会**原样**进 dnsmasq 的 `--address=`（`/域名/IP`）⇒
+       带斜杠、空格、换行都会改变 dnsmasq 的解析结果 ⇒ 一律拒。
+    """
+    if not domain:
+        return False, '域名不能为空'
+    if len(domain) > 253:
+        return False, '域名太长（最多 253 个字符）'
+    if not re.match(r'^[a-z0-9]([a-z0-9\-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]*[a-z0-9])?)+$',
+                    domain):
+        return False, '无效域名格式: %s' % domain
+    return True, ''
+
+
+def _validate_local_ip(ip):
+    """本地解析的目标 IP 校验（IPv4）。返回 (ok, 错误说明)。"""
+    if not ip:
+        return False, 'IP 地址不能为空'
+    parts = ip.split('.')
+    if len(parts) != 4:
+        return False, 'IP 地址格式不对（应为点分十进制）'
+    for p in parts:
+        if not _is_ascii_digits(p) or not (0 <= int(p) <= 255):
+            return False, 'IP 地址格式不对（应为点分十进制）'
+    return True, ''
+
+
+def set_local_domain_resolution(domain, ip):
+    """把「证书的基础域名」写成本机 dnsmasq 的本地解析记录。
+
+    返回 {'domain', 'ip', 'changed', 'reload'}。
+    domain 为空 ⇒ 删掉本面板写的那条（证书换掉了 / 不再用泛域名）。
+
+    ⚠️ 「属于本面板」的判定：标记 option 里的域名 + 这次要写的域名。
+       **用户自己写的 list address 一律不动**。
+    ⚠️ 标记 option 在 domain 为空时**不删** —— 留着它，
+       下次域名又变回同一个时，那条记录仍旧认得出来是「我们的」。
+    """
+    if not _uci_available():
+        raise DhcpWriteError('设备上没有 uci 命令，无法修改 DNS 解析')
+    domain = (domain or '').strip().lower().rstrip('.')
+    ip = (ip or '').strip()
+    if domain:
+        ok, why = _validate_local_domain(domain)
+        if not ok:
+            raise DhcpWriteError(why)
+        ok, why = _validate_local_ip(ip)
+        if not ok:
+            raise DhcpWriteError(why)
+
+    with _write_lock():
+        section = _dnsmasq_section()
+        marker = ''
+        for v in _uci_list(section, LOCAL_DOMAIN_OPTION):
+            marker = v.strip().lower()
+            break
+        current = _uci_list(section, 'address')
+
+        # 属于「本面板」的条目 = 标记里的域名 + 这次要写的域名
+        ours = set(d for d in (marker, domain) if d)
+        keep = [e for e in current if _address_domain(e) not in ours]
+        want = ('/%s/%s' % (domain, ip)) if domain else ''
+        desired = keep + ([want] if want else [])
+
+        if current == desired and (not domain or marker == domain):
+            return {'domain': domain, 'ip': ip, 'changed': False,
+                    'reload': {'ok': True, 'message': '本地解析已是最新，未改动'}}
+
+        backup = _make_backup('local-domain')
+        try:
+            for e in current:
+                if _address_domain(e) in ours:
+                    # 只删确实在列表里的值 ⇒ del_list 不会 rc=1
+                    _run_uci(['del_list',
+                              'dhcp.%s.address=%s' % (section, e)])
+            if want:
+                rc, out = _run_uci(['add_list',
+                                    'dhcp.%s.address=%s' % (section, want)])
+                if rc != 0:
+                    raise DhcpWriteError('uci add_list 失败: %s' % out.strip())
+            if domain:
+                rc, out = _run_uci(['set', 'dhcp.%s.%s=%s'
+                                    % (section, LOCAL_DOMAIN_OPTION, domain)])
+                if rc != 0:
+                    raise DhcpWriteError('uci set 标记失败: %s' % out.strip())
+
+            rc, out = _run_uci(['commit', 'dhcp'])
+            if rc != 0:
+                raise DhcpWriteError('uci commit 失败: %s' % out.strip())
+
+            ok, detail = _check_syntax()
+            if not ok:
+                raise DhcpWriteError('改完的配置解析不了（已回滚）: %s' % detail)
+        except DhcpWriteError as e:
+            pending_ok, pend_detail = _discard_pending()
+            rolled = _restore(backup)
+            if not rolled:
+                raise DhcpWriteError('%s；**且回滚失败**，请手工从 %s 恢复'
+                                     % (e, backup), rolled_back=False)
+            if not pending_ok:
+                raise DhcpWriteError(
+                    '%s（文件已回滚，但 uci 的未提交变更未能清除：%s）'
+                    % (e, pend_detail), rolled_back=False)
+            raise DhcpWriteError('%s（已回滚）' % e, rolled_back=True)
+
+        # ⚠️ 重载也在锁内（理由同新增：两个 restart 撞在一起可能起不来）
+        reload_result = reload_dnsmasq()
+
+    return {'domain': domain, 'ip': ip, 'changed': True,
+            'reload': reload_result}
+
+
 def reload_dnsmasq():
     """重载 dnsmasq，让新的静态绑定生效。
 

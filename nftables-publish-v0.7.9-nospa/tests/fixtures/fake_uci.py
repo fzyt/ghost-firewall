@@ -25,6 +25,8 @@
   set  <pkg.sec=type>     建段
   set  <pkg.sec.opt=val>  设选项（段不存在 ⇒ rc=1）
   set  <pkg.sec.opt=      设空值 ⇒ rc=1（.232 实测：Entry not found）
+  add_list <pkg.sec.opt=val>   往列表选项追加一个值
+  del_list <pkg.sec.opt=val>   从列表选项删掉一个值（值不在 ⇒ rc=1）
   commit <pkg>            写回文件
   delete <pkg.sec>        删段（不存在 ⇒ rc=1）
 
@@ -42,6 +44,7 @@
 """
 import json
 import os
+import re
 import sys
 
 PKG = 'dhcp'
@@ -138,6 +141,25 @@ def load():
                 return None, "uci: Parse error (unterminated quote)"
             cur['opts'][key] = val
             continue
+        if s.startswith('list '):
+            # ⚠️ list 选项的值是**列表**（.193 实测 2026-11-17）：
+            #   落盘是 `list address '/x/1.2.3.4'` 一行一条；
+            #   `uci get` 把它**空格分隔**成一行返回（不是每行一个）。
+            parts = s.split(None, 2)
+            if cur is None:
+                continue
+            key = parts[1] if len(parts) > 1 else ''
+            val, ok = parse_value(parts[2] if len(parts) > 2 else '')
+            if not ok:
+                return None, "uci: Parse error (unterminated quote)"
+            old = cur['opts'].get(key)
+            if old is None:
+                cur['opts'][key] = [val]
+            elif isinstance(old, list):
+                old.append(val)
+            else:
+                cur['opts'][key] = [old, val]
+            continue
         # 其它行忽略
     return sections, None
 
@@ -151,12 +173,24 @@ def dump(sections):
         else:
             out.append('config %s' % sec['type'])
         for k, v in sec['opts'].items():
-            if v == CORRUPT_MARK:
+            if isinstance(v, list):
+                # list 选项：一行一条（.193 实测 2026-11-17）
+                for item in v:
+                    if item == CORRUPT_MARK:
+                        out.append("\tlist %s 'BROKEN" % k)
+                    else:
+                        out.append("\tlist %s %s" % (k, escape_value(item)))
+            elif v == CORRUPT_MARK:
                 # 故意写出没闭合的引号 ⇒ 模拟「uci 写出坏配置」
                 out.append("\toption %s 'BROKEN" % k)
             else:
                 out.append("\toption %s %s" % (k, escape_value(v)))
         out.append('')
+    if os.environ.get('FAKE_UCI_CORRUPT_COMMIT') == '1':
+        # ⚠️ 模拟「uci 写回了一个**坏配置**」——
+        #   与 CORRUPT_MARK（值本身是坏标记）不同，这个是**整个文件**坏掉，
+        #   用来验「写完发现配置解析不了 ⇒ 必须回滚」那条路。
+        out.append("\toption __corrupted__ 'BROKEN")
     with open(cfg_file(), 'w', encoding='utf-8') as f:
         f.write('\n'.join(out))
 
@@ -188,6 +222,18 @@ def find_section(sections, name):
     for sec in sections:
         if sec['name'] == name:
             return sec
+    # ⚠️ 匿名段用 `@type[index]` 寻址（.193 实测 2026-11-17：
+    #    `uci show dhcp` 把默认 dnsmasq 实例显示成 `dhcp.@dnsmasq[0]`）。
+    #    index 是**该类型内部**的序号。
+    m = re.match(r'^@([A-Za-z0-9_-]+)\[(\d+)\]$', name or '')
+    if m:
+        want_type, want_idx = m.group(1), int(m.group(2))
+        cnt = 0
+        for sec in sections:
+            if sec['type'] == want_type:
+                if cnt == want_idx:
+                    return sec
+                cnt += 1
     return None
 
 
@@ -210,7 +256,37 @@ def apply_delta(sections, ops):
             if sec is None:
                 # .232 实测：段不存在时设选项 ⇒ uci: Invalid argument
                 return 'uci: Invalid argument'
+            # ⚠️ set 作用在 list 选项上时，真 uci 是**整条列表被替换成这一个值**
+            #   （.193 实测 2026-11-17）⇒ 这里直接存标量。
             sec['opts'][op['key']] = op['value']
+        elif kind == 'addlist':
+            sec = find_section(sections, op['name'])
+            if sec is None:
+                return 'uci: Invalid argument'
+            cur = sec['opts'].get(op['key'])
+            if cur is None:
+                sec['opts'][op['key']] = [op['value']]
+            elif isinstance(cur, list):
+                cur.append(op['value'])
+            else:
+                sec['opts'][op['key']] = [cur, op['value']]
+        elif kind == 'dellist':
+            sec = find_section(sections, op['name'])
+            if sec is None:
+                return 'uci: Invalid argument'
+            cur = sec['opts'].get(op['key'])
+            if cur is None:
+                return 'uci: Entry not found'
+            if isinstance(cur, list):
+                if op['value'] not in cur:
+                    return 'uci: Entry not found'
+                cur.remove(op['value'])
+                if not cur:
+                    del sec['opts'][op['key']]
+            else:
+                if cur != op['value']:
+                    return 'uci: Entry not found'
+                del sec['opts'][op['key']]
         elif kind == 'del':
             sec = find_section(sections, op['name'])
             if sec is None:
@@ -231,9 +307,22 @@ def state():
 
 
 def ident(sec):
-    """show 输出里的段标识：有名字用名字，没名字用 @type[index]。"""
+    """show 输出里的段标识：有名字用名字，没名字用 @type[index]。
+
+    ⚠️ index 是**该类型内部**的序号（.193 实测 2026-11-17）。
+    """
     return sec['name'] if sec['name'] else '@%s[%d]' % (
         sec['type'], sec['_idx'])
+
+
+def assign_idx(sections):
+    """给每段算好「类型内序号」（匿名段在 show 里要用）。"""
+    counters = {}
+    for sec in sections:
+        t = sec['type']
+        i = counters.get(t, 0)
+        sec['_idx'] = i
+        counters[t] = i + 1
 
 
 def main(argv):
@@ -272,6 +361,40 @@ def main(argv):
         _secs, err = state()
         if err:
             die(err, 1)
+        return 0
+
+    if cmd in ('add_list', 'del_list'):
+        if not rest:
+            die('uci: Invalid argument')
+        target = rest[0]
+        if '=' not in target:
+            die('uci: Invalid argument')
+        path, _, value = target.partition('=')
+        pkg, _, rest2 = path.partition('.')
+        if pkg != PKG:
+            die('uci: Entry not found')
+        head, _, opt = rest2.partition('.')
+        if not opt:
+            die('uci: Invalid argument')
+        # ⚠️ 先在**当前状态**上试一次：失败就不该留下 delta
+        #   （真 uci：del_list 值不存在 ⇒ rc=1 且配置不变）。
+        _secs, err = state()
+        if err:
+            die(err, 1)
+        sec = find_section(_secs, head)
+        if sec is None:
+            die('uci: Invalid argument', 1)
+        if cmd == 'del_list':
+            cur = sec['opts'].get(opt)
+            if cur is None:
+                die('uci: Entry not found', 1)
+            vals = cur if isinstance(cur, list) else [cur]
+            if value not in vals:
+                die('uci: Entry not found', 1)
+        ops = load_delta()
+        ops.append({'op': 'addlist' if cmd == 'add_list' else 'dellist',
+                    'name': head, 'key': opt, 'value': value})
+        save_delta(ops)
         return 0
 
     if cmd == 'delete':
@@ -334,14 +457,19 @@ def main(argv):
         die(err, 1)
 
     if cmd == 'show':
-        for i, sec in enumerate(sections):
-            sec['_idx'] = i
+        assign_idx(sections)
         lines = []
         for sec in sections:
             sid = ident(sec)
             lines.append('%s.%s=%s' % (PKG, sid, sec['type']))
             for k, v in sec['opts'].items():
-                lines.append('%s.%s.%s=%s' % (PKG, sid, k, escape_value(v)))
+                if isinstance(v, list):
+                    # list 选项：值**空格分隔**在同一行（.193 实测 2026-11-17）
+                    lines.append('%s.%s.%s=%s' % (
+                        PKG, sid, k,
+                        ' '.join(escape_value(i) for i in v)))
+                else:
+                    lines.append('%s.%s.%s=%s' % (PKG, sid, k, escape_value(v)))
         sys.stdout.write('\n'.join(lines) + ('\n' if lines else ''))
         return 0
 
@@ -355,15 +483,20 @@ def main(argv):
         if pkg != PKG:
             die('uci: Entry not found')
         head, _, opt = path.partition('.')
-        for sec in sections:
-            if sec['name'] == head:
-                if not opt:
-                    sys.stdout.write(sec['type'] + '\n')
-                    return 0
-                if opt in sec['opts']:
-                    sys.stdout.write(sec['opts'][opt] + '\n')
-                    return 0
-                die('uci: Entry not found')
+        sec = find_section(sections, head)
+        if sec is not None:
+            if not opt:
+                sys.stdout.write(sec['type'] + '\n')
+                return 0
+            if opt in sec['opts']:
+                val = sec['opts'][opt]
+                if isinstance(val, list):
+                    # list 选项：`uci get` 返回**空格分隔**的一行
+                    # （.193 实测 2026-11-17）
+                    sys.stdout.write(' '.join(val) + '\n')
+                else:
+                    sys.stdout.write(val + '\n')
+                return 0
         die('uci: Entry not found')
 
     die('uci: Invalid argument')
