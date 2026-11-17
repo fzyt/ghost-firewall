@@ -1,0 +1,11 @@
+# 渲染产物与依赖，不入库
+node_modules/
+out/
+stills/
+tmp/
+audio/*.wav
+segments.txt
+
+# 字体：10 个 OFL 字体（OFL-1.1）是 纯代码视频制作/01-代码/fonts/ 的副本，
+# 属于第三方二进制资源，不在本仓库重复保存（需要时从技能工程复制过来）
+fonts/

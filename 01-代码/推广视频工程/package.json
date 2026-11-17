@@ -1,0 +1,9 @@
+{
+  "name": "ghost-firewall-promo-video",
+  "private": true,
+  "type": "module",
+  "description": "Ghost Firewall 产品讲解片工程（独立包，避免向上解析到别的 package.json）",
+  "dependencies": {
+    "playwright-core": "1.65.1"
+  }
+}

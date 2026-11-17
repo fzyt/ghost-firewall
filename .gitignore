@@ -29,6 +29,11 @@ Thumbs.db
 tmp/
 .tmp/
 
+# 推广物料：成片 mp4（80MB 级）与质检图不入库
+# 仓库只留源码与文档；成片放在工作区的 05-媒体/ 下。
+# ⚠️ 这条同时防住 `git add .` 把 80MB 的 mp4 顺手带进版本库。
+05-媒体/
+
 # e2e 测试产物（每次跑都会变，不入库）
 nftables-publish-v0.7.9-nospa/tests/reports/
 

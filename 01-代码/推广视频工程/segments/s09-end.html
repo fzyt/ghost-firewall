@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="/shared/fonts.css">
+<title>09 收尾</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0e0e0d; overflow: hidden; }
+  #stage { position: relative; width: 1920px; height: 1080px; overflow: hidden; }
+  canvas#c { position: absolute; inset: 0; width: 1920px; height: 1080px; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="c" width="1920" height="1080"></canvas></div>
+
+<script type="module">
+import { createSegment, loadFonts, clamp, ease, drawCapsuleLabel, drawStamp } from '../common.js';
+import { themeFromURL, chrome, drawGrain, drawVignette } from '../themes.js';
+
+const W = 1920, H = 1080;
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const theme = themeFromURL(location.search);
+const HUD = chrome(theme);
+const seg = createSegment();
+
+window.DURATION = seg.duration;
+window.__ready = false;
+window.__bootError = null;
+
+// ---------- 调色板（coral-noir，与讲解页完全一致） ----------
+const C = {
+  bg: '#0e0e0d', surface: '#1a1917', ink: '#f5f0e8', muted: '#8f8981',
+  accent: '#d97757', accentSoft: '#f0b49c', line: 'rgba(245,240,232,0.10)',
+};
+
+// ---------- 文案（timeline.json 的 copy 字段，唯一真相源，逐字照抄） ----------
+const BRAND = 'Ghost Firewall';
+const TITLE = '把内网服务暴露到公网，\n但只暴露一个必须认证的入口';
+const CTA = 'GitHub：fzyt/ghost-firewall';
+const FOOTNOTE = '本片画面由代码逐帧渲染 · 配乐由 numpy/scipy 合成 · 全程零生成模型';
+
+const TAG_LINES = TITLE.split('\n');
+const CTA_CUT = CTA.indexOf('：');
+const CTA_HEAD = CTA.slice(0, CTA_CUT + 1);
+const CTA_PATH = CTA.slice(CTA_CUT + 1);
+
+// ---------- 版面常量 ----------
+const WORDMARK = { y: 330, size: 108, track: 8 };
+const TAG_Y = [512, 598];
+const CTA_Y = 712;
+const FOOT_Y = 950;
+
+// ============================================================
+// 节拍表（120 BPM，每拍 0.5s）
+//   0.0-1.0   品牌 wordmark 落下（outBack），背后暖光晕亮起
+//   1.0-1.8   品牌下方 accent 细线从中心拉开
+//   2.0-2.8   tagline 第一行上浮
+//   3.0-3.8   tagline 第二行上浮
+//   4.5-5.3   行动号召出现，下划线拉开
+//   6.0-6.8   底部脚注淡入
+//   6.8-18.0  保持（光晕呼吸 + 扫描线缓慢扫过）
+// ============================================================
+
+// 品牌 wordmark：逐字绘制以精确控制字距（ctx.letterSpacing 不通用）
+function drawWordmark(u) {
+  const p = clamp(u / 1.0, 0, 1);
+  if (p <= 0) return;
+  const e = ease.outBack(p);
+  const chars = [...BRAND];
+  ctx.font = `700 ${WORDMARK.size}px "Orbitron", sans-serif`;
+  const widths = chars.map((c) => ctx.measureText(c).width);
+  const total = widths.reduce((a, b) => a + b, 0) + WORDMARK.track * (chars.length - 1);
+
+  ctx.save();
+  ctx.globalAlpha = clamp(p * 2, 0, 1);
+  ctx.translate(0, (1 - e) * -30);
+  ctx.textBaseline = 'alphabetic';
+  ctx.textAlign = 'left';
+  ctx.fillStyle = C.ink;
+  let x = 960 - total / 2;
+  for (let i = 0; i < chars.length; i++) {
+    ctx.fillText(chars[i], x, WORDMARK.y);
+    x += widths[i] + WORDMARK.track;
+  }
+  ctx.restore();
+}
+
+// 品牌下方的 accent 细线：从中心向两侧拉开
+function drawRule(u) {
+  const p = clamp((u - 1.0) / 0.8, 0, 1);
+  if (p <= 0) return;
+  const e = ease.outCubic(p);
+  ctx.save();
+  ctx.globalAlpha = e;
+  ctx.fillStyle = C.accent;
+  ctx.fillRect(960 - 120, 374, 240 * e, 3);
+  ctx.restore();
+}
+
+// tagline 两行：上行铺垫、下行落点，字号字色分出层次
+function drawTagline(u) {
+  const sizes = [42, 48];
+  const colors = [C.muted, C.ink];
+  for (let i = 0; i < TAG_LINES.length; i++) {
+    const p = clamp((u - (2.0 + i * 1.0)) / 0.8, 0, 1);
+    if (p <= 0) continue;
+    const e = ease.outCubic(p);
+    ctx.save();
+    ctx.globalAlpha = e;
+    ctx.translate(0, (1 - e) * 18);
+    ctx.font = `400 ${sizes[i]}px "Noto Sans SC", sans-serif`;
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = colors[i];
+    ctx.fillText(TAG_LINES[i], 960, TAG_Y[i]);
+    ctx.restore();
+  }
+}
+
+// 行动号召：中文标签 + 等宽仓库路径
+function drawCta(u) {
+  const p = clamp((u - 4.5) / 0.8, 0, 1);
+  if (p <= 0) return;
+  const e = ease.outCubic(p);
+  ctx.save();
+  ctx.globalAlpha = e;
+
+  ctx.font = '400 30px "Noto Sans SC", sans-serif';
+  const hw = ctx.measureText(CTA_HEAD).width;
+  ctx.font = '500 30px "JetBrains Mono", monospace';
+  const pw = ctx.measureText(CTA_PATH).width;
+  const total = hw + pw;
+  const x0 = 960 - total / 2;
+
+  ctx.textBaseline = 'alphabetic';
+  ctx.textAlign = 'left';
+  ctx.font = '400 30px "Noto Sans SC", sans-serif';
+  ctx.fillStyle = C.ink;
+  ctx.fillText(CTA_HEAD, x0, CTA_Y);
+  ctx.font = '500 30px "JetBrains Mono", monospace';
+  ctx.fillStyle = C.accent;
+  ctx.fillText(CTA_PATH, x0 + hw, CTA_Y);
+
+  // 路径下划线：从左往右拉开
+  ctx.fillStyle = 'rgba(217,119,87,0.6)';
+  ctx.fillRect(x0 + hw, CTA_Y + 12, pw * e, 2);
+  ctx.restore();
+}
+
+// 底部脚注：本片是怎么做出来的
+function drawFootnote(u) {
+  const p = clamp((u - 6.0) / 0.8, 0, 1);
+  if (p <= 0) return;
+  ctx.save();
+  ctx.globalAlpha = ease.outCubic(p) * 0.62;
+  ctx.font = '400 22px "Noto Sans SC", sans-serif';
+  ctx.textBaseline = 'alphabetic';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = C.ink;
+  ctx.fillText(FOOTNOTE, 960, FOOT_Y);
+  ctx.restore();
+}
+
+// 品牌背后的暖光晕：6 秒一个呼吸周期，只给画面一点生气
+function drawGlow(u) {
+  const p = clamp(u / 1.0, 0, 1);
+  if (p <= 0) return;
+  const breathe = 0.5 + 0.5 * Math.sin(u * (Math.PI * 2 / 6) - Math.PI / 2);
+  const a = (0.07 + 0.05 * breathe) * ease.outCubic(p);
+  const g = ctx.createRadialGradient(960, 300, 40, 960, 300, 640);
+  g.addColorStop(0, `rgba(217,119,87,${a.toFixed(3)})`);
+  g.addColorStop(1, 'rgba(217,119,87,0)');
+  ctx.save();
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  ctx.restore();
+}
+
+// 全幅扫描线：与 s01 / s07 同一套语言，周期 7 秒、两端淡出
+function drawScan(u) {
+  const period = 7;
+  const cyc = (u % period) / period;
+  const fade = Math.sin(Math.PI * cyc);
+  if (fade <= 0.01) return;
+  const sy = -120 + cyc * (H + 240);
+  ctx.save();
+  const g = ctx.createLinearGradient(0, sy - 120, 0, sy + 10);
+  g.addColorStop(0, 'rgba(217,119,87,0)');
+  g.addColorStop(1, `rgba(217,119,87,${(0.07 * fade).toFixed(3)})`);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, sy - 120, W, 130);
+  ctx.strokeStyle = `rgba(217,119,87,${(0.16 * fade).toFixed(3)})`;
+  ctx.lineWidth = 1.4;
+  ctx.beginPath();
+  ctx.moveTo(0, sy);
+  ctx.lineTo(W, sy);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ============================================================
+window.renderFrame = (u) => {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.textBaseline = 'alphabetic';
+  ctx.textAlign = 'left';
+  ctx.fillStyle = C.bg;
+  ctx.fillRect(0, 0, W, H);
+
+  drawGrain(ctx, theme, W, H, u);
+
+  drawGlow(u);
+  drawWordmark(u);
+  drawRule(u);
+  drawTagline(u);
+  drawCta(u);
+  drawFootnote(u);
+  drawScan(u);
+  drawVignette(ctx, W, H, 0.46);
+
+  // HUD
+  drawCapsuleLabel(ctx, 9, 'Ghost Firewall', '收尾', {
+    numberColor: HUD.capsule.numberColor, textColor: HUD.capsule.textColor,
+    bg: HUD.capsule.bg, border: HUD.capsule.border,
+  });
+  drawStamp(ctx, 'GHOST FIREWALL', { color: HUD.stamp.color });
+};
+
+(async () => {
+  try {
+    await loadFonts(['Noto Sans SC', 'JetBrains Mono', 'Inter', 'Orbitron']);
+    window.__ready = true;
+  } catch (e) {
+    window.__bootError = String(e);
+  }
+})();
+</script>
+</body>
+</html>

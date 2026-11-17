@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="/shared/fonts.css">
+<title>05 认证网关</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0e0e0d; overflow: hidden; }
+  #stage { position: relative; width: 1920px; height: 1080px; overflow: hidden; }
+  canvas#c { position: absolute; inset: 0; width: 1920px; height: 1080px; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="c" width="1920" height="1080"></canvas></div>
+
+<script type="module">
+import { createSegment, loadFonts, clamp, ease, TAU, drawCapsuleLabel, drawStamp } from '../common.js';
+import { themeFromURL, chrome, drawGrain, drawVignette } from '../themes.js';
+
+const W = 1920, H = 1080;
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const theme = themeFromURL(location.search);
+const HUD = chrome(theme);
+const seg = createSegment({ duration: 20 });
+
+window.DURATION = seg.duration;
+window.__ready = false;
+window.__bootError = null;
+
+// ---------- 调色板（coral-noir，与讲解页同一套） ----------
+const C = {
+  bg: '#0e0e0d', surface: '#1a1917', ink: '#f5f0e8', muted: '#8f8981',
+  accent: '#d97757', accentSoft: '#f0b49c', line: 'rgba(245,240,232,0.10)',
+};
+
+// ---------- 文案（timeline.json 的 copy 字段，唯一真相源） ----------
+const KICKER = '认证网关';
+const TITLE = '一个端口，汇聚所有服务';
+const ROUTES = [
+  { path: '/nas', target: 'NAS 管理界面' },
+  { path: '/photos', target: '相册服务' },
+  { path: '/board', target: '自建服务' },
+  { path: '/', target: '服务门户（登录后进）' },
+];
+const NOTES = [
+  '公网只开一个端口，不用为每个服务各开一个',
+  '网关按路径前缀分流到内网各个服务',
+  '门户登录后就是一张服务卡片列表',
+];
+// 拆成四块只为把 N 和 1 放大，拼接起来与 timeline 逐字一致
+const PUNCH_A = '暴露面从一个';
+const PUNCH_B = 'N';
+const PUNCH_C = '变成一个';
+const PUNCH_D = '1';
+const PUNCH = [PUNCH_A, PUNCH_B, PUNCH_C, PUNCH_D].join(' ');
+
+// ---------- 版面常量 ----------
+const NODE = { x: 150, y: 444, w: 300, h: 260 };     // 左侧唯一入口
+const CARD = { x: 980, w: 850, h: 92, gap: 20, y0: 360 };  // 右侧四张服务卡
+const NOTE_X = [150, 720, 1290];                     // 底部三条旁注
+const FAN = { x0: 450, y0: 574, cx: 700 };            // 扇出起点 / 控制点
+
+// ============================================================
+// 节拍表（120 BPM，每拍 0.5s）
+//   0.0-0.9  底部分隔线拉开
+//   0.8-1.4  kicker 淡入 + 短横线
+//   1.2-2.0  标题落下（outBack）
+//   2.2-3.0  入口节点落下（认证网关 · 一个端口）
+//   2.6-5.0  四张服务卡依次滑入（每张隔 0.6s）
+//   3.4-5.7  四条路径依次画出（每条 0.5s，扇出）
+//   5.7 起   路径上跑请求点（2.4s 一个循环，持续流动）
+//   6.6-7.7  三条旁注逐条淡入
+//   8.6-9.4  punchline 浮现（N 与 1 放大）
+//   9.8-10.6 punchline 划出珊瑚下划线
+//  11.2-11.9 四条路径依次加亮一波（都走同一个端口）
+//  15.0-16.2 四个服务卡整体压暗，入口节点转珊瑚（收束）
+//  16.5-17.3 节点里的 1 弹一下
+// ============================================================
+
+// 二次贝塞尔：扇出路径用，控制点固定在入口右侧
+function qPoint(x0, y0, cx, cy, x1, y1, s) {
+  const e = s * s, f = 2 * (1 - s) * s;
+  return {
+    x: (1 - s) * (1 - s) * x0 + f * cx + e * x1,
+    y: (1 - s) * (1 - s) * y0 + f * cy + e * y1,
+  };
+}
+
+// 只画贝塞尔的前 s 段（s=1 画满）
+function strokeQ(x0, y0, cx, cy, x1, y1, s) {
+  const e = s * s, f = 2 * (1 - s) * s;
+  const ex = (1 - s) * (1 - s) * x0 + f * cx + e * x1;
+  const ey = (1 - s) * (1 - s) * y0 + f * cy + e * y1;
+  const bx = x0 + s * (cx - x0), by = y0 + s * (cy - y0);
+  ctx.beginPath();
+  ctx.moveTo(x0, y0);
+  ctx.bezierCurveTo(bx, by, ex, ey, ex, ey);
+  ctx.stroke();
+}
+
+// 左侧入口节点：认证网关只有 1 个公网端口
+function drawNode(u) {
+  const p = clamp((u - 2.2) / 0.8, 0, 1);
+  if (p <= 0) return;
+  const e = ease.outCubic(p);
+  const cx = NODE.x + NODE.w / 2;
+  const cy = NODE.y + NODE.h / 2;
+  // 15.0s 起收束：服务卡压暗，入口转珊瑚
+  const hot = clamp((u - 15.0) / 1.2, 0, 1);
+  // 16.5s 起那个 1 弹一下
+  const pop = clamp((u - 16.5) / 0.8, 0, 1);
+
+  ctx.save();
+  ctx.globalAlpha = e;
+  ctx.translate(0, (1 - e) * -20);
+
+  ctx.fillStyle = `rgba(217,119,87,${0.04 + 0.08 * hot})`;
+  ctx.beginPath();
+  ctx.roundRect(NODE.x, NODE.y, NODE.w, NODE.h, 20);
+  ctx.fill();
+  ctx.strokeStyle = `rgba(217,119,87,${0.32 + 0.45 * hot})`;
+  ctx.lineWidth = 1.6 + 0.8 * hot;
+  ctx.stroke();
+
+  // 节点名
+  ctx.font = '500 20px "JetBrains Mono", monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = C.muted;
+  ctx.fillText(KICKER, cx, NODE.y + 52);
+
+  // 那个「1」：珊瑚实心圆 + 深色数字
+  ctx.save();
+  ctx.translate(cx, cy - 4);
+  const s = 1 + 0.12 * Math.sin(pop * Math.PI);
+  ctx.scale(s, s);
+  ctx.fillStyle = C.accent;
+  ctx.beginPath();
+  ctx.arc(0, 0, 40, 0, TAU);
+  ctx.fill();
+  ctx.font = '700 48px "Noto Sans SC", sans-serif';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = '#0e0e0d';
+  ctx.fillText('1', 0, 17);
+  ctx.restore();
+
+  // 说明
+  ctx.font = '500 22px "Noto Sans SC", sans-serif';
+  ctx.fillStyle = 'rgba(245,240,232,0.82)';
+  ctx.fillText('公网端口', cx, NODE.y + 216);
+
+  ctx.restore();
+}
+
+// 右侧四张服务卡：路径前缀 + 目标服务
+function drawRouteCards(u) {
+  const dim = 1 - 0.5 * clamp((u - 15.0) / 1.2, 0, 1);
+  for (let i = 0; i < ROUTES.length; i++) {
+    const p = clamp((u - (2.6 + i * 0.6)) / 0.6, 0, 1);
+    if (p <= 0) continue;
+    const e = ease.outCubic(p);
+    const y = CARD.y0 + i * (CARD.h + CARD.gap);
+
+    ctx.save();
+    ctx.globalAlpha = e * dim;
+    ctx.translate((1 - e) * 44, 0);
+
+    ctx.fillStyle = 'rgba(245,240,232,0.05)';
+    ctx.beginPath();
+    ctx.roundRect(CARD.x, y, CARD.w, CARD.h, 14);
+    ctx.fill();
+    ctx.strokeStyle = C.line;
+    ctx.lineWidth = 1.3;
+    ctx.stroke();
+
+    // 路径前缀（等宽珊瑚色）
+    ctx.font = '500 26px "JetBrains Mono", monospace';
+    const pw = ctx.measureText(ROUTES[i].path).width;
+    ctx.fillStyle = 'rgba(217,119,87,0.12)';
+    ctx.beginPath();
+    ctx.roundRect(CARD.x + 24, y + 25, pw + 36, 42, 12);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(217,119,87,0.45)';
+    ctx.lineWidth = 1.3;
+    ctx.stroke();
+    ctx.fillStyle = C.accentSoft;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(ROUTES[i].path, CARD.x + 42, y + 47);
+
+    // 目标服务
+    ctx.font = '400 30px "Noto Sans SC", sans-serif';
+    ctx.fillStyle = C.ink;
+    ctx.fillText(ROUTES[i].target, CARD.x + 24 + pw + 36 + 28, y + 56);
+
+    ctx.restore();
+  }
+}
+
+// 扇出路径：一条端口分出四条去路
+function drawFan(u) {
+  const dim = 1 - 0.5 * clamp((u - 15.0) / 1.2, 0, 1);
+  for (let i = 0; i < ROUTES.length; i++) {
+    const y = CARD.y0 + i * (CARD.h + CARD.gap) + CARD.h / 2;
+    const p = clamp((u - (3.4 + i * 0.6)) / 0.5, 0, 1);
+    if (p <= 0) continue;
+    // 11.6s 起四条依次加亮一波：都走同一个端口
+    const wp = clamp((u - (11.2 + i * 0.18)) / 0.35, 0, 1);
+    const boost = wp > 0 && wp < 1 ? 1 + 0.9 * Math.sin(wp * Math.PI) : 1;
+
+    ctx.save();
+    ctx.globalAlpha = dim * Math.min(1, 0.72 * boost);
+    ctx.strokeStyle = C.accent;
+    ctx.lineWidth = 2.4 * boost;
+    ctx.lineCap = 'round';
+    strokeQ(FAN.x0, FAN.y0, FAN.cx, FAN.y0, CARD.x, y, ease.outCubic(p));
+    ctx.restore();
+
+    // 请求点：路径上跑，表示流量真的从这里分流
+    const tp = ((u - 5.7) % 2.4) / 2.4;
+    if (u > 5.7) {
+      const ph = (tp + i * 0.18) % 1;
+      const q = qPoint(FAN.x0, FAN.y0, FAN.cx, FAN.y0, CARD.x, y, ph);
+      ctx.save();
+      ctx.globalAlpha = dim * Math.sin(ph * Math.PI) * 0.9;
+      ctx.fillStyle = C.accentSoft;
+      ctx.beginPath();
+      ctx.arc(q.x, q.y, 5, 0, TAU);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+}
+
+// 标题区
+function drawHead(u) {
+  const kp = clamp((u - 0.8) / 0.6, 0, 1);
+  if (kp > 0) {
+    ctx.save();
+    ctx.globalAlpha = ease.outCubic(kp);
+    ctx.font = '500 34px "Noto Sans SC", sans-serif';
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = C.accent;
+    ctx.fillText(KICKER, 150, 212);
+    ctx.fillStyle = 'rgba(217,119,87,0.55)';
+    ctx.fillRect(150, 230, 260 * ease.outCubic(kp), 2);
+    ctx.restore();
+  }
+
+  const tp = clamp((u - 1.2) / 0.8, 0, 1);
+  if (tp > 0) {
+    ctx.save();
+    ctx.globalAlpha = clamp(tp * 2, 0, 1);
+    ctx.translate(0, (1 - ease.outBack(tp)) * -24);
+    ctx.font = '700 70px "Noto Sans SC", sans-serif';
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = C.ink;
+    ctx.fillText(TITLE, 150, 308);
+    ctx.restore();
+  }
+}
+
+// 三条旁注
+function drawNotes(u) {
+  for (let i = 0; i < NOTES.length; i++) {
+    const p = clamp((u - (6.6 + i * 0.3)) / 0.5, 0, 1);
+    if (p <= 0) continue;
+    const e = ease.outCubic(p);
+    const x = NOTE_X[i];
+    ctx.save();
+    ctx.globalAlpha = e;
+    ctx.translate((1 - e) * -20, 0);
+    ctx.fillStyle = C.accent;
+    ctx.beginPath();
+    ctx.roundRect(x, 876, 11, 11, 2);
+    ctx.fill();
+    ctx.font = '400 25px "Noto Sans SC", sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = 'rgba(245,240,232,0.74)';
+    ctx.fillText(NOTES[i], x + 26, 890);
+    ctx.restore();
+  }
+}
+
+// 收束：punchline 里的 N 与 1 放大
+function drawPunch(u) {
+  const p = clamp((u - 8.6) / 0.8, 0, 1);
+  if (p <= 0) return;
+  const e = ease.outCubic(p);
+  ctx.save();
+  ctx.globalAlpha = e;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+
+  let x = 150;
+  ctx.font = '600 46px "Noto Sans SC", sans-serif';
+  ctx.fillStyle = C.ink;
+  ctx.fillText(PUNCH_A, x, 985);
+  x += ctx.measureText(PUNCH_A).width + 10;
+
+  ctx.font = '900 64px "Noto Sans SC", sans-serif';
+  ctx.fillStyle = C.accent;
+  ctx.fillText(PUNCH_B, x, 985);
+  x += ctx.measureText(PUNCH_B).width + 10;
+
+  ctx.font = '600 46px "Noto Sans SC", sans-serif';
+  ctx.fillStyle = C.ink;
+  ctx.fillText(PUNCH_C, x, 985);
+  x += ctx.measureText(PUNCH_C).width + 10;
+
+  ctx.font = '900 78px "Noto Sans SC", sans-serif';
+  ctx.fillStyle = C.accent;
+  ctx.fillText(PUNCH_D, x, 985);
+  const wEnd = x + ctx.measureText(PUNCH_D).width;
+
+  // 左侧竖线做视觉锚
+  ctx.fillStyle = 'rgba(217,119,87,0.55)';
+  ctx.fillRect(116, 957, 3, 46);
+  // 10.2s 起划重点
+  const up = clamp((u - 9.8) / 0.8, 0, 1);
+  if (up > 0) {
+    ctx.fillStyle = C.accent;
+    ctx.fillRect(150, 999, (wEnd - 150) * ease.outCubic(up), 3);
+  }
+  ctx.restore();
+}
+
+// ============================================================
+window.renderFrame = (u) => {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.textBaseline = 'alphabetic';
+  ctx.textAlign = 'left';
+  ctx.fillStyle = C.bg;
+  ctx.fillRect(0, 0, W, H);
+
+  drawGrain(ctx, theme, W, H, u);
+
+  // 底部旁注区的分隔线
+  const ruleP = clamp(u / 0.9, 0, 1);
+  if (ruleP > 0) {
+    ctx.save();
+    ctx.globalAlpha = ease.outCubic(ruleP) * 0.9;
+    ctx.strokeStyle = C.line;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(150, 826);
+    ctx.lineTo(150 + 1680 * ease.outCubic(ruleP), 826);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  drawHead(u);
+  drawNode(u);
+  drawRouteCards(u);
+  drawFan(u);
+  drawNotes(u);
+  drawPunch(u);
+  drawVignette(ctx, W, H, 0.42);
+
+  // HUD
+  drawCapsuleLabel(ctx, 5, '认证网关', '网关', {
+    numberColor: HUD.capsule.numberColor, textColor: HUD.capsule.textColor,
+    bg: HUD.capsule.bg, border: HUD.capsule.border,
+  });
+  drawStamp(ctx, 'GHOST FIREWALL', { color: HUD.stamp.color });
+};
+
+(async () => {
+  try {
+    await loadFonts(['Noto Sans SC', 'JetBrains Mono', 'Inter']);
+    window.__ready = true;
+  } catch (e) {
+    window.__bootError = String(e);
+  }
+})();
+</script>
+</body>
+</html>

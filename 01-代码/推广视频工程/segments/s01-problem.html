@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="/shared/fonts.css">
+<title>01 暴露风险</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0e0e0d; overflow: hidden; }
+  #stage { position: relative; width: 1920px; height: 1080px; overflow: hidden; }
+  canvas#c { position: absolute; inset: 0; width: 1920px; height: 1080px; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="c" width="1920" height="1080"></canvas></div>
+
+<script type="module">
+import { createSegment, loadFonts, clamp, ease, TAU, drawCapsuleLabel, drawStamp } from '../common.js';
+import { themeFromURL, chrome, drawGrain, drawVignette } from '../themes.js';
+
+const W = 1920, H = 1080;
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const theme = themeFromURL(location.search);
+const HUD = chrome(theme);
+const seg = createSegment();
+
+window.DURATION = seg.duration;
+window.__ready = false;
+window.__bootError = null;
+
+// ---------- 调色板（coral-noir，与讲解页同一套） ----------
+const C = {
+  bg: '#0e0e0d', surface: '#1a1917', ink: '#f5f0e8', muted: '#8f8981',
+  accent: '#d97757', accentSoft: '#f0b49c', line: 'rgba(245,240,232,0.10)',
+};
+
+// ---------- 文案（timeline.json 的 copy 字段，唯一真相源） ----------
+const KICKER = '把内网服务暴露到公网';
+const TITLE = '是一件天然危险的事';
+const RISKS = [
+  '端口一开，全世界的扫描器 24 小时在找',
+  '一个弱口令 = 一整条内网沦陷',
+  'VPN 客户端要先装、要先连、还可能连不上',
+];
+const PUNCH = '问题的根子是：公网上开了几个不该开的门';
+
+// ---------- 版面常量 ----------
+// 左图右文：两侧内容顶边对齐在 380，底部留白是统一的呼吸空间
+const STACK = { x: 150, y: 380, w: 540, h: 56, gap: 20, n: 5, open: 2 };  // open = 第几条是开放端口
+const RIGHT = { x: 880, w: 860 };
+const RULE_X = 790;   // 左右分隔线
+
+// ============================================================
+// 节拍表（120 BPM，每拍 0.5s）
+//   0.0-1.0  端口栈淡入，扫描线开始上下扫
+//   1.0-2.0  kicker 淡入
+//   2.0-3.0  title 落下（outBack）
+//   3.0-4.0  风险 1 滑入
+//   4.0-5.0  风险 2 滑入
+//   5.0-6.0  风险 3 滑入，同时开放端口条闪红
+//   6.0-8.0  保持读字
+//   8.0-10.0 三条风险收拢变暗，punchline 浮现
+//  10.0-14.0 保持
+// ============================================================
+
+// 左侧：防火墙规则栈 + 一条上下扫的扫描线
+function drawStack(u) {
+  const inP = clamp(u / 0.8, 0, 1);
+  const e = ease.outCubic(inP);
+  for (let i = 0; i < STACK.n; i++) {
+    const y = STACK.y + i * (STACK.h + STACK.gap);
+    const isOpen = i === STACK.open;
+    const rowIn = clamp((inP - i * 0.08) / 0.5, 0, 1);
+    if (rowIn <= 0) continue;
+    const re = ease.outCubic(rowIn);
+
+    ctx.save();
+    ctx.globalAlpha = re;
+    ctx.translate((1 - re) * -60, 0);
+
+    // 条本体
+    ctx.fillStyle = isOpen ? 'rgba(217,119,87,0.16)' : 'rgba(245,240,232,0.045)';
+    ctx.beginPath();
+    ctx.roundRect(STACK.x, y, STACK.w, STACK.h, 10);
+    ctx.fill();
+    ctx.strokeStyle = isOpen ? 'rgba(217,119,87,0.55)' : C.line;
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+
+    // 左端的状态点
+    ctx.fillStyle = isOpen ? C.accent : 'rgba(245,240,232,0.22)';
+    ctx.beginPath();
+    ctx.arc(STACK.x + 30, y + STACK.h / 2, 7, 0, TAU);
+    ctx.fill();
+
+    // 条上的伪规则文本（等宽，暗示 nftables 规则）
+    ctx.font = '400 20px "JetBrains Mono", monospace';
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = isOpen ? C.accentSoft : 'rgba(245,240,232,0.30)';
+    const label = isOpen ? 'tcp dport 443 accept' : `ip saddr 10.0.${i}.0/24 drop`;
+    ctx.fillText(label, STACK.x + 56, y + STACK.h / 2 + 1);
+
+    ctx.restore();
+  }
+
+  // 扫描线：周期 3 秒上下扫，扫过开放端口条时让它闪一下
+  const cyc = (u % 3) / 3;
+  const sy = STACK.y - 40 + cyc * (STACK.n * (STACK.h + STACK.gap) + 80);
+  const grad = ctx.createLinearGradient(0, sy - 70, 0, sy + 10);
+  grad.addColorStop(0, 'rgba(217,119,87,0)');
+  grad.addColorStop(1, 'rgba(217,119,87,0.30)');
+  ctx.save();
+  ctx.fillStyle = grad;
+  ctx.fillRect(STACK.x, sy - 70, STACK.w, 80);
+  ctx.strokeStyle = 'rgba(217,119,87,0.75)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(STACK.x, sy);
+  ctx.lineTo(STACK.x + STACK.w, sy);
+  ctx.stroke();
+  ctx.restore();
+
+  // 开放端口条的脉冲：扫线靠近时亮度上去
+  const openY = STACK.y + STACK.open * (STACK.h + STACK.gap);
+  const d = Math.abs(sy - (openY + STACK.h / 2));
+  const flash = clamp(1 - d / 260, 0, 1);
+  if (flash > 0.01) {
+    ctx.save();
+    ctx.globalAlpha = flash * 0.9;
+    ctx.strokeStyle = C.accent;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.roundRect(STACK.x - 5, openY - 5, STACK.w + 10, STACK.h + 10, 14);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+// 右侧：kicker + 大标题
+function drawHeadline(u) {
+  const kp = clamp((u - 1.0) / 0.7, 0, 1);
+  if (kp > 0) {
+    ctx.save();
+    ctx.globalAlpha = ease.outCubic(kp);
+    ctx.font = '500 34px "JetBrains Mono", monospace';
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = C.accent;
+    ctx.fillText(KICKER, RIGHT.x, 380);
+    // kicker 下方的短横线，随文字推进拉开
+    ctx.fillStyle = 'rgba(217,119,87,0.55)';
+    ctx.fillRect(RIGHT.x, 410, 260 * ease.outCubic(kp), 2);
+    ctx.restore();
+  }
+
+  const tp = clamp((u - 2.0) / 0.8, 0, 1);
+  if (tp > 0) {
+    const e = ease.outBack(tp);
+    ctx.save();
+    ctx.globalAlpha = clamp(tp * 2, 0, 1);
+    ctx.translate(0, (1 - e) * -26);
+    ctx.font = '700 92px "Noto Sans SC", sans-serif';
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = C.ink;
+    ctx.fillText(TITLE, RIGHT.x, 512);
+    ctx.restore();
+  }
+}
+
+// 三条风险：逐条滑入，收拢阶段向左退并变暗
+function drawRisks(u) {
+  const startY = 640;
+  const collapse = clamp((u - 8.0) / 1.2, 0, 1);
+  const ce = ease.outCubic(collapse);
+
+  for (let i = 0; i < RISKS.length; i++) {
+    const p = clamp((u - (3.0 + i * 1.0)) / 0.6, 0, 1);
+    if (p <= 0) continue;
+    const e = ease.outCubic(p);
+    const y = startY + i * 76;
+
+    ctx.save();
+    // 收拢：往左退 + 缩小 + 变暗
+    ctx.globalAlpha = e * (1 - ce * 0.72);
+    ctx.translate(-ce * 150, -ce * i * 26);
+    ctx.font = '400 34px "Noto Sans SC", sans-serif';
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+
+    // 前面的方形标记
+    const mx = RIGHT.x - 34 + (1 - e) * -24;
+    ctx.fillStyle = C.accent;
+    ctx.beginPath();
+    ctx.roundRect(mx, y - 26, 14, 14, 3);
+    ctx.fill();
+
+    ctx.fillStyle = C.ink;
+    ctx.fillText(RISKS[i], RIGHT.x, y);
+    ctx.restore();
+  }
+}
+
+// 收束：punchline 在风险收拢后浮现
+function drawPunch(u) {
+  const p = clamp((u - 9.2) / 0.8, 0, 1);
+  if (p <= 0) return;
+  const e = ease.outCubic(p);
+  ctx.save();
+  ctx.globalAlpha = e;
+  ctx.font = '600 42px "Noto Sans SC", sans-serif';
+  ctx.textBaseline = 'alphabetic';
+  ctx.textAlign = 'left';
+  ctx.fillStyle = C.accent;
+  ctx.fillText(PUNCH, RIGHT.x, 880);
+  // 左侧一条竖线做视觉锚
+  ctx.fillStyle = 'rgba(217,119,87,0.55)';
+  ctx.fillRect(RIGHT.x - 34, 852, 3, 46);
+  ctx.restore();
+}
+
+// ============================================================
+window.renderFrame = (u) => {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.textBaseline = 'alphabetic';
+  ctx.textAlign = 'left';
+  ctx.fillStyle = C.bg;
+  ctx.fillRect(0, 0, W, H);
+
+  drawGrain(ctx, theme, W, H, u);
+
+  // 左右分隔线：随左侧栈淡入一起拉开，把「图」和「文」绑成一版
+  const ruleP = clamp(u / 0.9, 0, 1);
+  if (ruleP > 0) {
+    ctx.save();
+    ctx.globalAlpha = ease.outCubic(ruleP) * 0.9;
+    ctx.strokeStyle = C.line;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(RULE_X, 380);
+    ctx.lineTo(RULE_X, 380 + 520 * ease.outCubic(ruleP));
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  drawStack(u);
+  drawHeadline(u);
+  drawRisks(u);
+  drawPunch(u);
+  drawVignette(ctx, W, H, 0.42);
+
+  // HUD
+  drawCapsuleLabel(ctx, 1, '暴露风险', '开篇', {
+    numberColor: HUD.capsule.numberColor, textColor: HUD.capsule.textColor,
+    bg: HUD.capsule.bg, border: HUD.capsule.border,
+  });
+  drawStamp(ctx, 'GHOST FIREWALL', { color: HUD.stamp.color });
+};
+
+(async () => {
+  try {
+    await loadFonts(['Noto Sans SC', 'JetBrains Mono', 'Inter']);
+    window.__ready = true;
+  } catch (e) {
+    window.__bootError = String(e);
+  }
+})();
+</script>
+</body>
+</html>

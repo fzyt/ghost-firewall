@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ghost Firewall — 讲解</title>
+<style>
+:root{
+  --bg:#0e0e0d; --bg-2:#141413; --ink:#f2efe9; --ink-dim:#9a958c; --ink-faint:#5d594f;
+  --accent:#d97757; --accent-soft:rgba(217,119,87,.16); --accent-ink:#2a1a13;
+  --line:rgba(242,239,233,.10); --line-2:rgba(242,239,233,.05);
+  --mono:"JetBrains Mono","SFMono-Regular",Menlo,Consolas,monospace;
+  --sans:"Noto Sans SC","Noto Sans CJK SC","PingFang SC","Microsoft YaHei",system-ui,-apple-system,sans-serif;
+  --pad:clamp(20px,4vw,72px);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{
+  background:var(--bg); color:var(--ink); font-family:var(--sans);
+  font-size:16px; line-height:1.75; -webkit-font-smoothing:antialiased;
+  background-image:
+    linear-gradient(var(--line-2) 1px,transparent 1px),
+    linear-gradient(90deg,var(--line-2) 1px,transparent 1px);
+  background-size:72px 72px,72px 72px;
+}
+::selection{background:var(--accent);color:var(--accent-ink)}
+
+/* ── 导航 ─────────────────────────────────── */
+nav{
+  position:sticky; top:0; z-index:50; display:flex; gap:4px; flex-wrap:wrap;
+  padding:10px var(--pad); background:rgba(14,14,13,.86); backdrop-filter:blur(12px);
+  border-bottom:1px solid var(--line);
+}
+nav a{
+  font-family:var(--mono); font-size:12px; letter-spacing:.06em; text-decoration:none;
+  color:var(--ink-dim); padding:6px 12px; border-radius:6px; white-space:nowrap;
+  transition:color .18s,background .18s;
+}
+nav a:hover{color:var(--ink);background:rgba(242,239,233,.06)}
+nav a.on{color:var(--accent-ink);background:var(--accent)}
+
+/* ── 版式 ─────────────────────────────────── */
+section{padding:clamp(56px,9vw,132px) var(--pad);border-bottom:1px solid var(--line);position:relative}
+.wrap{max-width:1180px;margin:0 auto}
+.kicker{
+  font-family:var(--mono); font-size:12px; letter-spacing:.22em; color:var(--accent);
+  text-transform:uppercase; margin-bottom:20px; display:flex; align-items:center; gap:12px;
+}
+.kicker::after{content:""; flex:1; height:1px; background:var(--line)}
+h1{font-size:clamp(38px,7.2vw,92px); line-height:1.05; letter-spacing:-.03em; font-weight:800}
+h2{font-size:clamp(26px,4vw,46px); line-height:1.2; letter-spacing:-.02em; margin-bottom:18px; font-weight:700}
+h3{font-size:19px; margin-bottom:10px; font-weight:700}
+p{color:var(--ink-dim); max-width:74ch}
+p strong,li strong{color:var(--ink); font-weight:600}
+.lead{font-size:clamp(17px,2vw,21px); color:var(--ink); max-width:62ch}
+.mono{font-family:var(--mono)}
+.tag{
+  display:inline-block; font-family:var(--mono); font-size:11px; letter-spacing:.1em;
+  padding:3px 9px; border:1px solid var(--accent); color:var(--accent);
+  border-radius:4px; margin-right:8px; vertical-align:middle;
+}
+.muted{color:var(--ink-faint)}
+
+/* ── 封面 ─────────────────────────────────── */
+.hero{min-height:92vh; display:flex; flex-direction:column; justify-content:center; position:relative}
+.hero .badge{
+  display:inline-flex; align-items:center; gap:9px; font-family:var(--mono); font-size:12px;
+  letter-spacing:.1em; color:var(--accent); border:1px solid var(--accent);
+  padding:6px 14px; border-radius:999px; align-self:flex-start; margin-bottom:28px;
+}
+.hero h1 em{font-style:normal; color:var(--accent)}
+.hero .sub{margin-top:26px; font-size:clamp(16px,1.9vw,20px); color:var(--ink-dim); max-width:56ch}
+.hud{
+  position:absolute; right:var(--pad); bottom:34px; font-family:var(--mono); font-size:11px;
+  color:var(--ink-faint); letter-spacing:.14em;
+}
+
+/* ── 数字条 ───────────────────────────────── */
+/* auto-fit 会把空轨道折叠成 0 宽；写死列数会让空格子露出容器底色 */
+.stats{display:grid; grid-template-columns:repeat(auto-fit,minmax(148px,1fr)); gap:1px; background:var(--line); margin-top:56px}
+.stat{background:var(--bg); padding:24px 20px}
+.stat .n{font-family:var(--mono); font-size:34px; font-weight:700; color:var(--accent); line-height:1.1}
+.stat .n small{font-size:16px; color:var(--ink-dim)}
+.stat .l{font-size:13px; color:var(--ink-dim); margin-top:6px}
+
+/* ── 卡片 / 网格 ──────────────────────────── */
+.grid{display:grid; gap:16px; margin-top:38px}
+.g2{grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+.g3{grid-template-columns:repeat(auto-fit,minmax(238px,1fr))}
+.card{
+  background:linear-gradient(180deg,rgba(242,239,233,.035),rgba(242,239,233,.012));
+  border:1px solid var(--line); border-radius:12px; padding:24px;
+  transition:border-color .2s,transform .2s,background .2s;
+}
+.card:hover{border-color:rgba(217,119,87,.42); transform:translateY(-2px)}
+.card .idx{font-family:var(--mono); font-size:11px; color:var(--accent); letter-spacing:.14em; margin-bottom:10px}
+.card p{font-size:14.5px; margin-top:6px}
+.card ul{margin:10px 0 0 18px; color:var(--ink-dim); font-size:14.5px}
+.card li{margin:4px 0}
+
+/* ── 代码块 ───────────────────────────────── */
+pre{
+  background:#0a0a09; border:1px solid var(--line); border-left:3px solid var(--accent);
+  border-radius:8px; padding:18px 20px; overflow-x:auto; font-family:var(--mono);
+  font-size:13px; line-height:1.85; margin-top:20px; color:#cfcabf;
+}
+pre .c{color:var(--ink-faint)}
+pre .k{color:var(--accent)}
+pre .s{color:#9ec27a}
+
+/* ── 暴露面交互图 ─────────────────────────── */
+.expo{display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:14px; margin-top:34px}
+.ent{
+  border:1px solid var(--line); border-radius:12px; padding:20px; cursor:pointer;
+  background:rgba(242,239,233,.02); transition:all .2s; position:relative;
+}
+.ent:hover{border-color:rgba(217,119,87,.5)}
+.ent.sel{border-color:var(--accent); background:var(--accent-soft)}
+.ent .r{font-family:var(--mono); font-size:11px; letter-spacing:.14em; color:var(--ink-faint)}
+.ent.sel .r{color:var(--accent)}
+.ent h3{margin:8px 0 4px}
+.ent .addr{font-family:var(--mono); font-size:12.5px; color:var(--ink-dim); margin-top:6px}
+.ent .face{display:inline-block; margin-top:12px; font-family:var(--mono); font-size:11px; padding:3px 9px; border-radius:4px}
+.face.lan{background:rgba(158,194,122,.16); color:#9ec27a}
+.face.pub{background:rgba(217,119,87,.18); color:var(--accent)}
+.face.loop{background:rgba(242,239,233,.08); color:var(--ink-dim)}
+.explain{
+  margin-top:22px; padding:22px 24px; border:1px solid var(--line); border-radius:12px;
+  background:rgba(242,239,233,.03); min-height:118px;
+}
+.explain .t{font-family:var(--mono); font-size:12px; color:var(--accent); letter-spacing:.12em; margin-bottom:10px}
+.explain p{font-size:15px}
+
+/* ── 判定流程 ─────────────────────────────── */
+.flow{display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:12px; margin-top:30px}
+.step{
+  border:1px solid var(--line); border-radius:10px; padding:18px; position:relative;
+  background:rgba(242,239,233,.02); cursor:pointer; transition:all .18s;
+}
+.step:hover{border-color:rgba(217,119,87,.45)}
+.step .code{font-family:var(--mono); font-size:22px; font-weight:700; color:var(--ink-faint); transition:color .18s}
+.step.on .code{color:var(--accent)}
+.step .lbl{font-size:14px; margin-top:6px; font-weight:600}
+.step .d{font-size:13px; color:var(--ink-dim); margin-top:4px}
+.verdict{
+  margin-top:20px; padding:20px 22px; border-radius:10px; border:1px solid var(--line);
+  font-family:var(--mono); font-size:14px; background:#0a0a09;
+}
+.verdict b{color:var(--accent)}
+
+/* ── 模块表 ───────────────────────────────── */
+.mods{display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:10px; margin-top:34px}
+.mod{
+  border:1px solid var(--line); border-radius:9px; padding:15px 17px; background:rgba(242,239,233,.02);
+}
+.mod .n{font-family:var(--mono); font-size:11px; color:var(--accent); letter-spacing:.1em}
+.mod .t{font-size:14.5px; margin-top:5px; font-weight:600}
+.mod .d{font-size:12.5px; color:var(--ink-dim); margin-top:3px}
+
+/* ── 安全条目 ─────────────────────────────── */
+.sec{display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:16px; margin-top:34px}
+.sec .card{border-left:3px solid var(--accent)}
+
+/* ── 收尾 ─────────────────────────────────── */
+footer{padding:56px var(--pad) 70px; text-align:center}
+footer p{margin:0 auto; font-size:13.5px; color:var(--ink-faint)}
+footer .mono{color:var(--ink-dim)}
+
+@media (max-width:640px){
+  .hud{display:none}
+  .stats{grid-template-columns:repeat(2,1fr)}
+}
+</style>
+</head>
+<body>
+
+<nav>
+  <a href="#top">封面</a>
+  <a href="#problem">问题</a>
+  <a href="#arch">架构</a>
+  <a href="#rules">规则引擎</a>
+  <a href="#features">功能</a>
+  <a href="#security">安全</a>
+  <a href="#engineering">工程</a>
+</nav>
+
+<!-- 封面 -->
+<section id="top" class="hero">
+  <div class="wrap">
+    <div class="badge"><span>◆</span> GHOST FIREWALL · v0.19.19</div>
+    <h1>把「谁能进你家路由器」<br>变成<em>一个需要认证的端口</em></h1>
+    <p class="sub">
+      跑在 OpenWrt 上的 <strong>nftables 防火墙 Web 管理面板</strong>。
+      纯 Python 标准库后端 + 原生前端，零构建、零 CDN；
+      管理面板只在局域网可达，公网入口收敛成一个必须先过认证的单端口网关。
+    </p>
+
+    <div class="stats">
+      <div class="stat"><div class="n">2.6<small>万行</small></div><div class="l">后端 + 前端核心代码</div></div>
+      <div class="stat"><div class="n">3</div><div class="l">入口 / 三种暴露面</div></div>
+      <div class="stat"><div class="n">0</div><div class="l">构建步骤 / 外部 CDN</div></div>
+      <div class="stat"><div class="n">578</div><div class="l">行 nftables 规则模板</div></div>
+      <div class="stat"><div class="n">99<small> +58</small></div><div class="l">测试文件 + 变异脚本</div></div>
+      <div class="stat"><div class="n">14</div><div class="l">功能模块</div></div>
+    </div>
+  </div>
+  <div class="hud">SECTION 00 / 06</div>
+</section>
+
+<!-- 问题 -->
+<section id="problem">
+  <div class="wrap">
+    <div class="kicker">SECTION 01 / 06 · 问题</div>
+    <h2>「把内网服务暴露到公网」<br>是一件天然危险的事</h2>
+    <p class="lead">
+      家里那台路由器上跑着 NAS、监控、测试环境。想让外面能访问，最直觉的做法是开端口转发 ——
+      于是每暴露一个服务，就多一个公网入口，每个入口都要自己记得加固。
+    </p>
+
+    <div class="grid g3">
+      <div class="card">
+        <div class="idx">入口散乱</div>
+        <h3>一个服务一个端口</h3>
+        <p>五个服务 = 五个公网端口。防火墙规则表越滚越长，没人敢删。</p>
+      </div>
+      <div class="card">
+        <div class="idx">暴露面失控</div>
+        <h3>面板也在公网上</h3>
+        <p>管理面板和被管理的服务同样暴露 —— 攻击者拿到的是「改规则的权限」本身。</p>
+      </div>
+      <div class="card">
+        <div class="idx">认证难做</div>
+        <h3>每个服务各写一遍</h3>
+        <p>要在每个服务前面加认证，工作量大且必然有遗漏 —— 漏掉的那个就是缺口。</p>
+      </div>
+    </div>
+
+    <div class="grid g2" style="margin-top:16px">
+      <div class="card" style="border-color:var(--accent)">
+        <div class="idx">解法</div>
+        <h3>反过来：先收口，再认证</h3>
+        <p>
+          不给每个服务开端口，而是<strong>开一个</strong>。所有内网服务挂在这个端口的路径前缀下，
+          访问任何一条路径之前，流量先经过统一的认证 —— 认证只写一遍，缺口只有一个。
+        </p>
+      </div>
+      <div class="card">
+        <div class="idx">附带收益</div>
+        <h3>面板彻底退出公网</h3>
+        <p>
+          认证通过之后连的是内网服务，公网上根本不需要存在管理面板。
+          面板只活在局域网里，攻击面从「整个规则系统」缩回「一个认证端点」。
+        </p>
+      </div>
+    </div>
+  </div>
+  <div class="hud">SECTION 01 / 06</div>
+</section>
+
+<!-- 架构 -->
+<section id="arch">
+  <div class="wrap">
+    <div class="kicker">SECTION 02 / 06 · 架构</div>
+    <h2>三个入口，三种暴露面</h2>
+    <p class="lead">
+      刻意拆成三个进程、三个暴露面：面板管规则，网关管对外，认证后端只在环回口上。
+      <strong>点下面任意一张卡片</strong>，看它到底能被谁访问到。
+    </p>
+
+    <div class="expo" id="expo">
+      <div class="ent sel" data-k="panel">
+        <div class="r">入口 A</div>
+        <h3>管理面板</h3>
+        <div class="addr">https://&lt;路由器IP&gt;:5443</div>
+        <span class="face lan">仅局域网可达</span>
+        <p style="font-size:13.5px;margin-top:12px">nftables 规则、反代配置、DDNS、日志、访问控制。</p>
+      </div>
+      <div class="ent" data-k="gw">
+        <div class="r">入口 B</div>
+        <h3>认证网关</h3>
+        <div class="addr">https://&lt;域名或公网IP&gt;:&lt;自定义端口&gt;/</div>
+        <span class="face pub">可映射公网</span>
+        <p style="font-size:13.5px;margin-top:12px">公网唯一入口。按路径前缀把请求分发到不同内网服务。</p>
+      </div>
+      <div class="ent" data-k="auth">
+        <div class="r">入口 C</div>
+        <h3>认证服务</h3>
+        <div class="addr">127.0.0.1:8444</div>
+        <span class="face loop">本机专属</span>
+        <p style="font-size:13.5px;margin-top:12px">网关的认证后端。公网侧永远看不到它。</p>
+      </div>
+    </div>
+
+    <div class="explain" id="explain">
+      <div class="t">管理面板 · 仅局域网</div>
+      <p>
+        自签证书的 HTTPS 面板，是日常改规则的地方。
+        v0.8.0 起它<strong>只在局域网可达</strong>，公网侧不再有任何指向它的转发 ——
+        这意味着即使公网被扫到，也找不到能改防火墙规则的那个端口。
+      </p>
+    </div>
+
+    <h3 style="margin-top:56px">网关怎么判定放行？</h3>
+    <p>
+      nginx 的 <span class="mono" style="color:var(--accent)">auth_request</span> 模块向认证服务发一个子请求，
+      用返回码决定放行与否。点击任意一种返回码看判定结果：
+    </p>
+
+    <div class="flow" id="flow">
+      <div class="step on" data-code="2xx">
+        <div class="code">2xx</div><div class="lbl">认证通过</div>
+        <div class="d">放行，请求转发到内网服务</div>
+      </div>
+      <div class="step" data-code="401">
+        <div class="code">401</div><div class="lbl">未认证 / 凭据无效</div>
+        <div class="d">拒绝，跳转登录页</div>
+      </div>
+      <div class="step" data-code="403">
+        <div class="code">403</div><div class="lbl">无权限</div>
+        <div class="d">拒绝</div>
+      </div>
+      <div class="step" data-code="500">
+        <div class="code">500</div><div class="lbl">认证服务自身出错</div>
+        <div class="d">报错，同样不放行</div>
+      </div>
+    </div>
+
+    <div class="verdict" id="verdict">
+      <b>2xx</b> → 放行。nginx 拿到 2xx 才把请求转给内网服务。
+    </div>
+
+    <pre><span class="c"># 认证服务里最重要的一条硬规则（auth_gateway.py）</span>
+<span class="c"># nginx 的判定是：2xx 放行；401/403 拒绝；其他（500 等）报错，同样不放行。</span>
+<span class="c"># ⇒ verify 的任何异常路径都必须返回 401，绝不能漏出 5xx。</span>
+
+<span class="k">def</span> verify():
+    <span class="k">try</span>:
+        ...  <span class="c"># 正常校验</span>
+        <span class="k">return</span> <span class="s">200</span>, <span class="s">""</span>
+    <span class="k">except</span> Exception:
+        <span class="k">return</span> <span class="s">401</span>, <span class="s">"unauthorized"</span>   <span class="c"># 不是 500</span></pre>
+  </div>
+  <div class="hud">SECTION 02 / 06</div>
+</section>
+
+<!-- 规则引擎 -->
+<section id="rules">
+  <div class="wrap">
+    <div class="kicker">SECTION 03 / 06 · 规则引擎</div>
+    <h2>规则不是「拼出来的」，<br>是「模板 + 前导段」生成的</h2>
+    <p class="lead">
+      nftables 规则由 <span class="mono">backend/templates/nftables.conf</span>（578 行）渲染，
+      变量从面板的配置灌进去。但真正难的不是模板 —— 是模板前面那一段
+      <strong>preamble</strong>，它决定了「更新规则」会不会伤到系统里别人的东西。
+    </p>
+
+    <div class="grid g3">
+      <div class="card">
+        <div class="idx">坑 ①</div>
+        <h3>表不存在时 flush 会报错</h3>
+        <p>
+          <span class="mono">flush table inet fw4</span> 在表<strong>不存在</strong>时报错。
+          首次部署时表还没建 → 直接炸。
+        </p>
+        <pre style="font-size:12px;padding:12px 14px"><span class="k">table</span> inet fw4 { }
+<span class="k">flush table</span> inet fw4</pre>
+      </div>
+      <div class="card">
+        <div class="idx">坑 ②</div>
+        <h3>table ip nat 是宿主机标准表</h3>
+        <p>
+          Docker / iptables-nft 的 dnat 和 masquerade 规则都住在里面。
+          <span class="mono">flush table ip nat</span> 会把它们<strong>一起清掉</strong>。
+        </p>
+      </div>
+      <div class="card">
+        <div class="idx">解法</div>
+        <h3>只删自己那两条链</h3>
+        <p>
+          用 <span class="mono">delete chain</span> 而不是 <span class="mono">flush chain</span> ——
+          前者保留链对象和 hook 声明，后者会把 preamble 里的 hook 一起冲掉。
+        </p>
+        <pre style="font-size:12px;padding:12px 14px"><span class="k">delete chain</span> ip nat prerouting
+<span class="k">delete chain</span> ip nat postrouting</pre>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px;border-color:var(--accent)">
+      <div class="idx">设计原则</div>
+      <h3>只覆盖，不删除</h3>
+      <p>
+        升级部署不碰配置、口令、密钥、限流表。规则集与 nginx 网关配置由面板<strong>运行时</strong>生成 ——
+        「换了代码 ≠ 生效」，必须重新生成规则。而每次生成都只重建本项目自己声明的那几条链，
+        宿主机上其他程序留下的痕迹一律不碰。
+      </p>
+    </div>
+  </div>
+  <div class="hud">SECTION 03 / 06</div>
+</section>
+
+<!-- 功能 -->
+<section id="features">
+  <div class="wrap">
+    <div class="kicker">SECTION 04 / 06 · 功能</div>
+    <h2>十三块拼在一起</h2>
+    <p class="lead">规则、转发、反代、DDNS、认证、日志、网络接口 —— 一个 OpenWrt 设备上能想到的都收了。</p>
+
+    <div class="mods">
+      <div class="mod"><div class="n">01</div><div class="t">认证网关</div><div class="d">单端口汇聚所有服务，公网访问需认证</div></div>
+      <div class="mod"><div class="n">02</div><div class="t">端口敲门</div><div class="d">自定义 4 端口序列，敲对才加白名单</div></div>
+      <div class="mod"><div class="n">03</div><div class="t">端口转发</div><div class="d">TCP / UDP，IPv4 / IPv6 双栈</div></div>
+      <div class="mod"><div class="n">04</div><div class="t">反代管理</div><div class="d">Nginx 反向代理 + SSL 证书（手动 / ACME）</div></div>
+      <div class="mod"><div class="n">05</div><div class="t">DDNS</div><div class="d">通用 + 阿里云，多 DNS 服务商，支持 IPv6</div></div>
+      <div class="mod"><div class="n">06</div><div class="t">访问控制</div><div class="d">LAN 模式 / 信任 IP 模式</div></div>
+      <div class="mod"><div class="n">07</div><div class="t">名单管理</div><div class="d">IP 黑白名单</div></div>
+      <div class="mod"><div class="n">08</div><div class="t">国外 IP 拦截</div><div class="d">自动拦截境外来源</div></div>
+      <div class="mod"><div class="n">09</div><div class="t">DNS 局域网解析</div><div class="d">允许 LAN 设备查询内网 DNS；证书域名自动写入 dnsmasq</div></div>
+      <div class="mod"><div class="n">10</div><div class="t">防火墙状态</div><div class="d">nftables 规则实时查看</div></div>
+      <div class="mod"><div class="n">11</div><div class="t">日志管理</div><div class="d">开关 + 环形缓冲上限 + 远程转发</div></div>
+      <div class="mod"><div class="n">12</div><div class="t">系统日志</div><div class="d">与认证审计合并为一条时间线，可导出</div></div>
+      <div class="mod"><div class="n">13</div><div class="t">网络接口</div><div class="d">PPPoE 拨号、网关 IP 管理；多 LAN 口提示排除二层环路</div></div>
+    </div>
+  </div>
+  <div class="hud">SECTION 04 / 06</div>
+</section>
+
+<!-- 安全 -->
+<section id="security">
+  <div class="wrap">
+    <div class="kicker">SECTION 05 / 06 · 安全设计</div>
+    <h2>处理的是「谁能进你家路由器」，<br>所以取舍写得很死</h2>
+
+    <div class="sec">
+      <div class="card">
+        <div class="idx">口令</div>
+        <h3>PBKDF2-HMAC-SHA256 / 200000 轮</h3>
+        <p>标准库 <span class="mono">hashlib</span> 实现，不引第三方依赖。</p>
+      </div>
+      <div class="card">
+        <div class="idx">进程边界</div>
+        <h3>认证服务只监听 127.0.0.1</h3>
+        <p>公网侧只有 nginx 一个入口，它必须先过认证。</p>
+      </div>
+      <div class="card">
+        <div class="idx">文件权限</div>
+        <h3>配置 640 root:nftweb / 密钥 600 root:root</h3>
+        <p>
+          且网关进程的 <strong>gid 必须等于配置文件的组 gid</strong> ——
+          读不到配置时网关会<strong>静默退回默认值而不报错</strong>，部署自检专门验这一条。
+        </p>
+      </div>
+      <div class="card">
+        <div class="idx">密钥不可变</div>
+        <h3>替换前后比对 md5</h3>
+        <p>不一致就大声报错 —— 密钥变了 = 所有设备的网关令牌全部作废 = 用户全部要重新登录。</p>
+      </div>
+      <div class="card">
+        <div class="idx">数据安全</div>
+        <h3>只覆盖，不删除</h3>
+        <p>升级部署不碰配置、口令、密钥、限流表；失败自动回滚，不重启路由器。</p>
+      </div>
+      <div class="card">
+        <div class="idx">前端</div>
+        <h3>严格 CSP</h3>
+        <p>前端不连任何外部域名 —— Alpine.js 与 Tailwind 全部随包分发，CSP 可以开得很死。</p>
+      </div>
+    </div>
+  </div>
+  <div class="hud">SECTION 05 / 06</div>
+</section>
+
+<!-- 工程 -->
+<section id="engineering">
+  <div class="wrap">
+    <div class="kicker">SECTION 06 / 06 · 工程</div>
+    <h2>零构建的代价，<br>是用测试量换来的</h2>
+    <p class="lead">
+      没有 npm、没有 webpack、没有依赖树 —— 意味着没有工具链兜底，
+      所以验证只能靠<strong>大量行为级测试 + 变异脚本</strong>硬扛。
+    </p>
+
+    <div class="stats" style="margin-top:36px">
+      <div class="stat"><div class="n">99</div><div class="l">行为级测试文件</div></div>
+      <div class="stat"><div class="n">58</div><div class="l">变异脚本</div></div>
+      <div class="stat"><div class="n">0</div><div class="l">外部测试依赖</div></div>
+      <div class="stat"><div class="n">3</div><div class="l">真浏览器 e2e 档位</div></div>
+    </div>
+
+    <div class="grid g2" style="margin-top:34px">
+      <div class="card">
+        <div class="idx">变异测试</div>
+        <h3>故意改坏，看测试抓不抓得住</h3>
+        <p>
+          每个变异脚本注入一个缺陷（改条件、删校验、错 API 前缀……），
+          确认对应测试会失败。<strong>测试没报错 = 这个测试没在测它该测的东西。</strong>
+        </p>
+        <pre><span class="c"># 全量回归（行为级 + 变异，零外部依赖）</span>
+bash tests/run_all.sh
+
+<span class="c"># 真浏览器 e2e</span>
+bash tests/run_e2e.sh setup   <span class="c"># 装浏览器</span>
+bash tests/run_e2e.sh probe   <span class="c"># 14 页逐页枚举</span>
+bash tests/run_e2e.sh click   <span class="c"># 逐个点击，捕获 JS 异常与 4xx/5xx</span>
+bash tests/run_e2e.sh portal  <span class="c"># 认证门户全链路</span></pre>
+      </div>
+      <div class="card">
+        <div class="idx">点击权限</div>
+        <h3>三档，默认最保守</h3>
+        <p>
+          <span class="mono">--destructive</span> 才点删除 / 清空 / 应用规则；
+          <span class="mono">--allow-network</span> 才点重启网络 / 切 PPPoE。
+          最后一档会直接把网络搞挂 —— 开之前务必确认有一条带外恢复通道。
+        </p>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <div class="idx">装机</div>
+      <h3>一条命令</h3>
+      <p>OpenWrt 24.10（opkg）或 25.x（apk）：</p>
+      <pre>wget -O /tmp/setup.sh \
+  https://raw.githubusercontent.com/fzyt/ghost-firewall/main/nftables-publish-v0.7.9-nospa/setup/setup.sh
+sh /tmp/setup.sh
+
+<span class="c"># 覆盖安装</span>
+sh /tmp/setup.sh --force</pre>
+      <p style="margin-top:14px">
+        自动探测包管理器、装齐依赖、生成自签证书、落地配置、注册开机自启。
+        装完访问 <span class="mono">https://&lt;路由器IP&gt;:5443</span>。
+      </p>
+    </div>
+  </div>
+  <div class="hud">SECTION 06 / 06</div>
+</section>
+
+<footer>
+  <p class="mono">GHOST FIREWALL · v0.19.19 · GPL-3.0-or-later</p>
+  <p style="margin-top:10px">
+    内容取自 <span class="mono">/home/kirito/main/项目/nftables-web-v2</span> 的真实代码与文档<br>
+    数字按 <span class="mono">VERSION</span>、<span class="mono">tests/</span>、<span class="mono">backend/templates/nftables.conf</span> 实际统计
+  </p>
+</footer>
+
+<script>
+// ── 暴露面切换 ──────────────────────────────
+const EX = {
+  panel:{t:'管理面板 · 仅局域网',
+    p:'自签证书的 HTTPS 面板，是日常改规则的地方。v0.8.0 起它<strong>只在局域网可达</strong>，公网侧不再有任何指向它的转发 —— 这意味着即使公网被扫到，也找不到能改防火墙规则的那个端口。'},
+  gw:{t:'认证网关 · 公网唯一入口',
+    p:'公网上能看到的东西只有一个 nginx 入口。它按路径前缀把请求分发到不同的内网服务，但每个请求在转发之前都必须先过认证 —— 认证只写一遍，缺口只有一个。'},
+  auth:{t:'认证服务 · 本机专属',
+    p:'网关的认证后端，只监听 127.0.0.1:8444。公网永远看不到它。它负责校验凭据、签发网关令牌、维护吊销列表。设计上刻意把它藏起来：能改防火墙规则的东西不应该出现在公网上。'}
+};
+const exBox = document.getElementById('expo');
+const exOut = document.getElementById('explain');
+exBox.addEventListener('click', e => {
+  const card = e.target.closest('.ent');
+  if(!card) return;
+  [...exBox.children].forEach(c => c.classList.remove('sel'));
+  card.classList.add('sel');
+  const d = EX[card.dataset.k];
+  exOut.innerHTML = '<div class="t">'+d.t+'</div><p>'+d.p+'</p>';
+});
+
+// ── auth_request 判定 ───────────────────────
+const VD = {
+  '2xx':'<b>2xx</b> → 放行。nginx 拿到 2xx 才把请求转给内网服务。',
+  '401':'<b>401</b> → 拒绝。凭据缺失、过期或无效，跳转登录页。',
+  '403':'<b>403</b> → 拒绝。凭据有效但权限不足。',
+  '500':'<b>500</b> → 报错，同样不放行。这正是认证服务所有异常路径都必须返回 401 的原因 —— 漏出一个 5xx 也不会造成误放行，但会让真实故障被伪装成「服务端错误」。'
+};
+const flow = document.getElementById('flow');
+const verdict = document.getElementById('verdict');
+flow.addEventListener('click', e => {
+  const s = e.target.closest('.step');
+  if(!s) return;
+  [...flow.children].forEach(c => c.classList.remove('on'));
+  s.classList.add('on');
+  verdict.innerHTML = VD[s.dataset.code];
+});
+
+// ── 导航高亮 ────────────────────────────────
+const secs = [...document.querySelectorAll('section[id]')];
+const links = [...document.querySelectorAll('nav a')];
+const io = new IntersectionObserver(es => {
+  es.forEach(en => {
+    if(!en.isIntersecting) return;
+    links.forEach(l => l.classList.toggle('on', l.getAttribute('href') === '#'+en.target.id));
+  });
+}, {rootMargin:'-45% 0px -50% 0px'});
+secs.forEach(s => io.observe(s));
+</script>
+</body>
+</html>

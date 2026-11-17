@@ -1,0 +1,64 @@
+/* 本地 OFL 字体。skill 要求字体必须本地提供，不能依赖 Google Fonts CDN。
+   全部是变量字体，用 font-weight 范围声明即可覆盖粗细。
+   来源：github.com/google/fonts（OFL-1.1） */
+@font-face {
+  font-family: "Noto Sans SC";
+  src: url("/fonts/NotoSansSC.ttf") format("truetype");
+  font-weight: 100 900;
+  font-display: block;
+}
+@font-face {
+  font-family: "Inter";
+  src: url("/fonts/Inter.ttf") format("truetype");
+  font-weight: 100 900;
+  font-display: block;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("/fonts/JetBrainsMono.ttf") format("truetype");
+  font-weight: 100 800;
+  font-display: block;
+}
+@font-face {
+  font-family: "Orbitron";
+  src: url("/fonts/Orbitron.ttf") format("truetype");
+  font-weight: 400 900;
+  font-display: block;
+}
+/* 以下为 11 种风格配方额外用到的字体，同样出自 google/fonts（OFL-1.1） */
+@font-face {
+  font-family: "ZCOOL KuaiLe";
+  src: url("/fonts/ZCOOLKuaiLe-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-display: block;
+}
+@font-face {
+  font-family: "Long Cang";
+  src: url("/fonts/LongCang-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-display: block;
+}
+@font-face {
+  font-family: "Ma Shan Zheng";
+  src: url("/fonts/MaShanZheng-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-display: block;
+}
+@font-face {
+  font-family: "ZCOOL QingKe HuangYou";
+  src: url("/fonts/ZCOOLQingKeHuangYou-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-display: block;
+}
+@font-face {
+  font-family: "Press Start 2P";
+  src: url("/fonts/PressStart2P-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-display: block;
+}
+@font-face {
+  font-family: "Playfair Display";
+  src: url("/fonts/PlayfairDisplay[wght].ttf") format("truetype");
+  font-weight: 400 900;
+  font-display: block;
+}

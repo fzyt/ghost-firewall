@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="/shared/fonts.css">
+<title>06 令牌保险</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0e0e0d; overflow: hidden; }
+  #stage { position: relative; width: 1920px; height: 1080px; overflow: hidden; }
+  canvas#c { position: absolute; inset: 0; width: 1920px; height: 1080px; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="c" width="1920" height="1080"></canvas></div>
+
+<script type="module">
+import { createSegment, loadFonts, clamp, ease, TAU, drawCapsuleLabel, drawStamp } from '../common.js';
+import { themeFromURL, chrome, drawGrain, drawVignette } from '../themes.js';
+
+const W = 1920, H = 1080;
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const theme = themeFromURL(location.search);
+const HUD = chrome(theme);
+const seg = createSegment({ duration: 22 });
+
+window.DURATION = seg.duration;
+window.__ready = false;
+window.__bootError = null;
+
+// ---------- 调色板（coral-noir，与讲解页同一套） ----------
+const C = {
+  bg: '#0e0e0d', surface: '#1a1917', ink: '#f5f0e8', muted: '#8f8981',
+  accent: '#d97757', accentSoft: '#f0b49c', line: 'rgba(245,240,232,0.10)',
+};
+
+// ---------- 文案（timeline.json → s06-gateway-auth.copy，逐字照抄） ----------
+const KICKER = '进门前，先过认证';
+const TITLE = '令牌有三道保险';
+const GUARDS = [
+  { name: '滑动有效期', detail: '30 分钟 —— 一直在用就自动续期' },
+  { name: '绝对上限', detail: '12 小时 —— 到点必登出，不存在永不过期' },
+  { name: '即时撤销', detail: '登出即失效，令牌立刻进撤销表' },
+];
+const EXTRAS = [
+  '撞密码会被限速、失败会进审计日志',
+  '令牌签名密钥与面板会话密钥相互独立',
+  '认证后端只监听 127.0.0.1，公网根本够不着',
+];
+const PUNCH = '认证不是一道门，是三道';
+
+// ---------- 版面常量 ----------
+// 章节胶囊在左上 (96,72)-(400,130)，主标题一律从 160 以下起，排版不打架
+const HEAD = { kickerY: 196, titleY: 288 };
+const RAIL = { y: 428, x0: 120, x1: 1800, labelY: 356, bandH: 60 };
+const MARK = { login: 120, renew: 792, cap: 1800 };     // renew 正好是 40% 位置，令牌条 9.0s 时经过它
+const RENEW_XS = [792, 1044, 1296, 1548];              // 每一次 30 分钟续期落点
+const STRIKE_X = 1170;                                 // 撤销可以在任意时刻划下来
+const CARD = { y: 556, h: 152, w: 548, xs: [96, 686, 1276] };
+const EXTRA = { y: 780, h: 64 };
+const PUNCH_Y = 930;
+
+// ============================================================
+// 节拍表（120 BPM，每拍 0.5s）
+//   0.5-1.5   时间轴基线从左拉开
+//   1.5-3.0   三个刻度依次点亮：登录 / 30 分钟 / 12 小时
+//   3.5-6.5   三道保险卡逐张滑入
+//   7.0-12.0  令牌沿轨生长，经过每个 30 分钟刻度时续期图标点亮
+//   12.0-13.0 令牌抵到 12 小时上限，墙脉冲闪一下
+//   13.0-14.0 撤销竖线划下，轨道右半段变暗
+//   14.0-16.0 三条附加保障依次淡入
+//   16.5-17.5 punchline 浮现
+//   17.5-22.0 保持静帧
+// ============================================================
+
+// 按像素宽度折行（中文逐字断行），避免长句压出卡片
+function wrapText(text, maxW) {
+  const lines = [];
+  let line = '';
+  for (const ch of text) {
+    if (line && ctx.measureText(line + ch).width > maxW) {
+      lines.push(line);
+      line = ch;
+    } else {
+      line += ch;
+    }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
+// ---------- 三个图标：循环箭头 / 终止墙 / 撤销叉 ----------
+function iconRenew(cx, cy, r, color) {
+  const a0 = Math.PI * 0.6, a1 = Math.PI * 2.15;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2.6;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, a0, a1);
+  ctx.stroke();
+  // 箭头：切线方向 (-sin a1, cos a1)
+  const px = cx + Math.cos(a1) * r, py = cy + Math.sin(a1) * r;
+  const tx = -Math.sin(a1), ty = Math.cos(a1);
+  const nx = Math.cos(a1), ny = Math.sin(a1);
+  ctx.beginPath();
+  ctx.moveTo(px + tx * 9, py + ty * 9);
+  ctx.lineTo(px + nx * 5, py + ny * 5);
+  ctx.lineTo(px - nx * 5, py - ny * 5);
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.restore();
+}
+
+function iconWall(cx, cy, color) {
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2.6;
+  ctx.lineCap = 'round';
+  // 禁止号：到此为止 —— 12 小时硬上限
+  ctx.beginPath();
+  ctx.arc(cx, cy, 12, 0, TAU);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(cx - 7, cy);
+  ctx.lineTo(cx + 7, cy);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function iconRevoke(cx, cy, color) {
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2.8;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(cx - 10, cy - 10);
+  ctx.lineTo(cx + 10, cy + 10);
+  ctx.moveTo(cx + 10, cy - 10);
+  ctx.lineTo(cx - 10, cy + 10);
+  ctx.stroke();
+  ctx.restore();
+}
+
+const ICONS = [iconRenew, iconWall, iconRevoke];
+
+// ---------- 头部：kicker + 主标题 ----------
+function drawHead(u) {
+  const kp = clamp((u - 1.5) / 0.7, 0, 1);
+  if (kp > 0) {
+    ctx.save();
+    ctx.globalAlpha = ease.outCubic(kp);
+    ctx.font = '500 30px "JetBrains Mono", monospace';
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = C.accent;
+    ctx.fillText(KICKER, 96, HEAD.kickerY);
+    ctx.fillStyle = 'rgba(217,119,87,0.55)';
+    ctx.fillRect(96, HEAD.kickerY + 14, 240 * ease.outCubic(kp), 2);
+    ctx.restore();
+  }
+
+  const tp = clamp((u - 2.5) / 0.8, 0, 1);
+  if (tp > 0) {
+    const e = ease.outBack(tp);
+    ctx.save();
+    ctx.globalAlpha = clamp(tp * 2, 0, 1);
+    ctx.translate(0, (1 - e) * -26);
+    ctx.font = '700 76px "Noto Sans SC", sans-serif';
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = C.ink;
+    ctx.fillText(TITLE, 96, HEAD.titleY);
+    ctx.restore();
+  }
+}
+
+// ---------- 时间轴：令牌的寿命轨 ----------
+function drawRail(u) {
+  const rp = clamp((u - 0.5) / 1.0, 0, 1);
+  if (rp <= 0) return;
+  const re = ease.outCubic(rp);
+
+  // 轨道底带：给这一段一点体量，不让轴看起来像一根头发丝
+  ctx.save();
+  ctx.globalAlpha = re;
+  ctx.fillStyle = 'rgba(245,240,232,0.035)';
+  ctx.beginPath();
+  ctx.roundRect(RAIL.x0, RAIL.y - RAIL.bandH / 2, (RAIL.x1 - RAIL.x0) * re, RAIL.bandH, RAIL.bandH / 2);
+  ctx.fill();
+  ctx.restore();
+
+  // 轨基线（从左拉开）
+  ctx.save();
+  ctx.globalAlpha = re;
+  ctx.strokeStyle = C.line;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(RAIL.x0, RAIL.y);
+  ctx.lineTo(RAIL.x0 + (RAIL.x1 - RAIL.x0) * re, RAIL.y);
+  ctx.stroke();
+  ctx.restore();
+
+  // 令牌条：7.0s 起沿轨生长，12.0s 抵到 12 小时墙
+  const grow = clamp((u - 7.0) / 5.0, 0, 1);
+  const barX = RAIL.x0 + (RAIL.x1 - RAIL.x0) * grow;
+  if (grow > 0) {
+    const grad = ctx.createLinearGradient(RAIL.x0, 0, barX, 0);
+    grad.addColorStop(0, C.accent);
+    grad.addColorStop(1, C.accentSoft);
+    ctx.save();
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.roundRect(RAIL.x0, RAIL.y - 5, Math.max(1, barX - RAIL.x0), 10, 5);
+    ctx.fill();
+    // 撤销之后，条右半段作废变暗
+    if (u >= 13.0) {
+      const cut = Math.min(barX, STRIKE_X);
+      ctx.fillStyle = 'rgba(14,14,13,0.78)';
+      ctx.fillRect(cut, RAIL.y - 5, barX - cut, 10);
+    }
+    ctx.restore();
+  }
+
+  // 三个主刻度：登录 / 30 分钟 / 12 小时
+  const marks = [
+    { x: MARK.login, at: 1.5, text: '登录', align: 'left' },
+    { x: MARK.renew, at: 2.0, text: '30 分钟', align: 'center' },
+    { x: MARK.cap, at: 2.5, text: '12 小时', align: 'right' },
+  ];
+  for (const m of marks) {
+    const p = clamp((u - m.at) / 0.5, 0, 1);
+    if (p <= 0) continue;
+    const e = ease.outCubic(p);
+    ctx.save();
+    ctx.globalAlpha = e;
+    ctx.strokeStyle = 'rgba(245,240,232,0.28)';
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.moveTo(m.x, RAIL.y - 22);
+    ctx.lineTo(m.x, RAIL.y + 22);
+    ctx.stroke();
+    ctx.font = '500 24px "Noto Sans SC", sans-serif';
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = m.align;
+    ctx.fillStyle = C.ink;
+    ctx.fillText(m.text, m.x, RAIL.labelY);
+    ctx.restore();
+  }
+
+  // 续期刻度：一直在轴上，被令牌条经过时点亮成珊瑚色
+  for (const rx of RENEW_XS) {
+    const tCross = 7.0 + 5.0 * ((rx - RAIL.x0) / (RAIL.x1 - RAIL.x0));
+    const passed = barX >= rx;
+    const pop = ease.outBack(clamp((u - tCross) / 0.4, 0, 1));
+    const s = passed ? 1 + 0.18 * (pop - 1) : 0.82;
+    ctx.save();
+    ctx.globalAlpha = passed ? 1 : 0.42;
+    iconRenew(rx, RAIL.y, 14 * s, passed ? C.accent : 'rgba(245,240,232,0.55)');
+    ctx.restore();
+  }
+
+  // 12 小时墙：令牌抵到时脉冲一下
+  const hit = clamp((u - 12.0) / 0.5, 0, 1);
+  if (hit > 0) {
+    const pulse = hit < 1 ? 1 - hit : 0.55;
+    ctx.save();
+    ctx.fillStyle = C.accent;
+    ctx.beginPath();
+    ctx.roundRect(MARK.cap - 4, RAIL.y - 30, 8, 60, 4);
+    ctx.fill();
+    ctx.globalAlpha = pulse * 0.5;
+    ctx.strokeStyle = C.accent;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.roundRect(MARK.cap - 16, RAIL.y - 42, 32, 84, 14);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // 撤销：竖线划下，轨道右半段作废
+  const sp = clamp((u - 13.0) / 0.5, 0, 1);
+  if (sp > 0) {
+    const e = ease.outCubic(sp);
+    ctx.save();
+    ctx.globalAlpha = e;
+    ctx.strokeStyle = C.ink;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(STRIKE_X, RAIL.y - 40 * e);
+    ctx.lineTo(STRIKE_X, RAIL.y + 40 * e);
+    ctx.stroke();
+    // 小标：撤销
+    ctx.font = '500 20px "Noto Sans SC", sans-serif';
+    const tw = ctx.measureText('撤销').width;
+    ctx.fillStyle = C.bg;
+    ctx.beginPath();
+    ctx.roundRect(STRIKE_X - tw / 2 - 12, RAIL.y + 34, tw + 24, 34, 8);
+    ctx.fill();
+    ctx.strokeStyle = C.accent;
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+    ctx.fillStyle = C.accentSoft;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('撤销', STRIKE_X, RAIL.y + 51);
+    ctx.restore();
+  }
+}
+
+// ---------- 三张保险卡 ----------
+function drawCards(u) {
+  for (let i = 0; i < GUARDS.length; i++) {
+    const p = clamp((u - (3.5 + i * 1.0)) / 0.6, 0, 1);
+    if (p <= 0) continue;
+    const e = ease.outCubic(p);
+    const x = CARD.xs[i], y = CARD.y;
+
+    ctx.save();
+    ctx.globalAlpha = e;
+    ctx.translate(0, (1 - e) * 28);
+
+    // 卡底
+    ctx.fillStyle = 'rgba(245,240,232,0.045)';
+    ctx.beginPath();
+    ctx.roundRect(x, y, CARD.w, CARD.h, 16);
+    ctx.fill();
+    ctx.strokeStyle = C.line;
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+
+    // 图标盒
+    ctx.fillStyle = 'rgba(217,119,87,0.14)';
+    ctx.beginPath();
+    ctx.roundRect(x + 26, y + 26, 56, 56, 14);
+    ctx.fill();
+    ICONS[i](x + 54, y + 54, 15, C.accent);
+
+    // 名称
+    ctx.font = '600 30px "Noto Sans SC", sans-serif';
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = C.ink;
+    ctx.fillText(GUARDS[i].name, x + 100, y + 62);
+
+    // 编号
+    ctx.font = '500 20px "JetBrains Mono", monospace';
+    ctx.textAlign = 'right';
+    ctx.fillStyle = C.accent;
+    ctx.fillText(String(i + 1).padStart(2, '0'), x + CARD.w - 26, y + 44);
+
+    // 说明
+    ctx.font = '400 23px "Noto Sans SC", sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = C.muted;
+    const lines = wrapText(GUARDS[i].detail, CARD.w - 52);
+    for (let k = 0; k < lines.length; k++) {
+      ctx.fillText(lines[k], x + 26, y + 118 + k * 30);
+    }
+
+    ctx.restore();
+  }
+}
+
+// ---------- 三条附加保障 ----------
+function drawExtras(u) {
+  let x = 96;
+  ctx.font = '400 25px "Noto Sans SC", sans-serif';
+  for (let i = 0; i < EXTRAS.length; i++) {
+    const p = clamp((u - (14.0 + i * 0.6)) / 0.5, 0, 1);
+    if (p <= 0) break;
+    const e = ease.outCubic(p);
+    const tw = ctx.measureText(EXTRAS[i]).width;
+    const w = tw + 28 + 14 + 26;
+    ctx.save();
+    ctx.globalAlpha = e;
+    ctx.translate((1 - e) * -24, 0);
+
+    ctx.fillStyle = 'rgba(245,240,232,0.05)';
+    ctx.beginPath();
+    ctx.roundRect(x, EXTRA.y, w, EXTRA.h, 12);
+    ctx.fill();
+    ctx.strokeStyle = C.line;
+    ctx.lineWidth = 1.3;
+    ctx.stroke();
+
+    ctx.fillStyle = C.accent;
+    ctx.beginPath();
+    ctx.roundRect(x + 26, EXTRA.y + EXTRA.h / 2 - 5, 10, 10, 2);
+    ctx.fill();
+
+    ctx.font = '400 25px "Noto Sans SC", sans-serif';
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = C.ink;
+    ctx.fillText(EXTRAS[i], x + 50, EXTRA.y + EXTRA.h / 2 + 1);
+    ctx.restore();
+
+    x += w + 22;
+  }
+}
+
+// ---------- punchline ----------
+function drawPunch(u) {
+  const p = clamp((u - 16.5) / 0.8, 0, 1);
+  if (p <= 0) return;
+  const e = ease.outCubic(p);
+  ctx.save();
+  ctx.globalAlpha = e;
+  ctx.font = '600 44px "Noto Sans SC", sans-serif';
+  ctx.textBaseline = 'alphabetic';
+  ctx.textAlign = 'left';
+  ctx.fillStyle = C.accent;
+  ctx.fillText(PUNCH, 124, PUNCH_Y);
+  ctx.fillStyle = 'rgba(217,119,87,0.55)';
+  ctx.fillRect(96, PUNCH_Y - 32, 3, 44);
+  ctx.restore();
+}
+
+// ============================================================
+window.renderFrame = (u) => {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.textBaseline = 'alphabetic';
+  ctx.textAlign = 'left';
+  ctx.fillStyle = C.bg;
+  ctx.fillRect(0, 0, W, H);
+
+  drawGrain(ctx, theme, W, H, u);
+
+  drawHead(u);
+  drawRail(u);
+  drawCards(u);
+  drawExtras(u);
+  drawPunch(u);
+
+  drawVignette(ctx, W, H, 0.42);
+
+  // HUD
+  drawCapsuleLabel(ctx, 6, '令牌保险', '认证', {
+    numberColor: HUD.capsule.numberColor, textColor: HUD.capsule.textColor,
+    bg: HUD.capsule.bg, border: HUD.capsule.border,
+  });
+  drawStamp(ctx, 'GHOST FIREWALL', { color: HUD.stamp.color });
+};
+
+(async () => {
+  try {
+    await loadFonts(['Noto Sans SC', 'JetBrains Mono', 'Inter']);
+    window.__ready = true;
+  } catch (e) {
+    window.__bootError = String(e);
+  }
+})();
+</script>
+</body>
+</html>

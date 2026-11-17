@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="/shared/fonts.css">
+<title>07 功能全景</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0e0e0d; overflow: hidden; }
+  #stage { position: relative; width: 1920px; height: 1080px; overflow: hidden; }
+  canvas#c { position: absolute; inset: 0; width: 1920px; height: 1080px; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="c" width="1920" height="1080"></canvas></div>
+
+<script type="module">
+import { createSegment, loadFonts, clamp, ease, drawCapsuleLabel, drawStamp } from '../common.js';
+import { themeFromURL, chrome, drawGrain, drawVignette } from '../themes.js';
+
+const W = 1920, H = 1080;
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const theme = themeFromURL(location.search);
+const HUD = chrome(theme);
+const seg = createSegment();
+
+window.DURATION = seg.duration;
+window.__ready = false;
+window.__bootError = null;
+
+// ---------- 调色板（coral-noir，与讲解页完全一致） ----------
+const C = {
+  bg: '#0e0e0d', surface: '#1a1917', ink: '#f5f0e8', muted: '#8f8981',
+  accent: '#d97757', accentSoft: '#f0b49c', line: 'rgba(245,240,232,0.10)',
+};
+
+// ---------- 文案（timeline.json 的 copy 字段，唯一真相源，逐字照抄） ----------
+const KICKER = '十三块，拼在一起';
+const TITLE = '一个面板管完路由器';
+const WAVES = [
+  ['认证网关', '端口敲门', '端口转发', '反代管理'],
+  ['DDNS', '访问控制', '名单管理', '国外 IP 拦截'],
+  ['DNS 局域网解析', '防火墙状态', '日志管理', '系统日志', '网络接口'],
+];
+const NOTES = [
+  '端口转发：TCP / UDP，IPv4 / IPv6 双栈',
+  '反代管理：SSL 手动上传 + ACME 自动申请，多 DNS 服务商',
+  '系统日志：认证审计与系统日志合并成一条时间线，可导出 CSV / JSON',
+  'DNS 局域网解析：证书域名自动写入 dnsmasq',
+  '网络接口：多 LAN 口时提示先排除二层环路',
+];
+// 前三条走左栏，后两条是本轮新增：走右栏、带「新」标记，并高亮对应的功能卡
+const NEW_FROM = 3;
+const NEW_CARDS = { 'DNS 局域网解析': 3, '网络接口': 4 };
+const PUNCH = '零构建、零 CDN —— 前端不连任何外部域名';
+
+// 每块功能的一行极短说明（取自 README「功能一览」各模块说明，不新增功能）
+const DESC = {
+  '认证网关': '单端口汇聚所有内网服务',
+  '端口敲门': '敲对序列才放行来源 IP',
+  '端口转发': 'TCP / UDP 双栈转发',
+  '反代管理': 'Nginx 反代 + SSL 证书',
+  'DDNS': '通用 + 阿里云，多服务商',
+  '访问控制': 'LAN 模式 / 信任 IP 模式',
+  '名单管理': 'IP 黑白名单',
+  '国外 IP 拦截': '自动拦截境外 IP',
+  'DNS 局域网解析': 'LAN 内可查内网 DNS',
+  '防火墙状态': 'nftables 规则实时查看',
+  '日志管理': '日志开关 + 远程转发',
+  '系统日志': '认证审计时间线，可导出',
+  '网络接口': 'PPPoE 拨号 + 网关 IP 管理',
+};
+
+// ---------- 版面常量 ----------
+const GRID_X = 96, GRID_W = 1728, GAP = 24, ROW_H = 112;
+const ROW_Y = [372, 508, 644];          // 三波各一行，行距 24
+const WAVE_START = [2.5, 7.5, 12.5];    // 每波首块卡片的入场拍点
+const CARD_DUR = 0.5;                   // 单块卡片的入场时长（一拍）
+const NOTE_Y0 = 812, NOTE_STEP = 44;     // 旁注基线
+const NEW_NOTE_X = 1000;                 // 新增旁注走右栏
+const PUNCH_Y = 992;
+
+// ============================================================
+// 节拍表（120 BPM，每拍 0.5s）
+//   0.0-0.7   kicker 淡入 + 短横线拉开
+//   0.5-1.4   title 落下（outBack）
+//   2.0-2.8   面板底框淡入
+//   2.5-4.5   波 1：四块卡逐块浮现（2.5 / 3.0 / 3.5 / 4.0）
+//   4.5-7.5   读字停顿
+//   7.5-9.5   波 2：四块卡逐块浮现（7.5 / 8.0 / 8.5 / 9.0）
+//   9.5-12.5  读字停顿
+//  12.5-15.0  波 3：五块卡逐块浮现（12.5 / 13.0 / 13.5 / 14.0 / 14.5）
+//  15.0-17.0  读字停顿
+//  17.0-19.5  五条旁注逐条浮现（17.0 / 17.5 / 18.0 / 18.5 / 19.0）
+//              后两条是新增能力，走右栏并带「新」标记，同时高亮对应卡片
+//  19.5-20.3  punchline 落下
+//  20.3-28.0  保持（扫描线缓慢扫过网格）
+// ============================================================
+
+// 卡面文字按可用宽度收缩字号：中文长短差异大，固定字号会压出卡片
+function fitFont(ctx, text, maxW, size, weight = 400) {
+  let s = size;
+  const set = () => { ctx.font = `${weight} ${s}px "Noto Sans SC", sans-serif`; };
+  set();
+  while (s > 13 && ctx.measureText(text).width > maxW) { s -= 1; set(); }
+  return s;
+}
+
+// 一波里的第 i 块卡片落在哪
+function cardRect(wave, i) {
+  const n = WAVES[wave].length;
+  const w = (GRID_W - GAP * (n - 1)) / n;
+  return { x: GRID_X + i * (w + GAP), y: ROW_Y[wave], w, h: ROW_H };
+}
+
+// 面板底框：下沿随波次往下长一格，读起来就是「一个面板被一块块填满」
+function drawFrame(u) {
+  const p = clamp((u - 2.0) / 0.8, 0, 1);
+  if (p <= 0) return;
+  const e = ease.outCubic(p);
+  let bottom = ROW_Y[0] + ROW_H;
+  for (let w = 1; w < 3; w++) {
+    const q = ease.outCubic(clamp((u - WAVE_START[w]) / 0.6, 0, 1));
+    bottom += (ROW_Y[w] + ROW_H - bottom) * q;
+  }
+  const top = ROW_Y[0] - 24;
+  ctx.save();
+  ctx.globalAlpha = e;
+  ctx.strokeStyle = 'rgba(245,240,232,0.07)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.roundRect(GRID_X - 16, top, GRID_W + 32, bottom + 18 - top, 20);
+  ctx.stroke();
+  // 顶边一条亮线，作为面板上沿
+  ctx.strokeStyle = 'rgba(245,240,232,0.16)';
+  ctx.beginPath();
+  ctx.moveTo(GRID_X - 16, top + 0.75);
+  ctx.lineTo(GRID_X + GRID_W + 16, top + 0.75);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// 头部：kicker + 主标题
+function drawHeadline(u) {
+  const kp = clamp(u / 0.7, 0, 1);
+  if (kp > 0) {
+    ctx.save();
+    ctx.globalAlpha = ease.outCubic(kp);
+    ctx.font = '500 32px "JetBrains Mono", "Noto Sans SC", monospace';
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = C.accent;
+    ctx.fillText(KICKER, GRID_X, 202);
+    ctx.fillStyle = 'rgba(217,119,87,0.5)';
+    ctx.fillRect(GRID_X, 230, 240 * ease.outCubic(kp), 2);
+    ctx.restore();
+  }
+
+  const tp = clamp((u - 0.5) / 0.9, 0, 1);
+  if (tp > 0) {
+    const e = ease.outBack(tp);
+    ctx.save();
+    ctx.globalAlpha = clamp(tp * 2, 0, 1);
+    ctx.translate(0, (1 - e) * -26);
+    ctx.font = '700 76px "Noto Sans SC", sans-serif';
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = C.ink;
+    ctx.fillText(TITLE, GRID_X, 330);
+    ctx.restore();
+  }
+}
+
+// 波次指示：右上三条，已过的点亮、当前波高亮
+function drawWaveMeter(u) {
+  if (u < 1.2) return;
+  let cur = -1;
+  for (let w = 0; w < 3; w++) if (u >= WAVE_START[w]) cur = w;
+  const done = u >= WAVE_START[2] + WAVES[2].length * CARD_DUR;
+  const barW = 36, barH = 6, step = 48;
+  const x0 = 1824 - (barW * 3 + step * 2);
+  for (let w = 0; w < 3; w++) {
+    // 当前波高亮；已过的和做完的三波统一压成淡 accent
+    const a = done ? 0.35 : (w === cur ? 1 : (w < cur ? 0.28 : 0.10));
+    ctx.save();
+    ctx.globalAlpha = a * ease.outCubic(clamp((u - 1.2) / 0.5, 0, 1));
+    ctx.fillStyle = done ? C.accent : (w === cur ? C.accent : C.ink);
+    ctx.beginPath();
+    ctx.roundRect(x0 + w * step, 150, barW, barH, 3);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+// 功能矩阵：每波按拍点逐块浮现
+function drawCards(u) {
+  for (let w = 0; w < 3; w++) {
+    for (let i = 0; i < WAVES[w].length; i++) {
+      const p = clamp((u - (WAVE_START[w] + i * CARD_DUR)) / CARD_DUR, 0, 1);
+      if (p <= 0) continue;
+      const e = ease.outCubic(p);
+      const r = cardRect(w, i);
+      const name = WAVES[w][i];
+      const desc = DESC[name] || '';
+      const avail = r.w - 62;
+
+      ctx.save();
+      ctx.globalAlpha = e;
+      ctx.translate(0, (1 - e) * 22);
+
+      // 卡底
+      ctx.fillStyle = 'rgba(245,240,232,0.045)';
+      ctx.beginPath();
+      ctx.roundRect(r.x, r.y, r.w, r.h, 14);
+      ctx.fill();
+      ctx.strokeStyle = C.line;
+      ctx.lineWidth = 1.4;
+      ctx.stroke();
+
+      // 左侧 accent 竖条：随入场一起长出来
+      ctx.fillStyle = 'rgba(217,119,87,0.65)';
+      ctx.beginPath();
+      ctx.roundRect(r.x + 1, r.y + 16, 3, (r.h - 32) * e, 2);
+      ctx.fill();
+
+      // 功能名
+      ctx.textBaseline = 'alphabetic';
+      ctx.textAlign = 'left';
+      fitFont(ctx, name, avail, 27, 700);
+      ctx.fillStyle = C.ink;
+      ctx.fillText(name, r.x + 44, r.y + 48);
+
+      // 一行极短说明
+      fitFont(ctx, desc, avail, 18, 400);
+      ctx.fillStyle = C.muted;
+      ctx.fillText(desc, r.x + 44, r.y + 84);
+
+      // 本轮新增的两个能力：对应的卡片在旁注出现时描一圈 accent
+      const ni = NEW_CARDS[name];
+      if (ni !== undefined) {
+        const hp = clamp((u - (17.0 + ni * 0.5)) / 0.5, 0, 1);
+        if (hp > 0) {
+          ctx.save();
+          ctx.globalAlpha = e * hp;
+          ctx.strokeStyle = 'rgba(217,119,87,0.9)';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.roundRect(r.x - 4, r.y - 4, r.w + 8, r.h + 8, 17);
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
+
+      ctx.restore();
+    }
+  }
+}
+
+// 旁注：模块名用 accent，正文用 muted；新增的两条在右栏，带「新」标记
+function drawNotes(u) {
+  for (let i = 0; i < NOTES.length; i++) {
+    const p = clamp((u - (17.0 + i * 0.5)) / 0.5, 0, 1);
+    if (p <= 0) continue;
+    const e = ease.outCubic(p);
+    const isNew = i >= NEW_FROM;
+    const x = isNew ? NEW_NOTE_X : GRID_X;
+    const y = NOTE_Y0 + (isNew ? (i - NEW_FROM) : i) * NOTE_STEP;
+    const cut = NOTES[i].indexOf('：');
+    const head = NOTES[i].slice(0, cut + 1);
+    const tail = NOTES[i].slice(cut + 1);
+
+    ctx.save();
+    ctx.globalAlpha = e;
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+
+    let tx = x;
+    if (isNew) {
+      // 「新」标记：实心小徽标，比一条竖杠更醒目
+      ctx.fillStyle = C.accent;
+      ctx.beginPath();
+      ctx.roundRect(x + 14, y - 24, 34, 26, 6);
+      ctx.fill();
+      ctx.font = '600 18px "Noto Sans SC", sans-serif';
+      ctx.fillStyle = C.bg;
+      ctx.fillText('新', x + 22, y - 5);
+      tx = x + 62;
+    } else {
+      ctx.fillStyle = 'rgba(217,119,87,0.55)';
+      ctx.fillRect(x, y - 20, 3, 26);
+      tx = x + 30;
+    }
+
+    ctx.font = '600 26px "Noto Sans SC", sans-serif';
+    ctx.fillStyle = C.accent;
+    ctx.fillText(head, tx, y);
+    const hw = ctx.measureText(head).width;
+
+    ctx.font = '400 26px "Noto Sans SC", sans-serif';
+    ctx.fillStyle = C.muted;
+    ctx.fillText(tail, tx + hw, y);
+    ctx.restore();
+  }
+}
+
+// 收束：punchline 居中落下，上方一条短横线拉开
+function drawPunch(u) {
+  const p = clamp((u - 19.5) / 0.8, 0, 1);
+  if (p <= 0) return;
+  const e = ease.outCubic(p);
+  ctx.save();
+  ctx.globalAlpha = e;
+  ctx.fillStyle = 'rgba(217,119,87,0.4)';
+  ctx.fillRect(960 - 150 * e, 940, 300 * e, 2);
+
+  ctx.font = '600 40px "Noto Sans SC", sans-serif';
+  ctx.textBaseline = 'alphabetic';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = C.accent;
+  ctx.fillText(PUNCH, 960, PUNCH_Y);
+  ctx.restore();
+}
+
+// 网格上的扫描线：与 s01 同一套语言，周期 8 秒、两端淡出避免回卷突变
+function drawScan(u) {
+  const period = 8;
+  const cyc = (u % period) / period;
+  const fade = Math.sin(Math.PI * cyc);
+  if (fade <= 0.01) return;
+  const top = ROW_Y[0] - 70, bottom = ROW_Y[2] + ROW_H + 70;
+  const sy = top + cyc * (bottom - top);
+  ctx.save();
+  const g = ctx.createLinearGradient(0, sy - 90, 0, sy + 10);
+  g.addColorStop(0, 'rgba(217,119,87,0)');
+  g.addColorStop(1, `rgba(217,119,87,${(0.07 * fade).toFixed(3)})`);
+  ctx.fillStyle = g;
+  ctx.fillRect(GRID_X - 20, sy - 90, GRID_W + 40, 100);
+  ctx.strokeStyle = `rgba(217,119,87,${(0.2 * fade).toFixed(3)})`;
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  ctx.moveTo(GRID_X - 20, sy);
+  ctx.lineTo(GRID_X + GRID_W + 20, sy);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ============================================================
+window.renderFrame = (u) => {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.textBaseline = 'alphabetic';
+  ctx.textAlign = 'left';
+  ctx.fillStyle = C.bg;
+  ctx.fillRect(0, 0, W, H);
+
+  drawGrain(ctx, theme, W, H, u);
+
+  drawFrame(u);
+  drawHeadline(u);
+  drawWaveMeter(u);
+  drawCards(u);
+  drawNotes(u);
+  drawPunch(u);
+  drawScan(u);
+  drawVignette(ctx, W, H, 0.42);
+
+  // HUD
+  drawCapsuleLabel(ctx, 7, '功能全景', '功能', {
+    numberColor: HUD.capsule.numberColor, textColor: HUD.capsule.textColor,
+    bg: HUD.capsule.bg, border: HUD.capsule.border,
+  });
+  drawStamp(ctx, 'GHOST FIREWALL', { color: HUD.stamp.color });
+};
+
+(async () => {
+  try {
+    await loadFonts(['Noto Sans SC', 'JetBrains Mono', 'Inter']);
+    window.__ready = true;
+  } catch (e) {
+    window.__bootError = String(e);
+  }
+})();
+</script>
+</body>
+</html>

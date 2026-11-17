@@ -1,0 +1,227 @@
+{
+  "title": "Ghost Firewall 产品讲解片（3 分钟）",
+  "product": "Ghost Firewall",
+  "tagline": "把内网服务暴露到公网，但只暴露一个必须认证的入口",
+  "theme": "coral-noir",
+  "brand": "GHOST FIREWALL",
+  "fps": 30,
+  "width": 1920,
+  "height": 1080,
+  "bpm": 120,
+  "totalDuration": 180.0,
+  "totalFrames": 5400,
+  "note": "每段 type=scene，page 指向自写页面；speed=1（段内内容多，不做时间加速）；t0=0。文案在本文件里是唯一真相源，页面必须照抄。",
+  "segments": [
+    {
+      "id": "s01-problem",
+      "type": "scene",
+      "page": "/segments/s01-problem.html",
+      "start": 0,
+      "duration": 14,
+      "t0": 0,
+      "speed": 1,
+      "frames": 420,
+      "chapter": "问题",
+      "copy": {
+        "kicker": "把内网服务暴露到公网",
+        "title": "是一件天然危险的事",
+        "points": [
+          "端口一开，全世界的扫描器 24 小时在找",
+          "一个弱口令 = 一整条内网沦陷",
+          "VPN 客户端要先装、要先连、还可能连不上"
+        ],
+        "punchline": "问题的根子是：公网上开了几个不该开的门"
+      }
+    },
+    {
+      "id": "s02-entries",
+      "type": "scene",
+      "page": "/segments/s02-entries.html",
+      "start": 14,
+      "duration": 16,
+      "t0": 0,
+      "speed": 1,
+      "frames": 480,
+      "chapter": "架构",
+      "copy": {
+        "kicker": "Ghost Firewall",
+        "title": "三个入口，三种暴露面",
+        "entries": [
+          { "name": "管理面板", "addr": "https://<路由器IP>:5443", "reach": "仅局域网", "use": "nftables 规则、反代、DDNS、日志" },
+          { "name": "认证网关", "addr": "https://<域名或公网IP>:<自定义端口>/", "reach": "可映射公网", "use": "单端口汇聚全部内网服务" },
+          { "name": "认证服务", "addr": "127.0.0.1:8444", "reach": "本机专属", "use": "网关的认证后端，公网不可达" }
+        ],
+        "punchline": "公网上只有一个入口 —— 而且它必须先过认证"
+      }
+    },
+    {
+      "id": "s03-knock-how",
+      "type": "scene",
+      "page": "/segments/s03-knock-how.html",
+      "start": 30,
+      "duration": 22,
+      "t0": 0,
+      "speed": 1,
+      "frames": 660,
+      "chapter": "端口敲门",
+      "copy": {
+        "kicker": "端口敲门",
+        "title": "看不见的门，敲对才开",
+        "acts": [
+          { "who": "陌生人路过", "line": "眼前只有一堵墙，敲哪里都是空的" },
+          { "who": "你知道规律", "line": "敲4个指定位置，每一步8秒内接上" },
+          { "who": "换个人来", "line": "门重新隐形，对他依旧是一堵墙" }
+        ],
+        "beats": ["knock1", "knock2", "knock3", "knock4"],
+        "badge": { "set": "@allowed4", "ttl": "5 小时" },
+        "punchline": "服务器藏在公网之下 —— 但能敲门的服务，随时可以敲开"
+      }
+    },
+    {
+      "id": "s04-knock-safe",
+      "type": "scene",
+      "page": "/segments/s04-knock-safe.html",
+      "start": 52,
+      "duration": 26,
+      "t0": 0,
+      "speed": 1,
+      "frames": 780,
+      "chapter": "安全性",
+      "copy": {
+        "kicker": "敲错了会怎样",
+        "title": "三级惩罚，逐级加重",
+        "ladder": [
+          { "level": 1, "name": "记入惩罚窗口", "detail": "顺序敲错 → 进 error_ips，30 秒内敲任何门都不算" },
+          { "level": 2, "name": "直接拉黑", "detail": "惩罚窗口内再敲 → 立刻进 blacklist" },
+          { "level": 3, "name": "永久封禁", "detail": "黑名单里的 IP 要管理员手工解封" }
+        ],
+        "rateLimit": {
+          "title": "限流按源地址分桶",
+          "good": "桶跟着来源 IP 走 —— 攻击者只能限流自己",
+          "bad": "曾经用规则级限流：任何人 2 包/分钟就能让全世界的合法敲门静默失效"
+        },
+        "punchline": "能被打瘫的功能，不叫能用"
+      }
+    },
+    {
+      "id": "s05-gateway-how",
+      "type": "scene",
+      "page": "/segments/s05-gateway-how.html",
+      "start": 78,
+      "duration": 20,
+      "t0": 0,
+      "speed": 1,
+      "frames": 600,
+      "chapter": "认证网关",
+      "copy": {
+        "kicker": "认证网关",
+        "title": "一个端口，汇聚所有服务",
+        "routes": [
+          { "path": "/nas", "target": "NAS 管理界面" },
+          { "path": "/photos", "target": "相册服务" },
+          { "path": "/board", "target": "自建服务" },
+          { "path": "/", "target": "服务门户（登录后进）" }
+        ],
+        "notes": [
+          "公网只开一个端口，不用为每个服务各开一个",
+          "网关按路径前缀分流到内网各个服务",
+          "门户登录后就是一张服务卡片列表"
+        ],
+        "punchline": "暴露面从一个 N 变成一个 1"
+      }
+    },
+    {
+      "id": "s06-gateway-auth",
+      "type": "scene",
+      "page": "/segments/s06-gateway-auth.html",
+      "start": 98,
+      "duration": 22,
+      "t0": 0,
+      "speed": 1,
+      "frames": 660,
+      "chapter": "认证",
+      "copy": {
+        "kicker": "进门前，先过认证",
+        "title": "令牌有三道保险",
+        "guards": [
+          { "name": "滑动有效期", "detail": "30 分钟 —— 一直在用就自动续期" },
+          { "name": "绝对上限", "detail": "12 小时 —— 到点必登出，不存在永不过期" },
+          { "name": "即时撤销", "detail": "登出即失效，令牌立刻进撤销表" }
+        ],
+        "extras": [
+          "撞密码会被限速、失败会进审计日志",
+          "令牌签名密钥与面板会话密钥相互独立",
+          "认证后端只监听 127.0.0.1，公网根本够不着"
+        ],
+        "punchline": "认证不是一道门，是三道"
+      }
+    },
+    {
+      "id": "s07-features",
+      "type": "scene",
+      "page": "/segments/s07-features.html",
+      "start": 120,
+      "duration": 28,
+      "t0": 0,
+      "speed": 1,
+      "frames": 840,
+      "chapter": "功能",
+      "copy": {
+        "kicker": "十三块，拼在一起",
+        "title": "一个面板管完路由器",
+        "waves": [
+          ["认证网关", "端口敲门", "端口转发", "反代管理"],
+          ["DDNS", "访问控制", "名单管理", "国外 IP 拦截"],
+          ["DNS 局域网解析", "防火墙状态", "日志管理", "系统日志", "网络接口"]
+        ],
+        "notes": [
+          "端口转发：TCP / UDP，IPv4 / IPv6 双栈",
+          "反代管理：SSL 手动上传 + ACME 自动申请，多 DNS 服务商",
+          "系统日志：认证审计与系统日志合并成一条时间线，可导出 CSV / JSON",
+          "DNS 局域网解析：证书域名自动写入 dnsmasq",
+          "网络接口：多 LAN 口时提示先排除二层环路"
+        ],
+        "punchline": "零构建、零 CDN —— 前端不连任何外部域名"
+      }
+    },
+    {
+      "id": "s08-install",
+      "type": "scene",
+      "page": "/segments/s08-install.html",
+      "start": 148,
+      "duration": 14,
+      "t0": 0,
+      "speed": 1,
+      "frames": 420,
+      "chapter": "安装",
+      "copy": {
+        "kicker": "装它只要一条命令",
+        "title": "零构建 · 零 CDN · 一键装",
+        "cmd": "wget -O /tmp/setup.sh https://raw.githubusercontent.com/fzyt/ghost-firewall/main/nftables-publish-v0.7.9-nospa/setup/setup.sh && sh /tmp/setup.sh",
+        "points": [
+          "自动探测包管理器、装齐依赖",
+          "自动生成自签证书、注册开机自启",
+          "OpenWrt 24.10（opkg）与 25.x（apk）都支持"
+        ],
+        "punchline": "clone 下来就能跑 —— 没有 npm、没有 webpack、没有依赖树"
+      }
+    },
+    {
+      "id": "s09-end",
+      "type": "scene",
+      "page": "/segments/s09-end.html",
+      "start": 162,
+      "duration": 18,
+      "t0": 0,
+      "speed": 1,
+      "frames": 540,
+      "chapter": "收尾",
+      "copy": {
+        "brand": "Ghost Firewall",
+        "title": "把内网服务暴露到公网，\n但只暴露一个必须认证的入口",
+        "cta": "GitHub：fzyt/ghost-firewall",
+        "footnote": "本片画面由代码逐帧渲染 · 配乐由 numpy/scipy 合成 · 全程零生成模型"
+      }
+    }
+  ]
+}

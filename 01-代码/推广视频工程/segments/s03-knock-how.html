@@ -1,0 +1,545 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="/shared/fonts.css">
+<title>03 看不见的门</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0e0e0d; overflow: hidden; }
+  #stage { position: relative; width: 1920px; height: 1080px; overflow: hidden; }
+  canvas#c { position: absolute; inset: 0; width: 1920px; height: 1080px; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="c" width="1920" height="1080"></canvas></div>
+
+<script type="module">
+import { clamp, ease, TAU, loadFonts, cachedGradient, drawCapsuleLabel, drawStamp } from '../common.js';
+import { themeFromURL, chrome, drawGrain, drawVignette } from '../themes.js';
+
+const W = 1920, H = 1080;
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const theme = themeFromURL(location.search);
+const HUD = chrome(theme);
+
+// 段长写死：与 timeline.json 一致，且不被 URL 的 dur 参数改写
+const DURATION = 22;
+window.DURATION = DURATION;
+window.__ready = false;
+window.__bootError = null;
+
+// ---------- 调色板（coral-noir） ----------
+const C = {
+  bg: '#0e0e0d', wall: '#151412', ink: '#f5f0e8', muted: '#8f8981',
+  accent: '#d97757', accentSoft: '#f0b49c',
+  line: 'rgba(245,240,232,0.10)',
+};
+
+// ---------- 文案（timeline.json 的 copy 字段，唯一真相源，逐字照抄） ----------
+const KICKER = '端口敲门';
+const TITLE = '看不见的门，敲对才开';
+const ACTS = [
+  { who: '陌生人路过', line: '眼前只有一堵墙，敲哪里都是空的' },
+  { who: '你知道规律', line: '敲4个指定位置，每一步8秒内接上' },
+  { who: '换个人来', line: '门重新隐形，对他依旧是一堵墙' },
+];
+const BEATS = ['knock1', 'knock2', 'knock3', 'knock4'];
+const BADGE_SET = '@allowed4';
+const BADGE_TTL = '5 小时';
+const PUNCH = '服务器藏在公网之下 —— 但能敲门的服务，随时可以敲开';
+
+// ---------- 版面常量 ----------
+const ACT_X = 96, ACT_Y = [436, 566, 696];   // 三幕文字的基线
+const DOOR = { x: 1200, y: 300, w: 420, h: 580 };
+const MARK_X = DOOR.x;                        // 四个敲击点落在门左边框上
+const MARK_Y = [380, 520, 660, 800];
+const LBL_X = 1178;                           // 端口名右对齐到此
+const FIG_X = 1040, FIG_HEAD = 560, FIG_FOOT = 900;
+const REST = { x: 1074, y: 712 };             // 手垂着时的位置
+const WINDOW = 8;                             // 每一步的 8 秒窗口
+
+// ---------- 节拍 ----------
+const T_ACT = [2.6, 7.4, 16.6];               // 三幕文字
+const T_MARKS = 7.4;                          // 四个敲击点浮现（剪影转成珊瑚色）
+const T_HIT = [8.8, 10.4, 12.0, 13.6];        // 按顺序敲的四下
+const T_OPEN = [14.4, 15.8];                  // 门向内打开
+const T_BADGE = 15.8;                         // @allowed4 徽标
+const T_CLOSE = [16.8, 18.0];                 // 门关上并消失
+const T_PUNCH = 19.4;
+
+// 敲击事件表：hit=true 是敲对了（打在四个点上），false 是敲空
+const KNOCKS = [
+  { t: 3.4, x: 1330, y: 470, hit: false },
+  { t: 4.6, x: 1420, y: 690, hit: false },
+  { t: 5.8, x: 1290, y: 810, hit: false },
+  { t: T_HIT[0], x: MARK_X, y: MARK_Y[0], hit: true },
+  { t: T_HIT[1], x: MARK_X, y: MARK_Y[1], hit: true },
+  { t: T_HIT[2], x: MARK_X, y: MARK_Y[2], hit: true },
+  { t: T_HIT[3], x: MARK_X, y: MARK_Y[3], hit: true },
+  { t: 18.4, x: 1360, y: 560, hit: false },
+];
+
+// ============================================================
+// 节拍表（120 BPM，每拍 0.5s）
+//   0.0-0.8   墙面淡入
+//   1.0-1.6   kicker 淡入
+//   1.5-2.4   标题落下（outBack）
+//   1.9-2.5   路人剪影走到墙前
+//   2.6       第一幕：眼前只有一堵墙
+//   3.4/4.6/5.8  路人乱敲三下 —— 只有涟漪，没有回应
+//   7.4       第二幕 + 四个敲击点浮现，剪影转成珊瑚色
+//   8.8/10.4/12.0/13.6  按顺序敲四下，每一下点亮一个点
+//   12.0-13.6 第 4 个点的 8 秒窗口条收缩
+//   14.0-14.4 门框合拢成一圈
+//   14.4-15.8 门向内打开，露出生机柜
+//   15.8      @allowed4 徽标浮现
+//   16.6       第三幕：换个人来
+//   16.8-18.0 门关上并消失（对别人又是那堵墙）
+//   18.4      换个人敲了一下 —— 空的
+//   19.4      punchline 浮现，画面整体退到背景
+//   19.4-22.0 保持
+// ============================================================
+
+// punchline 出现后，上方内容整体让位（globalAlpha 不相乘，所以统一乘一个系数）
+let focus = 1;
+const fa = (a) => a * focus;
+
+// 剪影颜色：0 = 灰（路人），1 = 珊瑚（你）
+function figMix(u) {
+  if (u < 7.0) return 0;
+  if (u < 7.4) return (u - 7.0) / 0.4;
+  if (u < 16.4) return 1;
+  if (u < 16.8) return 1 - (u - 16.4) / 0.4;
+  return 0;
+}
+
+// 手伸向哪里：敲击前 0.45 秒伸出，敲后 0.6 秒收回
+function armTarget(u) {
+  let best = null;
+  for (const k of KNOCKS) {
+    const dt = u - k.t;
+    if (dt < -0.45 || dt > 0.6) continue;
+    if (!best || Math.abs(dt) < Math.abs(best.dt)) best = { k, dt };
+  }
+  if (!best) return REST;
+  const { k, dt } = best;
+  const reach = dt < 0
+    ? ease.outCubic(clamp((dt + 0.45) / 0.45, 0, 1))
+    : 1 - ease.inCubic(clamp(dt / 0.6, 0, 1));
+  return { x: REST.x + (k.x - REST.x) * reach, y: REST.y + (k.y - REST.y) * reach };
+}
+
+// 墙面：一块块拼起来的暗色板
+function drawWall(u) {
+  const p = clamp(u / 0.8, 0, 1);
+  ctx.save();
+  ctx.globalAlpha = ease.outCubic(p);
+  ctx.fillStyle = C.wall;
+  ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = 'rgba(245,240,232,0.035)';
+  ctx.lineWidth = 1;
+  for (let x = 96; x < W; x += 176) {
+    ctx.beginPath();
+    ctx.moveTo(x + 0.5, 0);
+    ctx.lineTo(x + 0.5, H);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+// 头部：kicker + 主标题
+function drawHead(u) {
+  const kp = clamp((u - 1.0) / 0.6, 0, 1);
+  if (kp > 0) {
+    ctx.save();
+    ctx.globalAlpha = fa(ease.outCubic(kp));
+    ctx.font = '500 34px "JetBrains Mono", monospace';
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = C.accent;
+    ctx.fillText(KICKER, 96, 200);
+    ctx.fillStyle = 'rgba(217,119,87,0.55)';
+    ctx.fillRect(96, 214, 200 * ease.outCubic(kp), 2);
+    ctx.restore();
+  }
+
+  const tp = clamp((u - 1.5) / 0.9, 0, 1);
+  if (tp > 0) {
+    ctx.save();
+    ctx.globalAlpha = fa(clamp(tp * 2, 0, 1));
+    ctx.translate(0, (1 - ease.outBack(tp)) * -26);
+    ctx.font = '700 68px "Noto Sans SC", sans-serif';
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = C.ink;
+    ctx.fillText(TITLE, 96, 292);
+    ctx.restore();
+  }
+}
+
+// 三幕文字：谁 + 一句话，自上而下就是时间顺序
+function drawActs(u) {
+  for (let i = 0; i < ACTS.length; i++) {
+    const p = clamp((u - T_ACT[i]) / 0.7, 0, 1);
+    if (p <= 0) continue;
+    const e = ease.outCubic(p);
+    const y = ACT_Y[i];
+    ctx.save();
+    ctx.globalAlpha = fa(e);
+    ctx.translate(-24 * (1 - e), 0);
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = 'rgba(217,119,87,0.65)';
+    ctx.fillRect(62, y - 22, 3, 30);
+    ctx.font = '600 28px "Noto Sans SC", sans-serif';
+    ctx.fillStyle = C.accent;
+    ctx.fillText(ACTS[i].who, ACT_X, y);
+    ctx.font = '400 28px "Noto Sans SC", sans-serif';
+    ctx.fillStyle = C.ink;
+    ctx.fillText(ACTS[i].line, ACT_X, y + 42);
+    ctx.restore();
+  }
+}
+
+// 站在墙前的人：灰 = 路人，珊瑚 = 你
+function drawFigure(u) {
+  const p = clamp((u - 1.9) / 0.6, 0, 1);
+  if (p <= 0) return;
+  const e = ease.outCubic(p);
+  const m = figMix(u);
+  const col = `rgba(${Math.round(143 + 74 * m)},${Math.round(137 - 18 * m)},${Math.round(129 - 42 * m)},${(0.55 + 0.3 * m).toFixed(3)})`;
+  const hand = armTarget(u);
+
+  ctx.save();
+  ctx.globalAlpha = fa(e);
+  ctx.fillStyle = col;
+
+  // 头
+  ctx.beginPath();
+  ctx.arc(FIG_X, FIG_HEAD + 28, 28, 0, TAU);
+  ctx.fill();
+
+  // 身体
+  ctx.beginPath();
+  ctx.moveTo(FIG_X - 28, FIG_HEAD + 60);
+  ctx.lineTo(FIG_X + 28, FIG_HEAD + 60);
+  ctx.lineTo(FIG_X + 40, FIG_FOOT);
+  ctx.lineTo(FIG_X - 40, FIG_FOOT);
+  ctx.closePath();
+  ctx.fill();
+
+  // 手臂：伸向正在敲的位置
+  ctx.strokeStyle = col;
+  ctx.lineWidth = 11;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(FIG_X + 24, FIG_HEAD + 82);
+  ctx.lineTo(hand.x, hand.y);
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.arc(hand.x, hand.y, 11, 0, TAU);
+  ctx.fill();
+  ctx.restore();
+}
+
+// 敲空的痕迹：墙上留下几个空圈
+function drawMissMarks(u) {
+  for (const k of KNOCKS) {
+    if (k.hit || u < k.t) continue;
+    ctx.save();
+    ctx.globalAlpha = fa(0.35);
+    ctx.strokeStyle = 'rgba(245,240,232,0.5)';
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.arc(k.x, k.y, 13, 0, TAU);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+// 四个敲击点：只有知道规律的人才看得见
+function drawMarks(u) {
+  const p = clamp((u - T_MARKS) / 0.6, 0, 1);
+  if (p <= 0) return;
+  // 门一开，门框这一侧就被门板盖住；门关上后敲击点也跟着隐形
+  const hide = Math.max(
+    clamp((u - T_OPEN[0]) / 0.6, 0, 1),
+    clamp((u - T_CLOSE[0]) / 0.8, 0, 1),
+  );
+  const a = fa(ease.outCubic(p) * (1 - hide));
+  if (a <= 0.01) return;
+
+  for (let i = 0; i < 4; i++) {
+    const lit = clamp((u - T_HIT[i]) / 0.4, 0, 1);
+    const y = MARK_Y[i];
+
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.strokeStyle = lit > 0 ? C.accent : 'rgba(245,240,232,0.30)';
+    ctx.lineWidth = lit > 0 ? 2.4 : 1.6;
+    ctx.beginPath();
+    ctx.arc(MARK_X, y, 11, 0, TAU);
+    ctx.stroke();
+    if (lit > 0) {
+      ctx.fillStyle = 'rgba(217,119,87,0.35)';
+      ctx.beginPath();
+      ctx.arc(MARK_X, y, 11, 0, TAU);
+      ctx.fill();
+    }
+    ctx.restore();
+
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.font = '500 22px "JetBrains Mono", monospace';
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = lit > 0 ? C.accentSoft : C.muted;
+    ctx.fillText(BEATS[i], LBL_X, y);
+    ctx.restore();
+  }
+}
+
+// 敲击瞬间的扩散涟漪
+function drawKnocks(u) {
+  for (const k of KNOCKS) {
+    const dt = u - k.t;
+    if (dt < 0 || dt > 1.3) continue;
+    const p = dt / 1.3;
+    ctx.save();
+    ctx.globalAlpha = fa((1 - p) * 0.9);
+    ctx.strokeStyle = k.hit ? C.accent : 'rgba(245,240,232,0.38)';
+    ctx.lineWidth = k.hit ? 2.4 : 1.6;
+    ctx.beginPath();
+    ctx.arc(k.x, k.y, 14 + p * 92, 0, TAU);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+// 门：四下敲完后合拢 → 打开 → 再隐形
+function drawDoor(u) {
+  const born = clamp((u - (T_HIT[3] + 0.4)) / 0.4, 0, 1);
+  const gone = clamp((u - T_CLOSE[1]) / 0.4, 0, 1);
+  const on = born * (1 - gone);
+  if (on <= 0.01) return;
+
+  const openP = clamp((u - T_OPEN[0]) / (T_OPEN[1] - T_OPEN[0]), 0, 1);
+  const closeP = clamp((u - T_CLOSE[0]) / (T_CLOSE[1] - T_CLOSE[0]), 0, 1);
+  const ang = ease.outCubic(openP) * (1 - ease.inOutCubic(closeP)) * 1.35;
+
+  // 门后：内网服务
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(DOOR.x, DOOR.y, DOOR.w, DOOR.h);
+  ctx.clip();
+  ctx.globalAlpha = fa(on);
+  const glow = cachedGradient(ctx, 'door-glow', (c) => {
+    const cx = DOOR.x + DOOR.w / 2, cy = DOOR.y + DOOR.h / 2;
+    const g = c.createRadialGradient(cx, cy, 20, cx, cy, 340);
+    g.addColorStop(0, 'rgba(217,119,87,0.32)');
+    g.addColorStop(1, 'rgba(217,119,87,0.02)');
+    return g;
+  });
+  ctx.fillStyle = glow;
+  ctx.fillRect(DOOR.x, DOOR.y, DOOR.w, DOOR.h);
+
+  // 机柜
+  const rx = 1340, ry = 430, rw = 160, rh = 250;
+  ctx.fillStyle = 'rgba(14,14,13,0.88)';
+  ctx.beginPath();
+  ctx.roundRect(rx, ry, rw, rh, 10);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(245,240,232,0.20)';
+  ctx.lineWidth = 1.4;
+  ctx.stroke();
+  for (let i = 0; i < 5; i++) {
+    const sy = ry + 26 + i * 44;
+    ctx.fillStyle = 'rgba(245,240,232,0.07)';
+    ctx.beginPath();
+    ctx.roundRect(rx + 18, sy, rw - 36, 26, 5);
+    ctx.fill();
+    const blink = 0.4 + 0.6 * Math.abs(Math.sin(u * 2.2 + i * 1.7));
+    ctx.fillStyle = `rgba(217,119,87,${blink.toFixed(3)})`;
+    ctx.beginPath();
+    ctx.arc(rx + 32, sy + 13, 4.5, 0, TAU);
+    ctx.fill();
+    ctx.fillStyle = `rgba(240,180,156,${(blink * 0.7).toFixed(3)})`;
+    ctx.beginPath();
+    ctx.arc(rx + 46, sy + 13, 3.5, 0, TAU);
+    ctx.fill();
+  }
+  ctx.font = '400 22px "Noto Sans SC", sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = C.muted;
+  ctx.fillText('内网服务', rx + rw / 2, ry - 22);
+  ctx.restore();
+
+  // 门板：以左边框为轴转开
+  const farX = DOOR.x + DOOR.w * Math.cos(ang);
+  const dY = DOOR.w * Math.sin(ang) * 0.16;
+  ctx.save();
+  ctx.globalAlpha = fa(on);
+  ctx.beginPath();
+  ctx.moveTo(DOOR.x, DOOR.y);
+  ctx.lineTo(farX, DOOR.y - dY);
+  ctx.lineTo(farX, DOOR.y + DOOR.h + dY);
+  ctx.lineTo(DOOR.x, DOOR.y + DOOR.h);
+  ctx.closePath();
+  const pg = ctx.createLinearGradient(DOOR.x, 0, Math.max(farX, DOOR.x + 1), 0);
+  pg.addColorStop(0, '#1c1a17');
+  pg.addColorStop(1, '#272320');
+  ctx.fillStyle = pg;
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(245,240,232,0.16)';
+  ctx.lineWidth = 1.4;
+  ctx.stroke();
+  // 门缝里溢出的光
+  if (ang > 0.04) {
+    ctx.strokeStyle = 'rgba(240,180,156,0.8)';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(farX, DOOR.y - dY);
+    ctx.lineTo(farX, DOOR.y + DOOR.h + dY);
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  // 门框
+  const fr = clamp((u - (T_HIT[3] + 0.4)) / 0.6, 0, 1);
+  ctx.save();
+  ctx.globalAlpha = fa(ease.outCubic(fr) * (1 - gone));
+  ctx.strokeStyle = 'rgba(217,119,87,0.75)';
+  ctx.lineWidth = 2.4;
+  ctx.beginPath();
+  ctx.rect(DOOR.x, DOOR.y, DOOR.w, DOOR.h);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// 8 秒窗口：下一个待敲的位置下面挂着倒计时条
+function drawCountdown(u) {
+  for (let j = 1; j < 4; j++) {
+    const start = T_HIT[j - 1];
+    if (u < start || u >= T_HIT[j]) continue;
+    const remain = Math.max(0, WINDOW - (u - start));
+    const w = 150 * (remain / WINDOW);
+    const y = MARK_Y[j];
+
+    ctx.save();
+    ctx.globalAlpha = fa(0.95);
+    ctx.fillStyle = 'rgba(245,240,232,0.10)';
+    ctx.beginPath();
+    ctx.roundRect(MARK_X, y + 40, 150, 6, 3);
+    ctx.fill();
+    if (w > 0.5) {
+      ctx.fillStyle = C.accent;
+      ctx.beginPath();
+      ctx.roundRect(MARK_X, y + 40, w, 6, 3);
+      ctx.fill();
+    }
+    ctx.font = '500 20px "JetBrains Mono", monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = C.accent;
+    ctx.fillText('剩余 ' + remain.toFixed(1) + 's', MARK_X, y + 78);
+    ctx.restore();
+  }
+}
+
+// 白名单徽标：你的 IP 已经进 @allowed4
+function drawBadge(u) {
+  const p = clamp((u - T_BADGE) / 0.6, 0, 1);
+  if (p <= 0) return;
+  const e = ease.outCubic(p);
+  const bx = 1200, by = 896, bw = 420, bh = 64;
+  ctx.save();
+  ctx.globalAlpha = fa(e);
+  ctx.translate((1 - e) * 40, 0);
+  ctx.fillStyle = 'rgba(217,119,87,0.12)';
+  ctx.beginPath();
+  ctx.roundRect(bx, by, bw, bh, 12);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(217,119,87,0.5)';
+  ctx.lineWidth = 1.3;
+  ctx.stroke();
+
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'left';
+  ctx.font = '600 24px "JetBrains Mono", monospace';
+  ctx.fillStyle = C.accent;
+  ctx.fillText(BADGE_SET, bx + 24, by + bh / 2 + 1);
+  const w1 = ctx.measureText(BADGE_SET).width;
+  ctx.font = '400 22px "Noto Sans SC", sans-serif';
+  ctx.fillStyle = C.muted;
+  ctx.fillText('有效期', bx + 44 + w1, by + bh / 2 + 1);
+  const w2 = ctx.measureText('有效期').width;
+  ctx.font = '600 22px "Noto Sans SC", sans-serif';
+  ctx.fillStyle = C.ink;
+  ctx.fillText(BADGE_TTL, bx + 60 + w1 + w2, by + bh / 2 + 1);
+  ctx.restore();
+}
+
+function drawPunch(u) {
+  const p = clamp((u - T_PUNCH) / 0.9, 0, 1);
+  if (p <= 0) return;
+  ctx.save();
+  ctx.globalAlpha = ease.outCubic(p);
+  ctx.fillStyle = 'rgba(217,119,87,0.55)';
+  ctx.fillRect(62, 958, 3, 46);
+  ctx.font = '600 36px "Noto Sans SC", sans-serif';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = C.accent;
+  ctx.fillText(PUNCH, 96, 996);
+  ctx.restore();
+}
+
+// ============================================================
+window.renderFrame = (u) => {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.textBaseline = 'alphabetic';
+  ctx.textAlign = 'left';
+  ctx.fillStyle = C.bg;
+  ctx.fillRect(0, 0, W, H);
+
+  // punchline 出现后，其余内容退到背景
+  focus = 1 - clamp((u - T_PUNCH) / 1.0, 0, 1) * 0.72;
+
+  drawWall(u);
+  drawGrain(ctx, theme, W, H, u);
+
+  drawHead(u);
+  drawActs(u);
+  drawFigure(u);
+  drawMissMarks(u);
+  drawMarks(u);
+  drawKnocks(u);
+  drawDoor(u);
+  drawCountdown(u);
+  drawBadge(u);
+  drawPunch(u);
+  drawVignette(ctx, W, H, 0.42);
+
+  drawCapsuleLabel(ctx, 3, '端口敲门', '安全', {
+    numberColor: HUD.capsule.numberColor, textColor: HUD.capsule.textColor,
+    bg: HUD.capsule.bg, border: HUD.capsule.border,
+  });
+  drawStamp(ctx, 'GHOST FIREWALL', { color: HUD.stamp.color });
+};
+
+(async () => {
+  try {
+    await loadFonts(['Noto Sans SC', 'JetBrains Mono', 'Inter']);
+    window.__ready = true;
+  } catch (e) {
+    window.__bootError = String(e);
+  }
+})();
+</script>
+</body>
+</html>
