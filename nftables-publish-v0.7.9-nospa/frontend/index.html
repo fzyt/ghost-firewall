@@ -29,6 +29,12 @@
   <script defer src="/pixelfield.js"></script>
   <!-- 背景选档与挂载（面板自己那份引导，见 frontend/pixelbg.js） -->
   <script defer src="/pixelbg.js"></script>
+  <!-- 极简模式开关（2026-11-17）：把磨砂、动效、像素场背景一起关掉。
+       ⚠️ 必须**同步加载**（不能 defer）且排在 styles.css **之前** ——
+          浏览器解析到它就执行，<html> 上的 class 立刻到位，
+          极简模式的用户打开面板不会先看到一帧动效再卡住。
+          塞进 defer 脚本就晚了，会闪。 -->
+  <script src="/plainmode.js"></script>
   <link rel="stylesheet" href="styles.css">
 </head>
 
@@ -157,6 +163,17 @@
           加载中…
         </div>
         <span x-show="!loading">仅限内网访问</span>
+        <!-- 极简模式（2026-11-17）：去磨砂、去动效、去像素场背景，
+             页面只剩最简的元素。状态存在**本浏览器**（localStorage），
+             刷新后保持；换浏览器/换设备不跟随（观感偏好该这样）。
+             实测依据见报告《面板极简模式开关-2026-11-17.md》。 -->
+        <label x-show="!loading"
+          class="nf-plain-switch">
+          <input type="checkbox"
+            :checked="plainMode"
+            @change="setPlainMode($event.target.checked)">
+          <span>极简模式（无磨砂无动效）</span>
+        </label>
         <!-- 改密码入口。面板此前完全没有这个功能，密码只能用 ssh 手改文件。 -->
         <button x-show="!loading" @click="openPasswordModal()"
           class="mt-3 nf-btn nf-btn--magnetic" style="width:100%;padding:7px 12px;font-size:.78rem">

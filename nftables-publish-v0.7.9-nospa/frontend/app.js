@@ -18,6 +18,14 @@ const LOG_LEVELS = [
 function app() {
   return {
     logLevels: LOG_LEVELS,
+    // ======================= 极简模式 =======================
+    // 打开 ⇒ 磨砂、动效、像素场背景全不要，页面只剩最简元素。
+    //
+    // 状态存在**本浏览器**（localStorage），真相源是 frontend/plainmode.js
+    // 摆在 <html> 上的 class；界面上的这个字段只是它的镜像。
+    // ⚠️ 面板自己在启动阶段就会读它（那时界面还没渲染）⇒ 界面上的勾选框
+    //    必须跟着初始化，否则会出现「页面已经是极简了、勾却没勾」。
+    plainMode: false,
     // ======================= 认证状态 =======================
     auth: {
       authenticated: false,
@@ -354,6 +362,15 @@ function app() {
     },
 
     async init() {
+      // 极简模式：把本地存的状态同步进界面。
+      // 页面本身在 <head> 里就已经生效了（frontend/plainmode.js），
+      // 这里只管让勾选框显示得对。
+      try {
+        this.plainMode = !!(window.NfPlain && window.NfPlain.isOn());
+      } catch (e) {
+        this.plainMode = false;
+      }
+
       // 监听全局 401 事件，api.request 在收到 401 时派发
       window.addEventListener('auth-expired', () => this.handleAuthExpired());
       window.addEventListener('auth-needs-setup', () => {
@@ -376,6 +393,21 @@ function app() {
       await this.loadInterfaces();
       await this.loadLogdConfig();
       await this.loadDdns();
+    },
+
+    /**
+     * 切极简模式。
+     *
+     * 真正的活全在 frontend/plainmode.js 里（存状态 + 摆 class + 通知像素场），
+     * 这里只转发 —— 两边都改就会有两份真相源。
+     */
+    setPlainMode(on) {
+      this.plainMode = !!on;
+      try {
+        if (window.NfPlain) window.NfPlain.set(this.plainMode);
+      } catch (e) {
+        /* 开关本身写不进去也别把界面搞崩 */
+      }
     },
 
     async checkAuth() {

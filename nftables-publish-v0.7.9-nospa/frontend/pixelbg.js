@@ -64,9 +64,21 @@
     return CANDIDATES[Math.floor(r * CANDIDATES.length)];
   }
 
-  function boot() {
-    var cv = document.getElementById('nf-pix');
-    if (!cv || !window.GhostPixelField) return;
+  /* 极简模式（2026-11-17，见 frontend/plainmode.js）开着时，
+     像素场整块不要。 */
+  var canvas = null;
+  var instance = null;
+
+  function plainOn() {
+    try {
+      return !!(window.NfPlain && window.NfPlain.isOn());
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function mountField() {
+    if (!canvas || !window.GhostPixelField) return;
     try {
       /* 尊重系统的「减少动态效果」设置：引擎的 static 模式画一帧就不动了。
          面板是给人盯着看的后台界面，动效必须有降级路径。 */
@@ -74,12 +86,44 @@
         window.matchMedia('(prefers-reduced-motion: reduce)').matches);
       var opt = { static: reduce };
       if (window.GhostPixelField.createStyle) {
-        window.GhostPixelField.createStyle(cv, pickStyle(), opt);
+        instance = window.GhostPixelField.createStyle(canvas, pickStyle(), opt);
       } else if (window.GhostPixelField.mount) {
-        window.GhostPixelField.mount(cv, opt);
+        instance = window.GhostPixelField.mount(canvas, opt);
       }
     } catch (e) {
       /* 背景画不出来无所谓 —— 面板照常用（这条与门户同款） */
+    }
+  }
+
+  function boot() {
+    canvas = document.getElementById('nf-pix');
+    if (!canvas || !window.GhostPixelField) return;
+    if (plainOn()) {
+      /* 极简模式：**不挂载**像素场，不是「藏起来」。
+         藏起来 rAF 还在跑，每帧照样 putImageData（实测每帧约 14ms JS），
+         CPU 一分都不省。 */
+      canvas.style.display = 'none';
+      return;
+    }
+    mountField();
+  }
+
+  /* 极简模式开关切过来时用：停 / 起像素场。
+     ⚠️ 切回「关」时若首屏就是极简（引擎从没挂载过）⇒ 现在才第一次挂。
+        而且要先让画布可见再挂 —— display:none 的画布量不到尺寸，
+        引擎会按 0×0 初始化，显示出来也是一片空。 */
+  function applyPlain(on) {
+    if (canvas) canvas.style.display = on ? 'none' : '';
+    if (on) {
+      if (instance && instance.stop) {
+        try { instance.stop(); } catch (e) { /* 停不掉就算了 */ }
+      }
+      return;
+    }
+    if (!instance) {
+      mountField();
+    } else if (instance.start) {
+      try { instance.start(); } catch (e) { /* 起不来就算了 */ }
     }
   }
 
@@ -90,5 +134,9 @@
   }
 
   /* 暴露给测试与调试（不在页面里显示任何东西） */
-  window.__panelPixelBg = { pickStyle: pickStyle, candidates: CANDIDATES };
+  window.__panelPixelBg = {
+    pickStyle: pickStyle,
+    candidates: CANDIDATES,
+    apply: applyPlain,
+  };
 })();

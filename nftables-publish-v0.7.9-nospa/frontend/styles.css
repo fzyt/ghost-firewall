@@ -407,6 +407,36 @@ body .nf-sidebar__foot {
   display: flex; align-items: center; gap: 8px;
 }
 
+/* 极简模式开关（2026-11-17）：侧栏底部的一行勾选 */
+body .nf-plain-switch {
+  display: flex; align-items: center; gap: 7px;
+  margin-top: 10px; cursor: pointer; user-select: none;
+  color: var(--nf-text-lo);
+}
+body .nf-plain-switch input {
+  appearance: none; -webkit-appearance: none;
+  width: 30px; height: 17px; flex-shrink: 0; margin: 0;
+  border-radius: 9px; cursor: pointer;
+  background: rgba(255, 255, 255, .10);
+  border: 1px solid var(--nf-hairline);
+  position: relative;
+  transition: background .18s ease;
+}
+body .nf-plain-switch input::after {
+  content: ''; position: absolute; top: 1px; left: 1px;
+  width: 13px; height: 13px; border-radius: 50%;
+  background: var(--nf-text-lo);
+  transition: transform .18s ease, background .18s ease;
+}
+body .nf-plain-switch input:checked {
+  background: rgba(79, 201, 192, .35);
+}
+body .nf-plain-switch input:checked::after {
+  transform: translateX(13px);
+  background: var(--nf-accent);
+}
+body .nf-plain-switch:hover { color: var(--nf-text-hi); }
+
 /* 加载指示器：旋转环（不是粒子） */
 body .nf-spin {
   width: 12px; height: 12px; flex-shrink: 0;
@@ -754,6 +784,39 @@ body .nf-alert--warn {
   body .nf-btn--magnetic,
   body .nf-tilt { transform: none !important; }
 }
+
+/* ==========================================================================
+   极简模式（2026-11-17）
+   --------------------------------------------------------------------------
+   开关打开 ⇒ 磨砂、动效、像素场全不要，页面只剩最简元素。
+   开关本体见 frontend/plainmode.js，界面入口在侧栏底部。
+
+   为什么用一条通配而不是逐个元素改：
+   磨砂铺在 7 个选择器上（玻璃卡片基元 / 侧栏 / 顶栏 / 页面容器 /
+   所有 .bg-white 元素 / 弹窗遮罩 / 整页登录页），逐个改要改 7 处，
+   而且**以后新增玻璃面就会漏** ⇒ 一条通配把整棵树的磨砂与动效一起掐掉，
+   新增元素自动继承。
+
+   为什么用 duration/iteration-count 而不是 `animation: none` / `transition: none`：
+   `transition: none` 会让 transitionend 永远不触发 ⇒ Alpine 的 x-transition
+   以为过渡没结束，元素可能卡在起始态（opacity:0）＝**看不见**。
+   沿用本文件上面 prefers-reduced-motion 的做法：时长压到 .001ms，
+   事件照常触发，视觉上就是瞬切。
+   ========================================================================== */
+html.nf-plain *,
+html.nf-plain *::before,
+html.nf-plain *::after {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  animation-duration: .001ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: .001ms !important;
+  transition-delay: 0ms !important;
+  scroll-behavior: auto !important;
+}
+/* 像素场画布：正常模式下由 frontend/pixelbg.js 停掉引擎并隐藏；
+   这条是兜底（引擎还没挂上时，样式先把画布藏掉）。 */
+html.nf-plain .nf-pix { display: none !important; }
 
 /* Alpine 未启动时的兜底（沿用原有约定，不能删） */
 [x-cloak] { display: none !important; }
