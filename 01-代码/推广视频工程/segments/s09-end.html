@@ -68,7 +68,7 @@ function drawWordmark(u) {
   if (p <= 0) return;
   const e = ease.outBack(p);
   const chars = [...BRAND];
-  ctx.font = `700 ${WORDMARK.size}px "Orbitron", sans-serif`;
+  ctx.font = `700 ${WORDMARK.size}px "Orbitron", "Noto Sans SC", sans-serif`;
   const widths = chars.map((c) => ctx.measureText(c).width);
   const total = widths.reduce((a, b) => a + b, 0) + WORDMARK.track * (chars.length - 1);
 
@@ -128,7 +128,7 @@ function drawCta(u) {
 
   ctx.font = '400 30px "Noto Sans SC", sans-serif';
   const hw = ctx.measureText(CTA_HEAD).width;
-  ctx.font = '500 30px "JetBrains Mono", monospace';
+  ctx.font = '500 30px "JetBrains Mono", "Noto Sans SC", monospace';
   const pw = ctx.measureText(CTA_PATH).width;
   const total = hw + pw;
   const x0 = 960 - total / 2;
@@ -138,7 +138,7 @@ function drawCta(u) {
   ctx.font = '400 30px "Noto Sans SC", sans-serif';
   ctx.fillStyle = C.ink;
   ctx.fillText(CTA_HEAD, x0, CTA_Y);
-  ctx.font = '500 30px "JetBrains Mono", monospace';
+  ctx.font = '500 30px "JetBrains Mono", "Noto Sans SC", monospace';
   ctx.fillStyle = C.accent;
   ctx.fillText(CTA_PATH, x0 + hw, CTA_Y);
 

@@ -151,7 +151,7 @@ function drawHead(u) {
   if (kp > 0) {
     ctx.save();
     ctx.globalAlpha = ease.outCubic(kp);
-    ctx.font = '500 30px "JetBrains Mono", monospace';
+    ctx.font = '500 30px "JetBrains Mono", "Noto Sans SC", monospace';
     ctx.textBaseline = 'alphabetic';
     ctx.textAlign = 'left';
     ctx.fillStyle = C.accent;
@@ -345,7 +345,7 @@ function drawCards(u) {
     ctx.fillText(GUARDS[i].name, x + 100, y + 62);
 
     // 编号
-    ctx.font = '500 20px "JetBrains Mono", monospace';
+    ctx.font = '500 20px "JetBrains Mono", "Noto Sans SC", monospace';
     ctx.textAlign = 'right';
     ctx.fillStyle = C.accent;
     ctx.fillText(String(i + 1).padStart(2, '0'), x + CARD.w - 26, y + 44);

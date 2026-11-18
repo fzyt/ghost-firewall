@@ -129,7 +129,7 @@ function drawHead(u) {
   if (kp > 0) {
     ctx.save();
     ctx.globalAlpha = fa(ease.outCubic(kp));
-    ctx.font = '500 34px "JetBrains Mono", monospace';
+    ctx.font = '500 34px "JetBrains Mono", "Noto Sans SC", monospace';
     ctx.textBaseline = 'alphabetic';
     ctx.textAlign = 'left';
     ctx.fillStyle = C.accent;
@@ -182,7 +182,7 @@ function drawLadder(u) {
     ctx.roundRect(x + 2, top + 2, LAD.w - 4, 4, 2);
     ctx.fill();
 
-    ctx.font = '600 20px "JetBrains Mono", monospace';
+    ctx.font = '600 20px "JetBrains Mono", "Noto Sans SC", monospace';
     ctx.textAlign = 'left';
     ctx.textBaseline = 'alphabetic';
     ctx.fillStyle = col;
@@ -209,7 +209,7 @@ function drawLadder(u) {
     const tp = clamp((u - T_TAG[i]) / 0.7, 0, 1);
     if (tp > 0) {
       ctx.globalAlpha = fa(ease.outCubic(tp));
-      ctx.font = '500 17px "JetBrains Mono", monospace';
+      ctx.font = '500 17px "JetBrains Mono", "Noto Sans SC", monospace';
       const tw = ctx.measureText(LADDER[i].tag).width;
       ctx.fillStyle = hexA(col, 0.14);
       ctx.beginPath();
@@ -256,7 +256,7 @@ function drawIpChip(u) {
   ctx.strokeStyle = col;
   ctx.lineWidth = 1.6;
   ctx.stroke();
-  ctx.font = '500 17px "JetBrains Mono", monospace';
+  ctx.font = '500 17px "JetBrains Mono", "Noto Sans SC", monospace';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillStyle = idx === 0 ? C.ink : col;
@@ -344,7 +344,7 @@ function drawRateCard(u) {
       ctx.lineWidth = 1.3;
       ctx.stroke();
 
-      ctx.font = '400 15px "JetBrains Mono", monospace';
+      ctx.font = '400 15px "JetBrains Mono", "Noto Sans SC", monospace';
       ctx.textAlign = 'center';
       ctx.fillStyle = attacker ? C.accent : C.muted;
       ctx.fillText(BUCKET_LABEL[k], bx + 46, CARD.y + 240);
@@ -408,7 +408,7 @@ function drawRateCard(u) {
     ctx.lineWidth = 1.3;
     ctx.stroke();
 
-    ctx.font = '500 19px "JetBrains Mono", monospace';
+    ctx.font = '500 19px "JetBrains Mono", "Noto Sans SC", monospace';
     ctx.textAlign = 'center';
     ctx.fillStyle = C.gold;
     ctx.fillText('2 包/分钟', bx + bw / 2, CARD.y + 376);

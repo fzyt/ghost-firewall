@@ -143,7 +143,7 @@ function drawCards(u) {
     ctx.fillText(ent.reach, bx + 18, y + 47);
 
     // 地址（等宽；公网那个用珊瑚软色点一下）
-    ctx.font = '400 23px "JetBrains Mono", monospace';
+    ctx.font = '400 23px "JetBrains Mono", "Noto Sans SC", monospace';
     ctx.textBaseline = 'alphabetic';
     ctx.fillStyle = ent.tier === 'pub' ? C.accentSoft : 'rgba(245,240,232,0.50)';
     ctx.fillText(ent.addr, CARD.x + 56, y + 100);
@@ -282,7 +282,7 @@ function drawHead(u) {
   if (kp > 0) {
     ctx.save();
     ctx.globalAlpha = ease.outCubic(kp);
-    ctx.font = '500 34px "JetBrains Mono", monospace';
+    ctx.font = '500 34px "JetBrains Mono", "Noto Sans SC", monospace';
     ctx.textBaseline = 'alphabetic';
     ctx.textAlign = 'left';
     ctx.fillStyle = C.accent;

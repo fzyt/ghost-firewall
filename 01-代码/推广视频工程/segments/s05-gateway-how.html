@@ -124,7 +124,7 @@ function drawNode(u) {
   ctx.stroke();
 
   // 节点名
-  ctx.font = '500 20px "JetBrains Mono", monospace';
+  ctx.font = '500 20px "JetBrains Mono", "Noto Sans SC", monospace';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'alphabetic';
   ctx.fillStyle = C.muted;
@@ -175,7 +175,7 @@ function drawRouteCards(u) {
     ctx.stroke();
 
     // 路径前缀（等宽珊瑚色）
-    ctx.font = '500 26px "JetBrains Mono", monospace';
+    ctx.font = '500 26px "JetBrains Mono", "Noto Sans SC", monospace';
     const pw = ctx.measureText(ROUTES[i].path).width;
     ctx.fillStyle = 'rgba(217,119,87,0.12)';
     ctx.beginPath();

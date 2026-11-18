@@ -154,7 +154,7 @@ function drawHead(u) {
   if (kp > 0) {
     ctx.save();
     ctx.globalAlpha = fa(ease.outCubic(kp));
-    ctx.font = '500 34px "JetBrains Mono", monospace';
+    ctx.font = '500 34px "JetBrains Mono", "Noto Sans SC", monospace';
     ctx.textBaseline = 'alphabetic';
     ctx.textAlign = 'left';
     ctx.fillStyle = C.accent;
@@ -292,7 +292,7 @@ function drawMarks(u) {
 
     ctx.save();
     ctx.globalAlpha = a;
-    ctx.font = '500 22px "JetBrains Mono", monospace';
+    ctx.font = '500 22px "JetBrains Mono", "Noto Sans SC", monospace';
     ctx.textAlign = 'right';
     ctx.textBaseline = 'middle';
     ctx.fillStyle = lit > 0 ? C.accentSoft : C.muted;
@@ -440,7 +440,7 @@ function drawCountdown(u) {
       ctx.roundRect(MARK_X, y + 40, w, 6, 3);
       ctx.fill();
     }
-    ctx.font = '500 20px "JetBrains Mono", monospace';
+    ctx.font = '500 20px "JetBrains Mono", "Noto Sans SC", monospace';
     ctx.textAlign = 'left';
     ctx.textBaseline = 'alphabetic';
     ctx.fillStyle = C.accent;
@@ -468,7 +468,7 @@ function drawBadge(u) {
 
   ctx.textBaseline = 'middle';
   ctx.textAlign = 'left';
-  ctx.font = '600 24px "JetBrains Mono", monospace';
+  ctx.font = '600 24px "JetBrains Mono", "Noto Sans SC", monospace';
   ctx.fillStyle = C.accent;
   ctx.fillText(BADGE_SET, bx + 24, by + bh / 2 + 1);
   const w1 = ctx.measureText(BADGE_SET).width;

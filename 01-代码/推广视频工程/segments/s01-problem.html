@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <link rel="stylesheet" href="/shared/fonts.css">
-<title>01 暴露风险</title>
+<title>01 个人公网防火墙</title>
 <style>
   html, body { margin: 0; padding: 0; background: #0e0e0d; overflow: hidden; }
   #stage { position: relative; width: 1920px; height: 1080px; overflow: hidden; }
@@ -35,105 +35,146 @@ const C = {
 };
 
 // ---------- 文案（timeline.json 的 copy 字段，唯一真相源） ----------
-const KICKER = '把内网服务暴露到公网';
-const TITLE = '是一件天然危险的事';
-const RISKS = [
-  '端口一开，全世界的扫描器 24 小时在找',
-  '一个弱口令 = 一整条内网沦陷',
-  'VPN 客户端要先装、要先连、还可能连不上',
+const KICKER = '最新在做的个人公网防火墙';
+const TITLE = '把服务器隐身进公网';
+const POINTS = [
+  '服务、脚本、任何监测工具，都探明不了',
+  '公网上没有可被扫描到的端口',
+  '只有敲对门的人知道入口在哪',
 ];
-const PUNCH = '问题的根子是：公网上开了几个不该开的门';
+const PUNCH = '看不见，也扫不着 —— 这就是它的隐身方式';
 
 // ---------- 版面常量 ----------
-// 左图右文：两侧内容顶边对齐在 380，底部留白是统一的呼吸空间
-const STACK = { x: 150, y: 380, w: 540, h: 56, gap: 20, n: 5, open: 2 };  // open = 第几条是开放端口
+// 左图右文：左侧是「公网 + 探针扫不到」，右侧是定位三句
+const PANEL = { x: 130, y: 320, w: 580, h: 590 };
+const CENTER = { x: 420, y: 560 };
+const RACK = { x: 340, y: 415, w: 160, h: 290 };
+const FIELD_R = 190;               // 隐身场半径：探针的波到这里就散了
+const PROBE_R = 292;               // 探针到机柜中心的距离
 const RIGHT = { x: 880, w: 860 };
-const RULE_X = 790;   // 左右分隔线
+const RULE_X = 790;                // 左右分隔线
+
+// 四角的探针（扫描器 / 监测脚本的抽象）
+const PROBES = [0, 1, 2, 3].map((i) => {
+  const a = Math.PI / 4 + i * Math.PI / 2;
+  return { x: CENTER.x + Math.cos(a) * PROBE_R, y: CENTER.y + Math.sin(a) * PROBE_R };
+});
 
 // ============================================================
 // 节拍表（120 BPM，每拍 0.5s）
-//   0.0-1.0  端口栈淡入，扫描线开始上下扫
-//   1.0-2.0  kicker 淡入
-//   2.0-3.0  title 落下（outBack）
-//   3.0-4.0  风险 1 滑入
-//   4.0-5.0  风险 2 滑入
-//   5.0-6.0  风险 3 滑入，同时开放端口条闪红
-//   6.0-8.0  保持读字
-//   8.0-10.0 三条风险收拢变暗，punchline 浮现
-//  10.0-14.0 保持
+//   0.0-0.8   公网点阵淡入
+//   0.6-1.8   机柜与隐身场淡入
+//   1.0-1.7   kicker 淡入
+//   1.8-2.8   title 落下（outBack）
+//   3.0-4.0   第 1 条滑入
+//   4.0-5.0   第 2 条滑入
+//   5.0-6.0   第 3 条滑入
+//   6.0-8.5   读字停顿（探针一直在扫）
+//   8.5-9.5   punchline 浮现，三条收拢变暗
+//  14.0       段末静帧
 // ============================================================
 
-// 左侧：防火墙规则栈 + 一条上下扫的扫描线
-function drawStack(u) {
+// 左侧：公网 + 探针扫不到
+function drawLeft(u) {
   const inP = clamp(u / 0.8, 0, 1);
   const e = ease.outCubic(inP);
-  for (let i = 0; i < STACK.n; i++) {
-    const y = STACK.y + i * (STACK.h + STACK.gap);
-    const isOpen = i === STACK.open;
-    const rowIn = clamp((inP - i * 0.08) / 0.5, 0, 1);
-    if (rowIn <= 0) continue;
-    const re = ease.outCubic(rowIn);
 
+  // 公网点阵：一层稀疏的节点，暗示「外面全是探针在扫的东西」
+  ctx.save();
+  ctx.globalAlpha = e;
+  ctx.fillStyle = 'rgba(245,240,232,0.34)';
+  for (let y = PANEL.y; y < PANEL.y + PANEL.h; y += 30) {
+    for (let x = PANEL.x; x < PANEL.x + PANEL.w; x += 30) {
+      // 中心留空：机柜那一块不画点
+      if (Math.abs(x - CENTER.x) < 122 && Math.abs(y - CENTER.y) < 168) continue;
+      ctx.beginPath();
+      ctx.arc(x, y, 2.4, 0, TAU);
+      ctx.fill();
+    }
+  }
+  ctx.restore();
+
+  // 隐身场：虚线圈 + 一层极淡的填充
+  const fp = clamp((u - 0.6) / 1.0, 0, 1);
+  if (fp > 0) {
+    const fe = ease.outCubic(fp);
     ctx.save();
-    ctx.globalAlpha = re;
-    ctx.translate((1 - re) * -60, 0);
-
-    // 条本体
-    ctx.fillStyle = isOpen ? 'rgba(217,119,87,0.16)' : 'rgba(245,240,232,0.045)';
+    ctx.globalAlpha = fe;
+    ctx.fillStyle = 'rgba(217,119,87,0.05)';
     ctx.beginPath();
-    ctx.roundRect(STACK.x, y, STACK.w, STACK.h, 10);
+    ctx.arc(CENTER.x, CENTER.y, FIELD_R, 0, TAU);
     ctx.fill();
-    ctx.strokeStyle = isOpen ? 'rgba(217,119,87,0.55)' : C.line;
-    ctx.lineWidth = 1.4;
+    ctx.setLineDash([10, 12]);
+    ctx.strokeStyle = 'rgba(217,119,87,0.60)';
+    ctx.lineWidth = 1.8;
+    ctx.beginPath();
+    ctx.arc(CENTER.x, CENTER.y, FIELD_R, 0, TAU);
     ctx.stroke();
-
-    // 左端的状态点
-    ctx.fillStyle = isOpen ? C.accent : 'rgba(245,240,232,0.22)';
-    ctx.beginPath();
-    ctx.arc(STACK.x + 30, y + STACK.h / 2, 7, 0, TAU);
-    ctx.fill();
-
-    // 条上的伪规则文本（等宽，暗示 nftables 规则）
-    ctx.font = '400 20px "JetBrains Mono", monospace';
-    ctx.textBaseline = 'middle';
-    ctx.textAlign = 'left';
-    ctx.fillStyle = isOpen ? C.accentSoft : 'rgba(245,240,232,0.30)';
-    const label = isOpen ? 'tcp dport 443 accept' : `ip saddr 10.0.${i}.0/24 drop`;
-    ctx.fillText(label, STACK.x + 56, y + STACK.h / 2 + 1);
-
+    ctx.setLineDash([]);
     ctx.restore();
   }
 
-  // 扫描线：周期 3 秒上下扫，扫过开放端口条时让它闪一下
-  const cyc = (u % 3) / 3;
-  const sy = STACK.y - 40 + cyc * (STACK.n * (STACK.h + STACK.gap) + 80);
-  const grad = ctx.createLinearGradient(0, sy - 70, 0, sy + 10);
-  grad.addColorStop(0, 'rgba(217,119,87,0)');
-  grad.addColorStop(1, 'rgba(217,119,87,0.30)');
-  ctx.save();
-  ctx.fillStyle = grad;
-  ctx.fillRect(STACK.x, sy - 70, STACK.w, 80);
-  ctx.strokeStyle = 'rgba(217,119,87,0.75)';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(STACK.x, sy);
-  ctx.lineTo(STACK.x + STACK.w, sy);
-  ctx.stroke();
-  ctx.restore();
-
-  // 开放端口条的脉冲：扫线靠近时亮度上去
-  const openY = STACK.y + STACK.open * (STACK.h + STACK.gap);
-  const d = Math.abs(sy - (openY + STACK.h / 2));
-  const flash = clamp(1 - d / 260, 0, 1);
-  if (flash > 0.01) {
+  // 机柜：比 s03 门后那台更淡 —— 它还在公网「里面」，只是看不见
+  const rp = clamp((u - 0.6) / 1.0, 0, 1);
+  if (rp > 0) {
+    const re = ease.outCubic(rp);
     ctx.save();
-    ctx.globalAlpha = flash * 0.9;
-    ctx.strokeStyle = C.accent;
-    ctx.lineWidth = 2.5;
+    ctx.globalAlpha = re;
+    ctx.fillStyle = 'rgba(245,240,232,0.07)';
     ctx.beginPath();
-    ctx.roundRect(STACK.x - 5, openY - 5, STACK.w + 10, STACK.h + 10, 14);
+    ctx.roundRect(RACK.x, RACK.y, RACK.w, RACK.h, 10);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(245,240,232,0.45)';
+    ctx.lineWidth = 1.6;
     ctx.stroke();
+    // 5 个槽位
+    ctx.fillStyle = 'rgba(245,240,232,0.11)';
+    for (let i = 0; i < 5; i++) {
+      const sy = RACK.y + 30 + i * 49;
+      ctx.beginPath();
+      ctx.roundRect(RACK.x + 22, sy, RACK.w - 44, 32, 6);
+      ctx.fill();
+    }
     ctx.restore();
+  }
+
+  // 四个探针：发射的波到隐身场边缘就散了，从不进入
+  const probeP = clamp((u - 1.2) / 0.8, 0, 1);
+  if (probeP > 0) {
+    const pe = ease.outCubic(probeP);
+    // 波纹周期 1.5 秒，持续往外扩
+    const cyc = ((u - 1.2) % 1.5) / 1.5;
+    for (const p of PROBES) {
+      ctx.save();
+      ctx.globalAlpha = pe * 0.9;
+
+      // 探针本体：一个小碟形天线
+      const ang = Math.atan2(CENTER.y - p.y, CENTER.x - p.x);
+      ctx.translate(p.x, p.y);
+      ctx.rotate(ang);
+      ctx.fillStyle = 'rgba(245,240,232,0.78)';
+      ctx.beginPath();
+      ctx.moveTo(-11, -9);
+      ctx.lineTo(12, 0);
+      ctx.lineTo(-11, 9);
+      ctx.closePath();
+      ctx.fill();
+
+      // 三道同心弧，越远越淡，到隐身场边缘归零
+      ctx.strokeStyle = 'rgba(245,240,232,0.55)';
+      ctx.lineWidth = 2;
+      for (let k = 0; k < 3; k++) {
+        const base = 40 + k * 58;
+        const r = base + cyc * 50;
+        if (r > PROBE_R - FIELD_R) continue;
+        const fade = 1 - (r - 40) / (PROBE_R - FIELD_R);
+        ctx.globalAlpha = pe * fade * (1 - k * 0.18);
+        ctx.beginPath();
+        ctx.arc(0, 0, r, -0.55, 0.55);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
   }
 }
 
@@ -143,18 +184,17 @@ function drawHeadline(u) {
   if (kp > 0) {
     ctx.save();
     ctx.globalAlpha = ease.outCubic(kp);
-    ctx.font = '500 34px "JetBrains Mono", monospace';
+    ctx.font = '500 34px "JetBrains Mono", "Noto Sans SC", monospace';
     ctx.textBaseline = 'alphabetic';
     ctx.textAlign = 'left';
     ctx.fillStyle = C.accent;
     ctx.fillText(KICKER, RIGHT.x, 380);
-    // kicker 下方的短横线，随文字推进拉开
     ctx.fillStyle = 'rgba(217,119,87,0.55)';
-    ctx.fillRect(RIGHT.x, 410, 260 * ease.outCubic(kp), 2);
+    ctx.fillRect(RIGHT.x, 410, 460 * ease.outCubic(kp), 2);
     ctx.restore();
   }
 
-  const tp = clamp((u - 2.0) / 0.8, 0, 1);
+  const tp = clamp((u - 1.8) / 1.0, 0, 1);
   if (tp > 0) {
     const e = ease.outBack(tp);
     ctx.save();
@@ -164,32 +204,30 @@ function drawHeadline(u) {
     ctx.textBaseline = 'alphabetic';
     ctx.textAlign = 'left';
     ctx.fillStyle = C.ink;
-    ctx.fillText(TITLE, RIGHT.x, 512);
+    ctx.fillText(TITLE, RIGHT.x, 520);
     ctx.restore();
   }
 }
 
-// 三条风险：逐条滑入，收拢阶段向左退并变暗
-function drawRisks(u) {
-  const startY = 640;
-  const collapse = clamp((u - 8.0) / 1.2, 0, 1);
+// 三条定位：逐条滑入，收束阶段向左退并变暗
+function drawPoints(u) {
+  const startY = 660;
+  const collapse = clamp((u - 8.5) / 1.2, 0, 1);
   const ce = ease.outCubic(collapse);
 
-  for (let i = 0; i < RISKS.length; i++) {
+  for (let i = 0; i < POINTS.length; i++) {
     const p = clamp((u - (3.0 + i * 1.0)) / 0.6, 0, 1);
     if (p <= 0) continue;
     const e = ease.outCubic(p);
     const y = startY + i * 76;
 
     ctx.save();
-    // 收拢：往左退 + 缩小 + 变暗
     ctx.globalAlpha = e * (1 - ce * 0.72);
     ctx.translate(-ce * 150, -ce * i * 26);
     ctx.font = '400 34px "Noto Sans SC", sans-serif';
     ctx.textBaseline = 'alphabetic';
     ctx.textAlign = 'left';
 
-    // 前面的方形标记
     const mx = RIGHT.x - 34 + (1 - e) * -24;
     ctx.fillStyle = C.accent;
     ctx.beginPath();
@@ -197,14 +235,14 @@ function drawRisks(u) {
     ctx.fill();
 
     ctx.fillStyle = C.ink;
-    ctx.fillText(RISKS[i], RIGHT.x, y);
+    ctx.fillText(POINTS[i], RIGHT.x, y);
     ctx.restore();
   }
 }
 
-// 收束：punchline 在风险收拢后浮现
+// 收束：punchline 在三条定位之后浮现
 function drawPunch(u) {
-  const p = clamp((u - 9.2) / 0.8, 0, 1);
+  const p = clamp((u - 9.0) / 0.8, 0, 1);
   if (p <= 0) return;
   const e = ease.outCubic(p);
   ctx.save();
@@ -214,7 +252,6 @@ function drawPunch(u) {
   ctx.textAlign = 'left';
   ctx.fillStyle = C.accent;
   ctx.fillText(PUNCH, RIGHT.x, 880);
-  // 左侧一条竖线做视觉锚
   ctx.fillStyle = 'rgba(217,119,87,0.55)';
   ctx.fillRect(RIGHT.x - 34, 852, 3, 46);
   ctx.restore();
@@ -232,7 +269,7 @@ window.renderFrame = (u) => {
 
   drawGrain(ctx, theme, W, H, u);
 
-  // 左右分隔线：随左侧栈淡入一起拉开，把「图」和「文」绑成一版
+  // 左右分隔线：随左侧淡入一起拉开，把「图」和「文」绑成一版
   const ruleP = clamp(u / 0.9, 0, 1);
   if (ruleP > 0) {
     ctx.save();
@@ -246,14 +283,14 @@ window.renderFrame = (u) => {
     ctx.restore();
   }
 
-  drawStack(u);
+  drawLeft(u);
   drawHeadline(u);
-  drawRisks(u);
+  drawPoints(u);
   drawPunch(u);
   drawVignette(ctx, W, H, 0.42);
 
   // HUD
-  drawCapsuleLabel(ctx, 1, '暴露风险', '开篇', {
+  drawCapsuleLabel(ctx, 1, '个人公网防火墙', '开篇', {
     numberColor: HUD.capsule.numberColor, textColor: HUD.capsule.textColor,
     bg: HUD.capsule.bg, border: HUD.capsule.border,
   });

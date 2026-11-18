@@ -21,16 +21,16 @@
       "t0": 0,
       "speed": 1,
       "frames": 420,
-      "chapter": "问题",
+      "chapter": "定位",
       "copy": {
-        "kicker": "把内网服务暴露到公网",
-        "title": "是一件天然危险的事",
+        "kicker": "最新在做的个人公网防火墙",
+        "title": "把服务器隐身进公网",
         "points": [
-          "端口一开，全世界的扫描器 24 小时在找",
-          "一个弱口令 = 一整条内网沦陷",
-          "VPN 客户端要先装、要先连、还可能连不上"
+          "服务、脚本、任何监测工具，都探明不了",
+          "公网上没有可被扫描到的端口",
+          "只有敲对门的人知道入口在哪"
         ],
-        "punchline": "问题的根子是：公网上开了几个不该开的门"
+        "punchline": "看不见，也扫不着 —— 这就是它的隐身方式"
       }
     },
     {
@@ -169,17 +169,27 @@
       "copy": {
         "kicker": "十三块，拼在一起",
         "title": "一个面板管完路由器",
-        "waves": [
-          ["认证网关", "端口敲门", "端口转发", "反代管理"],
-          ["DDNS", "访问控制", "名单管理", "国外 IP 拦截"],
-          ["DNS 局域网解析", "防火墙状态", "日志管理", "系统日志", "网络接口"]
+        "modules": [
+          { "name": "防火墙状态", "desc": "规则实时查看" },
+          { "name": "网络接口", "desc": "PPPoE + 网关 IP" },
+          { "name": "端口敲门", "desc": "敲对序列才放行" },
+          { "name": "端口转发", "desc": "TCP / UDP 双栈" },
+          { "name": "访问控制", "desc": "LAN / 信任 IP 模式" },
+          { "name": "日志管理", "desc": "开关 + 远程转发" },
+          { "name": "系统日志", "desc": "审计时间线，可导出" },
+          { "name": "国外 IP 拦截", "desc": "自动拦境外 IP" },
+          { "name": "DNS 局域网解析", "desc": "域名写进 dnsmasq" },
+          { "name": "DDNS", "desc": "多服务商动态域名" },
+          { "name": "名单管理", "desc": "IP 黑白名单" },
+          { "name": "反代管理", "desc": "Nginx 反代 + SSL" },
+          { "name": "认证网关", "desc": "单端口汇聚所有服务" }
         ],
-        "notes": [
-          "端口转发：TCP / UDP，IPv4 / IPv6 双栈",
-          "反代管理：SSL 手动上传 + ACME 自动申请，多 DNS 服务商",
-          "系统日志：认证审计与系统日志合并成一条时间线，可导出 CSV / JSON",
-          "DNS 局域网解析：证书域名自动写入 dnsmasq",
-          "网络接口：多 LAN 口时提示先排除二层环路"
+        "demo": [
+          { "tab": "防火墙状态", "head": "nftables 规则已加载 · 默认策略 drop" },
+          { "tab": "端口敲门", "head": "4 步序列 · 每步 8 秒内接上" },
+          { "tab": "反代管理", "head": "SSL 手动上传 + ACME 自动申请，多 DNS 服务商" },
+          { "tab": "DNS 局域网解析", "head": "证书域名自动写入 dnsmasq" },
+          { "tab": "网络接口", "head": "多 LAN 口时提示先排除二层环路" }
         ],
         "punchline": "零构建、零 CDN —— 前端不连任何外部域名"
       }
@@ -196,7 +206,7 @@
       "chapter": "安装",
       "copy": {
         "kicker": "装它只要一条命令",
-        "title": "零构建 · 零 CDN · 一键装",
+        "title": "一键部署到 OpenWrt",
         "cmd": "wget -O /tmp/setup.sh https://raw.githubusercontent.com/fzyt/ghost-firewall/main/nftables-publish-v0.7.9-nospa/setup/setup.sh && sh /tmp/setup.sh",
         "points": [
           "自动探测包管理器、装齐依赖",

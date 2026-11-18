@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <link rel="stylesheet" href="/shared/fonts.css">
-<title>08 一键装</title>
+<title>08 一键部署 OpenWrt</title>
 <style>
   html, body { margin: 0; padding: 0; background: #0e0e0d; overflow: hidden; }
   #stage { position: relative; width: 1920px; height: 1080px; overflow: hidden; }
@@ -32,11 +32,12 @@ window.__bootError = null;
 const C = {
   bg: '#0e0e0d', surface: '#1a1917', ink: '#f5f0e8', muted: '#8f8981',
   accent: '#d97757', accentSoft: '#f0b49c', line: 'rgba(245,240,232,0.10)',
+  ok: '#7fc7a4',
 };
 
 // ---------- 文案（timeline.json → s08-install.copy，逐字照抄） ----------
 const KICKER = '装它只要一条命令';
-const TITLE = '零构建 · 零 CDN · 一键装';
+const TITLE = '一键部署到 OpenWrt';
 const CMD = 'wget -O /tmp/setup.sh https://raw.githubusercontent.com/fzyt/ghost-firewall/main/nftables-publish-v0.7.9-nospa/setup/setup.sh && sh /tmp/setup.sh';
 // CMD 按 token 折行显示，不增删任何字符（三行拼起来仍是 CMD 原文）
 const CMD_LINES = [
@@ -49,42 +50,69 @@ const POINTS = [
   '自动生成自签证书、注册开机自启',
   'OpenWrt 24.10（opkg）与 25.x（apk）都支持',
 ];
-const BADGES = ['零构建', '零 CDN', '开机自启'];
 const PUNCH = 'clone 下来就能跑 —— 没有 npm、没有 webpack、没有依赖树';
+
+// ---------- 终端输出（照 setup.sh 真实打印的格式，不编造阶段名） ----------
+// 真实脚本每个阶段打两行（开始 / 完成），这里只取完成行，再接安装完成块。
+// 真实输出的阶段完成行带一个对勾 emoji；本地字体没有它的字形（会变豆腐块），
+// 所以这里把对勾从字符串里拆出来，改成自己画 —— 文字一个字没改。
+const OUT_LINES = [
+  { kind: 'ok', pre: 'OK    ', text: '【依赖安装】完成' },
+  { kind: 'ok', pre: 'OK    ', text: '【nginx 配置】完成' },
+  { kind: 'ok', pre: 'OK    ', text: '【项目文件部署】完成' },
+  { kind: 'rule', text: '────────────────────────────────────────' },
+  { kind: 'plain', pre: '  ', text: 'Ghost Firewall 安装完成！' },
+  { kind: 'plain', pre: '  ', text: '访问地址: https://192.168.1.1:5443' },
+];
+const OUT_T0 = 6.3;          // 输出开始出现的时刻
+const OUT_STEP = 0.62;       // 每行间隔
 
 // ---------- 版面常量 ----------
 const HEAD = { kickerY: 196, titleY: 288 };
-const TERM = { x: 96, y: 336, w: 1728, h: 306, barH: 50, padX: 26, lineH: 60 };
-const TYPE_T0 = 2.0, TYPE_T1 = 5.5;          // 打字窗口
+const TERM = { x: 96, y: 316, w: 1728, h: 470, barH: 50, padX: 26, lineH: 42 };
+const TYPE_T0 = 2.1, TYPE_T1 = 6.3;   // 命令打字窗口（比首版慢，不再是 40 字/秒）
 const CMD_CHARS = CMD_LINES.reduce((a, l) => a + l.length, 0);
-const CPS = CMD_CHARS / (TYPE_T1 - TYPE_T0);  // 40 字/秒：已打字数 = 经过秒数 × CPS
-const LIST = { x: 96, textX: 132, ys: [690, 752, 814] };
-const BADGE = { right: 1824, ys: [686, 756, 826], h: 58 };
-const RULE_X = 1596;
-const PUNCH_Y = 950;
+const CPS = CMD_CHARS / (TYPE_T1 - TYPE_T0);
+const CHIPS = { x: 96, y: 852, h: 56, gap: 30 };
+const PUNCH_Y = 972;
 
 // ============================================================
 // 节拍表（120 BPM，每拍 0.5s）
-//   0.5-1.0   kicker 淡入
-//   1.0-1.5   title 落下（outBack）
-//   1.5-2.0   终端窗口从上往下展开
-//   2.0-5.5   命令逐字符打出
-//   5.5-6.0   回到新提示符，光标闪烁
-//   6.0-9.0   setup.sh 自动做的事逐条淡入
-//   9.0-10.2 三个徽章依次淡入
-//   10.5-11.5 punchline 浮现
-//   11.5-14.0 保持静帧
+//   0.4-1.0   kicker 淡入
+//   0.9-1.7   title 落下（outBack）
+//   1.5-2.1   终端窗口从上往下展开
+//   2.1-6.3   命令逐字符打出（≈30 字/秒）
+//   6.3-9.4   六行真实输出逐行出现
+//   9.4-10.4  「访问地址」高亮脉动
+//  10.2-11.4  三条要点横排胶囊
+//  11.6-12.4  punchline 浮现
+//  12.4-14.0  保持静帧
 // ============================================================
 
 // 终端正文字号：保证最长的那行 URL 塞得进终端内宽
 function cmdFontSize(maxW) {
   for (let s = 27; s >= 13; s -= 0.5) {
-    ctx.font = `500 ${s}px "JetBrains Mono", monospace`;
+    ctx.font = `500 ${s}px "JetBrains Mono", "Noto Sans SC", monospace`;
     let widest = 0;
     for (const l of CMD_LINES) widest = Math.max(widest, ctx.measureText('  ' + l).width);
     if (widest <= maxW) return s;
   }
   return 13;
+}
+
+// 自己画一个勾（替代对勾 emoji —— 本地字体没有它的字形，会变豆腐块）
+function drawCheck(x, y, s, color) {
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = s * 0.15;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  ctx.moveTo(x, y + s * 0.45);
+  ctx.lineTo(x + s * 0.35, y + s * 0.8);
+  ctx.lineTo(x + s * 0.95, y + s * 0.1);
+  ctx.stroke();
+  ctx.restore();
 }
 
 // 把已打出的字符数分配到各行（换行不占字符预算）
@@ -101,11 +129,11 @@ function typedLines(chars) {
 
 // ---------- 头部：kicker + 主标题 ----------
 function drawHead(u) {
-  const kp = clamp((u - 0.5) / 0.6, 0, 1);
+  const kp = clamp((u - 0.4) / 0.6, 0, 1);
   if (kp > 0) {
     ctx.save();
     ctx.globalAlpha = ease.outCubic(kp);
-    ctx.font = '500 30px "JetBrains Mono", monospace';
+    ctx.font = '500 30px "JetBrains Mono", "Noto Sans SC", monospace';
     ctx.textBaseline = 'alphabetic';
     ctx.textAlign = 'left';
     ctx.fillStyle = C.accent;
@@ -115,7 +143,7 @@ function drawHead(u) {
     ctx.restore();
   }
 
-  const tp = clamp((u - 1.0) / 0.8, 0, 1);
+  const tp = clamp((u - 0.9) / 0.8, 0, 1);
   if (tp > 0) {
     const e = ease.outBack(tp);
     ctx.save();
@@ -130,9 +158,9 @@ function drawHead(u) {
   }
 }
 
-// ---------- 终端窗口 + 打字机 ----------
+// ---------- 终端窗口 + 打字机 + 真实输出 ----------
 function drawTerminal(u) {
-  const wp = clamp((u - 1.5) / 0.5, 0, 1);
+  const wp = clamp((u - 1.5) / 0.6, 0, 1);
   if (wp <= 0) return;
   const we = ease.outCubic(wp);
   const h = TERM.h * we;
@@ -164,7 +192,7 @@ function drawTerminal(u) {
   ctx.stroke();
   ctx.restore();
 
-  // 三个圆点 + 窗口标签
+  // 三个圆点 + 窗口标签（OpenWrt 默认 LAN 地址）
   const dots = ['rgba(245,240,232,0.22)', 'rgba(245,240,232,0.16)', 'rgba(245,240,232,0.12)'];
   for (let i = 0; i < 3; i++) {
     ctx.fillStyle = dots[i];
@@ -172,18 +200,18 @@ function drawTerminal(u) {
     ctx.arc(TERM.x + 28 + i * 22, TERM.y + TERM.barH / 2, 5, 0, TAU);
     ctx.fill();
   }
-  ctx.font = '400 18px "JetBrains Mono", monospace';
+  ctx.font = '400 18px "JetBrains Mono", "Noto Sans SC", monospace';
   ctx.textBaseline = 'middle';
   ctx.textAlign = 'left';
   ctx.fillStyle = C.muted;
-  ctx.fillText('ssh root@openwrt:~#', TERM.x + 108, TERM.y + TERM.barH / 2 + 1);
+  ctx.fillText('ssh root@192.168.1.1', TERM.x + 108, TERM.y + TERM.barH / 2 + 1);
 
   // 打字机正文
   const size = cmdFontSize(TERM.w - TERM.padX * 2);
-  ctx.font = `500 ${size}px "JetBrains Mono", monospace`;
+  ctx.font = `500 ${size}px "JetBrains Mono", "Noto Sans SC", monospace`;
   const cw = ctx.measureText('M').width;
   const x0 = TERM.x + TERM.padX;
-  const baseY = TERM.y + TERM.barH + 46;
+  const baseY = TERM.y + TERM.barH + 40;
 
   const typed = Math.floor(clamp(u - TYPE_T0, 0, TYPE_T1 - TYPE_T0) * CPS);
   const lines = typedLines(typed);
@@ -202,16 +230,12 @@ function drawTerminal(u) {
     ctx.fillText(lines[i], x0 + indent * cw, y);
   }
 
-  // 光标：打字时跟在最后一个字符后，打完后落到新提示符
-  const done = typed >= CMD_CHARS;
+  // 光标：打字时跟在最后一个字符后
   const blink = Math.floor(u * 2) % 2 === 0 ? 1 : 0.12;
-  ctx.save();
-  ctx.globalAlpha = we * blink;
-  ctx.fillStyle = C.accent;
-  if (done) {
-    ctx.fillText('$', x0, baseY + 3 * TERM.lineH);
-    ctx.fillRect(x0 + 2 * cw, baseY + 3 * TERM.lineH - size * 0.78, cw, size * 0.86);
-  } else {
+  if (typed < CMD_CHARS) {
+    ctx.save();
+    ctx.globalAlpha = we * blink;
+    ctx.fillStyle = C.accent;
     let ci = -1, cl = 0;
     for (let i = 0; i < lines.length; i++) {
       if (lines[i].length) { ci = i; cl = lines[i].length; }
@@ -222,84 +246,93 @@ function drawTerminal(u) {
       const cy = baseY + ci * TERM.lineH;
       ctx.fillRect(cx, cy - size * 0.78, cw, size * 0.86);
     }
+    ctx.restore();
   }
-  ctx.restore();
 
-  ctx.restore();
-}
-
-// ---------- setup.sh 自动做的事 ----------
-function drawPoints(u) {
-  for (let i = 0; i < POINTS.length; i++) {
-    const p = clamp((u - (6.0 + i * 1.0)) / 0.6, 0, 1);
+  // 真实输出：逐行出现
+  for (let i = 0; i < OUT_LINES.length; i++) {
+    const line = OUT_LINES[i];
+    const p = clamp((u - (OUT_T0 + i * OUT_STEP)) / 0.25, 0, 1);
     if (p <= 0) continue;
     const e = ease.outCubic(p);
+    const y = baseY + (CMD_LINES.length + i) * TERM.lineH;
+    if (y > TERM.y + TERM.h - 8) break;
+
     ctx.save();
     ctx.globalAlpha = e;
-    ctx.translate((1 - e) * -26, 0);
-
-    ctx.fillStyle = C.accent;
-    ctx.beginPath();
-    ctx.roundRect(LIST.x, LIST.ys[i] - 10, 12, 12, 3);
-    ctx.fill();
-
-    ctx.font = '400 28px "Noto Sans SC", sans-serif';
+    ctx.font = '400 21px "JetBrains Mono", "Noto Sans SC", monospace';
     ctx.textBaseline = 'alphabetic';
     ctx.textAlign = 'left';
-    ctx.fillStyle = C.ink;
-    ctx.fillText(POINTS[i], LIST.textX, LIST.ys[i]);
+    const last = i === OUT_LINES.length - 1;
+    // 最后一行是访问地址：accent + 脉动
+    if (last) {
+      const pulse = 0.75 + 0.25 * Math.sin((u - OUT_T0) * 6);
+      ctx.fillStyle = `rgba(217,119,87,${pulse.toFixed(3)})`;
+      ctx.font = '600 21px "JetBrains Mono", "Noto Sans SC", monospace';
+    } else if (line.kind === 'ok') {
+      ctx.fillStyle = C.ok;
+    } else if (line.kind === 'rule') {
+      ctx.fillStyle = 'rgba(245,240,232,0.22)';
+    } else {
+      ctx.fillStyle = C.ink;
+    }
+
+    const pre = line.pre || '';
+    if (pre) ctx.fillText(pre, x0, y);
+    let cx = x0 + ctx.measureText(pre).width;
+    if (line.kind === 'ok') {
+      // 自己画勾：原本对勾 emoji 占的位置
+      drawCheck(cx + 3, y - 6, 15, C.ok);
+      cx += 26;
+    }
+    ctx.fillText(line.text, cx, y);
     ctx.restore();
   }
+
+  ctx.restore();
 }
 
-// ---------- 三个徽章 ----------
-function drawBadges(u) {
-  // 竖线把徽章列和要点列分开
-  const rp = clamp((u - 9.0) / 0.5, 0, 1);
-  if (rp > 0) {
-    ctx.save();
-    ctx.globalAlpha = ease.outCubic(rp);
-    ctx.fillStyle = 'rgba(217,119,87,0.45)';
-    ctx.fillRect(RULE_X, BADGE.ys[0] - 14, 3, BADGE.h + 28 + (BADGE.ys[2] - BADGE.ys[0]));
-    ctx.restore();
-  }
-
-  for (let i = 0; i < BADGES.length; i++) {
-    const p = clamp((u - (9.0 + i * 0.4)) / 0.5, 0, 1);
+// ---------- 三条要点：横排胶囊 ----------
+function drawPoints(u) {
+  let x = CHIPS.x;
+  for (let i = 0; i < POINTS.length; i++) {
+    const p = clamp((u - (10.2 + i * 0.3)) / 0.5, 0, 1);
     if (p <= 0) continue;
     const e = ease.outCubic(p);
     ctx.save();
     ctx.globalAlpha = e;
-    ctx.font = '600 28px "Noto Sans SC", sans-serif';
-    const tw = ctx.measureText(BADGES[i]).width;
-    const w = tw + 34 + 12 + 34;
-    const x = BADGE.right - w;
-    const y = BADGE.ys[i];
+    ctx.translate((1 - e) * -22, 0);
 
-    ctx.fillStyle = 'rgba(217,119,87,0.12)';
+    ctx.font = '400 24px "Noto Sans SC", sans-serif';
+    const tw = ctx.measureText(POINTS[i]).width;
+    const w = tw + 56;
+    const y = CHIPS.y;
+
+    ctx.fillStyle = 'rgba(217,119,87,0.10)';
     ctx.beginPath();
-    ctx.roundRect(x, y, w, BADGE.h, BADGE.h / 2);
+    ctx.roundRect(x, y, w, CHIPS.h, 10);
     ctx.fill();
-    ctx.strokeStyle = 'rgba(217,119,87,0.45)';
-    ctx.lineWidth = 1.4;
+    ctx.strokeStyle = 'rgba(217,119,87,0.38)';
+    ctx.lineWidth = 1.3;
     ctx.stroke();
 
     ctx.fillStyle = C.accent;
     ctx.beginPath();
-    ctx.arc(x + 40, y + BADGE.h / 2, 6, 0, TAU);
+    ctx.roundRect(x + 20, y + CHIPS.h / 2 - 5, 10, 10, 3);
     ctx.fill();
 
-    ctx.fillStyle = C.accentSoft;
+    ctx.fillStyle = C.ink;
     ctx.textBaseline = 'middle';
     ctx.textAlign = 'left';
-    ctx.fillText(BADGES[i], x + 58, y + BADGE.h / 2 + 1);
+    ctx.fillText(POINTS[i], x + 42, y + CHIPS.h / 2 + 1);
     ctx.restore();
+    x += w + CHIPS.gap;
   }
 }
 
 // ---------- punchline ----------
 function drawPunch(u) {
-  const p = clamp((u - 10.5) / 0.8, 0, 1);
+  const p = clamp((u - 11.6) / 0.8, 0, 1);
   if (p <= 0) return;
   const e = ease.outCubic(p);
   ctx.save();
@@ -329,13 +362,12 @@ window.renderFrame = (u) => {
   drawHead(u);
   drawTerminal(u);
   drawPoints(u);
-  drawBadges(u);
   drawPunch(u);
 
   drawVignette(ctx, W, H, 0.42);
 
   // HUD
-  drawCapsuleLabel(ctx, 8, '一条命令', '安装', {
+  drawCapsuleLabel(ctx, 8, '一键部署', '安装', {
     numberColor: HUD.capsule.numberColor, textColor: HUD.capsule.textColor,
     bg: HUD.capsule.bg, border: HUD.capsule.border,
   });
