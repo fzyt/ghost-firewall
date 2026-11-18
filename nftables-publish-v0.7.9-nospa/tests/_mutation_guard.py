@@ -72,6 +72,20 @@ class MutationGuard:
         self.backup_dir = None
 
     # ── 文件清单 ──────────────────────────────────────────────
+    # ⚠ 只快照**源码目录**（2026-11-18 修）：
+    #   原来快照的是 `git ls-files` 的全部跟踪文件 —— 包括 `报告/`。
+    #   变异脚本只改源码（backend/ frontend/ setup/ tests/ tools/ docker/），
+    #   文档目录**根本不该被这个保险丝碰**。
+    #   而它一碰就出事：脚本启动后我改了报告第四章，脚本退出时
+    #   `restore()` 判定「与快照不一致」⇒ 把我的改动还原掉 ⇒
+    #   报告内容**静默丢失**（文件还变回旧版，不报任何错）。
+    #   更糟的是回归收尾的源码指纹对账只覆盖 backend/ frontend/ setup/
+    #   tests/ docker/ ⇒ **不含报告目录** ⇒ 连对账都发现不了。
+    #
+    #   ⇒ 现在快照范围 = 源码目录。文档改动的正确做法是：
+    #     **等回归跑完再改**，或改在仓库之外。
+    SOURCE_DIRS = ('backend', 'frontend', 'setup', 'tests', 'tools', 'docker')
+
     def _tracked(self):
         try:
             out = subprocess.run(
@@ -79,6 +93,9 @@ class MutationGuard:
                 capture_output=True, text=True, timeout=60)
             if out.returncode == 0:
                 files = [p for p in out.stdout.split('\0') if p]
+                # 只要源码目录下的跟踪文件（见上面 SOURCE_DIRS 的说明）
+                files = [p for p in files
+                         if p.split('/', 1)[0] in self.SOURCE_DIRS]
                 if files:
                     return files
         except Exception:

@@ -322,9 +322,9 @@ MUTATIONS = [
      '                          text=True, timeout=timeout)', 1),
 
     ('FIX-11 list_add 退回裸 subprocess.run（绕过统一入口 = 绕过锁）', 'app',
-     "        result = _nft_set_write(['add', 'element', 'inet', 'fw4', set_name, '{', ip, '}'])",
+     "        result = _nft_set_write(['add', 'element', 'inet', 'fw4', set_name] + elem)",
      "        result = subprocess.run(\n"
-     "            ['nft', 'add', 'element', 'inet', 'fw4', set_name, '{', ip, '}'],\n"
+     "            ['nft', 'add', 'element', 'inet', 'fw4', set_name] + elem,\n"
      '            capture_output=True, text=True, timeout=10\n'
      '        )', 1),
 

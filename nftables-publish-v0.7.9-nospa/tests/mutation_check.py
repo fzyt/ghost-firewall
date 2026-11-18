@@ -188,12 +188,37 @@ MUTATIONS = [
 # （测试照样全绿，判成漏网）。这不是测试有洞，是「防线的数量变了」，
 # 变异脚本必须跟着变：只有**两道一起拆**才能观察到破坏。
 #
+# ⚠ 2026-11-18 补：第 ② 道里又长出了**三道**子防线 ——
+#   `split_list_elem` 拦截（元素形态非法）、`'%' in s` 拦截（scope-id）、
+#   `ipaddress.ip_address()` 拦截（IP 非法）。
+#   本批给名单元素加了「IP timeout Ns」形态 ⇒ 子句解析成了新的第一道关卡。
+#   ⇒ 只拆 `except ValueError` 那道**已不足以破坏** ⇒ 变异变成等价变异
+#      ⇒ 实测被判成漏网（捕获 21 / 22）。
+#   ⇒ 现在改成**整个校验块一起拆**（所有子防线同时失效）——
+#     以后再加防线也不必再改这个脚本。
+#
 # 格式：(描述, [(文件键, 旧文本, 新文本), ...])
 MUTATIONS_MULTI = [
-    ('名单元素的两道防线同时拆掉（非法元素真的进了规则集 = nft 注入）',
+    ('名单元素的所有防线同时拆掉（非法元素真的进了规则集 = nft 注入）',
      [('eng',
-       '            except ValueError:\n                dropped += 1\n                continue',
-       '            except ValueError:\n                lines.append(elem)\n                continue'),
+       "            ip, _clause = split_list_elem(s)\n"
+       "            if not ip:\n"
+       "                dropped += 1\n"
+       "                continue\n"
+       "            if '%' in s:       # IPv6 scope-id 后缀 ⇒ nft 不认，丢弃\n"
+       "                dropped += 1\n"
+       "                continue\n"
+       "            try:\n"
+       "                addr = ipaddress.ip_address(ip)\n"
+       "            except ValueError:\n"
+       "                dropped += 1\n"
+       "                continue\n"
+       "            if (addr.version == 6) != want6:\n"
+       "                dropped += 1\n"
+       "                continue\n"
+       "            lines.append(s)\n",
+       "            # 变异：整个校验块拆掉（所有防线一起失效，元素直接进规则集）\n"
+       "            lines.append(s)\n"),
       ('app',
        "            if not _valid_ip(ip, ver):\n"
        "                print(f'[WARN] 名单 {name} 里有非法元素，已丢弃: {ip!r}', flush=True)\n"

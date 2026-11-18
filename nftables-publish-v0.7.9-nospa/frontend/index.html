@@ -149,7 +149,7 @@
       </div>
       <nav class="nf-nav">
         <template x-for="item in navItems" :key="item.id">
-          <button @click="currentNav = item.id; if (item.id === 'ddns') loadDdns(); if (item.id === 'syslog') loadSystemLogs(); if (item.id === 'lists') loadLists(); if (item.id === 'firewall-status') loadFirewallStatus(); if (item.id === 'system-info') loadDeviceInfo(); if (item.id === 'reverse-proxy') loadReverseProxy();"
+          <button @click="currentNav = item.id; if (item.id === 'ddns') loadDdns(); if (item.id === 'syslog') loadSystemLogs(); if (item.id === 'lists') loadLists(); if (item.id === 'firewall-status') loadFirewallStatus(); if (item.id === 'system-info') loadDeviceInfo(); if (item.id === 'reverse-proxy') loadReverseProxy(); if (item.id === 'visitors') loadVisitors();"
             :class="currentNav === item.id ? 'is-active' : ''"
             class="nf-navitem">
             <span class="nf-navitem__dot" aria-hidden="true"></span>
@@ -2334,6 +2334,106 @@
         </div>
       </div>
     </div>
+
+      <!-- ========== 访客 ========== -->
+      <!--
+        数据来自网关自己的 nginx 访问日志（网关开着才有这个文件）——
+        不是另记一份，是直接读已经在采的那份，避免两个真相源。
+        加白名单的时效与端口敲门的时效是**两套**：这里默认 10 分钟，
+        敲门那套默认 5 小时，互不影响。
+      -->
+      <div class="nf-page" x-show="currentNav === 'visitors'"
+           x-transition:enter="nfx-enter"
+           x-transition:enter-start="nfx-enter-start"
+           x-transition:enter-end="nfx-enter-end">
+        <h1 class="text-2xl font-bold mb-2">访客</h1>
+        <p class="text-sm text-gray-500 mb-4">
+          最近访问过网关端口的 IP。数据来自网关的 nginx 访问日志 ——
+          网关没开过时这里是空的。
+        </p>
+
+        <div class="border rounded p-4 mb-4 bg-white">
+          <div class="flex flex-wrap items-end gap-3">
+            <label class="text-sm">
+              <span class="block text-xs text-gray-500 mb-1">观察窗口</span>
+              <select x-model.number="visitors.windowMinutes" @change="loadVisitors()"
+                class="border rounded px-3 py-2 text-sm bg-white focus:outline-none focus:border-black">
+                <!-- ⚠ option 的 value 必须是**静态**属性，不能用 :value 动态绑定。
+                     Alpine 初始化 x-model 时是**父先子后**遍历的（select 先于
+                     它的 option）⇒ 那一刻 option 还没有 value 属性，浏览器拿
+                     文本内容当 value（「最近 15 分钟」）⇒ model 值 60 匹配不上
+                     任何一项 ⇒ 下拉框回落到第一项，显示的窗口与实际值不一致。
+                     真机截图实测过这个现象（state 是 60，界面显示「最近 15 分钟」）。 -->
+                <option value="15">最近 15 分钟</option>
+                <option value="60">最近 1 小时</option>
+                <option value="360">最近 6 小时</option>
+                <option value="1440">最近 24 小时</option>
+              </select>
+            </label>
+            <label class="text-sm">
+              <span class="block text-xs text-gray-500 mb-1">加白名单时效（分钟）</span>
+              <input type="number" min="1" max="10080" x-model.number="visitors.ttlMinutes"
+                class="border rounded px-3 py-2 text-sm bg-white focus:outline-none focus:border-black">
+            </label>
+            <button @click="loadVisitors()" class="border rounded px-3 py-2 text-sm hover:bg-gray-50">
+              刷新
+            </button>
+          </div>
+          <p class="text-xs text-gray-500 mt-3">
+            这个时效只作用于「手动加的白名单」，与端口敲门的时效（默认 5 小时）是两套，互不影响。
+          </p>
+        </div>
+
+        <div x-show="visitors.loading" class="text-sm text-gray-500 py-6 text-center">正在读取…</div>
+
+        <div x-show="visitors.error"
+          class="border border-red-300 rounded p-3 text-sm text-red-700 mb-4">
+          读取访客失败：<span x-text="visitors.error"></span>
+        </div>
+
+        <div x-show="!visitors.loading && !visitors.error" class="border rounded bg-white overflow-x-auto">
+          <table class="w-full text-sm">
+            <thead>
+              <tr class="text-left text-xs text-gray-500 border-b">
+                <th class="py-2 px-3">IP</th>
+                <th class="py-2 px-3">次数</th>
+                <th class="py-2 px-3">最近访问</th>
+                <th class="py-2 px-3">访问过的服务</th>
+                <th class="py-2 px-3">白名单</th>
+                <th class="py-2 px-3">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-for="v in visitors.items" :key="v.ip">
+                <tr class="border-b border-gray-100">
+                  <td class="py-2 px-3 font-mono" x-text="v.ip"></td>
+                  <td class="py-2 px-3" x-text="v.count"></td>
+                  <td class="py-2 px-3 text-xs" x-text="v.last_seen"></td>
+                  <td class="py-2 px-3 text-xs text-gray-600">
+                    <span x-text="(v.hosts || []).join('、') || '—'"></span>
+                    <span x-show="(v.uris || []).length" class="block text-gray-400"
+                      x-text="(v.uris || []).slice(0, 3).join('、')"></span>
+                  </td>
+                  <td class="py-2 px-3 text-xs">
+                    <span x-show="v.whitelisted" class="text-green-700"
+                      x-text="v.whitelist_expires ? ('剩余 ' + v.whitelist_expires) : '永久'"></span>
+                    <span x-show="!v.whitelisted" class="text-gray-400">未加</span>
+                  </td>
+                  <td class="py-2 px-3">
+                    <button @click="addVisitorToWhitelist(v.ip)"
+                      :disabled="visitors.adding[v.ip] || v.whitelisted"
+                      class="text-xs border rounded px-2 py-1 disabled:opacity-40 hover:bg-gray-50"
+                      x-text="visitors.adding[v.ip] ? '处理中…' : '加白名单'"></button>
+                  </td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+          <p x-show="visitors.items.length === 0" class="text-sm text-gray-500 py-6 text-center">
+            这个窗口内没有访客记录。
+          </p>
+        </div>
+      </div>
 
       <!-- ========== 功能介绍 ========== -->
       <div class="nf-page" x-show="currentNav === 'intro'"

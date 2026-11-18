@@ -27,6 +27,7 @@ import sys
 import tempfile
 import time
 import builtins
+import hashlib
 
 BACKEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'backend')
 sys.path.insert(0, os.path.abspath(BACKEND))
@@ -298,14 +299,52 @@ def _timeit(fn, *a):
     return _best
 
 
+# 行为验证：dummy 路径的**迭代数**必须 ≥ 真实路径的迭代数
+#
+# ⚠️ 2026-11-18 改口径：原来比的是**耗时**（dummy ≥ 真实 × 0.85）。
+#   那是**在测机器，不是在测代码** —— 两个 PBKDF2 调用的耗时受
+#   CPU 频率、缓存争用、调度抖动影响，机器一忙就翻面。
+#   实测：单独跑三次全绿（比值 0.96x / 1.03x / 1.04x），
+#   而在完整回归里（并发负载下）掉到 0.80x ⇒ **偶发假红**。
+#   （脚本注释里记过同类历史：换 process_time 后「40 次里 1 次假红」，
+#     现在重载下又复现 —— 说明靠采样次数治不了本。）
+#
+# ⇒ 改成**确定性**断言：直接看两条路径**实际用了多少轮迭代**。
+#   这才是「dummy 不慢于真实」这件事的**成因**：
+#   迭代数相同 ⇒ 耗时必然相同；迭代数 dummy ≥ 真实 ⇒ dummy 必然不慢。
+#   拦 hashlib.pbkdf2_hmac 记录迭代数即可（不真的跑 PBKDF2，快且稳）。
+#
+#   ⚠️ 拦截时**必须真的返回合法摘要**：被测代码拿返回值算 hexdigest，
+#      拿 None 会 AttributeError ⇒ 判据崩掉（崩 ≠ 断言失败）。
 _real = "pbkdf2_sha256$200000$salt$" + "0" * 64
 _bad = "pbkdf2_sha256$notanumber$salt$deadbeef"
-_t_real = _timeit(_gw2._verify_password, "x", _real)
+_iter_calls = []
+_real_pbkdf2 = hashlib.pbkdf2_hmac
+
+
+def _fake_pbkdf2(algo, password, salt, iters, *a, **kw):
+    _iter_calls.append(int(iters))
+    # 真的算一遍，保证返回值是合法摘要（但用**最小**迭代数，省时间）
+    return _real_pbkdf2(algo, password, salt, 1)
+
+
+hashlib.pbkdf2_hmac = _fake_pbkdf2
+try:
+    _iter_calls.clear()
+    _gw2._verify_password("x", _real)
+    _iters_real = _iter_calls[-1] if _iter_calls else 0
+    _iter_calls.clear()
+    _gw2._verify_password("x", _bad)
+    _iters_dummy = _iter_calls[-1] if _iter_calls else 0
+finally:
+    hashlib.pbkdf2_hmac = _real_pbkdf2
+
+check('dummy 路径的迭代数 ≥ 真实路径（这才是「不慢于」的成因）',
+      _iters_dummy >= _iters_real and _iters_real > 0,
+      f'真实={_iters_real} 轮，dummy={_iters_dummy} 轮')
+
+# 「确实跑了真活」单独用耗时下限兜住：迭代数不是 0（不是直接 return False）
 _t_dummy = _timeit(_gw2._verify_password, "x", _bad)
-check('dummy 路径耗时 ≥ 真实路径（不能再用响应时间区分状态）',
-      _t_dummy >= _t_real * 0.85,
-      f'真实={_t_real * 1000:.1f}ms，dummy={_t_dummy * 1000:.1f}ms，'
-      f'比值={_t_dummy / max(_t_real, 1e-9):.2f}x')
 check('dummy 路径确实跑了真活（不是 0ms 直接返回）',
       _t_dummy >= 0.02, f'dummy={_t_dummy * 1000:.1f}ms')
 

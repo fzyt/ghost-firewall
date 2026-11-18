@@ -162,6 +162,99 @@ def main():
     check('没有被误判为外部改动', len(clobbered4) == 0, str(clobbered4))
     check('锚点没报未命中', len(noanchor4) == 0, str(noanchor4))
 
+    # ── 5. 快照范围不得包含文档目录 ──────────────────────────
+    # 2026-11-18 真踩到：一边跑全量回归，一边在 `报告/` 里补文档。
+    # 保险丝的快照用的是 `git ls-files`（**全部**跟踪文件，含 `报告/`）
+    # ⇒ 脚本退出时 `restore()` 判定「与快照不一致」⇒ 把文档改动还原掉
+    # ⇒ 内容静默丢失，不报任何错。
+    # 更隐蔽的是：回归收尾的源码指纹对账只覆盖 backend/ frontend/ setup/
+    # tests/ docker/ ⇒ **不含报告目录** ⇒ 连对账都发现不了。
+    #
+    # ⇒ 变异脚本只改源码，文档目录根本不该进快照。
+    sec('5. 快照范围只含源码目录，不含文档目录')
+    tmp5 = tempfile.mkdtemp(prefix='mutguard-test5-')
+    os.makedirs(os.path.join(tmp5, 'backend'), exist_ok=True)
+    os.makedirs(os.path.join(tmp5, '报告'), exist_ok=True)
+    src5 = os.path.join(tmp5, 'backend', 'app.py')
+    doc5 = os.path.join(tmp5, '报告', '说明.md')
+    with open(src5, 'w', encoding='utf-8') as f:
+        f.write('X = 1\n')
+    with open(doc5, 'w', encoding='utf-8') as f:
+        f.write('原始文档\n')
+
+    # 造一个「有 git 跟踪文件」的环境：真 git 仓库太重，这里直接
+    # 让 _tracked() 走 git 不可用的兜底分支（临时目录不是 git 仓库）
+    g5 = MutationGuard(tmp5)
+    tracked5 = g5._tracked()
+    check('兜底分支也不含文档目录',
+          not any('报告' in p for p in tracked5), str(tracked5))
+
+    # 再验真实仓库里的过滤结果（这才是实际生效的那条路径）
+    g5b = MutationGuard(ROOT)
+    tracked5b = g5b._tracked()
+    doc_hits = [p for p in tracked5b
+                if p.split('/', 1)[0] in ('报告', 'docs', '文档')]
+    check('真实仓库的快照范围不含文档目录',
+          not doc_hits, str(doc_hits[:3]))
+    check('真实仓库的快照范围仍含源码目录',
+          any(p.startswith('backend/') for p in tracked5b),
+          str(len(tracked5b)) + ' 个文件')
+
+    # 关键行为：文档目录的文件**不在快照里** ⇒ restore() 不会碰它。
+    # ⚠ 必须走**真实的 snapshot() 路径**（手工往 snap 里塞文件等于
+    #   绕过了 _tracked() 过滤，测出来的是假场景 —— 2026-11-18 首版
+    #   就是这么写错的，判据自己报了假失败）。
+    # 办法：临时目录里建一个真 git 仓库，把文档提交进去，
+    # 让 `git ls-files` 能列出它 —— 而 `_tracked()` 的 SOURCE_DIRS
+    # 过滤应当把它挡在快照之外。
+    import subprocess
+    tmp5r = tempfile.mkdtemp(prefix='mutguard-test5-repo-')
+    def _git(*args):
+        return subprocess.run(['git', '-C', tmp5r] + list(args),
+                              capture_output=True, text=True)
+    _git('init', '-q')
+    _git('config', 'user.email', 't@t')
+    _git('config', 'user.name', 't')
+    os.makedirs(os.path.join(tmp5r, 'backend'), exist_ok=True)
+    os.makedirs(os.path.join(tmp5r, '报告'), exist_ok=True)
+    with open(os.path.join(tmp5r, 'backend', 'app.py'), 'w',
+              encoding='utf-8') as f:
+        f.write('X = 1\n')
+    with open(os.path.join(tmp5r, '报告', '说明.md'), 'w',
+              encoding='utf-8') as f:
+        f.write('原始文档\n')
+    _git('add', '-A')
+    _git('commit', '-qm', 'init')
+
+    g5c = MutationGuard(tmp5r)
+    try:
+        g5c.snapshot()
+        check('快照里不含文档目录',
+              not os.path.isfile(os.path.join(g5c.snap, '报告', '说明.md')))
+        check('快照里含源码目录',
+              os.path.isfile(os.path.join(g5c.snap, 'backend', 'app.py')))
+        # 模拟「有人在运行期间改了文档」
+        with open(os.path.join(tmp5r, '报告', '说明.md'), 'w',
+                  encoding='utf-8') as f:
+            f.write('运行期间写的新内容\n')
+        g5c.restore()
+        after = open(os.path.join(tmp5r, '报告', '说明.md'),
+                     encoding='utf-8').read()
+        check('文档改动没有被保险丝还原', after == '运行期间写的新内容\n',
+              repr(after))
+    finally:
+        try:
+            g5c.restore()
+        except Exception:
+            pass
+        if g5c.snap and os.path.isdir(g5c.snap):
+            import shutil
+            shutil.rmtree(g5c.snap, ignore_errors=True)
+            shutil.rmtree(g5c.snap + '.pre-restore', ignore_errors=True)
+        g5c.snap = None
+        import shutil
+        shutil.rmtree(tmp5r, ignore_errors=True)
+
     print('\n' + '=' * 60)
     print(f' 合计: ✅ {len(PASS)}   ❌ {len(FAIL)}')
     if FAIL:

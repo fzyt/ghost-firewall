@@ -108,14 +108,14 @@ BACKUP_CHMOD = "                    os.chmod(_rules_backup, 0o600)\n"
 BACKUP_UNLINK = "                    _unlink_quiet(_rules_backup)\n"
 NFT_LIST_RUN = "                r = subprocess.run(['nft', 'list', 'ruleset'], stdout=bf,\n"
 SCOPE_CHECK_FORMAT_ELEMS = (
-    "        if '%' in text:      # IPv6 scope-id 后缀 ⇒ nft 不认，丢弃\n"
-    "            dropped += 1\n"
-    "            continue\n"
+    "        if '%' in text:    # IPv6 scope-id 后缀 ⇒ nft 不认，丢弃\n"
+    '            dropped += 1\n'
+    '            continue\n'
 )
 SCOPE_CHECK_INJECT = (
-    "            if '%' in s:      # IPv6 scope-id 后缀 ⇒ nft 不认，丢弃\n"
-    "                dropped += 1\n"
-    "                continue\n"
+    "            if '%' in s:       # IPv6 scope-id 后缀 ⇒ nft 不认，丢弃\n"
+    '                dropped += 1\n'
+    '                continue\n'
 )
 
 

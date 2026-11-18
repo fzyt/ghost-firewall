@@ -1,7 +1,8 @@
 # Version: 0.7.9.1
 from flask import Flask, jsonify, request, send_from_directory, send_file, session
 import os, subprocess, shutil, json, time, re, hmac, hashlib, base64, datetime, uuid, fcntl, io, zipfile, secrets, ssl, ipaddress, socket, threading, contextlib, sys
-from template_engine import load_template, generate_rules
+from template_engine import (load_template, generate_rules, split_list_elem,
+                             LIST_ELEM_MAX_TIMEOUT)
 import device_info
 import dhcp_hosts
 
@@ -931,6 +932,13 @@ DEFAULT_CONFIG = {
     "knock4_port": 4,
     # 白名单超时时间（秒），默认 5 小时
     "whitelist_timeout": 18000,
+    # 手动加白名单的时效（秒），默认 10 分钟。
+    #
+    # 为什么与 whitelist_timeout 分开：whitelist_timeout 管的是**敲门** ——
+    # 敲门成功后该 IP 免敲门多久（默认 5 小时）。手动加白名单是另一回事：
+    # 用户在「访客」页里点一下加白名单，是为了「临时放行一下」，
+    # 不该沿用 5 小时那个量级。两套时效互不影响。
+    "manual_whitelist_timeout": 600,
     # 端口转发（多条规则）
     #
     # ⚠️ 出厂值必须是**空列表**（P1-23）
@@ -1926,6 +1934,10 @@ def validate_config(cfg):
     wt = cfg.get('whitelist_timeout')
     if wt is not None and str(wt).strip() != '' and not str(wt).strip().isdigit():
         errs.append(f'whitelist_timeout 非法: {wt!r}（只允许非负整数秒）')
+
+    mwt = cfg.get('manual_whitelist_timeout')
+    if mwt is not None and str(mwt).strip() != '' and not str(mwt).strip().isdigit():
+        errs.append(f'manual_whitelist_timeout 非法: {mwt!r}（只允许非负整数秒）')
 
     for s in (cfg.get('dns_lan_servers') or []):
         if not _valid_ip(s):
@@ -3258,7 +3270,12 @@ def build_rules(config):
     """生成规则，替换白名单超时时间"""
     variables = config_to_variables(config)
     log_switches = config_to_log_switches(config)
-    rules = generate_rules(variables, log_switches, load_lists())
+    # 元素级 timeout（手动加的短期白名单）在渲染前套到元素上 ⇒
+    # 「点应用规则」重建 set 之后，10 分钟的时效仍然是 10 分钟，
+    # 不会退回敲门那套（whitelist_timeout，默认 5 小时）。
+    list_elements = _apply_list_timeouts(load_lists(),
+                                          config.get('whitelist_ttls') or {})
+    rules = generate_rules(variables, log_switches, list_elements)
     # 白名单超时强制非负整数：这里是 rules.replace() 字符串拼接，
     # 任意非数字内容都会被原样写进 nft 规则（可注入 delete table 等指令）
     whitelist_timeout = config.get("whitelist_timeout", 18000)
@@ -8208,11 +8225,17 @@ def _format_list_elements(elements, want6):
         text = str(elem).strip()
         if not text:
             continue
-        if '%' in text:      # IPv6 scope-id 后缀 ⇒ nft 不认，丢弃
+        # 元素可能是 'IP' 或 'IP timeout Ns'（元素级 timeout）两种形态，
+        # 校验只针对 IP 部分 —— timeout 子句由 split_list_elem 负责把关。
+        ip, _clause = split_list_elem(text)
+        if not ip:
+            dropped += 1
+            continue
+        if '%' in text:    # IPv6 scope-id 后缀 ⇒ nft 不认，丢弃
             dropped += 1
             continue
         try:
-            addr = ipaddress.ip_address(text)
+            addr = ipaddress.ip_address(ip)
         except ValueError:
             dropped += 1
             continue
@@ -8221,6 +8244,86 @@ def _format_list_elements(elements, want6):
             continue
         out.append(text)
     return out, dropped
+
+
+def _apply_list_timeouts(list_elements, ttls):
+    """把 config 里的元素级 timeout 套到白名单元素上。
+
+    返回**新的** dict（不改传入的对象）—— 传入的是 load_lists() 的结果，
+    别处还要拿它统计「白名单有多少条」，带上 " timeout 600s" 后缀会让那些
+    统计把整串当成一个 IP。
+
+    为什么名单文件里不直接存 timeout：lists.json 的格式**不变** ⇒ 老设备
+    升级零风险、不用做数据迁移。元素级 timeout 单独存在 config 的
+    whitelist_ttls 里（见 _set_list_timeout），渲染前才把两者合成
+    'IP timeout Ns' 这个中间形态交给渲染层（见 template_engine.split_list_elem）。
+
+    ⚠ 只对白名单（allowed4/allowed6）生效：黑名单的 set 是 `flags dynamic`
+    （**没有** timeout），带 timeout 的元素 nft 会拒收。
+    """
+    if not ttls or not isinstance(ttls, dict):
+        return list_elements
+    out = {}
+    for name, items in (list_elements or {}).items():
+        if not name.startswith('allowed'):
+            out[name] = list(items or [])
+            continue
+        new_items = []
+        for raw in items or []:
+            ip = str(raw).strip()
+            ttl = ttls.get(ip)
+            if (isinstance(ttl, int) and not isinstance(ttl, bool)
+                    and 0 < ttl <= LIST_ELEM_MAX_TIMEOUT):
+                new_items.append(f'{ip} timeout {ttl}s')
+            else:
+                new_items.append(ip)
+        out[name] = new_items
+    return out
+
+
+def _set_list_timeout(ip, ttl=None):
+    """维护名单元素的元素级 timeout（存在 config 的 whitelist_ttls 里）。
+
+    ttl=None ⇒ 删掉该 IP 的时效记录（回到 set 的默认 timeout，即敲门那套）。
+
+    为什么单独存一份：见 _apply_list_timeouts 的说明（名单文件格式不变）。
+    """
+    config = load_config()
+    ttls = config.get('whitelist_ttls')
+    if not isinstance(ttls, dict):
+        ttls = {}
+    if ttl is None:
+        ttls.pop(ip, None)
+    else:
+        ttls[ip] = int(ttl)
+    config['whitelist_ttls'] = ttls
+    save_config(config)
+    return ttls
+
+
+def _clear_list_timeouts(ips):
+    """清掉一批 IP 的元素级 timeout（名单被清空时用）。
+
+    不清会怎样：名单已经空了，config 里却还留着这些 IP 的时效 ——
+    用户下次把同一个 IP 加回来（不带 timeout）却带着一条陈旧的时效，
+    生效的时长与用户填的不一致。
+    """
+    ips = list(ips or [])
+    if not ips:
+        return
+    config = load_config()
+    ttls = config.get('whitelist_ttls')
+    if not isinstance(ttls, dict) or not ttls:
+        return
+    changed = False
+    for ip in ips:
+        if ip in ttls:
+            del ttls[ip]
+            changed = True
+    if not changed:
+        return
+    config['whitelist_ttls'] = ttls
+    save_config(config)
 
 
 def _replace_set_elements(text, set_name, elements):
@@ -8287,9 +8390,12 @@ def _persist_list_elements_to_ruleset(lists):
 
     new_text = text
     found = False
+    # 元素级 timeout 同样要落进规则集文件：设备重启加载的是**规则集文件**
+    # 而不是内核内存 ⇒ 不写进去的话，10 分钟的时效重启后就退回敲门那套了。
+    timed = _apply_list_timeouts(lists, load_config().get('whitelist_ttls') or {})
     for name in _LIST_SET_NAMES:
         new_text, ok = _replace_set_elements(new_text, name,
-                                             (lists or {}).get(name) or [])
+                                             (timed or {}).get(name) or [])
         found = found or ok
     if not found:
         return False
@@ -8643,7 +8749,13 @@ def _nft_set_write(args, timeout=10):
 
 @app.route('/api/lists/add', methods=['POST'])
 def list_add():
-    """添加 IP 到指定名单"""
+    """添加 IP 到指定名单
+
+    可选的 timeout（秒）：**只有白名单**支持元素级 timeout。
+    不传 ⇒ 保持原行为（元素用 set 的默认 timeout，即敲门那套）。
+    传了 ⇒ 内核元素、config 里的时效记录、规则集回填三处都带这个时效，
+    「点应用规则」重建 set 之后仍然有效。
+    """
     data = request.get_json(silent=True)
     if not data:
         return jsonify({"success": False, "message": "请求体不能为空"}), 400
@@ -8656,12 +8768,38 @@ def list_add():
     # 校验 IP 格式（标准库 ipaddress；防止协议层注入和数据合法性问题）
     if _detect_ip_version(ip) is None:
         return jsonify({"success": False, "message": f"无效的 IP 地址: {ip!r}（应为单个 IPv4/IPv6，不支持 CIDR）"}), 400
+
+    # 元素级 timeout（秒）。0 = 不带（沿用 set 的默认 timeout）。
+    timeout_s = 0
+    raw_timeout = data.get('timeout')
+    if raw_timeout is not None and str(raw_timeout).strip() != '':
+        try:
+            timeout_s = int(str(raw_timeout).strip())
+        except (TypeError, ValueError):
+            return jsonify({"success": False,
+                            "message": f"timeout 非法: {raw_timeout!r}（只允许非负整数秒）"}), 400
+        if timeout_s < 0 or timeout_s > LIST_ELEM_MAX_TIMEOUT:
+            return jsonify({"success": False,
+                            "message": f"timeout 超出范围: {timeout_s}"
+                                       f"（0=用默认，最大 {LIST_ELEM_MAX_TIMEOUT} 秒）"}), 400
+        # 黑名单的 set 是 `flags dynamic`（**没有** timeout 标志）⇒ 带 timeout
+        # 的元素 nft 会拒收。提前拒掉，别让用户等到内核报错才看见原因。
+        if timeout_s and not set_name.startswith('allowed'):
+            return jsonify({"success": False,
+                            "message": "黑名单不支持时效（黑名单 set 没有 timeout 标志）"}), 400
+
     # try 的范围**只包住 nft 那一次调用**：FileNotFoundError 只可能来自
     # "nft 二进制不存在"，而下面的 _mutate_lists / _record_list_history 写的是
     # 磁盘配置 —— 它们的 FileNotFoundError 意思是"配置目录没了"，
     # 混进 NFT_UNAVAILABLE 会把真故障说成环境固有。
     try:
-        result = _nft_set_write(['add', 'element', 'inet', 'fw4', set_name, '{', ip, '}'])
+        elem = ['{', ip]
+        if timeout_s:
+            # OpenWrt 自带 nft 不支持 'timeout <N> s' 的空格 + 单位写法，
+            # 必须用 'timeout <N>s'（无空格、无单位后缀视为秒）
+            elem += ['timeout', f'{timeout_s}s']
+        elem.append('}')
+        result = _nft_set_write(['add', 'element', 'inet', 'fw4', set_name] + elem)
     except FileNotFoundError:
         return _nft_missing('修改')
     except subprocess.TimeoutExpired:
@@ -8673,6 +8811,11 @@ def list_add():
     # 内核改成功之后再落盘。规则集以 flush ruleset 开头、每次应用都会重建，
     # 只存在内核里的成员会在重建后静默消失 —— 用户以为还封着，其实已放行。
     try:
+        # 时效先记进 config，再落盘名单：_mutate_lists 会把名单元素同步进
+        # **规则集文件**（设备重启加载的是那个文件，不是内核内存），
+        # 时效晚一步写进去的话，重启后就退回敲门那套了。
+        if timeout_s:
+            _set_list_timeout(ip, timeout_s)
         _mutate_lists(set_name, add=[ip])
         _record_list_history('add', ip, _list_type_from_set(set_name))
     except Exception as e:
@@ -8709,6 +8852,9 @@ def list_delete():
     try:
         _mutate_lists(set_name, remove=[ip])
         _record_list_history('delete', ip, _list_type_from_set(set_name))
+        # 时效字典里这条也要删：名单里已经没这个 IP 了，
+        # 留着会让「再加一次同一个 IP」带上一条用户没填过的时效。
+        _set_list_timeout(ip, None)
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 400
     return jsonify({"success": True, "message": f"已从 {set_name} 删除 {ip}"})
@@ -8737,11 +8883,156 @@ def list_flush():
     if result.returncode != 0:
         return jsonify({"success": False, "message": f"清空失败: {result.stderr.strip() or result.stdout.strip()}"}), 400
     try:
+        # 先记下要清掉哪些 IP 的时效：名单清空之后就读不到了
+        cleared = list(load_lists().get(set_name) or [])
         _mutate_lists(set_name, clear=True)
         _record_list_history('flush', '-', _list_type_from_set(set_name))
+        # 时效字典里这些 IP 的条目也要清：名单已经空了，
+        # 留着会让「再加一次同一个 IP」带上一条用户没填过的时效。
+        _clear_list_timeouts(cleared)
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 400
     return jsonify({"success": True, "message": f"已清空 {set_name}"})
+
+
+# ======================= 网关访客 =======================
+#
+# 数据源是网关自己的 nginx access_log（网关开着时才有这个文件）。
+# 为什么不另记一份：数据**已经在采**（见 _build_gateway_nginx_conf 的 log_format），
+# 再记一份就是两个真相源，迟早对不上。
+
+GATEWAY_ACCESS_LOG = os.environ.get(
+    "GATEWAY_ACCESS_LOG", "/var/log/nginx/nftables-web-gateway.access.log")
+
+# 一条访问日志的格式（由本模块生成 nginx 配置时定死）：
+#   $time_iso8601 $remote_addr $request_method $status $body_bytes_sent rt=$request_time
+#   host="..." uri="..." ua="..." ref="..." auth_user="..." auth_dev="..."
+#
+# 引号里的值可能为空、也可能含空格 ⇒ 用「引号内不含裸引号」的正则逐段取。
+_GW_ACCESS_RE = re.compile(
+    r'^(?P<ts>\S+)\s+(?P<ip>\S+)\s+(?P<method>\S+)\s+(?P<status>\d{3})\s+'
+    r'(?P<bytes>\S+)\s+rt=(?P<rt>\S+)\s+'
+    r'host="(?P<host>[^"]*)"\s+uri="(?P<uri>[^"]*)"\s+'
+    r'ua="(?P<ua>[^"]*)"\s+ref="(?P<ref>[^"]*)"\s+'
+    r'auth_user="(?P<auth_user>[^"]*)"\s+auth_dev="(?P<auth_dev>[^"]*)"\s*$'
+)
+
+# 访客列表的时间窗：默认 1 小时，最多 7 天；单次最多返回 500 个 IP。
+VISITOR_WINDOW_DEFAULT_MIN = 60
+VISITOR_WINDOW_MAX_MIN = 10080
+VISITOR_MAX = 500
+
+# 读访问日志时只取文件**尾部**这么多字节。
+#
+# 为什么不能整个读：网关的 access_log 落在 tmpfs 上（设备实测 /var → tmpfs，
+# 492MB），而 OpenWrt 上**没有 logrotate** ⇒ 这份日志只增不减、不轮转。
+# 整个文件读进来，早晚既是内存问题也是 IO 问题。
+# 访客页只关心最近 window_seconds 内的记录 ⇒ 取尾部足够。
+GATEWAY_LOG_TAIL_BYTES = 512 * 1024
+
+
+def _read_gateway_visitors(window_seconds):
+    """解析网关 nginx 访问日志，按 IP 聚合最近 window_seconds 秒内的访客。
+
+    返回 [{ip, count, first_seen, last_seen, hosts, uris, statuses, ua, auth_dev}, ...]
+    """
+    cutoff = time.time() - window_seconds
+    agg = {}
+    try:
+        size = os.path.getsize(GATEWAY_ACCESS_LOG)
+        with open(GATEWAY_ACCESS_LOG, 'rb') as f:
+            if size > GATEWAY_LOG_TAIL_BYTES:
+                f.seek(size - GATEWAY_LOG_TAIL_BYTES)
+                f.readline()      # 丢掉被截断的那半行（它一定不完整）
+            raw = f.read()
+    except (IOError, OSError):
+        return []          # 文件不存在 = 网关没开过 = 正常情况
+    for line in raw.decode('utf-8', 'replace').splitlines():
+        m = _GW_ACCESS_RE.match(line.strip())
+        if not m:
+            continue
+        rec = m.groupdict()
+        try:
+            epoch = datetime.datetime.fromisoformat(rec['ts']).timestamp()
+        except ValueError:
+            continue
+        if epoch < cutoff:
+            continue
+        ip = rec['ip']
+        # IP 必须真的是 IP。nginx 的 access_log 是**多个 worker 追加写**的，
+        # 偶发会写出半截/串行的行 —— 真机实测见过 "192.168.100.gzl" 这种
+        # 明显是字符交织的结果 ⇒ 正则照样能把它当 IP 收下 ⇒ 访客列表里
+        # 会出现一条**根本不存在**的访客。这种行整行不可信，直接跳过。
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        item = agg.get(ip)
+        if item is None:
+            item = {'ip': ip, 'count': 0, 'first_seen': rec['ts'], 'last_seen': rec['ts'],
+                    'hosts': [], 'uris': [], 'statuses': [], 'ua': '', 'auth_dev': ''}
+            agg[ip] = item
+        item['count'] += 1
+        if rec['ts'] < item['first_seen']:
+            item['first_seen'] = rec['ts']
+        if rec['ts'] > item['last_seen']:
+            item['last_seen'] = rec['ts']
+        for src, dst in (('host', 'hosts'), ('uri', 'uris'), ('status', 'statuses')):
+            val = rec[src]
+            if val and val not in item[dst]:
+                item[dst].append(val)
+        if rec['ua']:
+            item['ua'] = rec['ua']
+        if rec['auth_dev']:
+            item['auth_dev'] = rec['auth_dev']
+    return sorted(agg.values(), key=lambda x: x['last_seen'], reverse=True)
+
+
+@app.route('/api/gateway/visitors', methods=['GET'])
+def get_gateway_visitors():
+    """最近一段时间访问过网关端口的 IP 列表（按 IP 聚合）。
+
+    数据源是网关自己的 nginx access_log —— 网关没开过时那个文件不存在，
+    此时返回空列表（**不是错误**：网关没开，本来就没有访客）。
+    """
+    try:
+        window_min = int(request.args.get('window', VISITOR_WINDOW_DEFAULT_MIN))
+    except (TypeError, ValueError):
+        window_min = VISITOR_WINDOW_DEFAULT_MIN
+    window_min = max(1, min(window_min, VISITOR_WINDOW_MAX_MIN))
+
+    visitors = _read_gateway_visitors(window_min * 60)
+
+    # 每个访客当前的白名单状态：是否已在白名单、还剩多久。
+    # 读失败不报错：白名单状态只是附赠信息，拿不到就不给，
+    # 不能因为它把整个访客列表拖垮。
+    wl = {}
+    for name in ('allowed4', 'allowed6'):
+        try:
+            wl.update(_nft_read_set(name))
+        except Exception:
+            pass
+    for v in visitors:
+        # 用 `in` 而不是 `.get() is not None` 判存在：
+        # _nft_read_set 对「在名单里但没有时效」的元素返回 None，
+        # 那是**永久白名单**，不能当成「不在白名单」。
+        v['whitelisted'] = v['ip'] in wl
+        v['whitelist_expires'] = wl.get(v['ip'])
+
+    cfg = load_config()
+    try:
+        mwt = int(cfg.get('manual_whitelist_timeout', 600))
+    except (TypeError, ValueError):
+        mwt = 600
+    return jsonify({
+        'success': True,
+        'data': {
+            'visitors': visitors[:VISITOR_MAX],
+            'total': len(visitors),
+            'window_minutes': window_min,
+            'manual_whitelist_timeout': mwt,
+        }
+    })
 
 
 # ======================= 名单历史 / IP 预设 =======================

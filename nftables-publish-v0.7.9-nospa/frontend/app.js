@@ -86,6 +86,10 @@ function app() {
       { id: 'trust', label: '信任IP' },
       { id: 'logs', label: '日志开关' },
       { id: 'syslog', label: '系统日志' },
+      // 「访客」紧跟在「系统日志」后面 ——
+      // 两页都是「看」而不是「配」：系统日志看发生了什么，访客看**谁**来过。
+      // 放在一起是因为排查顺序就是「先看事件，再看来源」。
+      { id: 'visitors', label: '访客' },
       { id: 'foreign', label: '国外IP拦截' },
       { id: 'dns-lan', label: 'DNS 局域网解析', icon: '🌐' },
       { id: 'ddns', label: 'DDNS' },
@@ -105,6 +109,21 @@ function app() {
     },
     whitelistTimeoutValue: 5,
     whitelistTimeoutUnit: 'h',
+    // 访客（网关最近被访问过的 IP）
+    //
+    // windowMinutes 是「看多早之前」，ttlSeconds 是「加进白名单后放行多久」——
+    // 这是两件不同的事，不能混：前者是观察窗口，后者是放行时效，
+    // 而放行时效与敲门的时效（whitelist_timeout，默认 5 小时）是**分开**的。
+    visitors: {
+      loading: false,
+      error: '',
+      loaded: false,        // 是否已经从后端同步过默认值
+      windowMinutes: 60,   // 观察窗口（分钟）
+      ttlMinutes: 10,      // 手动加白名单的时效（分钟），默认 10
+      items: [],
+      total: 0,
+      adding: {},          // {ip: true} —— 正在加白名单的 IP，防止连点
+    },
     loading: false,
     saving: false,
     applying: false,
@@ -1479,6 +1498,65 @@ function app() {
       this.aliyun.loading = false;
     }
   },
+
+    // ── 访客（网关最近被访问过的 IP）─────────────────────────────
+
+    // 把秒数说成人话：白名单时效在配置和后端里都是秒，页面上是分钟。
+    formatTtl(seconds) {
+      const s = parseInt(seconds, 10) || 0;
+      if (s <= 0) return '永久';
+      if (s < 60) return s + ' 秒';
+      if (s < 3600) return Math.round(s / 60) + ' 分钟';
+      return (s / 3600).toFixed(1) + ' 小时';
+    },
+
+    async loadVisitors() {
+      this.visitors.loading = true;
+      this.visitors.error = '';
+      try {
+        // ⚠ 这里刻意直接写 api.get 字面量 —— 契约测试（tests/test_api_contract.py）
+        // 靠扫源码里的 `api.get('/api/...')` 对账「读哪一层」，包起来就扫不到了。
+        const raw = await api.get('/api/gateway/visitors?window=' + this.visitors.windowMinutes);
+        const d = unwrap(raw);
+        this.visitors.items = d.visitors || [];
+        this.visitors.total = d.total || 0;
+        // 后端给的默认时效是**秒**（配置的原始单位），页面上用分钟。
+        // 只在**第一次**加载时同步：否则用户改过的值会被每次刷新拉取覆盖掉。
+        if (d.manual_whitelist_timeout && !this.visitors.loaded) {
+          this.visitors.ttlMinutes = Math.max(1, Math.round(d.manual_whitelist_timeout / 60));
+          this.visitors.loaded = true;
+        }
+      } catch (e) {
+        // 「读不到」不能伪装成「没有访客」—— 空表格会让人以为网关没开。
+        this.visitors.error = e.message || String(e);
+        this.visitors.items = [];
+        this.visitors.total = 0;
+      } finally {
+        this.visitors.loading = false;
+      }
+    },
+
+    async addVisitorToWhitelist(ip) {
+      if (this.visitors.adding[ip]) return;   // 连点保护
+      this.visitors.adding[ip] = true;
+      try {
+        // IPv6 进 allowed6、IPv4 进 allowed4 —— set 的类型是写死的，
+        // 放错版本 nft 会拒收整个 set。
+        const setName = ip.indexOf(':') >= 0 ? 'allowed6' : 'allowed4';
+        const seconds = Math.max(1, Math.round(this.visitors.ttlMinutes * 60));
+        await api.post('/api/lists/add', {
+          set_name: setName,
+          ip: ip,
+          timeout: seconds,
+        });
+        this.showToast(ip + ' 已加入白名单，' + this.formatTtl(seconds) + '后失效', 'success');
+        await this.loadVisitors();
+      } catch (e) {
+        this.showToast('加白名单失败: ' + (e.message || e), 'error');
+      } finally {
+        this.visitors.adding[ip] = false;
+      }
+    },
 
     async loadLists() {
       this.listsLoading = true;

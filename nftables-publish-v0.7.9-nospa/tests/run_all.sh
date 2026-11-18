@@ -163,7 +163,18 @@ else
     if [ $rc -ne 0 ]; then
       FAILED="$FAILED $f"
       printf '  ❌ %-42s %s\n' "$(basename "$f")" "$last"
-      printf '%s\n' "$out" | grep -E '❌|⚠️' | head -8 | sed 's/^/       /'
+      # ⚠ 失败详情必须看得到「为什么」（2026-11-18 修）：
+      #   旧版只 grep '❌|⚠️'，而变异脚本的失败行用的是 [FAIL] 纯文本
+      #   （项目禁用 emoji）⇒ 匹配不到 ⇒ 日志里那行只剩个空壳，
+      #   得自己再跑一遍脚本才知道是哪条锚点失配。
+      #   白名单判据脚本的失败行同样是 [FAIL]。
+      detail=$(printf '%s\n' "$out" | grep -E '❌|⚠️|\[FAIL\]' | head -8)
+      if [ -n "$detail" ]; then
+        printf '%s\n' "$detail" | sed 's/^/       /'
+      else
+        # 实在没匹配到 ⇒ 退而求其次给尾部输出，别让失败原因彻底消失
+        printf '%s\n' "$out" | tail -n 8 | sed 's/^/       /'
+      fi
     else
       printf '  ✅ %-42s %s\n' "$(basename "$f")" "$last"
     fi

@@ -233,6 +233,13 @@ EXPECT = {
     'loadGatewayStatus':  ('normal', '刷新状态'),
     'loadLists':          ('normal', '加载'),
     'loadReverseProxy':   ('normal', '加载'),
+    # 访客页（2026-11-18 新增）。
+    # loadVisitors 是**只读**（读网关的 nginx 访问日志）⇒ 普通档。
+    'loadVisitors':        ('normal', '刷新'),
+    # addVisitorToWhitelist 会**真的往内核的 allowed set 里加元素**
+    # （与 applyPreset / deleteFromList 同性质：改的是防火墙规则集）
+    # ⇒ 破坏性档，默认档必须跳过，要显式 --destructive。
+    'addVisitorToWhitelist': ('des', '加白名单'),
     'loadRules':          ('normal', '刷新预览'),
     'loadRulesHealth':    ('normal', '刷新'),
     'loadSystemLogs':     ('normal', '刷新'),

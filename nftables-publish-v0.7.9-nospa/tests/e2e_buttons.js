@@ -64,7 +64,13 @@ const ONLY_PAGE = (process.argv.find(a => a.startsWith('--page=')) || '').split(
 // ⚠️ saveDhcpHost 的中文标签就是「保存」，**不能**靠中文兜住
 //   （「保存」太泛，加进正则会把一堆普通保存按钮也误跳过）
 //   ⇒ 只能靠英文动作名兜。
-const DESTRUCTIVE_PAT = /(删除|删|清空|删除规则|flush|应用防火墙|applyRules|removeDdns|deleteRp|deletePreset|恢复配置|restoreConfig|重置|restartDdns|重启服务|uploadRpCert|上传证书|pickRpReupload|重新上传|requestRpCert|申请证书|renewRpCert|续期证书|reloadNginx|重载 ?nginx|confirmSaveConfig|确认保存|applyPreset|应用预设|saveDhcpHost|deleteDhcpHost)/i;
+//
+// 2026-11-18 新增（网关访客页）：
+//   addVisitorToWhitelist() 标签「加白名单」 → 真的往内核的 allowed set 里
+//   加元素（与 applyPreset / deleteFromList 同性质：改的是防火墙规则集）
+//   ⇒ 归破坏性档，默认档必须跳过。
+//   中文标签与英文动作名都写，理由同上面两条。
+const DESTRUCTIVE_PAT = /(删除|删|清空|删除规则|flush|应用防火墙|applyRules|removeDdns|deleteRp|deletePreset|恢复配置|restoreConfig|重置|restartDdns|重启服务|uploadRpCert|上传证书|pickRpReupload|重新上传|requestRpCert|申请证书|renewRpCert|续期证书|reloadNginx|重载 ?nginx|confirmSaveConfig|确认保存|applyPreset|应用预设|saveDhcpHost|deleteDhcpHost|加白名单|addVisitorToWhitelist)/i;
 
 // 基础设施级操作：会改网络/系统自身状态。
 //

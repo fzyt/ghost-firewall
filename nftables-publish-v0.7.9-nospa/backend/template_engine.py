@@ -6,6 +6,50 @@ import os
 
 TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), 'templates', 'nftables.conf')
 
+# 名单元素级 timeout 的上限（秒）。7 天。
+# 为什么要有上限：这个秒数会被**原样拼进 nft 规则文本**，而规则集文件是
+# `nft -f` 执行的 ⇒ 超大值会让 nft 拒绝加载**整份**规则集（连带所有规则
+# 一起失效），不只是这一个元素失效。宁可丢弃这个元素，也不能拖垮整份规则。
+LIST_ELEM_MAX_TIMEOUT = 604800
+
+
+def split_list_elem(raw):
+    """把名单元素的中间形态拆成 (ip, timeout_clause)。
+
+    两种形态：
+      '1.2.3.4'              → 普通元素，用 set 声明里的默认 timeout
+      '1.2.3.4 timeout 600s' → 元素级 timeout（手动加的短期白名单）
+
+    为什么要有这个中间形态：名单文件（lists.json）里存的**始终是纯 IP**，
+    元素级 timeout 单独存在 config 的 whitelist_ttls 里（见 app.py）。
+    渲染前才把两者合成这个形态 ⇒ 渲染层只认一种写法，名单文件格式不变。
+
+    ⚠ timeout_clause 会被**原样拼进 nft 规则文本** ⇒ 解析不出来就整个
+    元素丢弃，绝不「尽力而为」放行。
+    """
+    s = str(raw).strip()
+    if not s:
+        return None, ''
+    parts = s.split()
+    if len(parts) == 1:
+        return parts[0], ''
+    if len(parts) == 3 and parts[1] == 'timeout':
+        secs = parts[2]
+        # nft 的元素级 timeout 写法是 'timeout 600s'；裸数字也收。
+        # 只认 's' 这一个单位 —— 'm'/'h' 是 set 声明里的写法，元素级用不上，
+        # 放进来只会让「秒数」这个语义变得含糊。
+        if secs.endswith('s'):
+            secs = secs[:-1]
+        # isdigit() 对全角数字也 True（'１'.isdigit() == True），而 int() 会
+        # 把它悄悄转成 1 ⇒ 必须额外要求 ASCII。
+        if not (secs.isascii() and secs.isdigit()):
+            return None, ''
+        n = int(secs)
+        if n <= 0 or n > LIST_ELEM_MAX_TIMEOUT:
+            return None, ''
+        return parts[0], f' timeout {n}s'
+    return None, ''
+
 
 def load_template():
     """读取原始模板"""
@@ -363,18 +407,24 @@ def _inject_list_elements(template, elements):
         lines, dropped = [], 0
         for elem in _format_set_elements(elements.get(key)):
             s = elem.strip()
-            if '%' in s:      # IPv6 scope-id 后缀 ⇒ nft 不认，丢弃
+            # 元素可能是 'IP' 或 'IP timeout Ns'（元素级 timeout）两种形态，
+            # 校验只针对 IP 部分 —— timeout 子句由 split_list_elem 负责把关。
+            ip, _clause = split_list_elem(s)
+            if not ip:
+                dropped += 1
+                continue
+            if '%' in s:       # IPv6 scope-id 后缀 ⇒ nft 不认，丢弃
                 dropped += 1
                 continue
             try:
-                addr = ipaddress.ip_address(s)
+                addr = ipaddress.ip_address(ip)
             except ValueError:
                 dropped += 1
                 continue
             if (addr.version == 6) != want6:
                 dropped += 1
                 continue
-            lines.append(elem)
+            lines.append(s)
         if dropped:
             print(f'[WARN] 名单 {key} 有 {dropped} 个非法元素被丢弃，不写入规则', flush=True)
         if lines:

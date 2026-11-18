@@ -2304,6 +2304,7 @@ init_config() {
     "knock3_port": ${k3},
     "knock4_port": ${k4},
     "whitelist_timeout": 3600,
+    "manual_whitelist_timeout": 600,
     "forward_rules": [],
     "trusted_ip4": ["${trusted_ip4}"],
     "trusted_ip6": ["${trusted_ip6}"],
