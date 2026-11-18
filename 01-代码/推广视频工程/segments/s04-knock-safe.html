@@ -16,6 +16,7 @@
 <script type="module">
 import { clamp, ease, TAU, loadFonts, drawCapsuleLabel, drawStamp } from '../common.js';
 import { themeFromURL, chrome, drawGrain, drawVignette } from '../themes.js';
+import { drawParticleField, drawLightSweep, drawEdgeSweep, withParallax } from '../motion.js';
 
 const W = 1920, H = 1080;
 const canvas = document.getElementById('c');
@@ -467,12 +468,24 @@ window.renderFrame = (u) => {
 
   drawGrain(ctx, theme, W, H, u);
 
+  // 背景浮尘
+  drawParticleField(ctx, { u, count: 120, seed: 57, color: '221,164,76', baseAlpha: 0.32, drift: 28 });
+
   // punchline 出现后，阶梯与卡片整体退到背景
   focus = 1 - clamp((u - 20.0) / 1.0, 0, 1) * 0.8;
   drawHead(u);
-  drawLadder(u);
-  drawIpChip(u);
-  drawRateCard(u);
+
+  // 阶梯 + 限流卡挂在视差层
+  withParallax(ctx, u, 0.65, 960, 540, () => {
+    drawLadder(u);
+    drawIpChip(u);
+    drawRateCard(u);
+  }, { amp: 15, drift: 7 });
+
+  // 限流卡上沿的流光
+  drawEdgeSweep(ctx, { x: CARD.x, y: CARD.y, w: CARD.w, u, period: 4.8, color: '240,180,156', strength: 0.6 });
+  drawLightSweep(ctx, { x: 0, y: 0, w: W, h: H, u, period: 8, strength: 0.04, band: 0.45 });
+
   drawPunch(u);
   drawVignette(ctx, W, H, 0.42);
 

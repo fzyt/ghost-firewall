@@ -10,7 +10,7 @@
 //   ?seg=1&t0=0.35&speed=1.4&dur=3
 //   -> local clip time u in [0,dur] maps to scene time t = t0 + u*speed
 //
-// Deterministic only: never call Date.now(), performance.now(), Math.random().
+// Deterministic only: 禁用 Math.random / Date.now / performance.now —— 画面必须是 t 的纯函数。
 
 export const TAU = Math.PI * 2;
 

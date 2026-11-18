@@ -55,6 +55,17 @@ const timeline = JSON.parse(fs.readFileSync(path.join(ROOT, 'timeline.json'), 'u
 const segments = timeline.segments;
 
 const { chromium } = await import('playwright-core');
+
+// 共享模块也要守纯函数契约：它们被所有段落 import，出了随机源整片就不确定
+const CORE_FILES = ['common.js', 'themes.js', 'motion.js'];
+const coreBad = [];
+for (const f of CORE_FILES) {
+  const p = path.join(ROOT, f);
+  if (!fs.existsSync(p)) continue;
+  const hits = FORBIDDEN.filter((re) => re.test(fs.readFileSync(p, 'utf8'))).map(String);
+  if (hits.length) coreBad.push(`${f}: ${hits.join(', ')}`);
+}
+
 const server = await startServer(ROOT);
 const port = server.address().port;
 const browser = await chromium.launch({
@@ -117,5 +128,9 @@ for (const seg of segments) {
 
 await browser.close();
 server.close();
+if (coreBad.length) {
+  failed++;
+  console.error(`\n共享模块里的禁用 API：${coreBad.join('；')}`);
+}
 console.log(failed ? `\n${failed} 个段落自检失败` : '\n全部段落自检通过');
 process.exit(failed ? 1 : 0);

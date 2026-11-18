@@ -16,6 +16,7 @@
 <script type="module">
 import { createSegment, loadFonts, clamp, ease, TAU, drawCapsuleLabel, drawStamp } from '../common.js';
 import { themeFromURL, chrome, drawGrain, drawVignette } from '../themes.js';
+import { drawParticleField, drawLightSweep, drawEdgeSweep, breathe } from '../motion.js';
 
 const W = 1920, H = 1080;
 const canvas = document.getElementById('c');
@@ -293,6 +294,55 @@ function isVisited(i, u) {
     if (u >= s.t0) return true;
   }
   return false;
+}
+
+// 面板内的扫描线（跟 s01 同一套语言）
+function drawPanelScan(u) {
+  const period = 7;
+  const cyc = (u % period) / period;
+  const fade = Math.sin(Math.PI * cyc);
+  if (fade <= 0.01) return;
+  const sy = MAIN.y + cyc * MAIN.h;
+  ctx.save();
+  const g = ctx.createLinearGradient(0, sy - 70, 0, sy);
+  g.addColorStop(0, 'rgba(217,119,87,0)');
+  g.addColorStop(1, `rgba(217,119,87,${(0.055 * fade).toFixed(3)})`);
+  ctx.fillStyle = g;
+  ctx.fillRect(MAIN.x, sy - 70, MAIN.w, 70);
+  ctx.strokeStyle = `rgba(217,119,87,${(0.16 * fade).toFixed(3)})`;
+  ctx.lineWidth = 1.1;
+  ctx.beginPath();
+  ctx.moveTo(MAIN.x, sy);
+  ctx.lineTo(MAIN.x + MAIN.w, sy);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// 侧栏上的光标：跟着当前页走，换页时点一下
+function drawCursor(u) {
+  const sc = currentScreen(u);
+  if (!sc || sc.mod < 0) return;
+  const y = NAV_Y0 + sc.mod * NAV_STEP - 6;
+  const x = SIDE.x + 40;
+  const rp = clamp((u - sc.t0) / 0.45, 0, 1);
+  ctx.save();
+  ctx.globalAlpha = 0.8;
+  ctx.fillStyle = C.accent;
+  ctx.beginPath();
+  ctx.moveTo(x, y);
+  ctx.lineTo(x + 7, y + 4.5);
+  ctx.lineTo(x, y + 9);
+  ctx.closePath();
+  ctx.fill();
+  // 换页时的点击涟漪
+  if (rp < 1) {
+    ctx.strokeStyle = `rgba(217,119,87,${(0.65 * (1 - rp)).toFixed(3)})`;
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.arc(x + 2, y + 4, 5 + rp * 24, 0, TAU);
+    ctx.stroke();
+  }
+  ctx.restore();
 }
 
 // ---------- 内容区通用外框：标题 + 副标题 + 右上角按钮 ----------
@@ -707,6 +757,10 @@ window.renderFrame = (u) => {
   ctx.fillRect(0, 0, W, H);
 
   drawGrain(ctx, theme, W, H, u);
+
+  // 窗外的浮尘：面板是浮在这层雾上的
+  drawParticleField(ctx, { u, count: 120, seed: 103, color: '217,119,87', baseAlpha: 0.34, drift: 30 });
+
   drawHeadline(u);
 
   // 窗口内的内容跟着窗口一起缩放
@@ -721,11 +775,19 @@ window.renderFrame = (u) => {
     ctx.translate(-(WIN.x + WIN.w / 2), -(WIN.y + WIN.h / 2));
 
     drawWindow(u);
+
+    // 窗框上沿的流光
+    drawEdgeSweep(ctx, { x: WIN.x + 20, y: WIN.y, w: WIN.w - 40, u, period: 6.0, color: '240,180,156', strength: 0.55 });
+
     drawSidebar(u);
+    drawCursor(u);
 
     // 内容区底板
     ctx.fillStyle = 'rgba(245,240,232,0.02)';
     ctx.fillRect(MAIN.x, MAIN.y, MAIN.w, MAIN.h);
+
+    // 面板里的扫描线：内容区一直在刷新
+    drawPanelScan(u);
 
     // 逐屏绘制，切换处交叉淡入淡出
     for (const sc of SCREENS) {
@@ -747,6 +809,7 @@ window.renderFrame = (u) => {
   }
 
   drawPunch(u);
+  drawLightSweep(ctx, { x: 0, y: 0, w: W, h: H, u, period: 8.4, strength: 0.04, band: 0.45 });
   drawVignette(ctx, W, H, 0.42);
 
   // HUD

@@ -16,6 +16,7 @@
 <script type="module">
 import { createSegment, loadFonts, clamp, ease, TAU, drawCapsuleLabel, drawStamp } from '../common.js';
 import { themeFromURL, chrome, drawGrain, drawVignette } from '../themes.js';
+import { drawParticleField, drawLightSweep, drawEdgeSweep } from '../motion.js';
 
 const W = 1920, H = 1080;
 const canvas = document.getElementById('c');
@@ -206,6 +207,10 @@ function drawTerminal(u) {
   ctx.fillStyle = C.muted;
   ctx.fillText('ssh root@192.168.1.1', TERM.x + 108, TERM.y + TERM.barH / 2 + 1);
 
+  // 终端窗口上沿的流光 + 窗口内一道缓慢的辉光带
+  drawEdgeSweep(ctx, { x: TERM.x + 16, y: TERM.y, w: TERM.w - 32, u, period: 5.6, color: '240,180,156', strength: 0.6 });
+  drawLightSweep(ctx, { x: TERM.x, y: TERM.y, w: TERM.w, h: TERM.h, u, period: 6.4, strength: 0.05, band: 0.55, angle: -0.18 });
+
   // 打字机正文
   const size = cmdFontSize(TERM.w - TERM.padX * 2);
   ctx.font = `500 ${size}px "JetBrains Mono", "Noto Sans SC", monospace`;
@@ -359,11 +364,15 @@ window.renderFrame = (u) => {
 
   drawGrain(ctx, theme, W, H, u);
 
+  // 背景浮尘
+  drawParticleField(ctx, { u, count: 110, seed: 127, color: '217,119,87', baseAlpha: 0.34, drift: 26 });
+
   drawHead(u);
   drawTerminal(u);
   drawPoints(u);
   drawPunch(u);
 
+  drawLightSweep(ctx, { x: 0, y: 0, w: W, h: H, u, period: 8.8, strength: 0.04, band: 0.45 });
   drawVignette(ctx, W, H, 0.42);
 
   // HUD

@@ -16,6 +16,7 @@
 <script type="module">
 import { createSegment, loadFonts, clamp, ease, TAU, drawCapsuleLabel, drawStamp } from '../common.js';
 import { themeFromURL, chrome, drawGrain, drawVignette } from '../themes.js';
+import { drawParticleField, drawLightSweep, withParallax, kineticText } from '../motion.js';
 
 const W = 1920, H = 1080;
 const canvas = document.getElementById('c');
@@ -269,6 +270,9 @@ window.renderFrame = (u) => {
 
   drawGrain(ctx, theme, W, H, u);
 
+  // 背景粒子：三层速度不同 ⇒ 天然视差
+  drawParticleField(ctx, { u, count: 130, seed: 11, color: '217,119,87', baseAlpha: 0.42, drift: 30 });
+
   // 左右分隔线：随左侧淡入一起拉开，把「图」和「文」绑成一版
   const ruleP = clamp(u / 0.9, 0, 1);
   if (ruleP > 0) {
@@ -283,10 +287,16 @@ window.renderFrame = (u) => {
     ctx.restore();
   }
 
-  drawLeft(u);
+  // 左图挂在更靠前的视差层上（比右边的文字走得多一点）
+  withParallax(ctx, u, 0.9, 420, 560, () => drawLeft(u), { amp: 20, drift: 9 });
+
+  // 隐身场上一道流光扫过
+  drawLightSweep(ctx, { x: 120, y: 330, w: 600, h: 570, u, period: 6.2, strength: 0.07, band: 0.5 });
+
   drawHeadline(u);
   drawPoints(u);
   drawPunch(u);
+  drawLightSweep(ctx, { x: 0, y: 0, w: W, h: H, u, period: 8.5, strength: 0.04, band: 0.45 });
   drawVignette(ctx, W, H, 0.42);
 
   // HUD

@@ -16,6 +16,7 @@
 <script type="module">
 import { createSegment, loadFonts, clamp, ease, TAU, drawCapsuleLabel, drawStamp } from '../common.js';
 import { themeFromURL, chrome, drawGrain, drawVignette } from '../themes.js';
+import { drawParticleField, drawLightSweep, drawEdgeSweep, withParallax } from '../motion.js';
 
 const W = 1920, H = 1080;
 const canvas = document.getElementById('c');
@@ -153,6 +154,14 @@ function drawCards(u) {
     ctx.fillStyle = 'rgba(245,240,232,0.60)';
     ctx.fillText(ent.use, CARD.x + 56, y + 142);
 
+    // 边缘流光：一道亮线沿卡片上沿走
+    drawEdgeSweep(ctx, {
+      x: CARD.x + 16, y, w: CARD.w - 32, u,
+      period: 4.6 + i * 0.9,
+      color: hot ? '240,180,156' : '245,240,232',
+      strength: hot ? 0.75 : 0.32,
+    });
+
     ctx.restore();
   }
 }
@@ -252,6 +261,28 @@ function drawTree(u) {
     ctx.restore();
   }
 
+  // 活路上的流动数据包：一条路真的在跑流量
+  if (u > 6.2) {
+    const liveY = TREE.rowY[LIVE] + TREE.rowH / 2;
+    const spanY = liveY - (box.y + box.h);
+    for (let k = 0; k < 3; k++) {
+      const q = ((u - 6.2) / 2.4 + k / 3) % 1;
+      const py = box.y + box.h + spanY * q;
+      const px = cx + (TREE.rowX - cx) * clamp((q - 0.72) / 0.28, 0, 1);
+      const a = Math.sin(Math.PI * clamp(q / 0.96, 0, 1));
+      ctx.save();
+      ctx.fillStyle = `rgba(240,180,156,${(0.85 * a).toFixed(3)})`;
+      ctx.beginPath();
+      ctx.arc(px, py, 3.4, 0, TAU);
+      ctx.fill();
+      ctx.fillStyle = `rgba(217,119,87,${(0.16 * a).toFixed(3)})`;
+      ctx.beginPath();
+      ctx.arc(px, py, 11, 0, TAU);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
   // 死路上的阻断标记 ×
   const deadRows = [0, 2];
   for (let k = 0; k < deadRows.length; k++) {
@@ -347,6 +378,9 @@ window.renderFrame = (u) => {
 
   drawGrain(ctx, theme, W, H, u);
 
+  // 背景粒子：三层速度不同，天然带视差
+  drawParticleField(ctx, { u, count: 120, seed: 21, color: '217,119,87', baseAlpha: 0.40, drift: 30 });
+
   // 左栏（文字）与右栏（示意图）之间的分隔线
   const ruleP = clamp(u / 0.9, 0, 1);
   if (ruleP > 0) {
@@ -362,9 +396,17 @@ window.renderFrame = (u) => {
   }
 
   drawHead(u);
-  drawCards(u);
-  drawTree(u);
+
+  // 主体内容挂在视差层上：随镜头推进轻微漂移
+  withParallax(ctx, u, 0.7, 960, 540, () => {
+    drawCards(u);
+    drawTree(u);
+  }, { amp: 16, drift: 7 });
+
   drawPunch(u);
+
+  // 全局流光：极淡的一层，让画面一直有东西在动
+  drawLightSweep(ctx, { x: 0, y: 0, w: W, h: H, u, period: 7.5, strength: 0.045, band: 0.42 });
   drawVignette(ctx, W, H, 0.42);
 
   // HUD

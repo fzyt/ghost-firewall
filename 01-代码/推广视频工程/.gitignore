@@ -3,7 +3,8 @@ node_modules/
 out/
 stills/
 tmp/
-audio/*.wav
+# 音频全是生成物：配乐 wav、逐段语音 mp3、混音 wav
+audio/
 segments.txt
 
 # 字体：10 个 OFL 字体（OFL-1.1）是 纯代码视频制作/01-代码/fonts/ 的副本，

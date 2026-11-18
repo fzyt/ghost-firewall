@@ -16,6 +16,7 @@
 <script type="module">
 import { clamp, ease, TAU, loadFonts, cachedGradient, drawCapsuleLabel, drawStamp } from '../common.js';
 import { themeFromURL, chrome, drawGrain, drawVignette } from '../themes.js';
+import { drawParticleField, drawLightSweep, drawEdgeSweep, withParallax } from '../motion.js';
 
 const W = 1920, H = 1080;
 const canvas = document.getElementById('c');
@@ -513,15 +514,27 @@ window.renderFrame = (u) => {
   drawWall(u);
   drawGrain(ctx, theme, W, H, u);
 
+  // 雾里的浮尘：三层速度 ⇒ 视差
+  drawParticleField(ctx, { u, count: 140, seed: 33, color: '217,119,87', baseAlpha: 0.38, drift: 34 });
+
   drawHead(u);
   drawActs(u);
-  drawFigure(u);
-  drawMissMarks(u);
-  drawMarks(u);
-  drawKnocks(u);
-  drawDoor(u);
-  drawCountdown(u);
-  drawBadge(u);
+
+  // 门与剪影这一组挂在前景视差层
+  withParallax(ctx, u, 0.8, 1200, 600, () => {
+    drawFigure(u);
+    drawMissMarks(u);
+    drawMarks(u);
+    drawKnocks(u);
+    drawDoor(u);
+    drawCountdown(u);
+    drawBadge(u);
+  }, { amp: 18, drift: 8 });
+
+  // 门框上沿一道流光
+  drawEdgeSweep(ctx, { x: DOOR.x, y: DOOR.y, w: DOOR.w, u, period: 5.4, color: '240,180,156', strength: 0.7 });
+  drawLightSweep(ctx, { x: 0, y: 0, w: W, h: H, u, period: 9, strength: 0.04, band: 0.4 });
+
   drawPunch(u);
   drawVignette(ctx, W, H, 0.42);
 

@@ -16,6 +16,7 @@
 <script type="module">
 import { createSegment, loadFonts, clamp, ease, TAU, drawCapsuleLabel, drawStamp } from '../common.js';
 import { themeFromURL, chrome, drawGrain, drawVignette } from '../themes.js';
+import { drawParticleField, drawLightSweep, drawEdgeSweep, withParallax } from '../motion.js';
 
 const W = 1920, H = 1080;
 const canvas = document.getElementById('c');
@@ -430,12 +431,25 @@ window.renderFrame = (u) => {
 
   drawGrain(ctx, theme, W, H, u);
 
-  drawHead(u);
-  drawRail(u);
-  drawCards(u);
-  drawExtras(u);
-  drawPunch(u);
+  // 背景浮尘
+  drawParticleField(ctx, { u, count: 110, seed: 89, color: '217,119,87', baseAlpha: 0.34, drift: 24 });
 
+  drawHead(u);
+
+  // 时间轴与三张保险卡挂在视差层
+  withParallax(ctx, u, 0.6, 960, 540, () => {
+    drawRail(u);
+    drawCards(u);
+    drawExtras(u);
+  }, { amp: 14, drift: 6 });
+
+  // 三张保险卡上沿的流光
+  for (let i = 0; i < 3; i++) {
+    drawEdgeSweep(ctx, { x: CARD.xs[i], y: CARD.y, w: CARD.w, u, period: 5.2 + i * 0.7, color: '240,180,156', strength: 0.5 });
+  }
+  drawLightSweep(ctx, { x: 0, y: 0, w: W, h: H, u, period: 7.8, strength: 0.04, band: 0.42 });
+
+  drawPunch(u);
   drawVignette(ctx, W, H, 0.42);
 
   // HUD
