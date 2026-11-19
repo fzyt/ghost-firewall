@@ -102,6 +102,59 @@ export function termHUD(ctx, o = {}) {
   ctx.restore();
 }
 
+// 终端脚本：一行 = 一个动作，按 at 的时刻依次出现
+//   k: 'c' 注释（逐字打出）| '$' 命令（提示符 + 逐字 + 光标）| 'o' 输出（整行刷出）
+//   dim 走暗色，accent 走珊瑚色；含中文的行自动放大一号（Noto 同号比等宽英文视觉偏小）
+export function termScript(ctx, items, o = {}) {
+  const {
+    u = 0, x = 0, y = 0, lineH = 40, size = 24, sizeCN = 26, font,
+    alpha = 1, dy = 0, cps = 0.06,
+  } = o;
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    const local = u - it.at;
+    if (local < 0) continue;
+    const ly = y + i * lineH + dy;
+    const dur = Array.from(it.t).length * cps;
+    const cn = /[一-鿿]/.test(it.t);
+    const fs = cn ? sizeCN : size;
+
+    if (it.k === 'o') {
+      const a = clamp(local / 0.14);
+      typeText(ctx, it.t, x, ly, {
+        size: fs,
+        color: it.accent ? TC.accent : it.dim ? TC.muted : TC.ink,
+        font, alpha: alpha * a,
+      });
+    } else if (it.k === 'c') {
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.font = `400 ${sizeCN}px ${font}`;
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = TC.dim;
+      ctx.fillText('#', x, ly);
+      ctx.restore();
+      typeText(ctx, it.t, x + 26, ly, {
+        p: clamp(local / dur), size: sizeCN, color: TC.muted, font, alpha,
+      });
+    } else {
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.font = `600 ${size}px ${font}`;
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = TC.accent;
+      ctx.fillText('$', x, ly);
+      ctx.restore();
+      const w = typeText(ctx, it.t, x + 26, ly, {
+        p: clamp(local / dur), size, color: TC.ink, font, alpha,
+      });
+      // 打字过程中光标跟在命令末尾；空提示符上光标一直闪
+      if (!it.t) drawCursor(ctx, x + 26, ly, u, { size, alpha });
+      else if (local < dur) drawCursor(ctx, x + 26 + w, ly, u, { size, alpha });
+    }
+  }
+}
+
 // 底部进度条 + 时间码：终端风的段落进度指示
 export function termProgress(ctx, o = {}) {
   const { u = 0, duration = 1, font, x = 140, y = 996, w = 1640 } = o;

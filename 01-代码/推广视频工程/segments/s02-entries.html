@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <link rel="stylesheet" href="/shared/fonts.css">
-<title>02 三个入口</title>
+<title>02 架构</title>
 <style>
   html, body { margin: 0; padding: 0; background: #0e0e0d; overflow: hidden; }
   #stage { position: relative; width: 1920px; height: 1080px; overflow: hidden; }
@@ -14,412 +14,64 @@
 <div id="stage"><canvas id="c" width="1920" height="1080"></canvas></div>
 
 <script type="module">
-import { createSegment, loadFonts, clamp, ease, TAU, drawCapsuleLabel, drawStamp } from '../common.js';
-import { themeFromURL, chrome, drawGrain, drawVignette } from '../themes.js';
-import { drawParticleField, drawLightSweep, drawEdgeSweep, withParallax } from '../motion.js';
+import { createSegment, loadFonts, clamp } from '../common.js';
+import { TC, termWindow, termScript, termHUD, termProgress } from '../terminal.js';
 
 const W = 1920, H = 1080;
 const canvas = document.getElementById('c');
 const ctx = canvas.getContext('2d');
-const theme = themeFromURL(location.search);
-const HUD = chrome(theme);
-const seg = createSegment({ duration: 16 });
+const seg = createSegment();
 
 window.DURATION = seg.duration;
 window.__ready = false;
 window.__bootError = null;
 
-// ---------- 调色板（coral-noir，与讲解页同一套） ----------
-const C = {
-  bg: '#0e0e0d', surface: '#1a1917', ink: '#f5f0e8', muted: '#8f8981',
-  accent: '#d97757', accentSoft: '#f0b49c', line: 'rgba(245,240,232,0.10)',
-  cool: '#58c4dd',   // 冰蓝：只在本机/局域网这一档出现
-};
+const MONO = '"JetBrains Mono", "Noto Sans SC", monospace';
 
-// 暴露面三档：仅局域网 = 冷色安全，可映射公网 = 珊瑚告警，本机专属 = 暗色
-const TIER = {
-  lan:   { c: C.cool,   bg: 'rgba(88,196,221,0.14)',  bd: 'rgba(88,196,221,0.55)' },
-  pub:   { c: C.accent, bg: 'rgba(217,119,87,0.16)',  bd: 'rgba(217,119,87,0.60)' },
-  local: { c: C.muted,  bg: 'rgba(143,137,129,0.12)', bd: 'rgba(143,137,129,0.45)' },
-};
+const WIN = { x: 140, y: 200, w: 1640, h: 572, headH: 54 };
+const X0 = WIN.x + 56;
+const Y0 = WIN.y + WIN.headH + 56;
+const LH = 40;
 
-// ---------- 文案（timeline.json 的 copy 字段，唯一真相源） ----------
-const KICKER = 'Ghost Firewall';
-const TITLE = '三个入口，三种暴露面';
-const ENTRIES = [
-  { name: '管理面板', addr: 'https://<路由器IP>:5443', reach: '仅局域网', tier: 'lan',
-    use: 'nftables 规则、反代、DDNS、日志' },
-  { name: '认证网关', addr: 'https://<域名或公网IP>:<自定义端口>/', reach: '可映射公网', tier: 'pub',
-    use: '单端口汇聚全部内网服务' },
-  { name: '认证服务', addr: '127.0.0.1:8444', reach: '本机专属', tier: 'local',
-    use: '网关的认证后端，公网不可达' },
+// 三个监听口：面板只在内网、认证只听本机，只有网关能映射公网
+const SCRIPT = [
+  { at: 0.4, k: '$', t: '' },
+  { at: 0.8, k: '$', t: "ss -tlnp | grep -E '5443|8443|8444'" },
+  { at: 3.4, k: 'o', t: 'LISTEN 0 511 127.0.0.1:8444  0.0.0.0:*  users:(("python3",pid=1330))' },
+  { at: 3.7, k: 'o', t: 'LISTEN 0 511 0.0.0.0:5443    0.0.0.0:*  users:(("python3",pid=1201))' },
+  { at: 4.0, k: 'o', t: 'LISTEN 0 511 *:8443            0.0.0.0:*  users:(("nginx",pid=980))' },
+  { at: 4.8, k: 'c', t: '5443 面板只在内网 · 8444 认证服务只听本机 · 只有 8443 能映射公网' },
+  { at: 7.0, k: '$', t: 'curl -sk --max-time 3 https://198.51.100.24:5443/' },
+  { at: 10.0, k: 'o', t: 'curl: (28) Operation timed out after 3001 milliseconds', accent: true },
+  { at: 10.4, k: '$', t: 'curl -sk --max-time 3 https://198.51.100.24:8443/' },
+  { at: 13.0, k: 'o', t: 'HTTP/2 200' },
+  { at: 13.4, k: 'c', t: '公网上暴露的入口，从一堆变成了一个' },
 ];
-const PUNCH_HEAD = '公网上只有一个入口 —— ';
-const PUNCH_TAIL = '而且它必须先过认证';
-const PUNCH = PUNCH_HEAD + PUNCH_TAIL;
 
-// ---------- 版面常量 ----------
-const CARD = { x: 150, y: 357, w: 980, h: 170, gap: 22 };   // 左侧三张入口卡
-const RULE_X = 1180;                                        // 左右分隔线
-const TREE = {
-  box: { x: 1230, y: 460, w: 220, h: 80 },                  // 右上「公网」框
-  spineX: 1340,                                             // 主干 x
-  rowX: 1400, rowW: 430, rowH: 64, rowY: [560, 660, 760],  // 三行入口名
-};
-const LIVE = 1;                                             // 认证网关 = 公网上唯一可达的那个
-
-// ============================================================
-// 节拍表（120 BPM，每拍 0.5s）
-//   0.0-0.9  分隔线拉开；「公网」框淡入
-//   0.8-1.4  kicker 淡入 + 短横线
-//   1.2-2.0  标题落下（outBack）
-//   2.4-3.0  入口卡 1 滑入（管理面板）
-//   3.2-3.8  入口卡 2 滑入（认证网关）
-//   4.0-4.6  入口卡 3 滑入（认证服务）
-//   4.8-5.3  三行入口名淡入
-//   5.0-5.6  树的主干画出
-//   5.6-6.0  珊瑚实线连到认证网关（公网可达）
-//   6.0-6.4  虚线连到管理面板
-//   6.4-6.8  虚线连到认证服务
-//   7.0-7.6  两个阻断标记 × 弹出
-//   7.8-8.4  认证网关卡片转珊瑚高亮
-//   9.6-10.4 punchline 浮现
-//  13.0-13.9 punchline 转折半句划出珊瑚下划线
-//  13.8-14.6 两条死路压暗，只留那条活路
-// ============================================================
-
-// 左侧：三个入口卡（名称 / 地址 / 暴露面 / 用途）
-function drawCards(u) {
-  for (let i = 0; i < ENTRIES.length; i++) {
-    const p = clamp((u - (2.4 + i * 0.8)) / 0.6, 0, 1);
-    if (p <= 0) continue;
-    const e = ease.outCubic(p);
-    const ent = ENTRIES[i];
-    const tier = TIER[ent.tier];
-    const y = CARD.y + i * (CARD.h + CARD.gap);
-    const hot = i === LIVE;
-    // 认证网关那张卡 7.8s 起转珊瑚并开始呼吸
-    const hotP = hot ? clamp((u - 7.8) / 0.6, 0, 1) : 0;
-    const breath = 0.55 + 0.45 * Math.sin((u - 7.8) * 2.1);
-
-    ctx.save();
-    ctx.globalAlpha = e;
-    ctx.translate((1 - e) * -56, 0);
-
-    // 卡底
-    ctx.fillStyle = hot ? `rgba(217,119,87,${0.05 + 0.07 * hotP})` : 'rgba(245,240,232,0.045)';
-    ctx.beginPath();
-    ctx.roundRect(CARD.x, y, CARD.w, CARD.h, 16);
-    ctx.fill();
-    ctx.strokeStyle = hot ? `rgba(217,119,87,${0.30 + 0.35 * hotP * breath})` : C.line;
-    ctx.lineWidth = hot ? 1.6 + 0.8 * hotP * breath : 1.4;
-    ctx.stroke();
-
-    // 左端暴露面色条：这一条就是「危险度」的图例
-    ctx.fillStyle = tier.c;
-    ctx.beginPath();
-    ctx.roundRect(CARD.x + 24, y + 26, 6, CARD.h - 52, 3);
-    ctx.fill();
-
-    // 名称
-    ctx.font = '700 34px "Noto Sans SC", sans-serif';
-    ctx.textBaseline = 'alphabetic';
-    ctx.textAlign = 'left';
-    ctx.fillStyle = C.ink;
-    ctx.fillText(ent.name, CARD.x + 56, y + 54);
-
-    // 暴露面徽标（右上角）
-    ctx.font = '500 22px "Noto Sans SC", sans-serif';
-    const bw = ctx.measureText(ent.reach).width + 36;
-    const bx = CARD.x + CARD.w - 32 - bw;
-    ctx.fillStyle = tier.bg;
-    ctx.beginPath();
-    ctx.roundRect(bx, y + 26, bw, 40, 20);
-    ctx.fill();
-    ctx.strokeStyle = tier.bd;
-    ctx.lineWidth = 1.3;
-    ctx.stroke();
-    ctx.fillStyle = tier.c;
-    ctx.textBaseline = 'middle';
-    ctx.fillText(ent.reach, bx + 18, y + 47);
-
-    // 地址（等宽；公网那个用珊瑚软色点一下）
-    ctx.font = '400 23px "JetBrains Mono", "Noto Sans SC", monospace';
-    ctx.textBaseline = 'alphabetic';
-    ctx.fillStyle = ent.tier === 'pub' ? C.accentSoft : 'rgba(245,240,232,0.50)';
-    ctx.fillText(ent.addr, CARD.x + 56, y + 100);
-
-    // 用途
-    ctx.font = '400 25px "Noto Sans SC", sans-serif';
-    ctx.fillStyle = 'rgba(245,240,232,0.60)';
-    ctx.fillText(ent.use, CARD.x + 56, y + 142);
-
-    // 边缘流光：一道亮线沿卡片上沿走
-    drawEdgeSweep(ctx, {
-      x: CARD.x + 16, y, w: CARD.w - 32, u,
-      period: 4.6 + i * 0.9,
-      color: hot ? '240,180,156' : '245,240,232',
-      strength: hot ? 0.75 : 0.32,
-    });
-
-    ctx.restore();
-  }
-}
-
-// 右上：公网视角的示意图 —— 公网只有一条实线通向认证网关，另外两条是死路
-function drawTree(u) {
-  const box = TREE.box;
-  const cx = TREE.spineX;
-
-  // 「公网」框：虚线轮廓 = 雾里的一侧
-  const bp = clamp((u - 0.8) / 0.6, 0, 1);
-  if (bp > 0) {
-    ctx.save();
-    ctx.globalAlpha = ease.outCubic(bp);
-    ctx.fillStyle = 'rgba(245,240,232,0.04)';
-    ctx.beginPath();
-    ctx.roundRect(box.x, box.y, box.w, box.h, 18);
-    ctx.fill();
-    ctx.setLineDash([10, 8]);
-    ctx.strokeStyle = 'rgba(245,240,232,0.30)';
-    ctx.lineWidth = 1.6;
-    ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.font = '500 30px "Noto Sans SC", sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'alphabetic';
-    ctx.fillStyle = C.ink;
-    ctx.fillText('公网', box.x + box.w / 2, box.y + 50);
-    ctx.restore();
-  }
-
-  // 三行入口名：先列出来，再连怎么连
-  for (let i = 0; i < ENTRIES.length; i++) {
-    const p = clamp((u - (4.8 + i * 0.15)) / 0.5, 0, 1);
-    if (p <= 0) continue;
-    const e = ease.outCubic(p);
-    const y = TREE.rowY[i];
-    const tier = TIER[ENTRIES[i].tier];
-    ctx.save();
-    ctx.globalAlpha = e;
-    ctx.translate((1 - e) * 24, 0);
-    ctx.fillStyle = i === LIVE ? 'rgba(217,119,87,0.10)' : 'rgba(245,240,232,0.035)';
-    ctx.beginPath();
-    ctx.roundRect(TREE.rowX, y, TREE.rowW, TREE.rowH, 14);
-    ctx.fill();
-    ctx.strokeStyle = i === LIVE ? 'rgba(217,119,87,0.45)' : C.line;
-    ctx.lineWidth = 1.3;
-    ctx.stroke();
-    // 暴露面色点
-    ctx.fillStyle = tier.c;
-    ctx.beginPath();
-    ctx.arc(TREE.rowX + 18, y + TREE.rowH / 2, 6, 0, TAU);
-    ctx.fill();
-    ctx.font = '500 27px "Noto Sans SC", sans-serif';
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'middle';
-    ctx.fillStyle = i === LIVE ? C.accentSoft : 'rgba(245,240,232,0.72)';
-    ctx.fillText(ENTRIES[i].name, TREE.rowX + 36, y + TREE.rowH / 2 + 1);
-    ctx.restore();
-  }
-
-  // 主干：从公网框往下
-  const tp = clamp((u - 5.0) / 0.6, 0, 1);
-  if (tp > 0) {
-    const yEnd = TREE.rowY[2] + TREE.rowH / 2;
-    const y = box.y + box.h + (yEnd - box.y - box.h) * ease.outCubic(tp);
-    ctx.save();
-    ctx.strokeStyle = 'rgba(245,240,232,0.26)';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(cx, box.y + box.h);
-    ctx.lineTo(cx, y);
-    ctx.stroke();
-    ctx.restore();
-  }
-
-  // 三条支线：先画活的那条（珊瑚实线），再画两条死路
-  const order = [LIVE, 0, 2];
-  for (let k = 0; k < order.length; k++) {
-    const idx = order[k];
-    const p = clamp((u - (5.6 + k * 0.4)) / 0.4, 0, 1);
-    if (p <= 0) continue;
-    const y = TREE.rowY[idx] + TREE.rowH / 2;
-    const x = cx + (TREE.rowX - cx) * ease.outCubic(p);
-    const live = idx === LIVE;
-    // 13.8s 起把两条死路压暗，画面只剩一条活路
-    const dead = live ? 1 : 1 - 0.72 * clamp((u - 13.8) / 0.8, 0, 1);
-    ctx.save();
-    ctx.globalAlpha = dead * (live ? 0.72 + 0.28 * (0.5 + 0.5 * Math.sin(u * 2.1)) : 1);
-    ctx.strokeStyle = live ? C.accent : 'rgba(245,240,232,0.22)';
-    ctx.lineWidth = live ? 3 : 2;
-    if (!live) ctx.setLineDash([7, 7]);
-    ctx.beginPath();
-    ctx.moveTo(cx, y);
-    ctx.lineTo(x, y);
-    ctx.stroke();
-    ctx.restore();
-  }
-
-  // 活路上的流动数据包：一条路真的在跑流量
-  if (u > 6.2) {
-    const liveY = TREE.rowY[LIVE] + TREE.rowH / 2;
-    const spanY = liveY - (box.y + box.h);
-    for (let k = 0; k < 3; k++) {
-      const q = ((u - 6.2) / 2.4 + k / 3) % 1;
-      const py = box.y + box.h + spanY * q;
-      const px = cx + (TREE.rowX - cx) * clamp((q - 0.72) / 0.28, 0, 1);
-      const a = Math.sin(Math.PI * clamp(q / 0.96, 0, 1));
-      ctx.save();
-      ctx.fillStyle = `rgba(240,180,156,${(0.85 * a).toFixed(3)})`;
-      ctx.beginPath();
-      ctx.arc(px, py, 3.4, 0, TAU);
-      ctx.fill();
-      ctx.fillStyle = `rgba(217,119,87,${(0.16 * a).toFixed(3)})`;
-      ctx.beginPath();
-      ctx.arc(px, py, 11, 0, TAU);
-      ctx.fill();
-      ctx.restore();
-    }
-  }
-
-  // 死路上的阻断标记 ×
-  const deadRows = [0, 2];
-  for (let k = 0; k < deadRows.length; k++) {
-    const p = clamp((u - (7.0 + k * 0.2)) / 0.4, 0, 1);
-    if (p <= 0) continue;
-    const e = ease.outBack(p);
-    const idx = deadRows[k];
-    const y = TREE.rowY[idx] + TREE.rowH / 2;
-    const x = (cx + TREE.rowX) / 2;
-    const r = 9 * e;
-    ctx.save();
-    ctx.globalAlpha = 1 - 0.72 * clamp((u - 13.8) / 0.8, 0, 1);
-    ctx.strokeStyle = 'rgba(245,240,232,0.55)';
-    ctx.lineWidth = 2.4;
-    ctx.beginPath();
-    ctx.moveTo(x - r, y - r);
-    ctx.lineTo(x + r, y + r);
-    ctx.moveTo(x + r, y - r);
-    ctx.lineTo(x - r, y + r);
-    ctx.stroke();
-    ctx.restore();
-  }
-}
-
-// 标题区：kicker + 主标题（压在章节胶囊下方，互不重叠）
-function drawHead(u) {
-  const kp = clamp((u - 0.8) / 0.6, 0, 1);
-  if (kp > 0) {
-    ctx.save();
-    ctx.globalAlpha = ease.outCubic(kp);
-    ctx.font = '500 34px "JetBrains Mono", "Noto Sans SC", monospace';
-    ctx.textBaseline = 'alphabetic';
-    ctx.textAlign = 'left';
-    ctx.fillStyle = C.accent;
-    ctx.fillText(KICKER, 150, 212);
-    ctx.fillStyle = 'rgba(217,119,87,0.55)';
-    ctx.fillRect(150, 230, 260 * ease.outCubic(kp), 2);
-    ctx.restore();
-  }
-
-  const tp = clamp((u - 1.2) / 0.8, 0, 1);
-  if (tp > 0) {
-    ctx.save();
-    ctx.globalAlpha = clamp(tp * 2, 0, 1);
-    ctx.translate(0, (1 - ease.outBack(tp)) * -24);
-    ctx.font = '700 76px "Noto Sans SC", sans-serif';
-    ctx.textBaseline = 'alphabetic';
-    ctx.textAlign = 'left';
-    ctx.fillStyle = C.ink;
-    ctx.fillText(TITLE, 150, 310);
-    ctx.restore();
-  }
-}
-
-// 收束：punchline 浮现，转折半句用珊瑚色并划重点
-function drawPunch(u) {
-  const p = clamp((u - 9.6) / 0.8, 0, 1);
-  if (p <= 0) return;
-  const e = ease.outCubic(p);
-  ctx.save();
-  ctx.globalAlpha = e;
-  ctx.font = '600 44px "Noto Sans SC", sans-serif';
-  ctx.textBaseline = 'alphabetic';
-  ctx.textAlign = 'left';
-  const x = 150;
-  const wHead = ctx.measureText(PUNCH_HEAD).width;
-  const wTail = ctx.measureText(PUNCH_TAIL).width;
-  ctx.fillStyle = C.ink;
-  ctx.fillText(PUNCH_HEAD, x, 990);
-  ctx.fillStyle = C.accent;
-  ctx.fillText(PUNCH_TAIL, x + wHead, 990);
-  // 左侧竖线做视觉锚
-  ctx.fillStyle = 'rgba(217,119,87,0.55)';
-  ctx.fillRect(x - 34, 962, 3, 46);
-  // 13.0s 起把转折半句划出来
-  const up = clamp((u - 13.0) / 0.9, 0, 1);
-  if (up > 0) {
-    ctx.fillStyle = C.accent;
-    ctx.fillRect(x + wHead, 1004, wTail * ease.outCubic(up), 3);
-  }
-  ctx.restore();
-}
-
-// ============================================================
 window.renderFrame = (u) => {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.globalAlpha = 1;
   ctx.globalCompositeOperation = 'source-over';
   ctx.textBaseline = 'alphabetic';
   ctx.textAlign = 'left';
-  ctx.fillStyle = C.bg;
+  ctx.fillStyle = TC.bg;
   ctx.fillRect(0, 0, W, H);
 
-  drawGrain(ctx, theme, W, H, u);
-
-  // 背景粒子：三层速度不同，天然带视差
-  drawParticleField(ctx, { u, count: 120, seed: 21, color: '217,119,87', baseAlpha: 0.40, drift: 30 });
-
-  // 左栏（文字）与右栏（示意图）之间的分隔线
-  const ruleP = clamp(u / 0.9, 0, 1);
-  if (ruleP > 0) {
-    ctx.save();
-    ctx.globalAlpha = ease.outCubic(ruleP) * 0.9;
-    ctx.strokeStyle = C.line;
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.moveTo(RULE_X, CARD.y);
-    ctx.lineTo(RULE_X, CARD.y + 3 * (CARD.h + CARD.gap) * ease.outCubic(ruleP));
-    ctx.stroke();
-    ctx.restore();
-  }
-
-  drawHead(u);
-
-  // 主体内容挂在视差层上：随镜头推进轻微漂移
-  withParallax(ctx, u, 0.7, 960, 540, () => {
-    drawCards(u);
-    drawTree(u);
-  }, { amp: 16, drift: 7 });
-
-  drawPunch(u);
-
-  // 全局流光：极淡的一层，让画面一直有东西在动
-  drawLightSweep(ctx, { x: 0, y: 0, w: W, h: H, u, period: 7.5, strength: 0.045, band: 0.42 });
-  drawVignette(ctx, W, H, 0.42);
-
-  // HUD
-  drawCapsuleLabel(ctx, 2, '三个入口', '架构', {
-    numberColor: HUD.capsule.numberColor, textColor: HUD.capsule.textColor,
-    bg: HUD.capsule.bg, border: HUD.capsule.border,
+  termWindow(ctx, {
+    x: WIN.x, y: WIN.y, w: WIN.w, h: WIN.h, headH: WIN.headH,
+    title: '~/ghost-firewall', right: 'zsh', font: MONO,
+    alpha: clamp(u / 0.45),
   });
-  drawStamp(ctx, 'GHOST FIREWALL', { color: HUD.stamp.color });
+
+  termScript(ctx, SCRIPT, { u, x: X0, y: Y0, lineH: LH, font: MONO });
+
+  termHUD(ctx, { index: 2, chapter: '架构', font: MONO });
+  termProgress(ctx, { u, duration: seg.duration, font: MONO, x: WIN.x, y: 996, w: WIN.w });
 };
 
 (async () => {
   try {
-    await loadFonts(['Noto Sans SC', 'JetBrains Mono', 'Inter']);
+    await loadFonts(['Noto Sans SC', 'JetBrains Mono']);
     window.__ready = true;
   } catch (e) {
     window.__bootError = String(e);

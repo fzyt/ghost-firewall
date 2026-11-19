@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <link rel="stylesheet" href="/shared/fonts.css">
-<title>04 三级惩罚</title>
+<title>04 安全性</title>
 <style>
   html, body { margin: 0; padding: 0; background: #0e0e0d; overflow: hidden; }
   #stage { position: relative; width: 1920px; height: 1080px; overflow: hidden; }
@@ -14,491 +14,69 @@
 <div id="stage"><canvas id="c" width="1920" height="1080"></canvas></div>
 
 <script type="module">
-import { clamp, ease, TAU, loadFonts, drawCapsuleLabel, drawStamp } from '../common.js';
-import { themeFromURL, chrome, drawGrain, drawVignette } from '../themes.js';
-import { drawParticleField, drawLightSweep, drawEdgeSweep, withParallax } from '../motion.js';
+import { createSegment, loadFonts, clamp } from '../common.js';
+import { TC, termWindow, termScript, termHUD, termProgress } from '../terminal.js';
 
 const W = 1920, H = 1080;
 const canvas = document.getElementById('c');
 const ctx = canvas.getContext('2d');
-const theme = themeFromURL(location.search);
-const HUD = chrome(theme);
+const seg = createSegment();
 
-// 段长写死：与 timeline.json 一致，且不被 URL 的 dur 参数改写
-const DURATION = 24;
-window.DURATION = DURATION;
+window.DURATION = seg.duration;
 window.__ready = false;
 window.__bootError = null;
 
-// ---------- 调色板（coral-noir + 主题 accents） ----------
-const C = {
-  bg: '#0e0e0d', ink: '#f5f0e8', muted: '#8f8981',
-  accent: '#d97757', accentSoft: '#f0b49c',
-  gold: '#ffcf5c', ice: '#58c4dd',
-  line: 'rgba(245,240,232,0.10)',
-};
+const MONO = '"JetBrains Mono", "Noto Sans SC", monospace';
 
-// ---------- 文案（timeline.json 的 copy 字段，唯一真相源，逐字照抄） ----------
-const KICKER = '敲错了会怎样';
-const TITLE = '三级惩罚，逐级加重';
-// name / detail 来自 copy.ladder；tag 是这一级对应的 nftables 机制
-const LADDER = [
-  { level: 1, name: '记入惩罚窗口', detail: '顺序敲错 → 进 error_ips，30 秒内敲任何门都不算', tag: '@error_ips · 30 秒' },
-  { level: 2, name: '直接拉黑', detail: '惩罚窗口内再敲 → 立刻进 blacklist', tag: '@blacklist' },
-  { level: 3, name: '永久封禁', detail: '黑名单里的 IP 要管理员手工解封', tag: '@blacklist · 永久' },
+const WIN = { x: 140, y: 140, w: 1640, h: 812, headH: 54 };
+const X0 = WIN.x + 56;
+const Y0 = WIN.y + WIN.headH + 56;
+const LH = 40;
+
+// 三级惩罚：错误集 → 黑名单 → 手工解封；限流按来源地址分桶
+const SCRIPT = [
+  { at: 0.4, k: '$', t: '' },
+  { at: 0.9, k: 'c', t: '敲错了要付代价' },
+  { at: 2.7, k: '$', t: 'knock 198.51.100.24 9 9 9 9' },
+  { at: 4.4, k: 'o', t: 'knock 1 -> wrong order   [warn] 进入惩罚窗口（30 秒）', accent: true },
+  { at: 5.2, k: '$', t: 'ipset list error_ips' },
+  { at: 6.4, k: 'o', t: 'Name: error_ips    Members: 198.51.100.99' },
+  { at: 6.8, k: 'c', t: '惩罚窗口里再敲，直接进黑名单' },
+  { at: 9.6, k: '$', t: 'knock 198.51.100.24 9 9 9 9' },
+  { at: 11.3, k: 'o', t: '[block] 进入黑名单，只能管理员手工解封', accent: true },
+  { at: 11.9, k: '$', t: 'ipset list blacklist' },
+  { at: 13.1, k: 'o', t: 'Name: blacklist    Members: 198.51.100.99' },
+  { at: 13.5, k: 'c', t: '限流按来源地址分桶 —— 攻击者只能限流自己' },
+  { at: 16.4, k: '$', t: 'ghost-firewall ratelimit status' },
+  { at: 17.6, k: 'o', t: 'bucket 203.0.113.7  12/20  drop   |  203.0.113.8  0/20  pass' },
+  { at: 17.9, k: 'c', t: '拖不垮别人的敲门' },
+  { at: 20.0, k: 'c', t: '能被打瘫的功能，不叫能用' },
 ];
-const RL = {
-  title: '限流按源地址分桶',
-  good: '桶跟着来源 IP 走 —— 攻击者只能限流自己',
-  bad: '曾经用规则级限流：任何人 2 包/分钟就能让全世界的合法敲门静默失效',
-};
-const PUNCH = '能被打瘫的功能，不叫能用';
 
-// ---------- 版面常量 ----------
-const LAD = { x: 96, w: 330, gap: 44, bottom: 880, heights: [250, 320, 400] };
-const CARD = { x: 1220, y: 480, w: 604, h: 400 };
-const LEVEL_COLORS = [C.muted, C.gold, C.accent];
-const T_RISE = [2.6, 5.0, 7.4];     // 台阶升起的时刻
-const T_DETAIL = [3.4, 5.8, 8.2];   // 机制说明出现
-const T_TAG = [4.0, 6.4, 8.8];      // 机制条出现
-const T_CHIP = [4.4, 6.8, 9.2];     // 同一个源地址升到这一级
-const T_CARD = 9.8;                 // 限流卡出现
-const T_GOOD = 11.4;                // 分桶图出现
-const T_BAD = 13.0;                 // 共享桶图出现
-const BUCKETS = [1256, 1363, 1470, 1577, 1684];  // 分桶：第 3 个是攻击者
-const BUCKET_LABEL = ['源 1', '源 2', '攻击者', '源 4', '源 5'];
-
-// ============================================================
-// 节拍表（120 BPM，每拍 0.5s）
-//   0.0-0.9   三级台阶的轮廓淡入
-//   1.0-1.6   kicker 淡入
-//   1.5-2.4   标题落下（outBack）
-//   2.6-3.4   一级升起 + 名称
-//   3.4-4.0   一级机制说明
-//   4.0-4.4   一级机制条 @error_ips · 30 秒
-//   4.4-4.8   源地址落进一级
-//   5.0-5.8   二级升起 + 名称
-//   5.8-6.4   二级机制说明
-//   6.4-6.8   二级机制条 @blacklist
-//   6.8-7.2   源地址升到二级
-//   7.4-8.2   三级升起 + 名称
-//   8.2-8.8   三级机制说明
-//   8.8-9.2   三级机制条 @blacklist · 永久
-//   9.2-9.6   源地址升到三级
-//   9.8-10.6  限流卡淡入 + 标题
-//  10.6-11.4  正面：桶跟着来源 IP 走
-//  11.4-12.2  分桶图（攻击者的桶打满，其它来源照常通过）
-//  12.2-13.0  反面：规则级限流会让合法敲门静默失效
-//  13.0-20.0  共享桶演示循环：桶被打满，合法敲门被静默丢弃
-//  20.0-21.0  punchline 浮现，阶梯与卡片整体退到背景
-//  21.0-26.0  保持
-// ============================================================
-
-// punchline 出现后，上方内容整体让位（globalAlpha 不相乘，所以统一乘一个系数）
-let focus = 1;
-const fa = (a) => a * focus;
-
-function hexA(hex, a) {
-  const n = parseInt(hex.slice(1), 16);
-  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
-}
-
-// 按宽度折行：ASCII 单词不拆开，中文逐字断。调用前要先设好 ctx.font
-function wrapText(text, maxW) {
-  const tokens = [];
-  let buf = '';
-  for (const ch of text) {
-    if (/[A-Za-z0-9_@.\-/]/.test(ch)) { buf += ch; continue; }
-    if (buf) { tokens.push(buf); buf = ''; }
-    tokens.push(ch);
-  }
-  if (buf) tokens.push(buf);
-
-  const lines = [];
-  let cur = '';
-  for (const tk of tokens) {
-    const t = cur + tk;
-    if (cur && ctx.measureText(t).width > maxW) { lines.push(cur); cur = tk; }
-    else cur = t;
-  }
-  if (cur) lines.push(cur);
-  return lines;
-}
-
-function drawHead(u) {
-  const kp = clamp((u - 1.0) / 0.6, 0, 1);
-  if (kp > 0) {
-    ctx.save();
-    ctx.globalAlpha = fa(ease.outCubic(kp));
-    ctx.font = '500 34px "JetBrains Mono", "Noto Sans SC", monospace';
-    ctx.textBaseline = 'alphabetic';
-    ctx.textAlign = 'left';
-    ctx.fillStyle = C.accent;
-    ctx.fillText(KICKER, 96, 200);
-    ctx.fillStyle = 'rgba(217,119,87,0.55)';
-    ctx.fillRect(96, 214, 200 * ease.outCubic(kp), 2);
-    ctx.restore();
-  }
-
-  const tp = clamp((u - 1.5) / 0.9, 0, 1);
-  if (tp > 0) {
-    ctx.save();
-    ctx.globalAlpha = fa(clamp(tp * 2, 0, 1));
-    ctx.translate(0, (1 - ease.outBack(tp)) * -26);
-    ctx.font = '700 68px "Noto Sans SC", sans-serif';
-    ctx.textBaseline = 'alphabetic';
-    ctx.textAlign = 'left';
-    ctx.fillStyle = C.ink;
-    ctx.fillText(TITLE, 96, 292);
-    ctx.restore();
-  }
-}
-
-// 三级阶梯：越往上惩罚越重
-function drawLadder(u) {
-  for (let i = 0; i < 3; i++) {
-    const rise = clamp((u - T_RISE[i]) / 0.8, 0, 1);
-    if (rise <= 0) continue;
-    const e = ease.outBack(rise);
-    const h = LAD.heights[i];
-    const x = LAD.x + i * (LAD.w + LAD.gap);
-    const top = LAD.bottom - h;
-    const col = LEVEL_COLORS[i];
-
-    ctx.save();
-    ctx.globalAlpha = fa(clamp(rise * 1.4, 0, 1));
-    ctx.translate(0, (1 - e) * 70);
-
-    ctx.fillStyle = 'rgba(245,240,232,0.04)';
-    ctx.beginPath();
-    ctx.roundRect(x, top, LAD.w, h, 12);
-    ctx.fill();
-    ctx.strokeStyle = i === 0 ? 'rgba(245,240,232,0.18)' : hexA(col, 0.5);
-    ctx.lineWidth = 1.4;
-    ctx.stroke();
-
-    // 踏面：这一级的颜色
-    ctx.fillStyle = hexA(col, 0.9);
-    ctx.beginPath();
-    ctx.roundRect(x + 2, top + 2, LAD.w - 4, 4, 2);
-    ctx.fill();
-
-    ctx.font = '600 20px "JetBrains Mono", "Noto Sans SC", monospace';
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'alphabetic';
-    ctx.fillStyle = col;
-    ctx.fillText('L' + (i + 1), x + 28, top + 36);
-
-    // 名称与说明在块内按高度分布，块越高留白越多（惩罚越重）
-    ctx.font = '600 30px "Noto Sans SC", sans-serif';
-    ctx.fillStyle = C.ink;
-    ctx.fillText(LADDER[i].name, x + 28, top + Math.max(84, h * 0.28));
-
-    const dp = clamp((u - T_DETAIL[i]) / 0.7, 0, 1);
-    if (dp > 0) {
-      ctx.globalAlpha = fa(ease.outCubic(dp));
-      ctx.font = '400 21px "Noto Sans SC", sans-serif';
-      ctx.fillStyle = 'rgba(245,240,232,0.72)';
-      const lines = wrapText(LADDER[i].detail, LAD.w - 56);
-      const dy = top + Math.max(128, h * 0.52);
-      for (let k = 0; k < lines.length; k++) {
-        ctx.fillText(lines[k], x + 28, dy + k * 28);
-      }
-    }
-
-    // 机制条：这一级落到哪个集合
-    const tp = clamp((u - T_TAG[i]) / 0.7, 0, 1);
-    if (tp > 0) {
-      ctx.globalAlpha = fa(ease.outCubic(tp));
-      ctx.font = '500 17px "JetBrains Mono", "Noto Sans SC", monospace';
-      const tw = ctx.measureText(LADDER[i].tag).width;
-      ctx.fillStyle = hexA(col, 0.14);
-      ctx.beginPath();
-      ctx.roundRect(x + 28, LAD.bottom - 58, tw + 28, 32, 8);
-      ctx.fill();
-      ctx.fillStyle = col;
-      ctx.fillText(LADDER[i].tag, x + 42, LAD.bottom - 36);
-    }
-    ctx.restore();
-  }
-}
-
-// 同一个源地址在三级惩罚里逐级升级
-function chipAnchor(i) {
-  return {
-    x: LAD.x + i * (LAD.w + LAD.gap) + LAD.w - 100,
-    y: LAD.bottom - LAD.heights[i] - 26,
-  };
-}
-
-function drawIpChip(u) {
-  let idx = -1;
-  for (let i = 0; i < 3; i++) if (u >= T_CHIP[i]) idx = i;
-  if (idx < 0) return;
-
-  const to = chipAnchor(idx);
-  let cx = to.x, cy = to.y;
-  if (idx > 0) {
-    const from = chipAnchor(idx - 1);
-    const p = clamp((u - T_CHIP[idx]) / 0.7, 0, 1);
-    const e = ease.outCubic(p);
-    cx = from.x + (to.x - from.x) * e;
-    cy = from.y + (to.y - from.y) * e;
-  }
-
-  const col = LEVEL_COLORS[idx];
-  const w = 152, h = 34;
-  ctx.save();
-  ctx.globalAlpha = fa(1);
-  ctx.fillStyle = 'rgba(14,14,13,0.94)';
-  ctx.beginPath();
-  ctx.roundRect(cx - w / 2, cy - h / 2, w, h, 8);
-  ctx.fill();
-  ctx.strokeStyle = col;
-  ctx.lineWidth = 1.6;
-  ctx.stroke();
-  ctx.font = '500 17px "JetBrains Mono", "Noto Sans SC", monospace';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillStyle = idx === 0 ? C.ink : col;
-  ctx.fillText('198.51.100.24', cx, cy + 1);
-
-  // 升到第三级时闪一下
-  if (idx === 2) {
-    const p = clamp((u - T_CHIP[2]) / 0.7, 0, 1);
-    if (p > 0 && p < 1) {
-      ctx.globalAlpha = fa((1 - p) * 0.9);
-      ctx.strokeStyle = C.accent;
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.roundRect(cx - w / 2 - 6 * (1 - p), cy - h / 2 - 6 * (1 - p), w + 12 * (1 - p), h + 12 * (1 - p), 12);
-      ctx.stroke();
-    }
-  }
-  ctx.restore();
-}
-
-// 限流卡：正面是按源分桶，反面是曾经用过的规则级限流
-function drawRateCard(u) {
-  const p = clamp((u - T_CARD) / 1.0, 0, 1);
-  if (p <= 0) return;
-  const e = ease.outCubic(p);
-
-  ctx.save();
-  ctx.globalAlpha = fa(e);
-  ctx.translate(0, (1 - e) * 30);
-
-  ctx.fillStyle = 'rgba(245,240,232,0.04)';
-  ctx.beginPath();
-  ctx.roundRect(CARD.x, CARD.y, CARD.w, CARD.h, 14);
-  ctx.fill();
-  ctx.strokeStyle = 'rgba(245,240,232,0.16)';
-  ctx.lineWidth = 1.4;
-  ctx.stroke();
-
-  ctx.font = '600 30px "Noto Sans SC", sans-serif';
-  ctx.textAlign = 'left';
-  ctx.textBaseline = 'alphabetic';
-  ctx.fillStyle = C.ink;
-  ctx.fillText(RL.title, CARD.x + 36, CARD.y + 52);
-
-  ctx.strokeStyle = C.line;
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(CARD.x + 36, CARD.y + 72);
-  ctx.lineTo(CARD.x + CARD.w - 36, CARD.y + 72);
-  ctx.stroke();
-
-  // 正面
-  const gp = clamp((u - (T_CARD + 0.8)) / 0.8, 0, 1);
-  if (gp > 0) {
-    ctx.globalAlpha = fa(ease.outCubic(gp));
-    ctx.font = '400 21px "Noto Sans SC", sans-serif';
-    ctx.textAlign = 'left';
-    ctx.fillStyle = C.ice;
-    ctx.fillText(RL.good, CARD.x + 36, CARD.y + 112);
-  }
-
-  // 分桶图：每个来源一个桶
-  const bp = clamp((u - T_GOOD) / 0.8, 0, 1);
-  if (bp > 0) {
-    ctx.globalAlpha = fa(ease.outCubic(bp));
-    const cyc = ((u - T_GOOD) % 2.4 + 2.4) % 2.4;
-    for (let k = 0; k < BUCKETS.length; k++) {
-      const bx = BUCKETS[k];
-      const attacker = k === 2;
-      const st = ((cyc - k * 0.45) % 2.4 + 2.4) % 2.4;
-
-      // 桶里的余量
-      const fillH = attacker ? 48 : (st < 0.6 ? 12 : 12 + 12 * (1 - (st - 0.6) / 1.8));
-      ctx.fillStyle = 'rgba(245,240,232,0.05)';
-      ctx.beginPath();
-      ctx.roundRect(bx, CARD.y + 160, 92, 60, 8);
-      ctx.fill();
-
-      ctx.fillStyle = attacker ? hexA(C.accent, 0.45) : hexA(C.ice, 0.40);
-      ctx.beginPath();
-      ctx.roundRect(bx + 5, CARD.y + 160 + 60 - fillH, 82, fillH, 6);
-      ctx.fill();
-
-      ctx.strokeStyle = attacker ? hexA(C.accent, 0.7) : 'rgba(245,240,232,0.16)';
-      ctx.lineWidth = 1.3;
-      ctx.stroke();
-
-      ctx.font = '400 15px "JetBrains Mono", "Noto Sans SC", monospace';
-      ctx.textAlign = 'center';
-      ctx.fillStyle = attacker ? C.accent : C.muted;
-      ctx.fillText(BUCKET_LABEL[k], bx + 46, CARD.y + 240);
-
-      if (attacker) {
-        // 攻击者把桶打满：包被限流回去
-        const as = ((cyc - 1.1) % 2.4 + 2.4) % 2.4;
-        if (as < 0.9) {
-          const pp = ease.outCubic(as / 0.9);
-          const px = bx - 46 + 32 * pp;
-          ctx.globalAlpha = fa(ease.outCubic(bp) * (1 - clamp((as - 0.5) / 0.4, 0, 1)));
-          ctx.fillStyle = C.accent;
-          ctx.beginPath();
-          ctx.roundRect(px, CARD.y + 137, 14, 14, 4);
-          ctx.fill();
-          if (as > 0.45) {
-            ctx.strokeStyle = C.accent;
-            ctx.lineWidth = 1.6;
-            const mx = px + 7, my = CARD.y + 144;
-            ctx.beginPath();
-            ctx.moveTo(mx - 4, my - 4); ctx.lineTo(mx + 4, my + 4);
-            ctx.moveTo(mx + 4, my - 4); ctx.lineTo(mx - 4, my + 4);
-            ctx.stroke();
-          }
-        }
-      } else if (st < 0.6) {
-        // 其它来源：包照常落进自己的桶
-        const pp = st / 0.6;
-        ctx.globalAlpha = fa(ease.outCubic(bp) * (1 - clamp((pp - 0.6) / 0.4, 0, 1)));
-        ctx.fillStyle = C.ice;
-        ctx.beginPath();
-        ctx.roundRect(bx + 46 - 46 * pp, CARD.y + 137, 14, 14, 4);
-        ctx.fill();
-      }
-    }
-  }
-
-  // 反面
-  const wp = clamp((u - (T_BAD - 0.8)) / 0.8, 0, 1);
-  if (wp > 0) {
-    ctx.globalAlpha = fa(ease.outCubic(wp));
-    ctx.font = '400 21px "Noto Sans SC", sans-serif';
-    ctx.textAlign = 'left';   // 桶标签用的是居中，这里必须切回左对齐
-    ctx.fillStyle = C.gold;
-    const lines = wrapText(RL.bad, CARD.w - 72);
-    for (let k = 0; k < lines.length; k++) {
-      ctx.fillText(lines[k], CARD.x + 36, CARD.y + 278 + k * 26);
-    }
-  }
-
-  // 共享桶：一个人打满，全世界的合法敲门被静默丢弃
-  const dp = clamp((u - T_BAD) / 0.8, 0, 1);
-  if (dp > 0) {
-    ctx.globalAlpha = fa(ease.outCubic(dp));
-    const bx = CARD.x + 36, bw = CARD.w - 72;
-    ctx.fillStyle = hexA(C.gold, 0.16);
-    ctx.beginPath();
-    ctx.roundRect(bx, CARD.y + 348, bw, 44, 10);
-    ctx.fill();
-    ctx.strokeStyle = hexA(C.gold, 0.55);
-    ctx.lineWidth = 1.3;
-    ctx.stroke();
-
-    ctx.font = '500 19px "JetBrains Mono", "Noto Sans SC", monospace';
-    ctx.textAlign = 'center';
-    ctx.fillStyle = C.gold;
-    ctx.fillText('2 包/分钟', bx + bw / 2, CARD.y + 376);
-    // 排队的合法敲门：一个接一个撞上满桶
-    const bcyc = ((u - T_BAD) % 3.6 + 3.6) % 3.6;
-    for (let k = 0; k < 3; k++) {
-      const st = k * 1.2;
-      if (bcyc < st || bcyc > st + 1.1) continue;
-      const pp = clamp((bcyc - st) / 0.5, 0, 1);
-      const fade = 1 - clamp((bcyc - st - 0.55) / 0.55, 0, 1);
-      const px = bx + 26 + 118 * ease.outCubic(pp);
-      ctx.globalAlpha = fa(ease.outCubic(dp) * fade);
-      ctx.fillStyle = 'rgba(245,240,232,0.32)';
-      ctx.beginPath();
-      ctx.roundRect(px, CARD.y + 324, 16, 16, 4);
-      ctx.fill();
-      if (pp > 0.55) {
-        ctx.strokeStyle = 'rgba(245,240,232,0.55)';
-        ctx.lineWidth = 1.6;
-        const mx = px + 8, my = CARD.y + 332;
-        ctx.beginPath();
-        ctx.moveTo(mx - 4, my - 4); ctx.lineTo(mx + 4, my + 4);
-        ctx.moveTo(mx + 4, my - 4); ctx.lineTo(mx - 4, my + 4);
-        ctx.stroke();
-      }
-    }
-  }
-
-  ctx.restore();
-}
-
-function drawPunch(u) {
-  const p = clamp((u - 20.0) / 1.0, 0, 1);
-  if (p <= 0) return;
-  ctx.save();
-  ctx.globalAlpha = ease.outCubic(p);
-  ctx.fillStyle = 'rgba(217,119,87,0.55)';
-  ctx.fillRect(62, 936, 3, 50);
-  ctx.font = '600 46px "Noto Sans SC", sans-serif';
-  ctx.textAlign = 'left';
-  ctx.textBaseline = 'alphabetic';
-  ctx.fillStyle = C.accent;
-  ctx.fillText(PUNCH, 96, 978);
-  ctx.restore();
-}
-
-// ============================================================
 window.renderFrame = (u) => {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.globalAlpha = 1;
   ctx.globalCompositeOperation = 'source-over';
   ctx.textBaseline = 'alphabetic';
   ctx.textAlign = 'left';
-  ctx.fillStyle = C.bg;
+  ctx.fillStyle = TC.bg;
   ctx.fillRect(0, 0, W, H);
 
-  drawGrain(ctx, theme, W, H, u);
-
-  // 背景浮尘
-  drawParticleField(ctx, { u, count: 120, seed: 57, color: '221,164,76', baseAlpha: 0.32, drift: 28 });
-
-  // punchline 出现后，阶梯与卡片整体退到背景
-  focus = 1 - clamp((u - 20.0) / 1.0, 0, 1) * 0.8;
-  drawHead(u);
-
-  // 阶梯 + 限流卡挂在视差层
-  withParallax(ctx, u, 0.65, 960, 540, () => {
-    drawLadder(u);
-    drawIpChip(u);
-    drawRateCard(u);
-  }, { amp: 15, drift: 7 });
-
-  // 限流卡上沿的流光
-  drawEdgeSweep(ctx, { x: CARD.x, y: CARD.y, w: CARD.w, u, period: 4.8, color: '240,180,156', strength: 0.6 });
-  drawLightSweep(ctx, { x: 0, y: 0, w: W, h: H, u, period: 8, strength: 0.04, band: 0.45 });
-
-  drawPunch(u);
-  drawVignette(ctx, W, H, 0.42);
-
-  drawCapsuleLabel(ctx, 4, '三级惩罚', '安全', {
-    numberColor: HUD.capsule.numberColor, textColor: HUD.capsule.textColor,
-    bg: HUD.capsule.bg, border: HUD.capsule.border,
+  termWindow(ctx, {
+    x: WIN.x, y: WIN.y, w: WIN.w, h: WIN.h, headH: WIN.headH,
+    title: '~/ghost-firewall', right: 'zsh', font: MONO,
+    alpha: clamp(u / 0.45),
   });
-  drawStamp(ctx, 'GHOST FIREWALL', { color: HUD.stamp.color });
+
+  termScript(ctx, SCRIPT, { u, x: X0, y: Y0, lineH: LH, font: MONO });
+
+  termHUD(ctx, { index: 4, chapter: '惩罚', font: MONO });
+  termProgress(ctx, { u, duration: seg.duration, font: MONO, x: WIN.x, y: 996, w: WIN.w });
 };
 
 (async () => {
   try {
-    await loadFonts(['Noto Sans SC', 'JetBrains Mono', 'Inter']);
+    await loadFonts(['Noto Sans SC', 'JetBrains Mono']);
     window.__ready = true;
   } catch (e) {
     window.__bootError = String(e);

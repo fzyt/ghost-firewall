@@ -22,6 +22,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 # 段内留白：旁白必须在段末之前收住，别压到下一段画面
 TAIL_MARGIN = 0.8
@@ -62,9 +63,15 @@ def synth(edge, voice, text, out_mp3, out_vtt, rate):
     # 用 --rate=... 等号形式：负值（如 -20%）才不会被 argparse 当成选项
     cmd = [edge, '--voice', voice, '--text', text, f'--rate={rate:+d}%',
            '--write-media', out_mp3, '--write-subtitles', out_vtt, '--no-progress']
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        raise RuntimeError(f'edge-tts 失败：{r.stderr.strip()[-300:]}')
+    # edge-tts 走微软公网，偶尔会吐 NoAudioReceived；重试三次，别让整条流水线断在抖动上
+    err = ''
+    for attempt in range(3):
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode == 0:
+            return
+        err = r.stderr.strip()[-300:]
+        time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f'edge-tts 失败（重试 3 次）：{err}')
 
 
 def main():

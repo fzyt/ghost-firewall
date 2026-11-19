@@ -2,17 +2,17 @@
 """180 秒产品讲解片配乐 —— 按 timeline.json 的分段编排，复用 synth_audio.py 音色库。
 
 结构（120 BPM，1 拍 0.5s，1 小节 2s，90 小节）：
-  0-14    问题    暗：低 pad + 稀疏 sub boom + 打字 tick
-  14-30   架构    稳：军鼓 4 分 + 轻 hat + pad
-  30-52   敲门    核心：4 音动机（对应真实的 4 步 UDP 敲门协议），每小节一组
-  52-78   安全    重：完整鼓组 + 逐级升高的低频脉冲（三级惩罚）
-  78-98   网关    流动：八分琶音 + bell
-  98-120  认证    心跳：强弱 kick + 稀疏 bell
-  120-148 功能    密：快速琶音 + 稳定 4/4
-  148-162 安装    简洁：干净 2 拍 + 上行 riser
-  162-180 收尾    宏大：全奏 + 176s impact + 淡出
+  0-21    问题    暗：低 pad + 稀疏 sub boom + 打字 tick
+  21-36   架构    稳：军鼓 4 分 + 轻 hat + pad
+  36-61   敲门    核心：4 音动机（对应真实的 4 步 UDP 敲门协议），每小节一组
+  61-87   安全    重：完整鼓组 + 逐级升高的低频脉冲（三级惩罚）
+  87-105  网关    流动：八分琶音 + bell
+  105-121 认证    心跳：强弱 kick + 稀疏 bell
+  121-142 功能    密：快速琶音 + 稳定 4/4
+  142-160 安装    简洁：干净 2 拍 + 上行 riser
+  160-180 收尾    宏大：全奏 + 176s impact + 淡出
 
-高频克制：金属铃音只在 78s（网关揭示）、120s（功能揭示）、176s（结尾 impact）三处。
+高频克制：金属铃音只在 87s（网关揭示）、121s（功能揭示）、176s（结尾 impact）三处。
 """
 import argparse
 import os
@@ -37,15 +37,15 @@ DUR = 180.0
 
 # 与 timeline.json 的 segments 对齐（start, end, 音量权重）
 SECTIONS = [
-    (0.0, 14.0, 0.45),      # 问题
-    (14.0, 30.0, 0.72),     # 架构
-    (30.0, 52.0, 0.85),     # 敲门
-    (52.0, 78.0, 1.00),     # 安全
-    (78.0, 98.0, 0.80),     # 网关
-    (98.0, 120.0, 0.82),    # 认证
-    (120.0, 148.0, 0.88),   # 功能
-    (148.0, 162.0, 0.75),   # 安装
-    (162.0, 180.0, 0.95),   # 收尾
+    (0.0, 21.0, 0.45),      # 问题
+    (21.0, 36.0, 0.72),     # 架构
+    (36.0, 61.0, 0.85),     # 敲门
+    (61.0, 87.0, 1.00),     # 安全
+    (87.0, 105.0, 0.80),    # 网关
+    (105.0, 121.0, 0.82),   # 认证
+    (121.0, 142.0, 0.88),   # 功能
+    (142.0, 160.0, 0.75),   # 安装
+    (160.0, 180.0, 0.95),   # 收尾
 ]
 
 # 敲门动机的 4 个音 —— 对应真实的 4 步 UDP 协议，音高逐级上行
@@ -217,7 +217,7 @@ def sec_features(music, drums, fx, t0, chord, roots):
             place(drums, clap(), tb, 0.24)
         place(drums, hat(), tb, 0.11)
         place(drums, hat(open_=True), tb + BEAT / 2, 0.07)
-    if abs(t0 - 120.0) < 0.01:
+    if abs(t0 - 121.0) < 0.01:
         place(fx, bell(note_freq("C6"), 1.4), t0, 0.16)   # 段落揭示点
 
 
@@ -268,28 +268,28 @@ def build() -> np.ndarray:
     for i in range(n_bars):
         t0 = i * BAR
         chord = CHORD_TABLE[i % len(CHORD_TABLE)]
-        if t0 < 14.0:
+        if t0 < 21.0:
             sec_problem(music, drums, fx, t0, chord, None)
-        elif t0 < 30.0:
+        elif t0 < 36.0:
             sec_arch(music, drums, fx, t0, chord, None)
-        elif t0 < 52.0:
+        elif t0 < 61.0:
             sec_knock(music, drums, fx, t0, chord, None)
-        elif t0 < 78.0:
+        elif t0 < 87.0:
             sec_security(music, drums, fx, t0, chord, None)
-        elif t0 < 98.0:
+        elif t0 < 105.0:
             sec_gateway(music, drums, fx, t0, chord, None)
-        elif t0 < 120.0:
+        elif t0 < 121.0:
             sec_auth(music, drums, fx, t0, chord, None)
-        elif t0 < 148.0:
+        elif t0 < 142.0:
             sec_features(music, drums, fx, t0, chord, None)
-        elif t0 < 162.0:
+        elif t0 < 160.0:
             sec_install(music, drums, fx, t0, chord, None)
         else:
             sec_end(music, drums, fx, t0, chord, None)
 
     # 段落的分界处加一个反向镲做「换气」
-    for _, t in [(14.0, 14.0), (30.0, 30.0), (52.0, 52.0), (78.0, 78.0),
-                 (98.0, 98.0), (120.0, 120.0), (148.0, 148.0), (162.0, 162.0)]:
+    for _, t in [(21.0, 21.0), (36.0, 36.0), (61.0, 61.0), (87.0, 87.0),
+                 (105.0, 105.0), (121.0, 121.0), (142.0, 142.0), (160.0, 160.0)]:
         place(fx, reverse_crash(1.0), t - 0.5, 0.20)
 
     # 混音

@@ -15,7 +15,7 @@
 
 <script type="module">
 import { createSegment, loadFonts, clamp } from '../common.js';
-import { TC, termWindow, typeText, drawCursor, termHUD, termProgress } from '../terminal.js';
+import { TC, termWindow, termScript, termHUD, termProgress } from '../terminal.js';
 
 const W = 1920, H = 1080;
 const canvas = document.getElementById('c');
@@ -29,89 +29,28 @@ window.__bootError = null;
 // 等宽负责英文与符号，中文回落 Noto Sans SC（成片机上没有带 CJK 的等宽字体）
 const MONO = '"JetBrains Mono", "Noto Sans SC", monospace';
 
-// ---------- 版面 ----------
-const WIN = { x: 140, y: 170, w: 1640, h: 620, headH: 54 };
-const X0 = WIN.x + 56;                       // 内容左边距
-const Y0 = WIN.y + WIN.headH + 66;           // 第一行基线
-const LH = 46;                               // 行距
-const FS = 26;                               // 字号
-const FS_CN = 28;                            // 中文注释字号（Noto 同号比等宽英文视觉偏小）
-const CPS = 0.06;                            // 每字打出耗时（秒）
+const WIN = { x: 140, y: 140, w: 1640, h: 692, headH: 54 };
+const X0 = WIN.x + 56;
+const Y0 = WIN.y + WIN.headH + 56;
+const LH = 40;
 
-// ---------- 屏幕 A：还没装防火墙，端口全裸在公网上 ----------
-const A = [
-  { at: 0.5, k: '$', t: '' },
-  { at: 0.9, k: 'c', t: '一个跑在家里的服务，想让它从公网访问' },
-  { at: 2.4, k: '$', t: 'nmap -sS -p- 198.51.100.24' },
-  { at: 4.4, k: 'o', t: 'PORT     STATE    SERVICE', dim: true },
-  { at: 4.7, k: 'o', t: '22/tcp   open     ssh' },
-  { at: 5.0, k: 'o', t: '443/tcp  open     https' },
-  { at: 5.3, k: 'o', t: '! 2 ports reachable from the internet', accent: true },
-  { at: 5.8, k: 'c', t: '端口一开，全世界的扫描器就找上门' },
-  { at: 7.0, k: '$', t: 'clear' },
+// 一行 = 一个动作。命令打完到出结果之间留一段空隙，像终端真在跑命令。
+const SCRIPT = [
+  { at: 0.4, k: '$', t: '' },
+  { at: 0.9, k: 'c', t: '你有个跑在家里的服务，想让它从公网访问' },
+  { at: 3.0, k: '$', t: 'nmap -sS -p- 198.51.100.24' },
+  { at: 6.0, k: 'o', t: 'Not shown: 65535 filtered tcp ports (100% stealth rate)' },
+  { at: 6.4, k: 'c', t: '默认不对外开任何入口 —— 扫过去只有沉默' },
+  { at: 8.4, k: '$', t: 'knock 198.51.100.24 1 2 3 4' },
+  { at: 11.2, k: 'o', t: '[OK] sequence accepted · entry opened on 8443', accent: true },
+  { at: 11.6, k: '$', t: 'nmap -sS -p- 198.51.100.24' },
+  { at: 14.6, k: 'o', t: 'PORT     STATE    SERVICE', dim: true },
+  { at: 14.9, k: 'o', t: '8443/tcp open     https' },
+  { at: 15.3, k: 'c', t: '敲对了门，入口才给你开' },
+  { at: 17.0, k: '$', t: 'ghost-firewall status' },
+  { at: 19.0, k: 'o', t: 'entry: 1   (knock required)' },
+  { at: 19.4, k: 'c', t: '所有服务都汇进这一个入口，进门还得过认证' },
 ];
-
-const CLEAR_AT = 7.6;                        // clear 执行完的时刻
-
-// ---------- 屏幕 B：装上 Ghost Firewall 之后，同一条命令 ----------
-const B = [
-  { at: 8.1, k: '$', t: '' },
-  { at: 8.4, k: 'c', t: 'Ghost Firewall —— 最新在做的个人公网防火墙' },
-  { at: 10.3, k: '$', t: 'nmap -sS -p- 198.51.100.24' },
-  { at: 12.1, k: 'o', t: 'Not shown: 65535 filtered tcp ports (100% stealth rate)' },
-  { at: 12.4, k: 'o', t: '[OK] 0 open ports', accent: true },
-  { at: 12.8, k: 'c', t: '没有端口可以扫，没有痕迹可以探' },
-  { at: 13.8, k: '$', t: 'ghost-firewall status' },
-  { at: 15.2, k: 'o', t: 'entry: 1   (knock required)' },
-  { at: 15.6, k: 'c', t: '入口只有一个，还得敲对门才开' },
-  { at: 17.2, k: 'c', t: '藏进公网 —— 这就是它的隐身方式' },
-];
-
-// 一行 = 一个动作：c 注释（逐字）、$ 命令（提示符 + 逐字 + 光标）、o 输出（整行刷出）
-function drawLines(items, u, o = {}) {
-  const { alpha = 1, dy = 0 } = o;
-  for (let i = 0; i < items.length; i++) {
-    const it = items[i];
-    const local = u - it.at;
-    if (local < 0) continue;
-    const y = Y0 + i * LH + dy;
-    const dur = Array.from(it.t).length * CPS;
-
-    if (it.k === 'o') {
-      const a = clamp(local / 0.14);
-      typeText(ctx, it.t, X0, y, {
-        size: FS,
-        color: it.accent ? TC.accent : it.dim ? TC.muted : TC.ink,
-        font: MONO, alpha: alpha * a,
-      });
-    } else if (it.k === 'c') {
-      ctx.save();
-      ctx.globalAlpha = alpha;
-      ctx.font = `400 ${FS_CN}px ${MONO}`;
-      ctx.textBaseline = 'alphabetic';
-      ctx.fillStyle = TC.dim;
-      ctx.fillText('#', X0, y);
-      ctx.restore();
-      typeText(ctx, it.t, X0 + 26, y, {
-        p: clamp(local / dur), size: FS_CN, color: TC.muted, font: MONO, alpha,
-      });
-    } else {
-      ctx.save();
-      ctx.globalAlpha = alpha;
-      ctx.font = `600 ${FS}px ${MONO}`;
-      ctx.textBaseline = 'alphabetic';
-      ctx.fillStyle = TC.accent;
-      ctx.fillText('$', X0, y);
-      ctx.restore();
-      const w = typeText(ctx, it.t, X0 + 26, y, {
-        p: clamp(local / dur), size: FS, color: TC.ink, font: MONO, alpha,
-      });
-      // 打字过程中光标跟在命令末尾；空提示符上光标一直闪
-      if (!it.t) drawCursor(ctx, X0 + 26, y, u, { size: FS, alpha });
-      else if (local < dur) drawCursor(ctx, X0 + 26 + w, y, u, { size: FS, alpha });
-    }
-  }
-}
 
 window.renderFrame = (u) => {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -122,21 +61,13 @@ window.renderFrame = (u) => {
   ctx.fillStyle = TC.bg;
   ctx.fillRect(0, 0, W, H);
 
-  // 窗口开机：0.45 秒淡入
   termWindow(ctx, {
     x: WIN.x, y: WIN.y, w: WIN.w, h: WIN.h, headH: WIN.headH,
     title: '~/ghost-firewall', right: 'zsh', font: MONO,
     alpha: clamp(u / 0.45),
   });
 
-  if (u < CLEAR_AT) {
-    drawLines(A, u);
-  } else {
-    // clear：A 向上滑出并淡出，B 从下方滑入
-    const wipe = clamp((u - CLEAR_AT) / 0.45);
-    drawLines(A, u, { alpha: 1 - wipe, dy: -280 * wipe });
-    drawLines(B, u, { alpha: wipe, dy: 46 * (1 - wipe) });
-  }
+  termScript(ctx, SCRIPT, { u, x: X0, y: Y0, lineH: LH, font: MONO });
 
   termHUD(ctx, { index: 1, chapter: '定位', font: MONO });
   termProgress(ctx, { u, duration: seg.duration, font: MONO, x: WIN.x, y: 996, w: WIN.w });
