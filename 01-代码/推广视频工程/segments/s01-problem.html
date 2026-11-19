@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <link rel="stylesheet" href="/shared/fonts.css">
-<title>01 个人公网防火墙</title>
+<title>01 定位</title>
 <style>
   html, body { margin: 0; padding: 0; background: #0e0e0d; overflow: hidden; }
   #stage { position: relative; width: 1920px; height: 1080px; overflow: hidden; }
@@ -14,302 +14,137 @@
 <div id="stage"><canvas id="c" width="1920" height="1080"></canvas></div>
 
 <script type="module">
-import { createSegment, loadFonts, clamp, ease, TAU, drawCapsuleLabel, drawStamp } from '../common.js';
-import { themeFromURL, chrome, drawGrain, drawVignette } from '../themes.js';
-import { drawParticleField, drawLightSweep, withParallax, kineticText } from '../motion.js';
+import { createSegment, loadFonts, clamp } from '../common.js';
+import { TC, termWindow, typeText, drawCursor, termHUD, termProgress } from '../terminal.js';
 
 const W = 1920, H = 1080;
 const canvas = document.getElementById('c');
 const ctx = canvas.getContext('2d');
-const theme = themeFromURL(location.search);
-const HUD = chrome(theme);
 const seg = createSegment();
 
 window.DURATION = seg.duration;
 window.__ready = false;
 window.__bootError = null;
 
-// ---------- 调色板（coral-noir，与讲解页同一套） ----------
-const C = {
-  bg: '#0e0e0d', surface: '#1a1917', ink: '#f5f0e8', muted: '#8f8981',
-  accent: '#d97757', accentSoft: '#f0b49c', line: 'rgba(245,240,232,0.10)',
-};
+// 等宽负责英文与符号，中文回落 Noto Sans SC（成片机上没有带 CJK 的等宽字体）
+const MONO = '"JetBrains Mono", "Noto Sans SC", monospace';
 
-// ---------- 文案（timeline.json 的 copy 字段，唯一真相源） ----------
-const KICKER = '最新在做的个人公网防火墙';
-const TITLE = '把服务器隐身进公网';
-const POINTS = [
-  '服务、脚本、任何监测工具，都探明不了',
-  '公网上没有可被扫描到的端口',
-  '只有敲对门的人知道入口在哪',
+// ---------- 版面 ----------
+const WIN = { x: 140, y: 170, w: 1640, h: 620, headH: 54 };
+const X0 = WIN.x + 56;                       // 内容左边距
+const Y0 = WIN.y + WIN.headH + 66;           // 第一行基线
+const LH = 46;                               // 行距
+const FS = 26;                               // 字号
+const FS_CN = 28;                            // 中文注释字号（Noto 同号比等宽英文视觉偏小）
+const CPS = 0.06;                            // 每字打出耗时（秒）
+
+// ---------- 屏幕 A：还没装防火墙，端口全裸在公网上 ----------
+const A = [
+  { at: 0.5, k: '$', t: '' },
+  { at: 0.9, k: 'c', t: '一个跑在家里的服务，想让它从公网访问' },
+  { at: 2.4, k: '$', t: 'nmap -sS -p- 198.51.100.24' },
+  { at: 4.4, k: 'o', t: 'PORT     STATE    SERVICE', dim: true },
+  { at: 4.7, k: 'o', t: '22/tcp   open     ssh' },
+  { at: 5.0, k: 'o', t: '443/tcp  open     https' },
+  { at: 5.3, k: 'o', t: '! 2 ports reachable from the internet', accent: true },
+  { at: 5.8, k: 'c', t: '端口一开，全世界的扫描器就找上门' },
+  { at: 7.0, k: '$', t: 'clear' },
 ];
-const PUNCH = '看不见，也扫不着 —— 这就是它的隐身方式';
 
-// ---------- 版面常量 ----------
-// 左图右文：左侧是「公网 + 探针扫不到」，右侧是定位三句
-const PANEL = { x: 130, y: 320, w: 580, h: 590 };
-const CENTER = { x: 420, y: 560 };
-const RACK = { x: 340, y: 415, w: 160, h: 290 };
-const FIELD_R = 190;               // 隐身场半径：探针的波到这里就散了
-const PROBE_R = 292;               // 探针到机柜中心的距离
-const RIGHT = { x: 880, w: 860 };
-const RULE_X = 790;                // 左右分隔线
+const CLEAR_AT = 7.6;                        // clear 执行完的时刻
 
-// 四角的探针（扫描器 / 监测脚本的抽象）
-const PROBES = [0, 1, 2, 3].map((i) => {
-  const a = Math.PI / 4 + i * Math.PI / 2;
-  return { x: CENTER.x + Math.cos(a) * PROBE_R, y: CENTER.y + Math.sin(a) * PROBE_R };
-});
+// ---------- 屏幕 B：装上 Ghost Firewall 之后，同一条命令 ----------
+const B = [
+  { at: 8.1, k: '$', t: '' },
+  { at: 8.4, k: 'c', t: 'Ghost Firewall —— 最新在做的个人公网防火墙' },
+  { at: 10.3, k: '$', t: 'nmap -sS -p- 198.51.100.24' },
+  { at: 12.1, k: 'o', t: 'Not shown: 65535 filtered tcp ports (100% stealth rate)' },
+  { at: 12.4, k: 'o', t: '[OK] 0 open ports', accent: true },
+  { at: 12.8, k: 'c', t: '没有端口可以扫，没有痕迹可以探' },
+  { at: 13.8, k: '$', t: 'ghost-firewall status' },
+  { at: 15.2, k: 'o', t: 'entry: 1   (knock required)' },
+  { at: 15.6, k: 'c', t: '入口只有一个，还得敲对门才开' },
+  { at: 17.2, k: 'c', t: '藏进公网 —— 这就是它的隐身方式' },
+];
 
-// ============================================================
-// 节拍表（120 BPM，每拍 0.5s）
-//   0.0-0.8   公网点阵淡入
-//   0.6-1.8   机柜与隐身场淡入
-//   1.0-1.7   kicker 淡入
-//   1.8-2.8   title 落下（outBack）
-//   3.0-4.0   第 1 条滑入
-//   4.0-5.0   第 2 条滑入
-//   5.0-6.0   第 3 条滑入
-//   6.0-8.5   读字停顿（探针一直在扫）
-//   8.5-9.5   punchline 浮现，三条收拢变暗
-//  14.0       段末静帧
-// ============================================================
+// 一行 = 一个动作：c 注释（逐字）、$ 命令（提示符 + 逐字 + 光标）、o 输出（整行刷出）
+function drawLines(items, u, o = {}) {
+  const { alpha = 1, dy = 0 } = o;
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    const local = u - it.at;
+    if (local < 0) continue;
+    const y = Y0 + i * LH + dy;
+    const dur = Array.from(it.t).length * CPS;
 
-// 左侧：公网 + 探针扫不到
-function drawLeft(u) {
-  const inP = clamp(u / 0.8, 0, 1);
-  const e = ease.outCubic(inP);
-
-  // 公网点阵：一层稀疏的节点，暗示「外面全是探针在扫的东西」
-  ctx.save();
-  ctx.globalAlpha = e;
-  ctx.fillStyle = 'rgba(245,240,232,0.34)';
-  for (let y = PANEL.y; y < PANEL.y + PANEL.h; y += 30) {
-    for (let x = PANEL.x; x < PANEL.x + PANEL.w; x += 30) {
-      // 中心留空：机柜那一块不画点
-      if (Math.abs(x - CENTER.x) < 122 && Math.abs(y - CENTER.y) < 168) continue;
-      ctx.beginPath();
-      ctx.arc(x, y, 2.4, 0, TAU);
-      ctx.fill();
-    }
-  }
-  ctx.restore();
-
-  // 隐身场：虚线圈 + 一层极淡的填充
-  const fp = clamp((u - 0.6) / 1.0, 0, 1);
-  if (fp > 0) {
-    const fe = ease.outCubic(fp);
-    ctx.save();
-    ctx.globalAlpha = fe;
-    ctx.fillStyle = 'rgba(217,119,87,0.05)';
-    ctx.beginPath();
-    ctx.arc(CENTER.x, CENTER.y, FIELD_R, 0, TAU);
-    ctx.fill();
-    ctx.setLineDash([10, 12]);
-    ctx.strokeStyle = 'rgba(217,119,87,0.60)';
-    ctx.lineWidth = 1.8;
-    ctx.beginPath();
-    ctx.arc(CENTER.x, CENTER.y, FIELD_R, 0, TAU);
-    ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.restore();
-  }
-
-  // 机柜：比 s03 门后那台更淡 —— 它还在公网「里面」，只是看不见
-  const rp = clamp((u - 0.6) / 1.0, 0, 1);
-  if (rp > 0) {
-    const re = ease.outCubic(rp);
-    ctx.save();
-    ctx.globalAlpha = re;
-    ctx.fillStyle = 'rgba(245,240,232,0.07)';
-    ctx.beginPath();
-    ctx.roundRect(RACK.x, RACK.y, RACK.w, RACK.h, 10);
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(245,240,232,0.45)';
-    ctx.lineWidth = 1.6;
-    ctx.stroke();
-    // 5 个槽位
-    ctx.fillStyle = 'rgba(245,240,232,0.11)';
-    for (let i = 0; i < 5; i++) {
-      const sy = RACK.y + 30 + i * 49;
-      ctx.beginPath();
-      ctx.roundRect(RACK.x + 22, sy, RACK.w - 44, 32, 6);
-      ctx.fill();
-    }
-    ctx.restore();
-  }
-
-  // 四个探针：发射的波到隐身场边缘就散了，从不进入
-  const probeP = clamp((u - 1.2) / 0.8, 0, 1);
-  if (probeP > 0) {
-    const pe = ease.outCubic(probeP);
-    // 波纹周期 1.5 秒，持续往外扩
-    const cyc = ((u - 1.2) % 1.5) / 1.5;
-    for (const p of PROBES) {
+    if (it.k === 'o') {
+      const a = clamp(local / 0.14);
+      typeText(ctx, it.t, X0, y, {
+        size: FS,
+        color: it.accent ? TC.accent : it.dim ? TC.muted : TC.ink,
+        font: MONO, alpha: alpha * a,
+      });
+    } else if (it.k === 'c') {
       ctx.save();
-      ctx.globalAlpha = pe * 0.9;
-
-      // 探针本体：一个小碟形天线
-      const ang = Math.atan2(CENTER.y - p.y, CENTER.x - p.x);
-      ctx.translate(p.x, p.y);
-      ctx.rotate(ang);
-      ctx.fillStyle = 'rgba(245,240,232,0.78)';
-      ctx.beginPath();
-      ctx.moveTo(-11, -9);
-      ctx.lineTo(12, 0);
-      ctx.lineTo(-11, 9);
-      ctx.closePath();
-      ctx.fill();
-
-      // 三道同心弧，越远越淡，到隐身场边缘归零
-      ctx.strokeStyle = 'rgba(245,240,232,0.55)';
-      ctx.lineWidth = 2;
-      for (let k = 0; k < 3; k++) {
-        const base = 40 + k * 58;
-        const r = base + cyc * 50;
-        if (r > PROBE_R - FIELD_R) continue;
-        const fade = 1 - (r - 40) / (PROBE_R - FIELD_R);
-        ctx.globalAlpha = pe * fade * (1 - k * 0.18);
-        ctx.beginPath();
-        ctx.arc(0, 0, r, -0.55, 0.55);
-        ctx.stroke();
-      }
+      ctx.globalAlpha = alpha;
+      ctx.font = `400 ${FS_CN}px ${MONO}`;
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = TC.dim;
+      ctx.fillText('#', X0, y);
       ctx.restore();
+      typeText(ctx, it.t, X0 + 26, y, {
+        p: clamp(local / dur), size: FS_CN, color: TC.muted, font: MONO, alpha,
+      });
+    } else {
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.font = `600 ${FS}px ${MONO}`;
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = TC.accent;
+      ctx.fillText('$', X0, y);
+      ctx.restore();
+      const w = typeText(ctx, it.t, X0 + 26, y, {
+        p: clamp(local / dur), size: FS, color: TC.ink, font: MONO, alpha,
+      });
+      // 打字过程中光标跟在命令末尾；空提示符上光标一直闪
+      if (!it.t) drawCursor(ctx, X0 + 26, y, u, { size: FS, alpha });
+      else if (local < dur) drawCursor(ctx, X0 + 26 + w, y, u, { size: FS, alpha });
     }
   }
 }
 
-// 右侧：kicker + 大标题
-function drawHeadline(u) {
-  const kp = clamp((u - 1.0) / 0.7, 0, 1);
-  if (kp > 0) {
-    ctx.save();
-    ctx.globalAlpha = ease.outCubic(kp);
-    ctx.font = '500 34px "JetBrains Mono", "Noto Sans SC", monospace';
-    ctx.textBaseline = 'alphabetic';
-    ctx.textAlign = 'left';
-    ctx.fillStyle = C.accent;
-    ctx.fillText(KICKER, RIGHT.x, 380);
-    ctx.fillStyle = 'rgba(217,119,87,0.55)';
-    ctx.fillRect(RIGHT.x, 410, 460 * ease.outCubic(kp), 2);
-    ctx.restore();
-  }
-
-  const tp = clamp((u - 1.8) / 1.0, 0, 1);
-  if (tp > 0) {
-    const e = ease.outBack(tp);
-    ctx.save();
-    ctx.globalAlpha = clamp(tp * 2, 0, 1);
-    ctx.translate(0, (1 - e) * -26);
-    ctx.font = '700 92px "Noto Sans SC", sans-serif';
-    ctx.textBaseline = 'alphabetic';
-    ctx.textAlign = 'left';
-    ctx.fillStyle = C.ink;
-    ctx.fillText(TITLE, RIGHT.x, 520);
-    ctx.restore();
-  }
-}
-
-// 三条定位：逐条滑入，收束阶段向左退并变暗
-function drawPoints(u) {
-  const startY = 660;
-  const collapse = clamp((u - 8.5) / 1.2, 0, 1);
-  const ce = ease.outCubic(collapse);
-
-  for (let i = 0; i < POINTS.length; i++) {
-    const p = clamp((u - (3.0 + i * 1.0)) / 0.6, 0, 1);
-    if (p <= 0) continue;
-    const e = ease.outCubic(p);
-    const y = startY + i * 76;
-
-    ctx.save();
-    ctx.globalAlpha = e * (1 - ce * 0.72);
-    ctx.translate(-ce * 150, -ce * i * 26);
-    ctx.font = '400 34px "Noto Sans SC", sans-serif';
-    ctx.textBaseline = 'alphabetic';
-    ctx.textAlign = 'left';
-
-    const mx = RIGHT.x - 34 + (1 - e) * -24;
-    ctx.fillStyle = C.accent;
-    ctx.beginPath();
-    ctx.roundRect(mx, y - 26, 14, 14, 3);
-    ctx.fill();
-
-    ctx.fillStyle = C.ink;
-    ctx.fillText(POINTS[i], RIGHT.x, y);
-    ctx.restore();
-  }
-}
-
-// 收束：punchline 在三条定位之后浮现
-function drawPunch(u) {
-  const p = clamp((u - 9.0) / 0.8, 0, 1);
-  if (p <= 0) return;
-  const e = ease.outCubic(p);
-  ctx.save();
-  ctx.globalAlpha = e;
-  ctx.font = '600 42px "Noto Sans SC", sans-serif';
-  ctx.textBaseline = 'alphabetic';
-  ctx.textAlign = 'left';
-  ctx.fillStyle = C.accent;
-  ctx.fillText(PUNCH, RIGHT.x, 880);
-  ctx.fillStyle = 'rgba(217,119,87,0.55)';
-  ctx.fillRect(RIGHT.x - 34, 852, 3, 46);
-  ctx.restore();
-}
-
-// ============================================================
 window.renderFrame = (u) => {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.globalAlpha = 1;
   ctx.globalCompositeOperation = 'source-over';
   ctx.textBaseline = 'alphabetic';
   ctx.textAlign = 'left';
-  ctx.fillStyle = C.bg;
+  ctx.fillStyle = TC.bg;
   ctx.fillRect(0, 0, W, H);
 
-  drawGrain(ctx, theme, W, H, u);
+  // 窗口开机：0.45 秒淡入
+  termWindow(ctx, {
+    x: WIN.x, y: WIN.y, w: WIN.w, h: WIN.h, headH: WIN.headH,
+    title: '~/ghost-firewall', right: 'zsh', font: MONO,
+    alpha: clamp(u / 0.45),
+  });
 
-  // 背景粒子：三层速度不同 ⇒ 天然视差
-  drawParticleField(ctx, { u, count: 130, seed: 11, color: '217,119,87', baseAlpha: 0.42, drift: 30 });
-
-  // 左右分隔线：随左侧淡入一起拉开，把「图」和「文」绑成一版
-  const ruleP = clamp(u / 0.9, 0, 1);
-  if (ruleP > 0) {
-    ctx.save();
-    ctx.globalAlpha = ease.outCubic(ruleP) * 0.9;
-    ctx.strokeStyle = C.line;
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.moveTo(RULE_X, 380);
-    ctx.lineTo(RULE_X, 380 + 520 * ease.outCubic(ruleP));
-    ctx.stroke();
-    ctx.restore();
+  if (u < CLEAR_AT) {
+    drawLines(A, u);
+  } else {
+    // clear：A 向上滑出并淡出，B 从下方滑入
+    const wipe = clamp((u - CLEAR_AT) / 0.45);
+    drawLines(A, u, { alpha: 1 - wipe, dy: -280 * wipe });
+    drawLines(B, u, { alpha: wipe, dy: 46 * (1 - wipe) });
   }
 
-  // 左图挂在更靠前的视差层上（比右边的文字走得多一点）
-  withParallax(ctx, u, 0.9, 420, 560, () => drawLeft(u), { amp: 20, drift: 9 });
-
-  // 隐身场上一道流光扫过
-  drawLightSweep(ctx, { x: 120, y: 330, w: 600, h: 570, u, period: 6.2, strength: 0.07, band: 0.5 });
-
-  drawHeadline(u);
-  drawPoints(u);
-  drawPunch(u);
-  drawLightSweep(ctx, { x: 0, y: 0, w: W, h: H, u, period: 8.5, strength: 0.04, band: 0.45 });
-  drawVignette(ctx, W, H, 0.42);
-
-  // HUD
-  drawCapsuleLabel(ctx, 1, '个人公网防火墙', '开篇', {
-    numberColor: HUD.capsule.numberColor, textColor: HUD.capsule.textColor,
-    bg: HUD.capsule.bg, border: HUD.capsule.border,
-  });
-  drawStamp(ctx, 'GHOST FIREWALL', { color: HUD.stamp.color });
+  termHUD(ctx, { index: 1, chapter: '定位', font: MONO });
+  termProgress(ctx, { u, duration: seg.duration, font: MONO, x: WIN.x, y: 996, w: WIN.w });
 };
 
 (async () => {
   try {
-    await loadFonts(['Noto Sans SC', 'JetBrains Mono', 'Inter']);
+    await loadFonts(['Noto Sans SC', 'JetBrains Mono']);
     window.__ready = true;
   } catch (e) {
     window.__bootError = String(e);

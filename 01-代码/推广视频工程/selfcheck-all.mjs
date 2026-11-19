@@ -57,7 +57,7 @@ const segments = timeline.segments;
 const { chromium } = await import('playwright-core');
 
 // 共享模块也要守纯函数契约：它们被所有段落 import，出了随机源整片就不确定
-const CORE_FILES = ['common.js', 'themes.js', 'motion.js'];
+const CORE_FILES = ['common.js', 'themes.js', 'motion.js', 'terminal.js'];
 const coreBad = [];
 for (const f of CORE_FILES) {
   const p = path.join(ROOT, f);
