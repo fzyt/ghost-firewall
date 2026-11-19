@@ -575,6 +575,10 @@ def main():
         'bash', 'seq', 'sleep', 'date', 'cp', 'mv', 'rm', 'mkdir', 'cat',
         'ls', 'test', 'true', 'false', 'env', 'id', 'uname', 'kill',
         'netstat', 'jsonfilter', 'nft', 'uci', 'opkg', 'apk',
+        # crontab：busybox 自带（设备上 crond 在跑）。
+        # 2026-11-19 加：回滚脚本开始还原 crontab，于是这里第一次出现它。
+        # 不是本脚本的辅助函数，是外部命令 —— 跟上面那些一个性质。
+        'crontab',
     }
     callers = set()
     for ln in deploy.splitlines():

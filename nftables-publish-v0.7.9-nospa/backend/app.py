@@ -8904,6 +8904,90 @@ def list_flush():
 GATEWAY_ACCESS_LOG = os.environ.get(
     "GATEWAY_ACCESS_LOG", "/var/log/nginx/nftables-web-gateway.access.log")
 
+# ── 访问日志封顶 ──────────────────────────────────────────────
+#
+# 为什么不能「挪到持久化路径」：设备实测 /var → /tmp 软链 ⇒ 日志现在落在
+# tmpfs（492.9M，当时只用 468K）；而持久化分区 /overlay 只剩 **2.0M（97% 满）**
+# ⇒ 日志挪过去会很快撑爆 overlay ⇒ 路由器文件系统转只读 ⇒ 配置写不进去。
+# 而且访问日志是持续追加写，落 flash 还磨损 flash。
+#
+# 所以：**位置不动，给它封顶**。设备上没有 logrotate（OpenWrt 默认不带），
+# 就自己写一个 cron 脚本：超过 20MB 就保留尾部 8MB 并原地截断。
+LOG_TRUNCATE_MAX_BYTES = 20 * 1024 * 1024
+LOG_TRUNCATE_KEEP_BYTES = 8 * 1024 * 1024
+LOG_TRUNCATE_SCRIPT_PATH = os.environ.get(
+    "NFTABLES_WEB_LOG_TRUNCATE_SCRIPT",
+    "/opt/nftables-web/truncate-gateway-log.sh")
+LOG_TRUNCATE_CRON_ENTRY = f'*/5 * * * * {LOG_TRUNCATE_SCRIPT_PATH}'
+LOG_TRUNCATE_SCRIPT = f'''#!/bin/sh
+# 网关访问日志封顶 —— 由 nftables-web 生成（要改内容请改面板源码）
+#
+# 三个参数都留了环境变量口子（括号里是默认值）：
+#   GATEWAY_ACCESS_LOG        要封顶的日志文件
+#   NFT_LOG_TRUNCATE_MAX      超过多少字节才动手
+#   NFT_LOG_TRUNCATE_KEEP     动手时保留尾部多少字节
+# 留口子有两个用处：运维临时换路径不用改面板；
+# 测试能用小阈值跑**真实脚本**，不必造 20MB 文件。
+LOG=${{GATEWAY_ACCESS_LOG:-{GATEWAY_ACCESS_LOG}}}
+MAX=${{NFT_LOG_TRUNCATE_MAX:-{LOG_TRUNCATE_MAX_BYTES}}}
+KEEP=${{NFT_LOG_TRUNCATE_KEEP:-{LOG_TRUNCATE_KEEP_BYTES}}}
+
+[ -f "$LOG" ] || exit 0
+size=$(wc -c < "$LOG" 2>/dev/null) || exit 0
+case "$size" in
+  ""|*[!0-9]*) exit 0 ;;
+esac
+
+# 保留量必须小于上限，否则「截断」完还是超标，下一轮又白跑一趟。
+[ "$KEEP" -lt "$MAX" ] || KEEP=$((MAX / 2))
+
+[ "$size" -gt "$MAX" ] || exit 0
+
+# copytruncate：nginx 一直握着这个文件的 fd（O_APPEND），
+# **不能**用 mv 换文件 —— 那样 nginx 继续往已被 unlink 的旧 inode 写，
+# 新文件永远是空的。所以只能原地截断：先拷尾部，再截断，再追加回去。
+#
+# 为什么保留尾部而不是直接清空：面板的访客页读的就是这个文件的最近内容，
+# 一清空页面就变成「没人来过」。
+#
+# `tail -n +2` 丢掉第一行：按字节切出来的第一行一定是**半行**（切点落在行中间），
+# 留着它就是在日志里塞一条残行。访客页的解析器能扛住残行，但没必要造。
+#
+# 「|| exit 0」和下面的空文件检查都不能省：
+# 拷贝失败（磁盘满、权限不对、临时文件建不出来）却接着往下走，
+# 等于把访问日志**清空**—— 那比不封顶糟得多（访客页直接变成「没人来过」）。
+tail -c "$KEEP" "$LOG" 2>/dev/null | tail -n +2 2>/dev/null > "$LOG.tmp" || exit 0
+if [ ! -s "$LOG.tmp" ]; then rm -f "$LOG.tmp" 2>/dev/null; exit 0; fi
+: > "$LOG"
+cat "$LOG.tmp" >> "$LOG"
+rm -f "$LOG.tmp"
+exit 0
+'''
+
+
+def _ensure_log_truncate_cron():
+    """静默确保访问日志封顶脚本与 crontab 已就绪（幂等）。
+
+    与 _ensure_ipv6_cron / _ensure_cert_renew_cron 同一套套路：
+    脚本由面板自己写，crontab 按「脚本路径」去重 ⇒ 反复调用不会堆出多条 cron。
+
+    写失败只告警、不阻断 —— 日志没封顶不会让面板起不来，
+    真要拦住启动，那用户就完全没法用面板去修这个问题了。
+    """
+    try:
+        os.makedirs(os.path.dirname(LOG_TRUNCATE_SCRIPT_PATH), exist_ok=True)
+        with open(LOG_TRUNCATE_SCRIPT_PATH, 'w') as f:
+            f.write(LOG_TRUNCATE_SCRIPT)
+        os.chmod(LOG_TRUNCATE_SCRIPT_PATH, 0o755)
+    except OSError as e:
+        print(f'[WARN] 访问日志封顶脚本写入失败: {e}', flush=True)
+        return False
+    ok, msg = _upsert_cron_for(LOG_TRUNCATE_SCRIPT_PATH, LOG_TRUNCATE_CRON_ENTRY)
+    if not ok:
+        print(f'[WARN] 访问日志封顶 cron 配置失败: {msg}', flush=True)
+    return ok
+
+
 # 一条访问日志的格式（由本模块生成 nginx 配置时定死）：
 #   $time_iso8601 $remote_addr $request_method $status $body_bytes_sent rt=$request_time
 #   host="..." uri="..." ua="..." ref="..." auth_user="..." auth_dev="..."
@@ -11473,7 +11557,7 @@ def _nginx_server_preamble(L, port, cert_path, key_path, tls_protos):
     L.append(f"    ssl_session_cache shared:{GATEWAY_SSL_ZONE}:{GATEWAY_SSL_CACHE_SIZE};")
     L.append("    ssl_session_tickets off;")
     L.append("")
-    L.append("    access_log /var/log/nginx/nftables-web-gateway.access.log nftgw;")
+    L.append(f"    access_log {GATEWAY_ACCESS_LOG} nftgw;")
     L.append("    error_log  /var/log/nginx/nftables-web-gateway.error.log warn;")
     L.append("")
 
@@ -15286,6 +15370,19 @@ def _start_servers():
         _ensure_ipv6_cron()
     except Exception as e:
         print(f'[WARN] 刷新 IPv6 自动更新脚本失败（不影响面板启动）: '
+              f'{type(e).__name__}: {e}', flush=True)
+
+    # ========== 启动时刷新访问日志封顶脚本 ==========
+    # 设备实测 /var → tmpfs，而持久化分区 /overlay 只剩 2MB（97% 满）
+    # ⇒ 访问日志挪不走，只能封顶（超 20MB 保留尾部 8MB）。
+    #
+    # 为什么在这里装而不是「部署网关时」：封顶脚本按**文件路径**工作，
+    # 与 nginx 配置无关 ⇒ 装一次就长期有效，面板重启时顺手续约一下即可。
+    # 失败不阻断启动：日志没封顶不影响面板本身。
+    try:
+        _ensure_log_truncate_cron()
+    except Exception as e:
+        print(f'[WARN] 刷新访问日志封顶脚本失败（不影响面板启动）: '
               f'{type(e).__name__}: {e}', flush=True)
 
     # ========== 启动时绝对上限的默认值迁移 ==========

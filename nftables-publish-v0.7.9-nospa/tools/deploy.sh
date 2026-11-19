@@ -68,6 +68,7 @@ HAS_INSTALL=0
 FAILED_CHECKS=0
 RULE_MD5_BEFORE=""
 CRON_COUNT_BEFORE=""
+CRON_BEFORE=""
 TOKEN_SECRET_MD5_BEFORE=""
 CHECK_FAILURES=()
 GW_PORT_CFG=""
@@ -321,6 +322,36 @@ phase_backup() {
     fi
     say "阶段 3/10　备份"
 
+    # ⚠ 备份**之前**先轮转旧备份（2026-11-19 实测踩到）
+    #
+    # 设备的 /overlay 只有 86MB，而每份备份 3.6MB（backend+frontend 的代码）。
+    # 备份目录堆到 5~6 份就写满了 ⇒ 备份阶段直接 "No space left on device"
+    # ⇒ 部署失败 ⇒ 而这次失败的备份目录**又留在设备上**
+    # ⇒ 越失败越没空间，下一次部署连备份都做不完（死循环）。
+    #
+    # 之前只在部署**成功后**轮转 ⇒ 失败路径下备份目录只增不减。
+    # 先腾地方再备份，这个坑就不用每次都手动救。
+    if [ "$KEEP_BACKUPS" -gt 1 ]; then
+        prune_backups_keep "$((KEEP_BACKUPS - 1))"
+        step "备份前先轮转旧备份（保留最近 $((KEEP_BACKUPS - 1)) 份）"
+    fi
+
+    # 空间预检：设备的 /overlay 总共才 86MB，备份一次要写 3.6MB。
+    # 不预检的话，等 cp 报 "No space left on device" 时现场已经被写坏了一半
+    # （备份残缺、回滚脚本也生成不出来），报错还指向 cp，
+    # 根本看不出真因是「磁盘满了」。
+    local avail_kb
+    avail_kb="$(rssh "df -k '$BACKUP_ROOT' 2>/dev/null | awk 'NR==2{print \$4}'" || true)"
+    case "${avail_kb:-}" in
+        ''|*[!0-9]*) : ;;   # 读不到就跳过，别因为预检本身把部署卡死
+        *)
+            if [ "$avail_kb" -lt 10240 ]; then
+                die "设备可用空间不足 10MB（实际 $((avail_kb / 1024))MB）—— 先清磁盘再部署（/overlay 总共才 86MB）"
+            fi
+            step "设备可用空间: $((avail_kb / 1024))MB"
+            ;;
+    esac
+
     TS="$(date +%Y%m%d-%H%M%S)"
     BACKUP_DIR="${BACKUP_ROOT}/${TS}"
     if [ "$DRY_RUN" = 1 ]; then
@@ -381,6 +412,9 @@ EOS
     # $( ) 里没配平，bash 会把右括号吞进引号里 → 「寻找匹配的 ) 时遇到了
     # 未预期的 EOF」。这个坑踩过一次。
     CRON_COUNT_BEFORE="$(rssh 'crontab -l 2>/dev/null | grep -c . || true')"
+    # 逐行内容也要留一份：自检的判据是「原有条目一条都没丢」，
+    # 光有条数不够 —— 丢一条又加一条，条数照样不变，看着像没动过。
+    CRON_BEFORE="$(rssh 'crontab -l 2>/dev/null' || true)"
     TOKEN_SECRET_MD5_BEFORE="$(rssh "md5sum '$CFG_DIR/nftables-web-secret' 2>/dev/null | cut -d' ' -f1" || true)"
     step "规则集 md5（部署前）: ${RULE_MD5_BEFORE:-无}"
     step "crontab 条数（部署前）: ${CRON_COUNT_BEFORE:-0}"
@@ -430,6 +464,19 @@ echo '==> 恢复用户状态（配置 / 密钥 / 口令 / 限流表）'
 echo '==> 恢复规则文件与 nginx 配置'
 [ -f "$BK/rules-99-custom-rules.nft" ] && cp -a "$BK/rules-99-custom-rules.nft" /etc/nftables.d/99-custom-rules.nft
 [ -f "$BK/gateway.conf" ] && cp -a "$BK/gateway.conf" /etc/nginx/conf.d/00-nftables-web-gateway.conf
+
+echo '==> 恢复 crontab'
+# 面板启动时会自己装 cron 条目 ⇒ 只还原代码的话，crontab 会比备份时多几条，
+# 设备就留在「代码是旧的、cron 是新的」这种混合状态
+# （2026-11-19 实测踩到：访问日志封顶的 cron 就是这么留在设备上的）。
+#
+# ⚠ 必须判文件非空再还原：`crontab <空文件>` 等于**清空整个 crontab**
+# （备份时 `crontab -l` 失败就会留下空文件）。
+if [ -s "$BK/crontab.txt" ]; then
+    crontab "$BK/crontab.txt" 2>/dev/null || echo '   crontab 还原失败，请手动核对'
+else
+    echo '   备份里的 crontab 是空的，跳过还原（空文件会让 crontab - 清空整张表）'
+fi
 
 echo '==> 重启服务'
 /etc/init.d/nftables-web start 2>/dev/null || true
@@ -964,11 +1011,10 @@ phase_verify() {
 
     # 旁证：规则集与 crontab 没被动过（升级路径）
     if [ "$MODE" = "upgrade" ]; then
-        local rmd5 ccount
+        local rmd5
         rmd5="$(rssh "md5sum '$RULES_FILE' 2>/dev/null | cut -d' ' -f1" || true)"
         check_eq "规则集文件 md5 未变（没碰线上防火墙）" "$RULE_MD5_BEFORE" "$rmd5"
-        ccount="$(rssh "crontab -l 2>/dev/null | grep -c . || true")"
-        check_eq "crontab 条数未变" "$CRON_COUNT_BEFORE" "$ccount"
+        check_crontab_intact
     fi
 
     if [ "$FAILED_CHECKS" -gt 0 ]; then
@@ -989,6 +1035,103 @@ count_to_yes() {
         ''|*[!0-9]*) echo no ;;
         *) if [ "$1" -ge 1 ]; then echo yes; else echo no; fi ;;
     esac
+}
+
+# ── crontab 完整性自检 ─────────────────────────────────────────────────
+#
+# 为什么不再判「条数未变」
+# ----------------------
+# 这条不变式的**本意**是：部署不许抹掉用户原有的 cron 条目
+# （P0-10 事故：crontab 被整体覆盖，acme 续期和证书续期双双消失）。
+#
+# 但「条数未变」这个判据太粗：面板**启动时**会自己装 cron
+# （IPv6 自动更新、证书续期、访问日志封顶），而部署本来就要重启面板
+# ⇒ crontab 合法地多了一条 ⇒ 被判成「部署动了 crontab」⇒ 自动回滚。
+#
+# 2026-11-19 实测踩到：访问日志封顶的 cron 一装上，部署自检立刻判红并回滚，
+# 而部署本身一点问题都没有。更糟的是回滚只还原代码、不还原 crontab
+# ⇒ 设备留在混合状态：代码是旧的，cron 条目和封顶脚本却是新的。
+#
+# 现在改成三条更准的判据
+# ----------------------
+#   ① 原有条目一条都没丢、也没被改（逐行精确比对）—— 这才是不变式的本意
+#   ② 同一条目没有被多装一遍
+#   ③ 新增的条目只允许指向面板自己管的脚本目录，且那个脚本必须可执行
+check_crontab_intact() {
+    local after lost grew added bad ln cpath nb na
+    # 基线读不到就别判 —— 否则会把「部署前就没读到」误判成「部署后多了条目」
+    if [ -z "$CRON_BEFORE" ]; then
+        warn "crontab 基线为空（部署前读不到），跳过 crontab 完整性检查"
+        return 0
+    fi
+    after="$(rssh 'crontab -l 2>/dev/null' || true)"
+
+    # ① 原有条目一条都不能少
+    lost=""
+    while IFS= read -r ln; do
+        [ -n "$ln" ] || continue
+        printf '%s\n' "$after" | grep -Fxq -- "$ln" || lost="${lost}${ln}"$'\n'
+    done <<< "$CRON_BEFORE"
+    if [ -z "$lost" ]; then
+        ok "crontab 原有条目一条都没丢"
+    else
+        err "crontab 原有条目丢了："
+        printf '%s' "$lost" | sed 's/^/       /'
+        FAILED_CHECKS=$((FAILED_CHECKS + 1))
+        CHECK_FAILURES+=("crontab 原有条目丢了")
+    fi
+
+    # ② 任何条目都不许被多装一遍
+    #
+    # 遍历的是**部署后**的列表，不是部署前的 ——
+    # 重复装的往往是**新增**的那条（面板把自己那行写了两遍），
+    # 只盯着部署前的条目就看不见它了。
+    grew=""
+    while IFS= read -r ln; do
+        [ -n "$ln" ] || continue
+        nb="$(printf '%s\n' "$CRON_BEFORE" | grep -Fxc -- "$ln" || true)"
+        na="$(printf '%s\n' "$after" | grep -Fxc -- "$ln" || true)"
+        if [ "${na:-0}" -gt 1 ] && [ "${na:-0}" -gt "${nb:-0}" ]; then
+            grew="${grew}${ln}"$'\n'
+        fi
+    done <<< "$after"
+    if [ -z "$grew" ]; then
+        ok "crontab 没有条目被重复安装"
+    else
+        err "crontab 有条目被重复安装："
+        printf '%s' "$grew" | sed 's/^/       /'
+        FAILED_CHECKS=$((FAILED_CHECKS + 1))
+        CHECK_FAILURES+=("crontab 有条目被重复安装")
+    fi
+
+    # ③ 新增条目只允许指向面板自己管的脚本目录，且脚本必须可执行
+    added=""
+    while IFS= read -r ln; do
+        [ -n "$ln" ] || continue
+        printf '%s\n' "$CRON_BEFORE" | grep -Fxq -- "$ln" && continue
+        added="${added}${ln}"$'\n'
+    done <<< "$after"
+    bad=""
+    while IFS= read -r ln; do
+        [ -n "$ln" ] || continue
+        cpath="$(printf '%s\n' "$ln" | awk '{print $NF}')"
+        case "$cpath" in
+            /opt/nftables-web/*) ;;
+            *) bad="${bad}${ln}（路径不在 /opt/nftables-web/ 下）"$'\n'; continue ;;
+        esac
+        rssh "test -x '$cpath'" >/dev/null 2>&1 || bad="${bad}${ln}（脚本不可执行）"$'\n'
+    done <<< "$added"
+    if [ -n "$bad" ]; then
+        err "crontab 出现了来路不明的条目："
+        printf '%s' "$bad" | sed 's/^/       /'
+        FAILED_CHECKS=$((FAILED_CHECKS + 1))
+        CHECK_FAILURES+=("crontab 出现了来路不明的条目")
+    elif [ -n "$added" ]; then
+        ok "crontab 新增的条目都是面板自己装的脚本："
+        printf '%s' "$added" | sed 's/^/       /'
+    else
+        ok "crontab 没有新增条目"
+    fi
 }
 
 # 比较「实际值」与「期望值」，不一致就记进失败清单
@@ -1034,11 +1177,18 @@ phase_summary() {
 }
 
 # 备份轮转：只留最近 N 份
+# $1 = 保留几份（0 = 不删）
+prune_backups_keep() {
+    local keep="$1"
+    [ "$keep" -gt 0 ] || return 0
+    rssh "ls -1dt '$BACKUP_ROOT'/*/ 2>/dev/null | tail -n +$((keep + 1)) | while read d; do rm -rf \"\$d\"; done" || true
+}
+
 prune_backups() {
     [ "$MODE" = "upgrade" ] || return 0
     [ "$KEEP_BACKUPS" -gt 0 ] || return 0
     [ -n "$BACKUP_DIR" ] || return 0
-    rssh "ls -1dt '$BACKUP_ROOT'/*/ 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)) | while read d; do rm -rf \"\$d\"; done" || true
+    prune_backups_keep "$KEEP_BACKUPS"
     step "备份轮转：保留最近 $KEEP_BACKUPS 份"
 }
 
