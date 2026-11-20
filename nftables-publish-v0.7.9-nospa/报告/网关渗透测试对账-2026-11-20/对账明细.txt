@@ -1,0 +1,317 @@
+本轮 48 条 / 基线 120 条
+本轮严重度分布: {'HIGH': 4, 'MEDIUM': 16, 'CRITICAL': 12, 'LOW': 16}
+本轮状态分布:   {'ALREADY_FIXED': 23, 'CONFIRMED': 20, 'UNCERTAIN': 5}
+基线严重度分布: {'HIGH': 15, 'MEDIUM': 60, 'LOW': 29, 'CRITICAL': 16}
+
+=== 仍在（基线有、本轮又确认）（3）===
+  [LOW     ] auth_status() reads the token straight from the cookie instead of _extract_token() — Bearer clients are t
+            CWE CWE-436
+  [MEDIUM  ] Gateway privilege drop fails open and silently: AUTH_DROP_UID unset leaves the public auth process runnin
+            CWE CWE-269
+  [CRITICAL] Shared secrets (Flask SECRET_KEY, Aliyun AK/SK) are created world-readable and only chmod'ed afterwards
+            CWE CWE-276
+
+=== 已修（基线有、本轮明确标 ALREADY_FIXED）（22）===
+  [HIGH    ] Any loopback peer is classified as a trusted "LAN" source and receives a credential-free 200 from /auth/v
+            CWE CWE-290
+  [MEDIUM  ] Gateway LAN matcher accepts a /1 subnet, so half of the IPv4 internet can be granted the credential-free 
+            CWE CWE-284
+  [HIGH    ] /auth/status omits the token epoch check — a pre-password-change token is still reported as an authentica
+            CWE CWE-613
+  [MEDIUM  ] auth_login revokes only the cookie-borne previous token — a Bearer client's old credential survives re-au
+            CWE CWE-384
+  [CRITICAL] Login rate-limit table has no cap on tracked IPs and is fully rewritten (json.load + truncate + dump + fs
+            CWE CWE-400
+  [CRITICAL] Degraded-mode in-memory rate-limit fallback `_RATE_FALLBACK` is unbounded and never pruned — one permanen
+            CWE CWE-400
+  [CRITICAL] Rate-limit table is rewritten in place (truncate+write) and read without the shared lock, so a corrupt/to
+            CWE CWE-362
+  [CRITICAL] Revocation last-known-good snapshot is never refreshed on write, so a logout revocation is silently lost 
+            CWE CWE-613
+  [CRITICAL] Init script only re-seeds the security tables when they are missing or 0 bytes; a non-empty but invalid-J
+            CWE CWE-703
+  [CRITICAL] Rate-limit mutation reports fail_count 0 immediately after arming the lockout, so the login error body te
+            CWE CWE-203
+  [CRITICAL] Audit log file mode regresses to 0644 (world-readable) after the first rotation, discarding the 0640 nftw
+            CWE CWE-732
+  [CRITICAL] `_is_locked` only catches OSError/JSONDecodeError, so a rate-limit table containing invalid UTF-8 raises 
+            CWE CWE-248
+  [CRITICAL] Revocation map has no size cap and every authenticated request re-reads and re-parses the whole file, so 
+            CWE CWE-400
+  [MEDIUM  ] Login CSRF origin check compares host names only and is anchored on the client-supplied Host header
+            CWE CWE-352
+  [CRITICAL] Open redirect in gateway login page: safeNext() bypassed by tab/newline in ?next= enables post-authentica
+            CWE CWE-601
+  [HIGH    ] Panel session-signing key is the shared master secret, readable by the de-privileged WAN-facing gateway, 
+            CWE CWE-732
+  [HIGH    ] Insecure default auth_lan_bypass=True is merged into every config and persisted to the live policy file, 
+            CWE CWE-1188
+  [LOW     ] Re-login token revocation reads only the gw_token cookie instead of _extract_token(), so a previously iss
+            CWE CWE-613
+  [CRITICAL] Unvalidated DDNS `ipv6_source` is interpolated into the root-evaluated `ip_script` shell command (root co
+            CWE CWE-78
+  [CRITICAL] Unhandled exception in the certificate auto-renewal loop aborts renewal of every remaining certificate
+            CWE CWE-248
+  [MEDIUM  ] LAN knock client injects the unvalidated host argument into a `bash -c` command string (shell command inj
+            CWE CWE-78
+  [MEDIUM  ] LAN knock client eval()s shell code generated from the JSON configuration file (command injection through
+            CWE CWE-78
+
+=== 未覆盖（基线有、本轮没提到 —— 不等于已修）（59）===
+  [LOW     ] /auth/portal returns the complete reverse-proxy service catalogue to any caller that passes the source-ad
+            CWE CWE-862
+  [LOW     ] /auth/status still discloses the LAN-bypass state ("user": "lan") and acts as an oracle for which source 
+            CWE CWE-200
+  [LOW     ] Credential-free LAN-bypass authorizations are granted without any audit record
+            CWE CWE-778
+  [MEDIUM  ] _load_secret() substitutes fresh random key material on any read failure and is re-read on every call — t
+            CWE CWE-320
+  [HIGH    ] Sliding renewal revokes the presented jti but delivers the replacement only through a Set-Cookie that ngi
+            CWE CWE-613
+  [MEDIUM  ] Portal page served without HSTS: nginx "location = /" does not forward X-Forwarded-Proto
+            CWE CWE-319
+  [MEDIUM  ] Loopback bind assertion validates an environment variable, not the actual listening socket (no protection
+            CWE CWE-1327
+  [LOW     ] setdefault lets the static route keep the weaker "Cache-Control: no-cache" instead of the required no-sto
+            CWE CWE-525
+  [LOW     ] Unified error handler can answer HTTP 200 because it propagates err.code verbatim (None -> default 200)
+            CWE CWE-393
+  [HIGH    ] 
+            CWE CWE-732
+  [MEDIUM  ] Panel sessions have no absolute lifetime: the 12 h cap is only a sliding cookie expiry, so a stolen sessi
+            CWE CWE-613
+  [MEDIUM  ] Fresh-install default config persists and applies a sample port-forward rule that DNATs three public port
+            CWE CWE-1188
+  [MEDIUM  ] POST /api/config read-modify-write is not serialised: the config_rev gate compares against a pre-write sn
+            CWE CWE-362
+  [LOW     ] Panel responses carry no Cache-Control: no-store, so the full firewall configuration and session cookie c
+            CWE CWE-525
+  [MEDIUM  ] save_config copies the .backup outside the file lock and the lock-free degradation path reuses one fixed 
+            CWE CWE-362
+  [MEDIUM  ] auth_api_port is neither checked against the panel's HTTPS port nor applied to the running auth service: 
+            CWE CWE-666
+  [MEDIUM  ] Config value `router_ip6` is rendered into the nftables ruleset without the `_safe_ip` whitelist (nftable
+            CWE CWE-94
+  [HIGH    ] deploy_mode=linux_gateway never clears the project’s own `table ip nat`, so revoked/changed port-forwards
+  [MEDIUM  ] linux_gateway preamble `flush table inet fw4` makes the generated ruleset unloadable on a host without a 
+            CWE CWE-755
+  [MEDIUM  ] Timing/state-enumeration oracle on POST /auth/login: dummy PBKDF2 path uses 100000 iterations while the d
+            CWE CWE-208
+  [LOW     ] Unhandled UnicodeEncodeError on a lone surrogate in the JSON password turns a login attempt into HTTP 500
+            CWE CWE-20
+  [MEDIUM  ] ssl_certificate / ssl_certificate_key interpolate an unsanitised on-disk path into the generated nginx co
+            CWE CWE-94
+  [LOW     ] Portal page location omits X-Forwarded-Proto, so the gateway landing page is served without HSTS
+            CWE CWE-319
+  [LOW     ] Client-supplied Host header trusted for the login redirect, for upstream requests and for rewritten Locat
+            CWE CWE-601
+  [MEDIUM  ] DNAT/auth-bypass conflict detection compares raw strings, so a hostname (or non-canonical IP) reverse-pro
+            CWE CWE-697
+  [MEDIUM  ] Certificate download endpoint exports the TLS private key to any panel session without re-authentication,
+            CWE CWE-306
+  [LOW     ] Private-key download response carries no Cache-Control: no-store, unlike the sibling auth gateway which s
+            CWE CWE-525
+  [LOW     ] Panel and auth gateway implement the cookie-domain derivation differently, so the panel can report a shar
+            CWE CWE-436
+  [LOW     ] Rule validation accepts target hosts the nginx generator silently drops, so the API reports a service as 
+            CWE CWE-754
+  [MEDIUM  ] GET /api/config returns the whole configuration, including unmasked third-party DNS provider credentials
+            CWE CWE-200
+  [MEDIUM  ] China IP geofence list fetched over the network and trusted as firewall policy with no integrity verifica
+            CWE CWE-494
+  [MEDIUM  ] China IP ruleset fragment is rewritten in place while the firewall ruleset concurrently includes it
+            CWE CWE-367
+  [MEDIUM  ] IPv6 cron empties the live nft set and re-adds it in a second, unchecked transaction
+            CWE CWE-252
+  [MEDIUM  ] Whitelist/blacklist operations write the whole config file back with an unsynchronised read-modify-write,
+            CWE CWE-362
+  [MEDIUM  ] IP value passed to `nft add element` is not strictly parsed: IPv6 literals with an arbitrary scope-id suf
+            CWE CWE-94
+  [LOW     ] Unbounded IP-preset list: every GET /api/lists/presets spawns one `nft` subprocess per stored preset and 
+            CWE CWE-400
+  [LOW     ] Whitelist/blacklist read endpoints report success with empty lists when the `nft list set` call fails
+            CWE CWE-252
+  [MEDIUM  ] Authentication audit trail can be flooded and evicted by an unauthenticated attacker; only the last 2000 
+            CWE CWE-778
+  [LOW     ] Panel serves the merged audit trail and other authenticated data without Cache-Control: no-store
+            CWE CWE-525
+  [HIGH    ] Panel init script permanently disables the platform firewall service before validating the replacement ru
+            CWE CWE-693
+  [MEDIUM  ] Boot ruleset recovery trusts only nft's exit code, so a non-functional ruleset is logged as loaded and th
+            CWE CWE-693
+  [MEDIUM  ] A failed ruleset load at boot permanently pins the device to the superseded .lastgood policy while the pa
+            CWE CWE-693
+  [MEDIUM  ] Gateway audit log is owned by the unprivileged service account and its rotation can never succeed, so the
+            CWE CWE-778
+  [MEDIUM  ] Post-authentication open redirect in the gateway login page: control characters in ?next= bypass safeNext
+            CWE CWE-601
+  [MEDIUM  ] Stale full copy of the admin SPA (frontend/index.html.bak) is deployed in the panel's served web root and
+            CWE CWE-530
+  [MEDIUM  ] prepare_nftweb_files aborts the gateway start when /etc/nftables is missing, taking the whole public entr
+            CWE CWE-703
+  [LOW     ] Panel CSP enables inline script execution (script-src 'unsafe-inline') although the SPA ships no inline s
+            CWE CWE-79
+  [LOW     ] Privilege-drop verification loop cannot detect an already-exited gateway, stalling the start for up to 15
+            CWE CWE-703
+  [LOW     ] Pre-existing nftweb account is trusted without validating uid/gid, so a uid 0 entry yields AUTH_DROP_UID=
+            CWE CWE-20
+  [HIGH    ] Installer pipes a remote third-party script straight into a root shell with no integrity check
+            CWE CWE-494
+  [HIGH    ] Whole application installed from an unverified GitHub tarball that is then executed as root by the init s
+            CWE CWE-494
+  [HIGH    ] wget compatibility shim disables TLS certificate verification when no CA bundle is present, making packag
+            CWE CWE-295
+  [MEDIUM  ] Installer leaves the shared config 0600 root:root so the privilege-dropped auth gateway cannot read it an
+            CWE CWE-732
+  [MEDIUM  ] Post-login open redirect on the gateway login page: safeNext() does not reject ASCII tab/newline, which t
+            CWE CWE-601
+  [MEDIUM  ] Gateway login form can fall back to a GET submission, placing the plaintext password in the URL, browser 
+            CWE CWE-598
+  [LOW     ] Panel SPA keeps cloud-provider and DDNS credentials resident in the DOM and Alpine state after logout / s
+            CWE CWE-522
+  [MEDIUM  ] China-IP list is only shape-validated before becoming nft set members: a supernet entry silently disables
+            CWE CWE-20
+  [MEDIUM  ] Root panel and root cron write the DDNS relay files into shared /tmp by predictable name without O_NOFOLL
+            CWE CWE-59
+  [LOW     ] Stale /tmp/ddns-ipv6-N relay files are never invalidated, so DDNS keeps publishing the address of a delet
+            CWE CWE-459
+
+=== 新引入（本轮有、基线没有）（14）===
+  [MEDIUM  ] The gateway login rate-limit table is wiped wholesale when its JSON is unreadable, so a corrupted table s
+            CWE CWE-636
+  [LOW     ] On the LAN-bypass branch the gateway forwards the raw, unvalidated gw_device cookie to upstream services 
+            CWE CWE-345
+  [LOW     ] The gateway login CSRF check is skipped entirely when both Origin and Referer are absent
+            CWE CWE-352
+  [MEDIUM  ] logd remote syslog target accepts any IPv4 literal, including loopback, link-local and cloud-metadata add
+            CWE CWE-918
+  [MEDIUM  ] DDNS service fields other than ipv6_source (service_name, domain, param_opt, check_interval, ...) reach t
+            CWE CWE-78
+  [MEDIUM  ] Unfiltered DNS credential values are injected into the root acme.sh child process environment and persist
+            CWE CWE-78
+  [LOW     ] Vendored acme.sh dns_huaweicloud.sh interpolates HUAWEICLOUD_Region into the DNS API host, but the panel 
+            CWE CWE-918
+  [LOW     ] Reverse-proxy rule connectivity test leaks a three-state TCP port-scan oracle because the minimum-wait pa
+            CWE CWE-208
+  [MEDIUM  ] Unescaped client-controlled fields in the gateway nginx log_format let any client silently drop its own a
+            CWE CWE-117
+  [MEDIUM  ] Client-asserted device id (gw_device cookie) and browser fingerprint (X-Device-Fingerprint header) are re
+            CWE CWE-345
+  [LOW     ] The gateway visitor endpoint is correctly restricted to panel sessions, but the requested observation win
+            CWE CWE-778
+  [LOW     ] First-run setup is a TOCTOU race: POST /api/auth/setup only checks that the password file does not exist 
+            CWE CWE-367
+  [LOW     ] The panel's login-failure rate-limit table fails open silently: a corrupt or unreadable table is swallowe
+            CWE CWE-636
+  [LOW     ] The auth gateway's degraded-mode in-memory rate-limit fallback is read-modify-written without a mutex whi
+            CWE CWE-362
+
+=== 逐条疑似同一的配对 ===
+  基线[MEDIUM] _authenticated() (/auth/portal) does not enforce the absolute-TTL deadline — the endpoint 
+  本轮[HIGH/ALREADY_FIXED] /auth/status omits the token epoch check — a pre-password-change token is still reported a
+  ---
+  基线[MEDIUM] load_revoked() reads the revocation table without the file lock — a read racing revoke_jti
+  本轮[CRITICAL/ALREADY_FIXED] Rate-limit table is rewritten in place (truncate+write) and read without the shared lock, 
+  ---
+  基线[MEDIUM] Sliding renewal treats a failed revoke_jti() as success — the superseded token stays valid
+  本轮[MEDIUM/ALREADY_FIXED] auth_login revokes only the cookie-borne previous token — a Bearer client's old credential
+  ---
+  基线[LOW] Token cookie Max-Age is derived from the sliding TTL and can outlive the token's actual ex
+  本轮[HIGH/ALREADY_FIXED] /auth/status omits the token epoch check — a pre-password-change token is still reported a
+  ---
+  基线[HIGH] Panel source-address boundary fails open (no restriction) when the configuration file is m
+  本轮[LOW/CONFIRMED] The panel login-failure rate-limit table fails open when the file is corrupt or unreadable
+  ---
+  基线[HIGH] Security-state field auth_token_epoch is writable through the generic POST /api/config mer
+  本轮[MEDIUM/ALREADY_FIXED] Gateway LAN matcher accepts a /1 subnet, so half of the IPv4 internet can be granted the c
+  ---
+  基线[HIGH] LAN-only nginx locations accept an over-broad lan_subnet4 (0.0.0.0/0) at the execution poi
+  本轮[LOW/CONFIRMED] Verified, not a vulnerability: the operational endpoints really do write root scripts, rew
+  ---
+  基线[MEDIUM] /api/knock-info LAN check accepts an over-broad lan_subnet4, disclosing the port-knocking 
+  本轮[LOW/CONFIRMED] Verified, not a vulnerability: the operational endpoints really do write root scripts, rew
+  ---
+  基线[MEDIUM] The panel's source allow-list fails open when the policy file is missing or corrupt, and l
+  本轮[LOW/CONFIRMED] The panel login-failure rate-limit table fails open when the file is corrupt or unreadable
+  ---
+  基线[LOW] The shared policy file is written world-readable (0644) and never tightened, exposing the 
+  本轮[HIGH/ALREADY_FIXED] Panel session-signing key is the shared master secret, readable by the de-privileged WAN-f
+  ---
+  基线[MEDIUM] Config values that pass validate_config crash rule generation (router_ip6 list → Attribute
+  本轮[LOW/CONFIRMED] POST /api/logd/config accepts any IPv4 as the remote syslog target with no destination all
+  ---
+  基线[MEDIUM] Rendered ruleset, .lastgood and .backup are created with umask-derived permissions and are
+  本轮[HIGH/ALREADY_FIXED] Panel session-signing key is the shared master secret, readable by the de-privileged WAN-f
+  ---
+  基线[LOW] Basic-lockdown fallback interpolates the unvalidated `lan_if` config value into nftables s
+  本轮[LOW/CONFIRMED] POST /api/logd/config accepts any IPv4 as the remote syslog target with no destination all
+  ---
+  基线[MEDIUM] CSRF origin check compares hostname only - scheme and port are ignored, so a different ori
+  本轮[LOW/CONFIRMED] No CSRF token exists anywhere in the product; the only defences are SameSite=Lax cookies a
+  ---
+  基线[MEDIUM] LAN allow-list accepts a /0 or /1 network, turning "LAN-only" services into world-readable
+  本轮[LOW/CONFIRMED] Verified, not a vulnerability: the operational endpoints really do write root scripts, rew
+  ---
+  基线[MEDIUM] Gateway nginx config is installed before it is validated and the rollback is silently skip
+  本轮[LOW/CONFIRMED] The panel password-hash file is written with truncate-then-write and no atomic rename, so 
+  ---
+  基线[MEDIUM] Reverse-proxy target address accepts loopback, link-local/cloud-metadata and DNS-resolved 
+  本轮[MEDIUM/CONFIRMED] detect-* endpoints enforce the LAN-only target policy on the first hop only; the default u
+  ---
+  基线[MEDIUM] detect-* endpoints fetch an arbitrary attacker-chosen host:port and echo fragments of the 
+  本轮[MEDIUM/CONFIRMED] detect-* endpoints enforce the LAN-only target policy on the first hop only; the default u
+  ---
+  基线[MEDIUM] Uploaded TLS private key is written world-readable (0644) before it is chmod'ed, and stays
+  本轮[HIGH/ALREADY_FIXED] Panel session-signing key is the shared master secret, readable by the de-privileged WAN-f
+  ---
+  基线[MEDIUM] Cookie Domain is derived from / set to an unvalidated certificate SAN, allowing the gatewa
+  本轮[LOW/ALREADY_FIXED] Recon claim not reproducible: a non-numeric ?limit= on GET /api/lists/history does not rai
+  ---
+  基线[MEDIUM] Third-party DNS provider credentials stored in plaintext in the world-readable shared conf
+  本轮[HIGH/ALREADY_FIXED] Panel session-signing key is the shared master secret, readable by the de-privileged WAN-f
+  ---
+  基线[MEDIUM] Aliyun AccessKey secret is written to a world/group-readable file before permissions are t
+  本轮[HIGH/ALREADY_FIXED] Panel session-signing key is the shared master secret, readable by the de-privileged WAN-f
+  ---
+  基线[MEDIUM] DDNS provider password is silently wiped on save because the masked value cannot be restor
+  本轮[LOW/CONFIRMED] The panel password-hash file is written with truncate-then-write and no atomic rename, so 
+  ---
+  基线[CRITICAL] Failed `crontab -l` read silently truncates the root crontab, destroying the IPv6 updater 
+  本轮[LOW/CONFIRMED] The panel password-hash file is written with truncate-then-write and no atomic rename, so 
+  ---
+  基线[CRITICAL] Shared-secret permission helper silently degrades to 0600 on any chown failure, breaking t
+  本轮[LOW/CONFIRMED] The panel password-hash file is written with truncate-then-write and no atomic rename, so 
+  ---
+  基线[CRITICAL] /etc/config/network is rewritten in place (truncate-then-write) without atomic replace or 
+  本轮[MEDIUM/CONFIRMED] POST /api/config/restore bypasses the config_rev optimistic-lock gate and silently rolls t
+  ---
+  基线[MEDIUM] List entries added through the API are never persisted into the ruleset file, so any reloa
+  本轮[MEDIUM/CONFIRMED] POST /api/config/restore bypasses the config_rev optimistic-lock gate and silently rolls t
+  ---
+  基线[LOW] Whitelist/blacklist policy file (and its lock/temp files) are created world-readable and t
+  本轮[HIGH/ALREADY_FIXED] Panel session-signing key is the shared master secret, readable by the de-privileged WAN-f
+  ---
+  基线[LOW] List API does not type-check request fields: a non-string `ip`/`set_name` or a non-object 
+  本轮[LOW/CONFIRMED] POST /api/logd/config accepts any IPv4 as the remote syslog target with no destination all
+  ---
+  基线[MEDIUM] Undecodable byte in the syslog ring buffer makes the entire /api/system/logs endpoint fail
+  本轮[LOW/ALREADY_FIXED] Recon claim not reproducible: a non-numeric ?limit= on GET /api/lists/history does not rai
+  ---
+  基线[LOW] Audit log recreated with default (world-readable) permissions after rotation; the 0640 mod
+  本轮[CRITICAL/ALREADY_FIXED] Audit log file mode regresses to 0644 (world-readable) after the first rotation, discardin
+  ---
+  基线[MEDIUM] prepare_nftweb_files gives /etc/nftables to the nftweb group without normalising the direc
+  本轮[HIGH/ALREADY_FIXED] Panel session-signing key is the shared master secret, readable by the de-privileged WAN-f
+  ---
+  基线[HIGH] acme.sh DNS-01 plugin scripts downloaded over the WAN without checksum/signature and later
+  本轮[MEDIUM/CONFIRMED] acme.sh DNS-01 plugin network-download fallback still has no checksum or signature and the
+  ---
+  基线[MEDIUM] Cron-installed IPv6 updater flushes the nft set before adding and ignores every nft error,
+  本轮[LOW/CONFIRMED] The panel password-hash file is written with truncate-then-write and no atomic rename, so 
+  ---
+  基线[MEDIUM] Crontab read-modify-write treats a failed `crontab -l` as "empty crontab" and silently wip
+  本轮[LOW/CONFIRMED] The panel password-hash file is written with truncate-then-write and no atomic rename, so 
+  ---
+  基线[LOW] IPv6 /64 prefix for the DDNS/forward-set composition is computed by naive string slicing i
+  本轮[LOW/CONFIRMED] POST /api/logd/config accepts any IPv4 as the remote syslog target with no destination all
+  ---
