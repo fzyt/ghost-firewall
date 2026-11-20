@@ -72,22 +72,30 @@ MUTATIONS = [
     {
         'id': 'P1-30a',
         'desc': 'save_config 拿不到锁时照样往下写（回退到无锁写入）',
-        'old': """        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        # ── 备份：**在锁内**做（P1-30）────────────────────────────────""",
-        'new': """        try:
+        # ⚠️ 锚点必须**缩进精确**：少写 4 个空格就会匹配到 12 空格那一行的中间
+        #   ⇒ 替换后 app.py 语法错误 ⇒ 测试导入就崩（输出里没有 [FAIL] 行）
+        #   ⇒ 被判成「没被抓住」（2026-11-21 回归实测）。
+        #   所以这里把 `if lock_owned:` 一起包进来，整块替换。
+        'old': """        if lock_owned:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        except OSError:
-            pass  # MUTATION: 拿不到锁也继续写
+        # ── 备份：**在锁内**做（P1-30）────────────────────────────────""",
+        'new': """        if lock_owned:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            except OSError:
+                pass  # MUTATION: 拿不到锁也继续写
         # ── 备份：**在锁内**做（P1-30）────────────────────────────────""",
     },
     {
         'id': 'P1-30b',
         'desc': 'save_config 干脆不加锁（备份与写入都没有互斥保护）',
         'old': """    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        if lock_owned:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
         # ── 备份：**在锁内**做（P1-30）────────────────────────────────""",
         'new': """    try:
-        pass  # MUTATION: 完全不加锁
+        if lock_owned:
+            pass  # MUTATION: 完全不加锁
         # ── 备份：**在锁内**做（P1-30）────────────────────────────────""",
     },
     {

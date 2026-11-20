@@ -69,7 +69,7 @@ MUTATIONS = [
 
     ("MISC-02：非 dict 的 JSON 也当成空表放行",
      AG,
-     '        if not isinstance(data, dict):\n            raise ValueError("吊销表不是 JSON 对象")',
+     '                if not isinstance(data, dict):\n                    raise ValueError("吊销表不是 JSON 对象")',
      '        if not isinstance(data, dict):\n            data = {}'),
 
     ("MISC-02：文件被删掉时也当干净初始状态（删表等于复活所有已吊销令牌）",

@@ -67,11 +67,11 @@ MUTATIONS = [
 
     ("P0-4  /api/config 不再剔除只读键（世代号能被通用路径改）",
      APP,
-     "    readonly_hits = sorted(k for k in incoming if k in READONLY_CONFIG_KEYS)\n"
-     "    for k in READONLY_CONFIG_KEYS:\n"
-     "        incoming.pop(k, None)\n",
-     "    readonly_hits = sorted(k for k in incoming if k in READONLY_CONFIG_KEYS)\n"
-     "    # 变异：不再剔除\n"),
+     "        readonly_hits = sorted(k for k in incoming if k in READONLY_CONFIG_KEYS)\n"
+     "        for k in READONLY_CONFIG_KEYS:\n"
+     "            incoming.pop(k, None)\n",
+     "        readonly_hits = sorted(k for k in incoming if k in READONLY_CONFIG_KEYS)\n"
+     "        # 变异：不再剔除\n"),
 
     # ══════════════════════════════════════════════════════════════════
     # P0-5  触发锁定的那次登录必须返 429 且 remaining=0

@@ -127,7 +127,7 @@ MUTATIONS = [
     ("init：轮询改回固定 sleep 1（竞态复活）",
      INIT,
      '    while [ "$waited" -lt 150 ]; do\n'
-     '        kill -0 "$pid" 2>/dev/null || break          # 进程自己退了，交给下面的失败分支\n'
+     '        _proc_alive "$pid" || break          # 进程自己退了（或已成僵尸），交给下面的失败分支\n'
      '        real_uid=$(awk \'/^Uid:/ {print $2}\' "/proc/$pid/status" 2>/dev/null)\n'
      '        # 非空且非 0 才算降权完成；空说明 /proc 还没建好，继续等\n'
      '        if [ -n "$real_uid" ] && [ "$real_uid" != "0" ]; then\n'

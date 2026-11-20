@@ -191,7 +191,7 @@ MUTATIONS = [
      SETUP, [('    mkdir -p "$CONFIG_DIR"', '    :')]),
 
     ('M14 网关 init 的轮询不再检查进程存活（空等 150 次才判失败）',
-     AUTH, [('        kill -0 "$pid" 2>/dev/null || break          # 进程自己退了，交给下面的失败分支',
+     AUTH, [('        _proc_alive "$pid" || break          # 进程自己退了（或已成僵尸），交给下面的失败分支',
              '        :')]),
 
     ('M15 setup.sh 播种配置时不再是 640 + nftweb 组（网关读不到）',

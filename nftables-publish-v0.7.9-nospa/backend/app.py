@@ -238,17 +238,25 @@ def _bump_token_epoch() -> int:
     先递增再改密码：万一密码写入失败，代价是「大家被登出」（安全、
     可重新登录），反过来则是「密码没改成功但旧会话还活着」—— 方向错了。
     """
-    cfg = load_config()
-    bad, err = _config_corrupted()
-    if bad:
-        raise ConfigCorruptedError(_CORRUPT_REFUSAL.format(err=err, path=CONFIG_PATH))
-    try:
-        new_ep = int(cfg.get('auth_token_epoch', 0) or 0) + 1
-    except (TypeError, ValueError):
-        new_ep = 1
-    cfg['auth_token_epoch'] = new_ep
-    save_config(cfg)
-    return new_ep
+    # ⚠️ 整段在写锁内（2026-11-21 核实补）：
+    # 世代号是「改密码作废全部会话」的依据，递增必须**不丢**。
+    # 原来 load→改→save 三步分开，两个并发的改密码请求会各自读到同一个
+    # 旧世代号、各自 +1、各自写 ⇒ 实际只涨了 1（而不是 2），
+    # 而按「令牌带的 ep 必须小于当前世代号」的语义，少涨一次就意味着
+    # 有一批本该作废的令牌**没作废**。
+    def _mutate(cfg):
+        bad, err = _config_corrupted()
+        if bad:
+            raise ConfigCorruptedError(_CORRUPT_REFUSAL.format(err=err, path=CONFIG_PATH))
+        try:
+            new_ep = int(cfg.get('auth_token_epoch', 0) or 0) + 1
+        except (TypeError, ValueError):
+            new_ep = 1
+        cfg['auth_token_epoch'] = new_ep
+        return cfg
+
+    new_cfg = update_config(_mutate)
+    return int(new_cfg.get('auth_token_epoch', 0) or 0)
 
 
 def _is_authenticated() -> bool:
@@ -961,8 +969,17 @@ DEFAULT_CONFIG = {
     # 这里只改**新装 / 配置丢失**时的出厂值。
     "forward_rules": [],
     # 信任IP
-    "trusted_ip4": "192.168.100.2",
-    "trusted_ip6": "fd93:86bb:a142:0:e9d:92ff:fe87:fd28",
+    #
+    # ⚠️ 默认**留空**（2026-11-21 核实补）：出厂值曾经是 192.168.100.2，
+    # 那是「我自己的开发网段里的某台机器」。用户自己的内网完全可能也有
+    # 同地址的设备 —— 于是**新装 / 配置丢失**时，那台机器自动成了
+    # 「免敲门、全部端口放行」的管理机，而用户对此毫无感知。
+    #
+    # 为什么留空是对的：trust 模式是「显式授权」，不是「默认授权」。
+    # 存量部署不受影响 —— 配置里有值就以配置为准（load_config 的合并顺序）。
+    # 留空时模板里那两条「信任 IP 全端口放行」整块不生成（见 nftables.conf）。
+    "trusted_ip4": "",
+    "trusted_ip6": "",
     # 日志开关
     "foreign_scan_log": False,
     "ipv6_wan_lan_log": False,
@@ -1316,6 +1333,99 @@ def _handle_config_write_error(e):
                                '本次未做任何修改。请检查磁盘空间与目录权限后重试。'}), 500
 
 
+# 配置写锁的**每线程**状态（2026-11-21 核实补）
+#
+# 为什么需要「可重入」
+# ------------------
+# 「读-改-写」必须**整段**在写锁里：load_config() → 改 → save_config()
+# 三步分开的话，两个并发请求会各自读到同一份旧配置、各自改、各自写，
+# 后写的覆盖先写的，而**两边都报 success**。
+#
+# 但 save_config 内部自己会 flock 锁文件。Linux 的 flock 是 OFD 语义：
+# 同一个 fd 重复加锁**立即成功**，不同 fd 加同一把锁则**互相阻塞** ——
+# 外层已经持锁时再让 save_config 自己开一个 fd，等于自己把自己锁死。
+#
+# 所以这里记下「本线程已持有的 fd」，内层 save_config 复用**同一个 fd**。
+#
+# 为什么用 threading.local 而不是普通全局变量：
+# 面板是 threaded=True 的多线程 Flask，同一个进程里多个线程会同时存配置。
+# 用普通全局变量的话，线程 B 会看到线程 A 的 depth>0 而「复用」A 的 fd ——
+# 两个线程共用一个 fd，A 释放时 B 还在用 ⇒ 锁失效。
+# 每线程一份状态，各线程各锁各的（flock 本身是跨线程互斥的）。
+_CONFIG_LOCK_LOCAL = threading.local()
+
+
+def _lock_depth():
+    """本线程当前持有的配置写锁层数（0 = 未持有）。"""
+    return getattr(_CONFIG_LOCK_LOCAL, 'depth', 0)
+
+
+def update_config(mutator):
+    """整段在写锁内完成「读 → 改 → 写」。
+
+    mutator 收到**锁内重读**的当前配置，返回要写回的新配置；
+    返回 None 表示「不写」（调用方自己决定应答，比如版本不符就 409）。
+
+    为什么不能自己 load + save（2026-11-21 核实补）：
+    那是两个独立临界区 —— A 读、B 读、A 写、B 写 ⇒ 后写覆盖先写，
+    而且两边都报成功。丢的是用户刚填的字段。
+
+    为什么锁要可重入：写盘走 save_config，它内部自己会取同一把锁。
+    """
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    lock_path = CONFIG_PATH + '.lock'
+    try:
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, _CONFIG_FILE_MODE)
+    except OSError as e:
+        print(f"[ERROR] update_config 无法打开配置锁（{type(e).__name__}），"
+              "已中止写入（未做任何修改）", flush=True)
+        raise ConfigWriteError('无法获取配置写锁，已中止保存（未做任何修改）')
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    except OSError as e:
+        os.close(lock_fd)
+        print(f"[ERROR] update_config 无法锁定配置锁文件（{type(e).__name__}），"
+              "已中止写入（未做任何修改）", flush=True)
+        raise ConfigWriteError('无法获取配置写锁，已中止保存（未做任何修改）')
+    _CONFIG_LOCK_LOCAL.depth = 1
+    _CONFIG_LOCK_LOCAL.fd = lock_fd
+    try:
+        config = load_config()
+        new_config = mutator(config)
+        if new_config is None:
+            return None
+        # 内层 save_config 会发现本线程已持锁 ⇒ 复用同一个 fd，不再 flock。
+        save_config(new_config)
+        return new_config
+    finally:
+        _CONFIG_LOCK_LOCAL.depth = 0
+        _CONFIG_LOCK_LOCAL.fd = None
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+
+class _ConfigRejected(Exception):
+    """「不该写」且应答已经确定 —— 由 update_config 的 mutator 抛出。
+
+    区别于普通异常：这不是「出错了」，是**预期中的拒绝**
+    （版本过期 / 有自锁风险），调用方要按 code/status 如实应答，不是 500。
+
+    ⚠️ extra 是应答体里的**顶层附加字段**，不是 data 里的内容：
+       少了这一层包装，前端读 e.data.data.risks（app.js 的 CRITICAL_RISK 分支）
+       读不到 ⇒ critical 风险的二次确认弹窗直接消失，用户再也看不到
+       「确认后仍可保存」这条路。extra 里要放 data 时得写成 {'data': {...}}。
+    """
+
+    def __init__(self, code, message, status=400, extra=None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status = status
+        self.extra = extra or {}
+
+
 def save_config(config, _force=False):
     """保存配置到 JSON 文件
 
@@ -1365,16 +1475,28 @@ def save_config(config, _force=False):
     tmp_path = CONFIG_PATH + '.tmp'
     lock_path = CONFIG_PATH + '.lock'
     # ⚠️ os.open 不带 mode 时按 umask 建文件（0644 = world-readable）
+    #
+    # ⚠️ 本线程已持锁时**复用同一个 fd**（2026-11-21 核实补）：
+    # update_config 把「读-改-写」整段锁住，写盘走的就是这里。
+    # Linux 的 flock 是 OFD 语义 —— 同一 fd 重复加锁立即成功，
+    # 不同 fd 加同一把锁则**互相阻塞** ⇒ 这里若再开一个新 fd，
+    # 就是自己把自己锁死（update_config 永远等不到 save_config 返回）。
+    lock_owned = True
+    if _lock_depth() > 0:
+        lock_fd = _CONFIG_LOCK_LOCAL.fd
+        lock_owned = False
+    else:
+        try:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, _CONFIG_FILE_MODE)
+        except OSError as e:
+            # 连锁文件都建不出来（目录不可写/只读文件系统）⇒ 无法保证互斥。
+            # **拒绝写入**：宁可不保存，也不能在无保护的情况下改共享配置。
+            print(f"[ERROR] save_config 无法打开配置锁（{type(e).__name__}），"
+                  "已中止写入（未做任何修改）", flush=True)
+            raise ConfigWriteError('无法获取配置写锁，已中止保存（未做任何修改）')
     try:
-        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, _CONFIG_FILE_MODE)
-    except OSError as e:
-        # 连锁文件都建不出来（目录不可写/只读文件系统）⇒ 无法保证互斥。
-        # **拒绝写入**：宁可不保存，也不能在无保护的情况下改共享配置。
-        print(f"[ERROR] save_config 无法打开配置锁（{type(e).__name__}），"
-              f"已中止写入（未做任何修改）", flush=True)
-        raise ConfigWriteError('无法获取配置写锁，已中止保存（未做任何修改）')
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        if lock_owned:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
         # ── 备份：**在锁内**做（P1-30）────────────────────────────────
         if os.path.exists(CONFIG_PATH):
             # 备份里是**完整配置**（含 DDNS API token、reverse_proxy 凭据），
@@ -1402,10 +1524,12 @@ def save_config(config, _force=False):
         os.chmod(tmp_path, _CONFIG_FILE_MODE)
         os.replace(tmp_path, CONFIG_PATH)
     finally:
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        finally:
-            os.close(lock_fd)
+        # 只释放**自己**打开的那把锁：复用的 fd 由外层 update_config 负责。
+        if lock_owned:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
 
 
 def _migrate_forward_rules(config):
@@ -1821,7 +1945,7 @@ def validate_config(cfg):
         if v and not _RE_IFACE.match(v):
             errs.append(f'{key} 接口名非法: {v!r}（只允许字母数字及 _ . -，最长 32）')
 
-    for key, ver, optional in (('router_ip4', 4, False), ('trusted_ip4', 4, False),
+    for key, ver, optional in (('router_ip4', 4, False), ('trusted_ip4', 4, True),
                                ('router_ip6', 6, True), ('trusted_ip6', 6, True)):
         raw = cfg.get(key)        # trusted_ip4/trusted_ip6 历史上有字符串和数组两种写法（setup.sh 写的是数组），
         # 这里必须都接受，否则老装机升级后每次保存配置都会被判 400
@@ -1840,6 +1964,24 @@ def validate_config(cfg):
             continue
         if not _valid_ip(v, ver):
             errs.append(f'{key} IPv{ver} 地址非法: {v!r}')
+
+    # ⚠️ access_mode=trusted 时必须有 trusted_ip4（2026-11-21 核实补）
+    #
+    # 为什么要这条：模板里 TRUSTED_IP4 为空 ⇒ `__TRUSTED_ACCEPT_BLOCK__`
+    # 整块不生成 ⇒ **没有任何来源能免认证访问**（trusted 模式本来就是
+    # 「LAN 默认全丢弃」）。也就是说：用户切到 trusted 模式却没填
+    # trusted_ip4 ⇒ 他把自己锁在外面，而面板上没有任何提示。
+    #
+    # lan 模式（默认）不需要它 —— 那条路是「内网默认可达」，不靠信任 IP。
+    # 所以 trusted_ip4 现在允许为空，但 trusted 模式下强制非空。
+    if cfg.get('access_mode') == 'trusted':
+        _t4 = cfg.get('trusted_ip4')
+        _t4_items = ([str(x).strip() for x in _t4 if str(x).strip()]
+                      if isinstance(_t4, (list, tuple, set))
+                      else [str(_t4 or '').strip()])
+        if not [x for x in _t4_items if x]:
+            errs.append('access_mode=trusted 时必须指定 trusted_ip4'
+                        '（否则没有任何来源能免认证访问：模板里的信任放行整块不生成）')
 
     # 面板来源访问边界。这里**必须**用 ip_network 而不是 _valid_ip：
     # _valid_ip 走 ipaddress.ip_address()，不接受 CIDR，而访问边界要写的
@@ -1932,11 +2074,13 @@ def validate_config(cfg):
         errs.append(f'lan_allowed_ports {e}')
 
     wt = cfg.get('whitelist_timeout')
-    if wt is not None and str(wt).strip() != '' and not str(wt).strip().isdigit():
+    # 用 _nonneg_int 判而不是 isdigit()：'²'.isdigit() 为真但 int('²') 会炸，
+    # 那样就是「校验放行、生成时 500」（2026-11-21 核实补）。
+    if wt is not None and str(wt).strip() != '' and _nonneg_int(wt, -1) < 0:
         errs.append(f'whitelist_timeout 非法: {wt!r}（只允许非负整数秒）')
 
     mwt = cfg.get('manual_whitelist_timeout')
-    if mwt is not None and str(mwt).strip() != '' and not str(mwt).strip().isdigit():
+    if mwt is not None and str(mwt).strip() != '' and _nonneg_int(mwt, -1) < 0:
         errs.append(f'manual_whitelist_timeout 非法: {mwt!r}（只允许非负整数秒）')
 
     for s in (cfg.get('dns_lan_servers') or []):
@@ -2151,14 +2295,66 @@ def _safe_cidr(v, default=""):
 
     必须单独一个函数：_safe_ip 只认单个 IP，喂进来 '192.168.100.0/24'
     会被判非法并静默回落 —— 那正好把「仅内网可达」的放行范围悄悄放大。
+
+    ⚠️ 过宽网段（prefixlen <= 1）同样算**非法**（2026-11-21 核实补）
+    --------------------------------------------------------------
+    这个函数的唯一调用点是生成 nginx 的 `allow <cidr>` 指令 ——
+    那是「仅内网可达」服务（public_access=false、**不调 auth_request**）
+    的唯一防线。`allow 0.0.0.0/0;` 等于把那些服务直接开放给整个互联网。
+
+    保存路径的 validate_config 已经拒了 prefixlen <= 1，
+    restore 路径也补跑了 validate_config（app.py 的 restore_config），
+    所以正常路径进不来。但配置文件**可以被手改**，
+    而这一层是**执行点**的最后一道闸 —— 与网关侧
+    auth_gateway.py 的 is_lan_source() 同口径（那里也是 prefixlen <= 1 一律跳过）。
+
+    回落方向是**收紧**不是放开：宁可放行范围小于预期（LAN-only 服务连不上），
+    也不能放行范围大于预期（服务对全网免认证）。
     """
     s = str(v or '').strip()
     if not s:
         return default
     try:
-        return str(ipaddress.ip_network(s, strict=False))
+        net = ipaddress.ip_network(s, strict=False)
     except (ValueError, TypeError):
         return default
+    if net.prefixlen <= 1:
+        print(f'[WARN] 网段 {s!r} 过宽（/{net.prefixlen}），已回落默认网段 {default!r}',
+              flush=True)
+        return default
+    return str(net)
+
+
+def _nonneg_int(v, default=0):
+    """把配置值读成非负整数。非法一律回落 default。
+
+    为什么不能用 str.isdigit()（2026-11-21 核实补）：
+    `isdigit()` 对**上标数字**返回 True —— '²'.isdigit() 是 True，
+    但 int('²') 抛 ValueError。于是「校验通过、生成阶段炸 500」：
+    validate_config 放行了 '²'，生成规则时 int() 抛异常，
+    apply 整个 500，boot 恢复退到 lockdown。
+    `isascii() and isdigit()` 才是「十进制数字」的准确判据。
+    """
+    s = str(v if v is not None else '').strip()
+    if not s or not s.isascii() or not s.isdigit():
+        return default
+    try:
+        n = int(s)
+    except ValueError:
+        return default
+    return n if n >= 0 else default
+
+
+def _req_str(data, key):
+    """从请求体里取字符串字段。非字符串一律当空串。
+
+    为什么不能直接 `data.get(key, '').strip()`（2026-11-21 核实补）：
+    请求体是**客户端可控**的 JSON。`{"ip": 123}` 会让 123.strip() 抛
+    AttributeError ⇒ 全局错误处理器回 500，而不是 400。
+    客户端传错类型是常事，不该被当成服务器故障。
+    """
+    v = data.get(key)
+    return v.strip() if isinstance(v, str) else ''
 
 
 # 网关内部端点占用的路径前缀，服务前缀不得与之冲突
@@ -2931,8 +3127,6 @@ def post_config():
     if not data:
         return jsonify({"success": False, "message": "请求体不能为空"}), 400
 
-    # merge 到现有配置，避免前端只发部分字段时清空其他配置
-    old_cfg = load_config()
     incoming = {k: v for k, v in data.items() if k != 'confirm'}  # confirm 不入配置
 
     # ── 版本闸：整份覆盖之前，先确认这份快照不是过期的 ─────────────────
@@ -2956,100 +3150,121 @@ def post_config():
     #   而是「内容过期了」，重试就能解决。
     sent_rev = str(data.get('config_rev') or '').strip()
     incoming.pop('config_rev', None)     # 版本号不是配置字段，绝不能落盘
-    cur_rev = _config_rev(old_cfg)
-    if not sent_rev:
-        return jsonify({
-            'success': False,
-            'code': 'CONFIG_REV_REQUIRED',
-            'message': ('本次保存缺少配置版本号（config_rev），已拒绝。'
-                        '请先 GET /api/config 取一份最新快照，'
-                        '带上 config_rev 再提交。'),
-            'data': {'config_rev': cur_rev},
-        }), 409
-    if sent_rev != cur_rev:
-        return jsonify({
-            'success': False,
-            'code': 'CONFIG_STALE',
-            'message': ('配置在你打开页面之后被改过，本次保存会覆盖掉那些改动，'
-                        '已拒绝。请刷新页面后重新编辑。'),
-            'data': {'config_rev': cur_rev},
-        }), 409
-
-    # 只读键：GET 为了让前端能显示「实际状态」会多给几个字段，而前端是把
-    # 整个 config 对象原样回传的。这些键不是配置，绝不能落盘。
-    readonly_hits = sorted(k for k in incoming if k in READONLY_CONFIG_KEYS)
-    for k in READONLY_CONFIG_KEYS:
-        incoming.pop(k, None)
-
-    # 反代配置块有独立写路径（/api/reverse-proxy/*），一律不收。
-    #
-    # 2026-10-21 .1 事故根因：前端那份 reverse_proxy 是**页面加载时的旧快照**，
-    # 而 new_cfg.update(incoming) 是整份覆盖 ⇒ 磁盘上刚建好的规则和证书
-    # 被旧快照静默清空（2 条规则 + 1 张阿里云证书 → 0 + 0）。
-    # 详见 RP_OWNED_CONFIG_KEYS 的注释。
-    rp_hits = sorted(k for k in incoming if k in RP_OWNED_CONFIG_KEYS)
-    for k in RP_OWNED_CONFIG_KEYS:
-        incoming.pop(k, None)
-    if rp_hits:
-        print(f'[WARN] /api/config 忽略了反代专属字段 {rp_hits}'
-              f'（只能由 /api/reverse-proxy/* 修改）', flush=True)
-
-    # 网关配置块不归这个端点管，原样剔除。
-    #
-    # 这个接口只落盘、不下发 nginx。留着 gateway_enabled 就会造出
-    # 「磁盘说开、8443 实际没人听」的状态（.224 实测），而面板各处都显示
-    # 「已启用」，没有任何一处会收敛。宁可前端传了也不生效 —— 生效路径只有
-    # /api/gateway/config，那边改完会真的下发并校验结果。
-    ignored = sorted(k for k in incoming if k in GATEWAY_OWNED_CONFIG_KEYS)
-    for k in GATEWAY_OWNED_CONFIG_KEYS:
-        incoming.pop(k, None)
-    if ignored:
-        print(f'[WARN] /api/config 忽略了网关专属字段 {ignored}（只能由 /api/gateway/config 修改）',
-              flush=True)
-    if readonly_hits:
-        print(f'[WARN] /api/config 丢弃了只读字段 {readonly_hits}（它们不是配置）',
-              flush=True)
-
-    new_cfg = dict(old_cfg)
-    new_cfg.update(incoming)
-
-    # 字段白名单校验：会进 nft 规则的字段必须合法，
-    # 否则可注入任意 nft 指令（如 whitelist_timeout="1s; delete table inet fw4; #"）
-    errs = validate_config(new_cfg)
-    if errs:
-        return jsonify({
-            'success': False,
-            'code': 'INVALID_CONFIG',
-            'message': '配置校验失败，未保存',
-            'errors': errs,
-        }), 400
 
     requester_ip = _client_ip()
-    risks = _detect_risks(old_cfg, new_cfg, requester_ip)
-
-    # trusted_ip4 归一化成单值再落盘。
+    # ⚠️ 下面这整段搬进 update_config 的 mutator（2026-11-21 核实补）
     #
-    # 必须放在 _detect_risks **之后**：风险检测要看到未归一化的多值，才能报出
-    # 「有 N 个被丢弃」。先归一化的话这条告警就永远不触发了。
+    # 为什么：原来是「锁外读 old_cfg → 比版本 → 剔除 → 合并 → 校验 → 锁内写」。
+    # 两个并发请求拿着**同一个** config_rev 进来时，两边都能通过开头的比对，
+    # 然后各自 save_config ⇒ 后写的覆盖先写的，而**两边都报 success**。
     #
-    # 为什么要在保存时归一化：配置里存着数组、规则里只认第一个，而两者之间
-    # 没有任何东西提醒用户。存成单值，配置与执行就永远一致了。
-    _eff_trusted, _ignored_trusted = _trusted_ip_single(new_cfg.get('trusted_ip4'))
-    new_cfg['trusted_ip4'] = _eff_trusted or ''
+    # 版本闸必须与写入在**同一个临界区**里才有意义：
+    # 比对用的配置和落盘用的必须是同一份，且期间没人能改。
+    old_cfg = None
+    # 这几个都要带出 mutator：后面的 LuCI 回滚段与成功应答都要用它们。
+    # （剔除动作在锁内做，但「剔了哪些」必须回给前端告知。）
+    risks = []
+    ignored = []
+    readonly_hits = []
+    rp_hits = []
 
-    critical_risks = [r for r in risks if r.get('level') == 'critical']
+    def _mutate(cfg):
+        nonlocal old_cfg, risks, ignored, readonly_hits, rp_hits
+        old_cfg = cfg
+        cur_rev = _config_rev(cfg)
+        # ── 版本闸：两个分支都在**锁内**（2026-11-21 核实补）────────────
+        #
+        # 为什么整个版本闸都在锁里：比对用的配置和落盘用的必须是**同一份**，
+        # 且期间没人能改。原来是「锁外读 old_cfg → 比版本 → 锁内写」，
+        # 两个并发请求拿着同一个 config_rev 进来时两边都能通过比对，
+        # 各自 save_config ⇒ 后写的覆盖先写的，而**两边都报 success**。
+        #
+        # 报错时回的 config_rev 也必须是锁内这份 cur_rev —— 锁外另读一份
+        # 的话，回给调用方的版本号可能已经是旧的，它拿着去重试还是会撞闸。
+        if not sent_rev:
+            raise _ConfigRejected(
+                'CONFIG_REV_REQUIRED',
+                '本次保存缺少配置版本号（config_rev），已拒绝。'
+                '请先 GET /api/config 取一份最新快照，'
+                '带上 config_rev 再提交。',
+                409, {'data': {'config_rev': cur_rev}})
+        if sent_rev != cur_rev:
+            raise _ConfigRejected(
+                'CONFIG_STALE',
+                '配置在你打开页面之后被改过，本次保存会覆盖掉那些改动，'
+                '已拒绝。请刷新页面后重新编辑。',
+                409, {'data': {'config_rev': cur_rev}})
+        # 只读键：GET 为了让前端能显示「实际状态」会多给几个字段，而前端是把
+        # 整个 config 对象原样回传的。这些键不是配置，绝不能落盘。
+        readonly_hits = sorted(k for k in incoming if k in READONLY_CONFIG_KEYS)
+        for k in READONLY_CONFIG_KEYS:
+            incoming.pop(k, None)
 
-    # critical 风险（如自锁）必须显式确认；绕过前端直接打 API 会被 409 拒绝
-    if critical_risks and not data.get('confirm'):
-        return jsonify({
-            'success': False,
-            'code': 'CRITICAL_RISK',
-            'message': '检测到可能导致自锁的变更，请确认后再保存',
-            'data': {'risks': risks},
-        }), 409
+        # 反代配置块有独立写路径（/api/reverse-proxy/*），一律不收。
+        #
+        # 2026-10-21 .1 事故根因：前端那份 reverse_proxy 是**页面加载时的旧快照**，
+        # 而 new_cfg.update(incoming) 是整份覆盖 ⇒ 磁盘上刚建好的规则和证书
+        # 被旧快照静默清空（2 条规则 + 1 张阿里云证书 → 0 + 0）。
+        # 详见 RP_OWNED_CONFIG_KEYS 的注释。
+        rp_hits = sorted(k for k in incoming if k in RP_OWNED_CONFIG_KEYS)
+        for k in RP_OWNED_CONFIG_KEYS:
+            incoming.pop(k, None)
+        if rp_hits:
+            print(f'[WARN] /api/config 忽略了反代专属字段 {rp_hits}'
+                  f'（只能由 /api/reverse-proxy/* 修改）', flush=True)
+
+        # 网关配置块不归这个端点管，原样剔除。
+        #
+        # 这个接口只落盘、不下发 nginx。留着 gateway_enabled 就会造出
+        # 「磁盘说开、8443 实际没人听」的状态（.224 实测），而面板各处都显示
+        # 「已启用」，没有任何一处会收敛。宁可前端传了也不生效 —— 生效路径只有
+        # /api/gateway/config，那边改完会真的下发并校验结果。
+        ignored = sorted(k for k in incoming if k in GATEWAY_OWNED_CONFIG_KEYS)
+        for k in GATEWAY_OWNED_CONFIG_KEYS:
+            incoming.pop(k, None)
+        if ignored:
+            print(f'[WARN] /api/config 忽略了网关专属字段 {ignored}（只能由 /api/gateway/config 修改）',
+                  flush=True)
+        if readonly_hits:
+            print(f'[WARN] /api/config 丢弃了只读字段 {readonly_hits}（它们不是配置）',
+                  flush=True)
+
+        new_cfg = dict(old_cfg)
+        new_cfg.update(incoming)
+
+        # 字段白名单校验：会进 nft 规则的字段必须合法，
+        # 否则可注入任意 nft 指令（如 whitelist_timeout="1s; delete table inet fw4; #"）
+        errs = validate_config(new_cfg)
+        if errs:
+            raise _ConfigRejected('INVALID_CONFIG', '配置校验失败，未保存', 400,
+                                  {'errors': errs})
+
+        risks = _detect_risks(cfg, new_cfg, requester_ip)
+
+        # trusted_ip4 归一化成单值再落盘。
+        #
+        # 必须放在 _detect_risks **之后**：风险检测要看到未归一化的多值，才能报出
+        # 「有 N 个被丢弃」。先归一化的话这条告警就永远不触发了。
+        #
+        # 为什么要在保存时归一化：配置里存着数组、规则里只认第一个，而两者之间
+        # 没有任何东西提醒用户。存成单值，配置与执行就永远一致了。
+        _eff_trusted, _ignored_trusted = _trusted_ip_single(new_cfg.get('trusted_ip4'))
+        new_cfg['trusted_ip4'] = _eff_trusted or ''
+
+        critical_risks = [r for r in risks if r.get('level') == 'critical']
+
+        # critical 风险（如自锁）必须显式确认；绕过前端直接打 API 会被 409 拒绝
+        if critical_risks and not data.get('confirm'):
+            raise _ConfigRejected('CRITICAL_RISK',
+                                  '检测到可能导致自锁的变更，请确认后再保存',
+                                  409, {'data': {'risks': risks}})
+        return new_cfg
 
     try:
-        save_config(new_cfg)
+        new_cfg = update_config(_mutate)
+    except _ConfigRejected as e:
+        return jsonify({'success': False, 'code': e.code,
+                        'message': e.message, **e.extra}), e.status
     except OSError as e:
         # 磁盘满 / 权限不足时 save_config 会抛出，不能让异常冒泡成 500 裸栈
         return jsonify({'success': False, 'message': f'配置保存失败: {e}'}), 500
@@ -3218,9 +3433,17 @@ def restore_config():
         _effective_cfg.update(_current_cfg)
         for _key in ('router_ip4', 'trusted_ip4'):
             if not str(restored.get(_key) or '').strip():
-                _cur_val = _effective_cfg.get(_key)
-                if _cur_val:
-                    restored[_key] = _cur_val
+                # 无条件补当前生效值 —— **即使是空串也要写回去**。
+                #
+                # 原来只在 `_cur_val` 非空时才补 ⇒ 键会整个缺失。
+                # 而「键缺失」与「键存在但为空」在下游不是一回事：
+                # 前者要靠 DEFAULT_CONFIG 兜底，后者直接就是空。
+                # 恢复的目标是「回到当前生效状态」，那就让落盘结果
+                # 与生效状态**逐字段一致**（2026-11-21 核实补）。
+                #
+                # trusted_ip4 的出厂值现在刻意是空串（不再默认填某个
+                # 具体 IP），所以「空」是常态，不是异常。
+                restored[_key] = _effective_cfg.get(_key) or ''
 
         # ⚠️ 恢复前必须跑一遍 validate_config（2026-11-08 补，对账残留 C3）
         #
@@ -3278,10 +3501,12 @@ def build_rules(config):
     rules = generate_rules(variables, log_switches, list_elements)
     # 白名单超时强制非负整数：这里是 rules.replace() 字符串拼接，
     # 任意非数字内容都会被原样写进 nft 规则（可注入 delete table 等指令）
-    whitelist_timeout = config.get("whitelist_timeout", 18000)
-    if not str(whitelist_timeout).strip().isdigit():
-        whitelist_timeout = 18000
-    timeout_str = f"timeout {int(whitelist_timeout)}s"
+    #
+    # ⚠️ 用 _nonneg_int 而不是 isdigit()+int() 两步（2026-11-21 核实补）：
+    # '²'.isdigit() 为真但 int('²') 抛 ValueError ⇒ 这里直接炸 500，
+    # apply 失败、boot 恢复退到 lockdown。_nonneg_int 一步到位且不抛。
+    whitelist_timeout = _nonneg_int(config.get("whitelist_timeout", 18000), 18000)
+    timeout_str = f"timeout {whitelist_timeout}s"
     rules = rules.replace("timeout 5h", timeout_str)
     return rules
 
@@ -5861,6 +6086,18 @@ for line in raw.decode("utf-8", "replace").splitlines():
         net = ipaddress.IPv4Network(addr + "/" + str(plen), strict=True)
     except ValueError:
         continue
+    # 超网（/0、/1）必须拒（2026-11-21 核实补）
+    #
+    # 形状合法 ≠ 语义合理：0.0.0.0/0 是**完全合法**的 IPv4Network，
+    # 但一条它就等于把「中国 IP 集合」变成整个地址空间 ——
+    # 「中国 IP 拦截」会把全世界都当成中国 IP 放行，规则直接失效。
+    # 1.0.0.0/8 这类超大网段同理。
+    #
+    # 按非法处理（die）而不是静默跳过：超网出现说明这份列表被改过或
+    # 上游被投毒，是**该停下来让人看**的信号。die 时原列表保持不变。
+    if net.prefixlen <= 1:
+        die("列表含超网条目 %s：/%d 匹配半个以上地址空间，已拒绝写入"
+            "（原列表保持不变）" % (net, net.prefixlen))
     entries.append(str(net))
 
 if len(entries) < min_entries:
@@ -8477,20 +8714,28 @@ def _detect_ip_version(ip):
 
 def _record_list_history(action, ip, list_type, label='', preset_id=''):
     """记录名单操作历史。list_type: 'whitelist' / 'blacklist'，action: 'add'/'delete'/'flush'"""
-    config = load_config()
-    history = config.setdefault('list_history', [])
-    entry = {
-        'id': 'h_' + uuid.uuid4().hex[:12],
-        'ts': datetime.datetime.now().isoformat(),
-        'action': action,
-        'ip': ip,
-        'type': list_type,
-        'label': label,
-        'preset_id': preset_id,
-    }
-    history.insert(0, entry)  # 最新的在前
-    config['list_history'] = history[:LIST_HISTORY_MAX]
-    save_config(config)
+    # ⚠️ 整段在写锁内（2026-11-21 核实补）：
+    # 原来这里是 load_config() → 改 → save_config() 三步分开 ——
+    # 两个并发名单操作会各自读到同一份旧配置、各自加一条历史、各自写，
+    # 后写的把先写的那条历史**整条覆盖掉**（而两边都报成功）。
+    # 名单操作是高频动作，并发窗口比配置保存宽得多；
+    # 丢的还不只是历史，同时被覆盖的还有别人刚改的配置字段。
+    def _mutate(config):
+        history = config.setdefault('list_history', [])
+        entry = {
+            'id': 'h_' + uuid.uuid4().hex[:12],
+            'ts': datetime.datetime.now().isoformat(),
+            'action': action,
+            'ip': ip,
+            'type': list_type,
+            'label': label,
+            'preset_id': preset_id,
+        }
+        history.insert(0, entry)  # 最新的在前
+        config['list_history'] = history[:LIST_HISTORY_MAX]
+        return config
+
+    update_config(_mutate)
 
 
 def _next_preset_id(presets):
@@ -8757,10 +9002,10 @@ def list_add():
     「点应用规则」重建 set 之后仍然有效。
     """
     data = request.get_json(silent=True)
-    if not data:
-        return jsonify({"success": False, "message": "请求体不能为空"}), 400
-    set_name = data.get('set_name', '').strip()
-    ip = data.get('ip', '').strip()
+    if not isinstance(data, dict) or not data:
+        return jsonify({"success": False, "message": "请求体必须是 JSON 对象"}), 400
+    set_name = _req_str(data, 'set_name')
+    ip = _req_str(data, 'ip')
     if not set_name or not ip:
         return jsonify({"success": False, "message": "set_name 和 ip 不能为空"}), 400
     if set_name not in VALID_SET_NAMES:
@@ -8827,10 +9072,10 @@ def list_add():
 def list_delete():
     """从指定名单删除 IP"""
     data = request.get_json(silent=True)
-    if not data:
-        return jsonify({"success": False, "message": "请求体不能为空"}), 400
-    set_name = data.get('set_name', '').strip()
-    ip = data.get('ip', '').strip()
+    if not isinstance(data, dict) or not data:
+        return jsonify({"success": False, "message": "请求体必须是 JSON 对象"}), 400
+    set_name = _req_str(data, 'set_name')
+    ip = _req_str(data, 'ip')
     if not set_name or not ip:
         return jsonify({"success": False, "message": "set_name 和 ip 不能为空"}), 400
     if set_name not in VALID_SET_NAMES:
@@ -8864,9 +9109,9 @@ def list_delete():
 def list_flush():
     """清空指定名单"""
     data = request.get_json(silent=True)
-    if not data:
-        return jsonify({"success": False, "message": "请求体不能为空"}), 400
-    set_name = data.get('set_name', '').strip()
+    if not isinstance(data, dict) or not data:
+        return jsonify({"success": False, "message": "请求体必须是 JSON 对象"}), 400
+    set_name = _req_str(data, 'set_name')
     if not set_name:
         return jsonify({"success": False, "message": "set_name 不能为空"}), 400
     if set_name not in VALID_SET_NAMES:
@@ -9145,10 +9390,12 @@ def list_get_presets():
 @app.route('/api/lists/presets', methods=['POST'])
 def list_create_preset():
     """新建 IP 预设"""
-    data = request.get_json(silent=True) or {}
-    label = data.get('label', '').strip()
-    ip = data.get('ip', '').strip()
-    list_type = data.get('type', 'whitelist').strip()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        data = {}
+    label = _req_str(data, 'label')
+    ip = _req_str(data, 'ip')
+    list_type = _req_str(data, 'type') or 'whitelist'
     auto_expire = bool(data.get('auto_expire', True))
 
     if not label or len(label) > 64:
@@ -12173,7 +12420,18 @@ def _deploy_gateway_nginx(config=None):
             shutil.copytree(NGINX_CONF_DIR, backup_dir)
             have_backup = True
         except OSError as e:
-            print(f'[WARN] 网关配置快照失败: {e}', flush=True)
+            # 快照失败 = 没有回滚材料 ⇒ **直接中止部署**（2026-11-21 核实补）
+            #
+            # 原来只打一条 WARN 就继续往下走：配置写上去以后若 nginx 起不来，
+            # _undo 因为 have_backup=False 直接返回「无可回滚的历史配置」——
+            # 而**坏配置已经躺在磁盘上了**。下次 nginx 启动直接失败，
+            # 整台设备的 nginx 起不来（不是「网关没开」，是「设备网页全挂」）。
+            #
+            # 此刻正式目录一个字节都没动（备份还没写、候选配置还在校验阶段），
+            # 所以中止是安全的：网关保持原样，设备照常可用。
+            # 宁可不部署 —— 网关不开总比开了但把 nginx 弄挂强。
+            print(f'[ERROR] 网关配置快照失败: {e}（已中止部署，磁盘未改动）', flush=True)
+            return False, f"网关配置快照失败：{e}（已中止部署，磁盘未改动）"
 
     def _undo(msg):
         # ⚠️ 顺序不能反。原先是「先 rmtree 快照，再 copytree 回来」——
@@ -13698,12 +13956,25 @@ def rp_download_cert(cert_id):
         return jsonify({"success": False, "message": f"打包失败: {e}"}), 500
 
     mem.seek(0)
-    return send_file(
+    resp = send_file(
         mem,
         as_attachment=True,
         download_name=f"{domain}.zip",
         mimetype="application/zip",
     )
+    # ⚠️ 必须**显式覆盖**，不能用 setdefault（2026-11-21 核实补）
+    #
+    # send_file 会无条件置 `Cache-Control: no-cache`（Werkzeug 3.1.9 的
+    # rv.cache_control.no_cache = True，在 max_age 分支之前就设了）。
+    # 而 _security_headers 里的 no-store 是 setdefault ⇒ 压不过已有的头。
+    # 实测（Flask 3.1.3 + Werkzeug 3.1.9）：send_file 的响应头就是 no-cache。
+    #
+    # no-cache ≠ no-store：no-cache 是「可以存，但复用前必须回源校验」，
+    # 浏览器**允许把响应写进磁盘缓存**。这个包里装的是 TLS 私钥 ——
+    # 落进磁盘缓存 = 私钥在磁盘上留了一份，共享电脑上谁都能拷走。
+    # 敏感响应只能 no-store。
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
 
 
 @app.route('/api/reverse-proxy/certificates/<cert_id>/reupload', methods=['POST'])

@@ -37,12 +37,12 @@ SRC = open(APP, encoding='utf-8').read()
 MUTANTS = [
     # ── 主防线：/api/config 不再剔除 reverse_proxy ───────────────────
     ('/api/config 不再剔除 reverse_proxy（.1 事故原样复现）',
-     """    rp_hits = sorted(k for k in incoming if k in RP_OWNED_CONFIG_KEYS)
-    for k in RP_OWNED_CONFIG_KEYS:
-        incoming.pop(k, None)""",
-     """    rp_hits = sorted(k for k in incoming if k in RP_OWNED_CONFIG_KEYS)
-    for k in ():
-        incoming.pop(k, None)"""),
+     """        rp_hits = sorted(k for k in incoming if k in RP_OWNED_CONFIG_KEYS)
+        for k in RP_OWNED_CONFIG_KEYS:
+            incoming.pop(k, None)""",
+     """        rp_hits = sorted(k for k in incoming if k in RP_OWNED_CONFIG_KEYS)
+        for k in ():
+            incoming.pop(k, None)"""),
 
     ('RP_OWNED_CONFIG_KEYS 变成空集（主防线整个失效）',
      """RP_OWNED_CONFIG_KEYS = frozenset({

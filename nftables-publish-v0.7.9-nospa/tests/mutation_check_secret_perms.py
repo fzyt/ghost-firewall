@@ -108,13 +108,19 @@ MUTATIONS = [
      [('os.open(LISTS_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)',
        'os.open(LISTS_LOCK_PATH, os.O_CREAT | os.O_RDWR)', 0, 'all')]),
 
+    # ⚠️ 出现序号跟着源码顺序走（2026-11-21 回归实测改过一次）：
+    #   `update_config` 是本轮新增的函数，位置在 save_config **之前**
+    #   ⇒ 这一行在 app.py 里现在出现 3 次，顺序是
+    #       update_config → save_config → restore_config
+    #   序号不动的话，M7 会打到 update_config（测试只走 save_config ⇒ 漏网），
+    #   M8 会打到 save_config，而 restore_config 反而没人测。
     ('M7  save_config 的锁 os.open 不带 mode',
      [('os.open(lock_path, os.O_CREAT | os.O_RDWR, _CONFIG_FILE_MODE)',
-       'os.open(lock_path, os.O_CREAT | os.O_RDWR)', 0, 1)]),
+       'os.open(lock_path, os.O_CREAT | os.O_RDWR)', 1, 1)]),
 
     ('M8  restore_config 的锁 os.open 不带 mode（同一个锁文件）',
      [('os.open(lock_path, os.O_CREAT | os.O_RDWR, _CONFIG_FILE_MODE)',
-       'os.open(lock_path, os.O_CREAT | os.O_RDWR)', 1, 1)]),
+       'os.open(lock_path, os.O_CREAT | os.O_RDWR)', 2, 1)]),
 
     # ⚠️ 锚点缩进必须是源码里的**真实缩进**（12 空格）。
     #   之前写的是 8 空格 —— 那匹配到的是行内子串（前 8 个空格属于 12 空格那一行的

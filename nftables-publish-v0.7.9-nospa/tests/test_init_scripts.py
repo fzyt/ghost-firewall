@@ -542,8 +542,15 @@ auth_src = open(AUTH_INIT, encoding='utf-8').read()
 
 check('P1-35：setup.sh 仍然 mkdir -p /etc/nftables（网关不会因目录缺失而中止）',
       re.search(r'mkdir -p\s+"\$CONFIG_DIR"', setup_src) is not None)
+# ⚠️ 2026-11-21：判据从 `kill -0 "$pid" || break` 改成 `_proc_alive "$pid" || break`。
+#   原因：kill -0 对**僵尸进程也返回成功**（它还没被父进程收走），
+#   而 /proc/<pid>/status 里的 State 仍然保留 ⇒ 那个判据会把僵尸当成
+#   健康进程：网关早就死了，脚本却报「Started」，端口没人听，
+#   nginx 的 auth_request 全部 502，而日志里看不出任何异常。
+#   _proc_alive 读 State，State=Z 视为已死。
+#   ⇒ 这里钉的是「轮询会因进程死亡而立刻跳出」这个**语义**，比原来更严。
 check('P1-36：网关 init 的轮询里检查进程存活（进程退出立刻跳出，不空等 150 次）',
-      'kill -0 "$pid" 2>/dev/null || break' in auth_src)
+      '_proc_alive "$pid" || break' in auth_src)
 
 sb, script = auth_sandbox(cfg=config_with('openwrt'))
 import time

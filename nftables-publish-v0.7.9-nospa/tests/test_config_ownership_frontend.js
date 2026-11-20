@@ -56,8 +56,13 @@ check('GET /api/config 的返回里带 config_rev',
 const postIdx = APP_PY.indexOf('def post_config()');
 const postBody = postIdx >= 0
   ? APP_PY.slice(postIdx, APP_PY.indexOf('\n@app.route', postIdx + 10)) : '';
+// ⚠️ 2026-11-21：后端改成用 _ConfigRejected 抛异常统一应答，
+//   字面量从 `'code': 'CONFIG_STALE'` 变成 `_ConfigRejected('CONFIG_STALE', …, 409, …)`。
+//   ⇒ 判据跟着改，但**强度不降**：既要认得出 CONFIG_STALE，
+//   也要确认它回的是 409（前端按 code 分支，状态码决定要不要重试）。
 check('POST /api/config 会拒收过期快照（CONFIG_STALE）',
-  /'code':\s*'CONFIG_STALE'/.test(postBody));
+  /CONFIG_STALE/.test(postBody) && /CONFIG_STALE[\s\S]{0,300}?409/.test(postBody),
+  '找不到 CONFIG_STALE，或它没有回 409');
 check('POST /api/config 会把 reverse_proxy 从提交里剔除',
   /for k in RP_OWNED_CONFIG_KEYS:\s*\n\s*incoming\.pop\(k, None\)/.test(postBody),
   '主防线：无条件剔除，不看调用方是谁');

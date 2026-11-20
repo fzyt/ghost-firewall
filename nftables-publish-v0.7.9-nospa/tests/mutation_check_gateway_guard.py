@@ -29,16 +29,16 @@ HSRC = open(HTML, encoding='utf-8').read()
 APP_MUTANTS = [
     # ── 缺陷本体：/api/config 不再剔除网关字段 ─────────────────────────
     ('/api/config 不再剔除 gateway_enabled（缺陷本体第 2 步）',
-     "    ignored = sorted(k for k in incoming if k in GATEWAY_OWNED_CONFIG_KEYS)\n"
-     "    for k in GATEWAY_OWNED_CONFIG_KEYS:\n"
-     "        incoming.pop(k, None)",
-     "    ignored = []"),
+     "        ignored = sorted(k for k in incoming if k in GATEWAY_OWNED_CONFIG_KEYS)\n"
+     "        for k in GATEWAY_OWNED_CONFIG_KEYS:\n"
+     "            incoming.pop(k, None)",
+     "        ignored = []"),
 
     # ── 只读键不剔除：GET 多给的视图会随前端回传落盘 ──────────────────
     ('/api/config 不再丢弃只读键',
-     "    for k in READONLY_CONFIG_KEYS:\n"
-     "        incoming.pop(k, None)",
-     "    pass"),
+     "        for k in READONLY_CONFIG_KEYS:\n"
+     "            incoming.pop(k, None)",
+     "        pass"),
 
     # ── 下发后不校验端口：.224 那次「回 200 但入口已死」 ────────────────
     # 校验点在 _deploy_gateway_nginx 内部（两个调用点共用），端点只负责

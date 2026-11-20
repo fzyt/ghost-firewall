@@ -52,21 +52,19 @@ MUTANTS = [
      "    if False:"),
 
     ('保存时不归一化成单值（配置与执行继续不一致）',
-     "    _eff_trusted, _ignored_trusted = _trusted_ip_single(new_cfg.get('trusted_ip4'))\n"
-     "    new_cfg['trusted_ip4'] = _eff_trusted or ''",
-     "    pass"),
+     "        _eff_trusted, _ignored_trusted = _trusted_ip_single(new_cfg.get('trusted_ip4'))\n"
+     "        new_cfg['trusted_ip4'] = _eff_trusted or ''",
+     "        pass"),
 
     ('归一化提到风险检测之前（多值告警永远不触发）',
-     "    requester_ip = _client_ip()\n"
-     "    risks = _detect_risks(old_cfg, new_cfg, requester_ip)\n"
+     "        risks = _detect_risks(cfg, new_cfg, requester_ip)\n"
      "\n"
-     "    # trusted_ip4 归一化成单值再落盘。",
-     "    requester_ip = _client_ip()\n"
-     "    _e0, _ = _trusted_ip_single(new_cfg.get('trusted_ip4'))\n"
-     "    new_cfg['trusted_ip4'] = _e0 or ''\n"
-     "    risks = _detect_risks(old_cfg, new_cfg, requester_ip)\n"
+     "        # trusted_ip4 归一化成单值再落盘。",
+     "        _e0, _ = _trusted_ip_single(new_cfg.get('trusted_ip4'))\n"
+     "        new_cfg['trusted_ip4'] = _e0 or ''\n"
+     "        risks = _detect_risks(cfg, new_cfg, requester_ip)\n"
      "\n"
-     "    # trusted_ip4 归一化成单值再落盘。"),
+     "        # trusted_ip4 归一化成单值再落盘。"),
 ]
 
 HTML_MUTANTS = [

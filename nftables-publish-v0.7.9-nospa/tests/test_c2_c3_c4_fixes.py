@@ -466,9 +466,16 @@ def group_c3():
                    'auth_token_epoch': 1}, f)
     effective_trusted = app.load_config().get('trusted_ip4')
     effective_router = app.load_config().get('router_ip4')
-    check('当前配置缺字段时，生效值确实存在（否则这条用例没意义）',
-          bool(effective_trusted) and bool(effective_router),
-          f'trusted={effective_trusted} router={effective_router}')
+    # ⚠️ trusted_ip4 的出厂值现在**刻意是空串**（2026-11-21 核实补：
+    # 出厂值曾经是 192.168.100.2 —— 那是开发网段里某台机器，
+    # 用户自己的内网完全可能也有同地址设备，于是那台机器自动成了
+    # 「信任 IP」。信任是显式授权，不该有隐式默认值）。
+    # ⇒ 前置条件从「两个生效值都非空」改成「两个生效值都取到了」：
+    # 键必须存在（值可以为空）。真正的判据在下面两条 ——
+    # 恢复必须成功，且补上的值必须**等于**生效值。
+    check('当前配置缺字段时，生效值已取到（trusted_ip4 允许为空）',
+          effective_trusted is not None and effective_router is not None,
+          f'trusted={effective_trusted!r} router={effective_router!r}')
     write_backup({'panel_allowed_nets': '127.0.0.1/32',
                   'lan_subnet4': '127.0.0.1/32',
                   'auth_token_epoch': 0})

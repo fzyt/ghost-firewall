@@ -121,68 +121,75 @@ MUTATIONS = [
 
     ('D-04  P1-24 版本闸被摘掉（又能用旧快照覆盖新配置）',
      APP_PY,
-     [('    if not sent_rev:\n'
-       '        return jsonify({\n'
-       "            'success': False,\n"
-       "            'code': 'CONFIG_REV_REQUIRED',\n"
-       "            'message': ('本次保存缺少配置版本号（config_rev），已拒绝。'\n"
-       "                        '请先 GET /api/config 取一份最新快照，'\n"
-       "                        '带上 config_rev 再提交。'),\n"
-       "            'data': {'config_rev': cur_rev},\n"
-       "        }), 409\n",
-       '    if False:\n'
-       '        pass\n')]),
+     [('''        if not sent_rev:
+            raise _ConfigRejected(
+                'CONFIG_REV_REQUIRED',
+                '本次保存缺少配置版本号（config_rev），已拒绝。'
+                '请先 GET /api/config 取一份最新快照，'
+                '带上 config_rev 再提交。',
+                409, {'data': {'config_rev': cur_rev}})
+''',
+       '''        if False:
+            pass
+''')]),
 
     ('D-05  P1-24 拒收时仍继续写盘（闸门形同虚设）',
      APP_PY,
-     [('    if not sent_rev:\n'
-       '        return jsonify({\n'
-       "            'success': False,\n"
-       "            'code': 'CONFIG_REV_REQUIRED',\n"
-       "            'message': ('本次保存缺少配置版本号（config_rev），已拒绝。'\n"
-       "                        '请先 GET /api/config 取一份最新快照，'\n"
-       "                        '带上 config_rev 再提交。'),\n"
-       "            'data': {'config_rev': cur_rev},\n"
-       "        }), 409\n",
-       '    if not sent_rev:\n'
-       "        print('[WARN] 缺少 config_rev，仍然放行', flush=True)\n")]),
+     [('''        if not sent_rev:
+            raise _ConfigRejected(
+                'CONFIG_REV_REQUIRED',
+                '本次保存缺少配置版本号（config_rev），已拒绝。'
+                '请先 GET /api/config 取一份最新快照，'
+                '带上 config_rev 再提交。',
+                409, {'data': {'config_rev': cur_rev}})
+        if sent_rev != cur_rev:
+            raise _ConfigRejected(
+                'CONFIG_STALE',
+                '配置在你打开页面之后被改过，本次保存会覆盖掉那些改动，'
+                '已拒绝。请刷新页面后重新编辑。',
+                409, {'data': {'config_rev': cur_rev}})
+''',
+       '''        print('[WARN] 缺少 config_rev，仍然放行', flush=True)
+''')]),
 
     ('D-06  P1-24 拒收用 400 而不是 409（调用方分不清「格式错」和「快照过期」）',
      APP_PY,
-     [("            'code': 'CONFIG_REV_REQUIRED',\n"
-       "            'message': ('本次保存缺少配置版本号（config_rev），已拒绝。'\n"
-       "                        '请先 GET /api/config 取一份最新快照，'\n"
-       "                        '带上 config_rev 再提交。'),\n"
-       "            'data': {'config_rev': cur_rev},\n"
-       "        }), 409\n",
-       "            'code': 'CONFIG_REV_REQUIRED',\n"
-       "            'message': ('本次保存缺少配置版本号（config_rev），已拒绝。'\n"
-       "                        '请先 GET /api/config 取一份最新快照，'\n"
-       "                        '带上 config_rev 再提交。'),\n"
-       "            'data': {'config_rev': cur_rev},\n"
-       "        }), 400\n")]),
+     [("        if not sent_rev:\n"
+       "            raise _ConfigRejected(\n"
+       "                'CONFIG_REV_REQUIRED',\n"
+       "                '本次保存缺少配置版本号（config_rev），已拒绝。'\n"
+       "                '请先 GET /api/config 取一份最新快照，'\n"
+       "                '带上 config_rev 再提交。',\n"
+       "                409, {'data': {'config_rev': cur_rev}})\n",
+       "        if not sent_rev:\n"
+       "            raise _ConfigRejected(\n"
+       "                'CONFIG_REV_REQUIRED',\n"
+       "                '本次保存缺少配置版本号（config_rev），已拒绝。'\n"
+       "                '请先 GET /api/config 取一份最新快照，'\n"
+       "                '带上 config_rev 再提交。',\n"
+       "                400, {'data': {'config_rev': cur_rev}})\n")]),
 
-    ('D-07  P1-24 版本号被 pop 掉之后才比对（比的是空串 ⇒ 永远放行）',
+    ('D-07  P1-24 版本比对被判废（过期快照也能写盘）',
      APP_PY,
-     [('    sent_rev = str(data.get(\'config_rev\') or \'\').strip()\n'
-       '    incoming.pop(\'config_rev\', None)     # 版本号不是配置字段，绝不能落盘\n'
-       '    cur_rev = _config_rev(old_cfg)\n',
-       '    sent_rev = str(data.get(\'config_rev\') or \'\').strip()\n'
-       '    incoming.pop(\'config_rev\', None)     # 版本号不是配置字段，绝不能落盘\n'
-       '    sent_rev = cur_rev = _config_rev(old_cfg)\n')]),
+     [('        if sent_rev != cur_rev:\n',
+       '        if sent_rev != cur_rev and False:\n')]),
 
     ('D-08  P1-24 拒收时不把当前版本号回给调用方（它没法重试）',
      APP_PY,
-     [("            'code': 'CONFIG_REV_REQUIRED',\n"
-       "            'message': ('本次保存缺少配置版本号（config_rev），已拒绝。'\n"
-       "                        '请先 GET /api/config 取一份最新快照，'\n"
-       "                        '带上 config_rev 再提交。'),\n"
-       "            'data': {'config_rev': cur_rev},\n",
-       "            'code': 'CONFIG_REV_REQUIRED',\n"
-       "            'message': ('本次保存缺少配置版本号（config_rev），已拒绝。'\n"
-       "                        '请先 GET /api/config 取一份最新快照，'\n"
-       "                        '带上 config_rev 再提交。'),\n"
-       "            'data': {},\n")]),
+     [("        if not sent_rev:\n"
+       "            raise _ConfigRejected(\n"
+       "                'CONFIG_REV_REQUIRED',\n"
+       "                '本次保存缺少配置版本号（config_rev），已拒绝。'\n"
+       "                '请先 GET /api/config 取一份最新快照，'\n"
+       "                '带上 config_rev 再提交。',\n"
+       "                409, {'data': {'config_rev': cur_rev}})\n",
+       "        if not sent_rev:\n"
+       "            raise _ConfigRejected(\n"
+       "                'CONFIG_REV_REQUIRED',\n"
+       "                '本次保存缺少配置版本号（config_rev），已拒绝。'\n"
+       "                '请先 GET /api/config 取一份最新快照，'\n"
+       "                '带上 config_rev 再提交。',\n"
+       "                409, {'data': {}})\n")]),
 
     ('D-09  P2-5 前端不再处理 CONFIG_REV_REQUIRED（用户看不懂为什么被拒）',
      FRONT_JS,

@@ -226,10 +226,8 @@ MUTATIONS = [
      _M12_NEW),
 
     ('M13 缺失必填字段不再继承当前配置（老备份连回退都做不了）',
-     "                if _cur_val:\n"
-     "                    restored[_key] = _cur_val\n",
-     "                if _cur_val and False:   # （变异：不再继承）\n"
-     "                    restored[_key] = _cur_val\n"),
+     "                restored[_key] = _effective_cfg.get(_key) or ''\n",
+     "                pass   # （变异：不再继承当前生效值）\n"),
 
     ('M14 _format_list_elements 的 scope-id 检查被摘掉（脏值进规则集）',
      SCOPE_CHECK_FORMAT_ELEMS,

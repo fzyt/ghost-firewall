@@ -57,6 +57,21 @@ ensure_nftweb_user() {
     if grep -q "^${NFTWEB_USER}:" /etc/passwd 2>/dev/null; then
         NFTWEB_UID=$(awk -F: -v u="$NFTWEB_USER" '$1==u {print $3}' /etc/passwd)
         NFTWEB_GID=$(awk -F: -v u="$NFTWEB_USER" '$1==u {print $4}' /etc/passwd)
+        # ⚠️ uid/gid 必须是 0 以外的值（2026-11-21 核实补）
+        #
+        # 原来只判「读出来了没有」，读出来是 0 也照样 return 0。
+        # uid=0 ⇒ AUTH_DROP_UID=0 ⇒ **降权等于没降**：公网可达的认证
+        # 网关进程以 root 运行，而它解析的是不可信的互联网流量。
+        # （auth_gateway.py 自己有一道「uid 仍是 0 就自杀」的兜底，
+        #  但那会让网关**起不来**而不是给出准确原因。）
+        # gid=0 ⇒ 进程属于 root 组 ⇒ 仍能读 group=root 的文件。
+        #
+        # 提前在这里拒绝，并说清是哪个值不对 —— 比让网关自己 FATAL 清楚得多。
+        if [ "$NFTWEB_UID" = "0" ] || [ "$NFTWEB_GID" = "0" ]; then
+            echo "  ${NFTWEB_USER} 的 uid/gid 是 0（等于 root）—— 降权等于没降，拒绝启动。" >&2
+            echo "  请先修 /etc/passwd 与 /etc/group 里 ${NFTWEB_USER} 那一行。" >&2
+            return 1
+        fi
         [ -n "$NFTWEB_UID" ] && [ -n "$NFTWEB_GID" ] && return 0
         echo "  $NFTWEB_USER 已在 /etc/passwd 里但 uid/gid 读不出来，请人工检查" >&2
         return 1
@@ -85,6 +100,22 @@ ensure_nftweb_user() {
 # 为什么用 python3 而不是 grep：JSON 里可能有嵌套、可能有转义引号，
 # 正则匹配出来的「端口/字段」是随机的。设备上 python3 是确定有的
 # （网关本身就是 python3 跑起来的），所以这里直接用它解析。
+# 判断一个 pid 是不是**活着的**进程。
+#
+# ⚠️ 不能用 `kill -0`（2026-11-21 核实补）：僵尸进程的 kill -0 **也返回成功**
+#   （它还没被父进程收走），而 /proc/<pid>/status 里的 Uid 字段仍然保留。
+#   ⇒ 原来那个「uid != 0 就是降权完成」的判据会把**僵尸**当成健康进程：
+#   网关早就死了，脚本却报「Started」，端口没人听，
+#   nginx 的 auth_request 全部 502，而日志里看不出任何异常。
+#
+# 判据：/proc/<pid> 不存在 = 进程没了；State 是 Z = 僵尸，也算没了。
+_proc_alive() {
+    [ -d "/proc/$1" ] || return 1
+    _proc_state=$(awk '/^State:/ {print $2}' "/proc/$1/status" 2>/dev/null)
+    [ "$_proc_state" = "Z" ] && return 1
+    return 0
+}
+
 _json_object_ok() {
     [ -f "$1" ] || return 1
     command -v python3 >/dev/null 2>&1 || return 1
@@ -102,6 +133,17 @@ sys.exit(0 if isinstance(d, dict) else 1)
 # 兼作自愈：文件若被误删或被 app.py 重建成 root 属主，这里会修回来。
 prepare_nftweb_files() {
     _cfgdir="/etc/nftables"
+
+    # ⚠️ 目录必须自己建（2026-11-21 核实补）
+    #
+    # 原来直接 chgrp "$_cfgdir" —— 目录不存在时 chgrp 失败 ⇒ return 1
+    # ⇒ 整个 prepare 失败 ⇒ init 拒绝启动 ⇒ **公网入口直接下线**。
+    # 而「目录不存在」完全可能发生：/etc/nftables 不是任何发行版的
+    # 标准目录，setup.sh 删掉重装、用户手工清理、或换镜像都可能没有它。
+    #
+    # setup.sh 装的时候会建，但 init 脚本不能依赖「一定有人先装过」——
+    # 它必须自己能自愈（这个函数的本意就是自愈）。
+    mkdir -p "$_cfgdir" || return 1
 
     # 目录 setgid：日后 app.py 以 root 重建文件时（新文件组默认跟目录走），
     # 组仍是 nftweb，降权后的网关才读得到密码/密钥。
@@ -374,7 +416,7 @@ start() {
     local pid real_uid waited=0
     pid=$(cat "$PID_FILE")
     while [ "$waited" -lt 150 ]; do
-        kill -0 "$pid" 2>/dev/null || break          # 进程自己退了，交给下面的失败分支
+        _proc_alive "$pid" || break          # 进程自己退了（或已成僵尸），交给下面的失败分支
         real_uid=$(awk '/^Uid:/ {print $2}' "/proc/$pid/status" 2>/dev/null)
         # 非空且非 0 才算降权完成；空说明 /proc 还没建好，继续等
         if [ -n "$real_uid" ] && [ "$real_uid" != "0" ]; then
@@ -384,7 +426,7 @@ start() {
         waited=$((waited + 1))
     done
 
-    if kill -0 "$pid" 2>/dev/null; then
+    if _proc_alive "$pid"; then
         real_uid=$(awk '/^Uid:/ {print $2}' "/proc/$pid/status" 2>/dev/null)
         if [ "$real_uid" = "0" ] || [ -z "$real_uid" ]; then
             echo "nftables-web-auth: 等待 ${waited}0ms 后 uid 仍为 ${real_uid:-未知}，降权未生效 —— 停掉它" >&2

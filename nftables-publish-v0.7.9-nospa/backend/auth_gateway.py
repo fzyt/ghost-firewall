@@ -439,6 +439,20 @@ def _verify_password(password: str, stored: str) -> bool:
     又给了一个绕开限流的廉价入口。
     """
     with PBKDF2_GATE:
+        # ⚠️ 孤立代理字符必须兜住（2026-11-21 核实补）
+        #
+        # JSON 里 "\ud800" 是合法字符串，解析出来就是一个含孤立代理的 str。
+        # password.encode("utf-8") 遇到它抛 UnicodeEncodeError ⇒
+        #   ① 全局错误处理器回 500（不是 401）；
+        #   ② 更糟：异常在 _verify_password 里抛出，**登录失败计数被跳过**
+        #      ⇒ 限流形同虚设（攻击者用这个载荷能让自己的失败次数不计数）。
+        #
+        # 编码失败就当「密码不匹配」：仍然走 dummy 路径真跑一次 PBKDF2，
+        # 耗时与真实路径一致（不泄露状态），失败计数正常 +1。
+        try:
+            pwd_bytes = password.encode("utf-8")
+        except UnicodeEncodeError:
+            pwd_bytes = None
         # 记住真实哈希里的迭代数，dummy 路径要用它（见下面 except 块）。
         # 解析失败时它是 0，except 里会退到基准值。
         iters = 0
@@ -461,11 +475,15 @@ def _verify_password(password: str, stored: str) -> bool:
             # 46.3ms（1.95x）——照样能区分。这里取三者的最大值，保证
             # dummy 路径**永远不慢于**真实路径。
             dummy_iters = max(iters, PBKDF2_ITERATIONS_MIN, PBKDF2_ITERATIONS_DUMMY)
-            hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+            hashlib.pbkdf2_hmac("sha256", pwd_bytes if pwd_bytes is not None else b"",
                                 b"nftables-web-dummy", dummy_iters)
             return False
+        if pwd_bytes is None:
+            # 编码失败的密码不可能匹配任何哈希 —— 但上面已经跑过 dummy，
+            # 耗时口径与真实路径一致（不泄露「这密码编码不合法」）。
+            return False
         digest = hashlib.pbkdf2_hmac(
-            "sha256", password.encode("utf-8"), salt.encode("utf-8"), iters)
+            "sha256", pwd_bytes, salt.encode("utf-8"), iters)
         return hmac.compare_digest(digest.hex(), hash_hex)
 
 
@@ -577,9 +595,23 @@ def load_revoked():
     global _REVOKED_LKG
     try:
         with open(_revocation_path(), "r") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            raise ValueError("吊销表不是 JSON 对象")
+            # ⚠️ 读端必须拿**共享锁**（2026-11-21 核实补）
+            #
+            # 写端 revoke_jti 持排他锁，但它是在**同一个 fd**上做
+            # seek(0) + truncate() + json.dump() ⇒ 这期间文件是半截的。
+            # 原来读端不取锁，撞上这个窗口就会 JSONDecodeError，
+            # 然后退到 last-known-good —— 而那份 LKG 是**这次吊销之前**的
+            # 快照 ⇒ 刚登出吊销掉的 jti 被判成「没吊销」⇒ **令牌当场复活**。
+            #
+            # 这与限流表的读端是同一个道理（那边早就加了 LOCK_SH），
+            # 吊销表漏了。共享锁保证读到的一定是写完之后的内容。
+            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+            try:
+                data = json.load(f)
+                if not isinstance(data, dict):
+                    raise ValueError("吊销表不是 JSON 对象")
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
     except FileNotFoundError:
         # 文件不存在有两种完全不同的含义，必须分开：
         #   · 进程启动至今**一次都没成功读到过** → 确实从未吊销过，正常初始状态
@@ -1585,7 +1617,16 @@ def static_files(filename):
         resp = make_response(_read_portal_html())
     else:
         resp = send_from_directory(STATIC_DIR, filename)
-    resp.headers["Cache-Control"] = "no-cache"
+    # ⚠️ HTML 页面用 no-store，静态资源仍用 no-cache（2026-11-21 核实补）
+    #
+    # _harden_response 里的 no-store 是 setdefault，压不过这里显式设的
+    # no-cache ⇒ login.html / portal.html 会被浏览器存进磁盘缓存。
+    # 门户页带着「已登录用户」的界面元素，登录页也不该在共享电脑上留副本。
+    #
+    # CSS/JS 保持 no-cache：它们内容不变、缓存能省流量，而 no-cache 的语义
+    # 是「可以存，但每次都要回源校验」⇒ 不会拿到过期内容。
+    resp.headers["Cache-Control"] = ("no-store" if filename.endswith(".html")
+                                      else "no-cache")
     resp.headers["X-Content-Type-Options"] = "nosniff"
     # HTML 必须带 CSP：白名单里的 login.html / portal.html 从这里也能直接取到，
     # 少了这一头就等于多了一条绕过 CSP 的路。CSS/JS 加了也无害。
@@ -1665,6 +1706,7 @@ def auth_status():
         # 那个字符串等于把「内网豁免」这套机制直接讲给任何能连到这里的人听，
         # 可用来校准哪些来源 IP 被当作内网。门户真正需要的只是「有没有会话
         # 倒计时」，用 expires_in 在不在表达就够了，不必知道走的哪条路。
+        audit("lan_bypass_granted", endpoint="status")
         return jsonify({
             "authenticated": True, "user": "lan",
             "device_id": device_id_from_request(),
@@ -1970,6 +2012,13 @@ def _verify_or_deny():
     try:
         cfg = load_gateway_config()
         if is_lan_source(cfg):
+            # ⚠️ 免凭据放行必须留痕（2026-11-21 核实补）
+            #
+            # 这是「不需要任何凭据就拿到 200」的授权决定。原实现一条审计
+            # 都不写 ⇒ 事后从审计日志里**完全看不出**有谁被免认证放行过。
+            # 别的分支（verify_denied / login_ok / logout）都有记录，
+            # 唯独这条「最宽松的路」是黑的。
+            audit("lan_bypass_granted")
             return Response(status=200, headers={
                 "X-Auth-User": "lan",
                 "X-Auth-Device": request.cookies.get(COOKIE_DEVICE, ""),
@@ -2132,6 +2181,8 @@ def _authenticated() -> bool:
     """
     cfg = load_gateway_config()
     if is_lan_source(cfg):
+        # 同上：免凭据放行要留痕（2026-11-21 核实补）
+        audit("lan_bypass_granted", endpoint="portal")
         return True
     payload = parse_token(_extract_token())
     if not payload:
@@ -2476,11 +2527,21 @@ def _on_unhandled(err):
     """
     from werkzeug.exceptions import HTTPException
     if isinstance(err, HTTPException):
+        # ⚠️ 状态码必须夹到合法区间（2026-11-21 核实补）
+        #
+        # werkzeug 允许 HTTPException 的 code 是 None，而 Flask 收到 None
+        # 会当成 **200** ⇒ 「一个异常变成了成功响应」。现在这里原样透传
+        # err.code，理论上存在这条路径。
+        # 3xx 保留（Redirect 的语义靠 location 头），其余（含 None / 2xx）
+        # 一律按 500 走 —— 异常绝不能变成 200。
+        _code = err.code
+        if not isinstance(_code, int) or not (300 <= _code <= 599):
+            _code = 500
         return jsonify({
             "success": False,
             "code": err.name.upper().replace(" ", "_"),
             "message": err.description,
-        }), err.code
+        }), _code
     try:
         audit("unhandled_exception", error=repr(err)[:200])
     except Exception:
