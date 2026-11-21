@@ -1167,6 +1167,20 @@ def _audit_maybe_rotate(path: str, incoming: int = 0) -> None:
     _audit_rotate_in_place(path)
 
 
+def _audit_line_is_always(line: str) -> bool:
+    """判断一行审计记录是不是「永远该留」的事件（login_ok / logout）。
+
+    解析失败就当不是 —— 宁可少留一行，也不能因为一行坏 JSON 把整个轮转搞挂。
+    """
+    try:
+        rec = json.loads(line)
+    except Exception:
+        return False
+    if not isinstance(rec, dict):
+        return False
+    return str(rec.get("event") or "") in _AUDIT_ALWAYS
+
+
 def _audit_rotate_in_place(path: str) -> None:
     """就地轮转：留下尾部若干行（总大小不超过上限的一半），其余丢掉。
 
@@ -1189,14 +1203,37 @@ def _audit_rotate_in_place(path: str) -> None:
     except OSError:
         lines = []
     budget = max(1, AUDIT_LOG_MAX_BYTES // 2)
-    keep, total = [], 0
-    for ln in reversed(lines):
-        sz = len(ln.encode("utf-8"))
-        if keep and total + sz > budget:
+    # ── 优先保留 login_ok / logout（条目 14）────────────────────────
+    #
+    # 为什么不能只按「尾部」裁剪：尾部全是攻击者刚灌出来的 verify_denied，
+    # 真正的登录成功记录在更早的位置 ⇒ 一次轮转就把「谁登录过」抹掉了。
+    # audit() 的 docstring 里记着这个缺口（_AUDIT_ALWAYS 豁免了**限流**，
+    # 但没豁免**轮转**）—— 限流是每 IP 120/60 秒，攻击者换几十个源 IP
+    # 就能在一分钟内灌满 2 MiB。
+    #
+    # 所以：预算先给「永远该留」的事件，剩下的再按尾部给其它记录。
+    # ALWAYS 自己超预算时从**后往前**留（最新的先留），
+    # 否则一次轮转就把文件清空，跟直接截断没区别。
+    keep_idx = set()
+    total = 0
+    for i in range(len(lines) - 1, -1, -1):
+        if not _audit_line_is_always(lines[i]):
+            continue
+        sz = len(lines[i].encode("utf-8"))
+        if keep_idx and total + sz > budget:
             break
-        keep.append(ln)
+        keep_idx.add(i)
         total += sz
-    keep.reverse()
+    for i in range(len(lines) - 1, -1, -1):
+        if i in keep_idx:
+            continue
+        sz = len(lines[i].encode("utf-8"))
+        if keep_idx and total + sz > budget:
+            break
+        keep_idx.add(i)
+        total += sz
+    # 按原顺序输出：审计记录的时间序不能被打乱。
+    keep = [lines[i] for i in sorted(keep_idx)]
     try:
         with open(path, "w") as f:
             f.writelines(keep)

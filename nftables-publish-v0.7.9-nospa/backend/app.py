@@ -5079,10 +5079,73 @@ def _apply_ruleset(config):
         _FW_APPLY_LOCK.release()
 
 
+def _ruleset_perm_guard():
+    """检查规则集所在目录与规则集文件本身的权限与属主。返回 (ok, msg)。
+
+    为什么要有这道（纵深防御）
+    ------------------------
+    nft 是**以 root 读** RULES_PATH 并加载的。如果这个文件、或它所在的目录，
+    能被非 root 用户写/替换，那么本地低权用户就能把自己的内容当成规则集
+    让 root 执行 —— 这是提权。
+
+    触发前提是「机器上已有低权用户」+「目录或文件可写」，概率不高，
+    但**代价是提权**，值得加一道。
+
+    三件事
+    ------
+    ① 目录不能 group/other 可写（可写 ⇒ 可替换规则集文件）
+       —— 权限过宽就**收紧到 0755**（自愈），而不是拒绝：
+       目录权限过宽通常是 umask/历史遗留，收紧不会打断任何功能。
+    ② 规则集文件的属主必须是 root
+       —— 不是 root 拥有的文件，root 不该加载它 ⇒ **拒绝**（fail-closed）。
+       只在当前进程是 root 时才查：非 root 环境既加载不了 nft 规则，
+       也没资格要求文件属主（否则开发机上的测试会被这条误伤）。
+    ③ 备份材料（.backup / .lastgood）不能 group/other 可读
+       —— 规则集里有白/黑名单 IP 与信任 IP，敏感度与本体一致。
+       老版本建的 .backup 是 0644（world-readable），这里一并收口。
+    """
+    d = os.path.dirname(RULES_PATH) or '/'
+    try:
+        st = os.stat(d)
+    except OSError as e:
+        return False, f'规则集目录不可访问: {e}'
+    if st.st_mode & 0o022:
+        try:
+            os.chmod(d, 0o755)
+            print(f'[WARN] 规则集目录 {d} 权限过宽，已收紧到 0755', flush=True)
+        except OSError as e:
+            return False, f'规则集目录权限过宽且无法收紧: {e}'
+    if os.path.exists(RULES_PATH):
+        try:
+            st = os.stat(RULES_PATH)
+        except OSError as e:
+            return False, f'规则集文件不可访问: {e}'
+        if os.geteuid() == 0 and st.st_uid != 0:
+            return False, (f'规则集文件 {RULES_PATH} 的属主是 uid {st.st_uid}，不是 root'
+                           f' —— 可能已被篡改，拒绝加载（请人工检查该文件）')
+        if st.st_mode & 0o022:
+            _ensure_file_mode(RULES_PATH, 0o600)
+            print(f'[WARN] 规则集文件 {RULES_PATH} 权限过宽，已收紧到 0600', flush=True)
+    for p in (RULES_PATH + '.backup', RULES_PATH + '.lastgood'):
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        if st.st_mode & 0o077:
+            _ensure_file_mode(p, 0o600)
+            print(f'[WARN] {p} 权限过宽，已收紧到 0600', flush=True)
+    return True, ''
+
+
 def _apply_ruleset_locked(config):
     """_apply_ruleset 的实现体。调用方必须已持有 _FW_APPLY_LOCK。"""
     rules = build_rules(config)
     os.makedirs(os.path.dirname(RULES_PATH), exist_ok=True)
+    # 权限/属主守卫：nft 以 root 读这个文件，文件或目录可被低权用户写
+    # 就等于给了他们一个「让 root 执行我的内容」的口子（条目 43）。
+    _perm_ok, _perm_msg = _ruleset_perm_guard()
+    if not _perm_ok:
+        return False, _perm_msg
 
     # 确保 include 所需的文件存在（避免因文件缺失导致校验失败）
     if config.get("china_ip_block", False):
@@ -13255,13 +13318,39 @@ def gateway_set_config():
     # 判据取**结果配置**而不是「本次请求改了什么」：在已开的网关上单独打开
     # bypass，比一开始就两个都开着更危险 —— 那是在拿掉一层已经生效的保护，
     # 但它不体现在 gateway_enabled 这个字段的变化里。
-    warning = None
+    # 应答里的提示语挂在这里：前端 app.js 把 data.warning 直接用 toast
+    # 显示（app.js:2410-2413）⇒ 前端零改动就能看到。
+    _notices = []
+    # ── 认证服务内部端口变了 ⇒ 必须提示重启（条目 55）────────────────
+    #
+    # 为什么必须提示：认证服务是**另一个进程**，监听端口在 import 时就
+    # 读死了（auth_gateway.py: BIND_PORT = int(os.environ.get("AUTH_API_PORT"))），
+    # 改配置不会让它重读。而 nginx 的 auth_request 子请求地址是**面板
+    # 生成配置时按新端口写进去的** ⇒ 改完端口的瞬间：nginx 指向新端口、
+    # 认证服务还在旧端口 ⇒ **所有登录请求 502**。
+    #
+    # 为什么面板一路绿灯查不出来：部署后的「端口真的在听吗」校验查的是
+    # 对外的 gateway_port，不是这个内部端口 ⇒ 查不出来。
+    #
+    # 为什么只提示不自动重启：重启认证服务要处理「新端口起不来」的回滚，
+    # 副作用面比提示大得多 —— 用户点了保存却发现网关瘫了，比没提示更难查。
+    _old_api_port = _safe_port(config.get("auth_api_port"), 8444)
+    _new_api_port = _safe_port(new_cfg.get("auth_api_port"), 8444)
+    if _old_api_port != _new_api_port:
+        _notices.append(
+            f"认证服务内部端口已从 {_old_api_port} 改为 {_new_api_port}："
+            f"认证服务是独立进程、监听端口在启动时固定，"
+            f"必须重启认证服务才生效（执行 /etc/init.d/nftables-web-auth restart）。"
+            f"在重启之前，nginx 的认证子请求会指向新端口、而认证服务仍在旧端口，"
+            f"所有登录都会失败。")
     if new_cfg.get("gateway_enabled") and new_cfg.get("auth_lan_bypass"):
         subnet = new_cfg.get("lan_subnet4") or "局域网网段"
-        warning = (f"网关已启用，且「LAN 内免登录」保持开启："
-                   f"来自 {subnet} 的设备访问 {new_cfg.get('gateway_port')} 端口无需登录，"
-                   f"可直接使用所有已开放的服务。如果这台路由器对外来访客网络开放"
-                   f"（访客 Wi-Fi 等），请在本页面关闭「LAN 内免登录」。")
+        _notices.append(
+            f"网关已启用，且「LAN 内免登录」保持开启："
+            f"来自 {subnet} 的设备访问 {new_cfg.get('gateway_port')} 端口无需登录，"
+            f"可直接使用所有已开放的服务。如果这台路由器对外来访客网络开放"
+            f"（访客 Wi-Fi 等），请在本页面关闭「LAN 内免登录」。")
+    warning = "；".join(_notices) if _notices else None
 
     return jsonify({"success": True,
                     "data": {"changed": changed, "message": deploy_msg,
