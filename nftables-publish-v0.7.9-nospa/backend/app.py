@@ -12008,8 +12008,16 @@ def _nginx_service_location(L, rule, prefix, protocol, host, tport,
         L.append("        allow 127.0.0.1;")
         L.append("        allow ::1;")
         L.append("        deny all;")
-        L.append("        auth_request_set $auth_user \"lan\";")
-        L.append("        auth_request_set $auth_device $cookie_gw_device;")
+        # 内网身份标记：必须用 set，不能用 auth_request_set ——
+        # auth_request_set 只在 auth_request 执行**之后**才给变量赋值，而本分支
+        # 故意不生成 auth_request（安全边界靠上面的 allow/deny 来源白名单），
+        # 写了也永远不会生效 ⇒ 实测 nginx 日志里 auth_user/auth_dev 恒空，
+        # 上游收到的 X-Auth-User 也是空串（.193 实测 974 行日志零命中）。
+        # "lan" 是服务端写死的常量、不是客户端自称 ⇒ 可安全作为身份标记。
+        # $auth_device 故意不给值：内网侧只有客户端自称的未签名 cookie，
+        # 填进身份头会给上游引入一个**可伪造**的身份，与公网分支签名的 dev
+        # 口径也不一致 ⇒ 要审计设备必须走 public_access=true 的公网令牌分支。
+        L.append("        set $auth_user \"lan\";")
 
     # 认证服务不可达时的 fail-closed 行为：
     # auth_request 拿不到上游 → nginx 自己返回 5xx，不会放行。

@@ -840,6 +840,18 @@ warn()  { log "WARN " "${YELLOW}$*${NC}"; }
 error() { log "ERROR" "${RED}$*${NC}"; }
 ok()    { log "OK   " "${GREEN}$*${NC}"; }
 
+# sha256 摘要（安装包完整性校验用）
+# 优先 sha256sum，缺了退回 openssl dgst ——
+#   openssl-util 是本安装器的硬依赖（见依赖安装段），coreutils 未必装了。
+#   两条路径都只取摘要本身，输出统一成 64 位小写 hex。
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        openssl dgst -sha256 "$1" | awk '{print $NF}'
+    fi
+}
+
 # ------------------------------------------------------------
 # 失败时的「重跑即可续装」指引
 # ------------------------------------------------------------
@@ -2145,11 +2157,15 @@ deploy_project() {
 
     # GitHub 安装
     local tag="${ARG_VERSION:-main}"
-    local url
+    local url sum_url=""
     if [ "$tag" = "main" ]; then
         url="https://github.com/${GITHUB_REPO}/archive/refs/heads/main.tar.gz"
     else
         url="https://github.com/${GITHUB_REPO}/archive/refs/tags/${tag}.tar.gz"
+        # 清单与安装包放在同一个 release 上 —— 校验和的信任边界到此为止：
+        # 它防的是传输损坏 / 中间人 / 资产被误改，**防不了 release 账号被攻破**
+        # （那需要签名，不在校验和的能力范围内）。
+        sum_url="https://github.com/${GITHUB_REPO}/releases/download/${tag}/sha256sums.txt"
     fi
     local tmp_dir
     tmp_dir="$(mktemp -d)"
@@ -2157,6 +2173,40 @@ deploy_project() {
     info "下载 ${PROJECT_NAME} ${tag} ..."
     if curl --connect-timeout 30 --max-time 300 --retry 2 --retry-delay 3 \
          -fsSL -o "${tmp_dir}/archive.tar.gz" "$url" 2>/dev/null; then
+
+        # ── 安装包完整性校验（fail-closed）────────────────────────
+        # 对不上就**中止**：坏包绝不能解到 root 目录里再谈别的。
+        # 清单用标准 sha256sum 格式（`<hash>  <文件名>`），只认第一个
+        # .tar.gz 条目 —— 发布流程约定清单里只放这一个。
+        if [ -n "$sum_url" ]; then
+            info "校验安装包 sha256 ..."
+            if ! curl --connect-timeout 30 --max-time 60 --retry 2 \
+                 -fsSL -o "${tmp_dir}/sha256sums.txt" "$sum_url" 2>/dev/null; then
+                rm -rf "$tmp_dir"
+                error "取不到 sha256 清单，无法校验安装包"
+                error "清单 URL: ${sum_url}"
+                error "该版本可能没有发布带校验的安装包"
+                warn "如需跳过校验，请改用 --local <path> 从本地安装"
+                die "拒绝安装未经校验的安装包"
+            fi
+            local expect actual
+            expect="$(awk '$2 ~ /\.tar\.gz$/ {print $1; exit}' "${tmp_dir}/sha256sums.txt" | tr -d '\r')"
+            actual="$(sha256_of "${tmp_dir}/archive.tar.gz")"
+            if [ -z "$expect" ] || [ "$expect" != "$actual" ]; then
+                rm -rf "$tmp_dir"
+                error "sha256 校验失败，拒绝安装"
+                error "期望: ${expect:-<清单里没有 .tar.gz 条目>}"
+                error "实际: ${actual}"
+                die "安装包完整性校验未通过"
+            fi
+            ok "sha256 校验通过"
+        else
+            # main 是开发分支，没有 release 资产 ⇒ 无清单可比。
+            # 开发分支本来就不保证可重现，标醒目警告而不是直接拒绝
+            # （拒绝会把「装最新开发代码」这条正常路径堵死）。
+            warn "main 是开发分支，没有 sha256 清单可校验"
+            warn "正式安装请用 release 版本（--version <tag>）"
+        fi
 
         info "解压..."
         tar -xzf "${tmp_dir}/archive.tar.gz" -C "$tmp_dir"
