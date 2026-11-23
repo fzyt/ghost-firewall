@@ -1610,7 +1610,7 @@ def _auto_detect_network(config=None):
     lan_if = _safe_iface(cfg.get('lan_if'), 'br-lan')
     wan_if = _safe_iface(cfg.get('wan_if'), 'pppoe-wan')
     try:
-        uci = parse_uci_config('/etc/config/network')
+        uci = parse_uci_config(NETWORK_CONF_PATH)
         ipaddr = uci.get('lan_ipaddr', '')
         netmask = uci.get('lan_netmask', '')
         if ipaddr and netmask:
@@ -3783,10 +3783,16 @@ def sanitize_uci_value(value):
 
 
 def extract_uci_value(line):
-    """从 UCI option 行提取值，如 "option device 'br-lan'" -> "br-lan" """
+    """从 UCI option 行提取值，如 "option device 'br-lan'" -> "br-lan"
+
+    ⚠️ 剥离顺序：先剥引号、再 strip 空白。
+    反过来（先 strip 再剥引号）会把引号**里面**的空格留下来 ——
+    `option device 'br-lan '` ⇒ 读出 "br-lan "（带尾随空格），
+    后面写进配置就成了一个不存在的设备名 ⇒ LAN 没设备 ⇒ 整机失联。
+    """
     parts = line.split(None, 2)
     if len(parts) >= 3:
-        return parts[2].strip().strip("'\"")
+        return parts[2].strip().strip("'\"").strip()
     return ''
 
 
@@ -3811,7 +3817,13 @@ def get_lan_ipv6():
 
 
 def parse_uci_config(path):
-    """简单的 UCI 配置解析器"""
+    """简单的 UCI 配置解析器。
+
+    段头写法、option 与键之间的空格都容错（见 _UCI_SECTION_RE 的说明）——
+    以前这里是写死的 `config interface 'lan'$`，用户手抖加个空格
+    就读不到 LAN 设备（读成空），而保存时会把空的 device 写回配置
+    ⇒ LAN 没设备 ⇒ 整机失联。
+    """
     result = {
         'lan_device': '', 'lan_proto': '', 'lan_ipaddr': '', 'lan_netmask': '',
         'wan_device': '', 'wan_proto': '',
@@ -3819,46 +3831,44 @@ def parse_uci_config(path):
         'wan_pppoe': False,
         'lan_ip6': '',
     }
-    current_section = None
     with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if re.match(r"config interface 'lan'$", line):
-                current_section = 'lan'
-            elif re.match(r"config interface 'wan'$", line):
-                current_section = 'wan'
-            elif line.startswith("config interface 'wan6'"):
-                current_section = 'wan6'
-            elif line.startswith("config "):
-                current_section = None
-            elif current_section == 'lan':
-                if 'option device' in line or 'option ifname' in line:
-                    result['lan_device'] = extract_uci_value(line)
-                elif 'option proto' in line:
-                    result['lan_proto'] = extract_uci_value(line)
-                elif 'option ipaddr' in line:
-                    result['lan_ipaddr'] = extract_uci_value(line)
-                elif 'option netmask' in line:
-                    result['lan_netmask'] = extract_uci_value(line)
-            elif current_section == 'wan':
-                if 'option ifname' in line or 'option device' in line:
-                    result['wan_device'] = extract_uci_value(line)
-                elif 'option proto' in line:
-                    proto = extract_uci_value(line)
-                    result['wan_proto'] = proto
-                    if proto == 'pppoe':
+        text = f.read()
+    for stype, name, body in _uci_sections(text):
+        if stype != 'interface':
+            continue
+        for line in body:
+            kind, key, val = _uci_option_of(line)
+            # 只认 option，不认 list：`list ipaddr '192.168.100.1/24'`（CIDR）
+            # 和 `option ipaddr '192.168.100.1'`（地址）是两码事。
+            if kind != 'option':
+                continue
+            if name == 'lan':
+                if key in ('device', 'ifname'):
+                    result['lan_device'] = val
+                elif key == 'proto':
+                    result['lan_proto'] = val
+                elif key == 'ipaddr':
+                    result['lan_ipaddr'] = val
+                elif key == 'netmask':
+                    result['lan_netmask'] = val
+            elif name == 'wan':
+                if key in ('ifname', 'device'):
+                    result['wan_device'] = val
+                elif key == 'proto':
+                    result['wan_proto'] = val
+                    if val == 'pppoe':
                         result['wan_pppoe'] = True
-                elif 'option username' in line:
-                    result['wan_pppoe_username'] = extract_uci_value(line)
-                elif 'option password' in line:
-                    result['wan_pppoe_password'] = extract_uci_value(line)
-            elif current_section == 'wan6':
-                if 'option ifname' in line or 'option device' in line:
-                    result['wan6_device'] = extract_uci_value(line)
-                elif 'option proto' in line:
-                    result['wan6_proto'] = extract_uci_value(line)
-                elif 'option ip6addr' in line:
-                    result['wan6_ip6addr'] = extract_uci_value(line)
+                elif key == 'username':
+                    result['wan_pppoe_username'] = val
+                elif key == 'password':
+                    result['wan_pppoe_password'] = val
+            elif name == 'wan6':
+                if key in ('ifname', 'device'):
+                    result['wan6_device'] = val
+                elif key == 'proto':
+                    result['wan6_proto'] = val
+                elif key == 'ip6addr':
+                    result['wan6_ip6addr'] = val
     return result
 
 
@@ -3911,20 +3921,22 @@ def _validate_network_config_content(old_content, new_content):
     """
     if not new_content.strip():
         return False, '新配置内容为空，已拒绝写入（否则整个网络配置会被清空）'
-    lan_re = r"config interface 'lan'\n((?:[ \t][^\n]*\n)*?)(?=\nconfig |\n*\Z)"
-    old_lan = re.search(lan_re, old_content)
-    new_lan = re.search(lan_re, new_content)
-    if old_lan and not new_lan:
+    # 段定位走 _uci_find_section（段头写法/段内缩进都容错）——
+    # 旧实现那条正则靠「段内每行以空白开头」截断，用户把某一行顶格写
+    # 就把 LAN 段截断了，后面的字段校验器根本看不见 ⇒ 该拦的没拦。
+    old_lan, _os, _oe = _uci_find_section(old_content, 'interface', 'lan')
+    new_lan, _ns, _ne = _uci_find_section(new_content, 'interface', 'lan')
+    if old_lan is not None and new_lan is None:
         return False, '新配置里找不到 LAN 接口段，已拒绝写入（丢了 LAN 段 = 整机失联）'
-    if old_lan and new_lan:
+    if old_lan is not None and new_lan is not None:
         for key in ('ipaddr', 'proto'):
-            had = re.search(rf"option\s+{key}\s", old_lan.group(1))
-            has = re.search(rf"option\s+{key}\s", new_lan.group(1))
+            had = _uci_has_option(old_lan, key)
+            has = _uci_has_option(new_lan, key)
             if had and not has:
                 return False, (f'LAN 段的 option {key} 丢失，已拒绝写入'
                                f'（LAN 没有地址 = 路由器失联）')
-    old_n = len(re.findall(r'(?m)^config\s', old_content))
-    new_n = len(re.findall(r'(?m)^config\s', new_content))
+    old_n = len(_uci_sections(old_content))
+    new_n = len(_uci_sections(new_content))
     if new_n < old_n - 1:
         return False, (f'配置段数量异常减少（{old_n} → {new_n}），已拒绝写入'
                        f'（只允许因为切换 PPPoE 而少掉 wan6 段）')
@@ -4002,12 +4014,27 @@ def _atomic_write_network_config(path, content):
 # 物理网卡的 sysfs 根目录。做成模块常量是为了让测试能指向假目录
 # （测试里 monkeypatch 这个常量，走的是和真机完全相同的代码路径）。
 SYSFS_NET_ROOT = '/sys/class/net'
-# OpenWrt 网络配置文件的路径。做成模块常量是为了让测试能指向临时文件
-# （走的是和真机完全相同的代码路径）。
-NETWORK_CONF_PATH = '/etc/config/network'
+# OpenWrt 网络配置文件的路径。做成模块常量（并允许用环境变量覆盖）是为了
+# 让测试能指向临时文件（走的是和真机完全相同的代码路径）。
+# 默认值就是 OpenWrt 的真实路径，部署时不需要额外配置任何东西。
+NETWORK_CONF_PATH = os.environ.get("NFTABLES_WEB_NETWORK_CONF", "/etc/config/network")
 
 # UCI 段头：`config interface 'lan'` / `config device` / `config globals 'globals'`
-_UCI_SECTION_RE = re.compile(r"^config\s+(\S+)\s*(.*)$")
+#
+# ⚠️ 段头的写法在 UCI 里是**自由**的，下面四种都合法：
+#     config interface 'lan'      ← 单引号
+#     config interface "lan"      ← 双引号
+#     config interface lan        ← 不带引号
+#     config  interface  'lan'    ← 关键字之间多个空格
+# 而 /etc/config/network 是**用户手写**的文件，用户手抖加个空格是常事。
+# 以前各处各写各的正则、容错程度还不一样：
+#     · 读页面用 parse_uci_config  → 段名一变就读不到 LAN 设备（读成空）
+#     · 写回校验用 lan_re           → 段内有一行顶格就截断，看不见后面的字段
+#     · 抢救 LAN 用 f'option {key}' → 加个空格就认为「字段不存在」，
+#                                    于是往段里**追加一份默认值的重复 option**
+# 而「读不到 LAN 段」的代价是**整机失联**（LAN 没设备 ⇒ 管理口没了）。
+# ⇒ 一律走下面这几个函数，别再手写段头正则。
+_UCI_SECTION_RE = re.compile(r"^[ \t]*config[ \t]+([A-Za-z0-9_.-]+)[ \t]*(.*?)[ \t]*$")
 # 桥成员声明：`list ports 'eth0'` / `list ports eth0` / `option ports 'eth0 eth1'`
 _UCI_PORTS_RE = re.compile(r"^(?:list|option)\s+ports\s+(.*)$")
 # 物理网卡命名：eth0 / ens33 / enp0s3 这类（前缀 + 数字）
@@ -4037,12 +4064,81 @@ def _uci_sections(text):
     for line in text.splitlines():
         m = _UCI_SECTION_RE.match(line.strip())
         if m:
-            cur = (m.group(1), m.group(2).strip().strip('\'"'), [])
+            cur = (m.group(1), _uci_section_name(m.group(2)), [])
             sections.append(cur)
             continue
         if cur is not None:
             cur[2].append(line)
     return sections
+
+
+def _uci_section_name(rest):
+    """段头里的段名：'lan' / "lan" / lan → lan（UCI 三种写法都合法）。
+
+    取第一个词再剥引号：段头后面万一跟了别的东西也不至于把段名读错。
+    """
+    r = (rest or '').strip()
+    if not r:
+        return ''
+    return r.split()[0].strip('\'"')
+
+
+def _uci_is_section(line, stype, name):
+    """这行是不是 `config <stype> '<name>'` 段头（引号/空格都容错）。"""
+    m = _UCI_SECTION_RE.match(line.strip())
+    return bool(m) and m.group(1) == stype and _uci_section_name(m.group(2)) == name
+
+
+def _uci_find_section(text, stype, name):
+    """找 UCI 里的某个段，返回 (段内原文, 段内起始偏移, 段结束偏移)。
+
+    找不到返回 (None, -1, -1)。段内原文**不含段头行**。
+
+    为什么不用一条正则：正则里「段体」的边界很难写对 ——
+    旧写法靠「段内每行都必须以空白开头」来截断，于是段内只要有一行
+    被顶格写（用户手工编辑时很常见），段体就在那儿**被截断**，
+    后面的字段校验器根本看不见 ⇒ 该拦的没拦。
+    这里改成按「下一个段头」划边界，段内行缩进怎么写都不影响。
+    """
+    off = 0
+    cur = None
+    for ln in text.splitlines(keepends=True):
+        m = _UCI_SECTION_RE.match(ln.rstrip('\r\n'))
+        if m:
+            if cur and cur[0] == stype and cur[1] == name:
+                return text[cur[2]:off], cur[2], off
+            cur = (m.group(1), _uci_section_name(m.group(2)), off + len(ln))
+        off += len(ln)
+    if cur and cur[0] == stype and cur[1] == name:
+        return text[cur[2]:off], cur[2], off
+    return None, -1, -1
+
+
+def _uci_option_of(line):
+    """'(类型, 键, 值)'：'option device 'br-lan'' → ('option','device','br-lan')。
+
+    不是 option/list 行返回 ('', '', '')。
+    键和值之间几个空格都行（UCI 认）。
+    """
+    parts = line.strip().split(None, 2)
+    if len(parts) >= 2 and parts[0] in ('option', 'list'):
+        val = extract_uci_value(line) if len(parts) >= 3 else ''
+        return parts[0], parts[1], val
+    return '', '', ''
+
+
+def _uci_has_option(body_text, key):
+    """段里有没有某个 option（键的写法容错：option ipaddr / option  ipaddr 都认）。
+
+    只认 `option`，不认 `list` —— `list ipaddr '192.168.100.1/24'`（CIDR）
+    和 `option ipaddr '192.168.100.1'`（地址）是两个不同的东西，
+    混起来读出来的值是错的。
+    """
+    for line in body_text.splitlines():
+        kind, k, _v = _uci_option_of(line)
+        if kind == 'option' and k == key:
+            return True
+    return False
 
 
 def _uci_declared_ports(text):
@@ -4417,7 +4513,7 @@ def update_uci_wan_config(path, data):
         line = lines[i]
         stripped = line.strip()
 
-        if re.match(r"config interface 'wan'$", stripped):
+        if _uci_is_section(stripped, 'interface', 'wan'):
             new_lines.append(line)
             if has_pppoe:
                 new_lines.append(f"\toption device '{wan_device}'\n")
@@ -4433,10 +4529,13 @@ def update_uci_wan_config(path, data):
             i += 1
             while i < len(lines):
                 next_stripped = lines[i].strip()
-                if next_stripped.startswith('config '):
+                # 段头判定走 _UCI_SECTION_RE：`config` 与段类型之间用几个空格、
+                # 用 tab、段名带不带引号都合法，硬编码 startswith('config ')
+                # 只认「一个空格」这一种写法。
+                if _UCI_SECTION_RE.match(next_stripped):
                     break
                 if next_stripped == '':
-                    if i + 1 < len(lines) and not lines[i+1].strip().startswith('config '):
+                    if i + 1 < len(lines) and not _UCI_SECTION_RE.match(lines[i+1].strip()):
                         new_lines.append(lines[i])
                         i += 1
                         continue
@@ -4447,12 +4546,12 @@ def update_uci_wan_config(path, data):
                 i += 1
             continue
 
-        if stripped.startswith("config interface 'wan6'"):
+        if _uci_is_section(stripped, 'interface', 'wan6'):
             # 收集 wan6 块所有行
             wan6_block = [line]
             i += 1
             while i < len(lines):
-                if lines[i].strip().startswith('config '):
+                if _UCI_SECTION_RE.match(lines[i].strip()):
                     break
                 wan6_block.append(lines[i])
                 i += 1
@@ -4469,13 +4568,13 @@ def update_uci_wan_config(path, data):
 
     # 切换回非 PPPoE 时，如果 wan6 被删除过且原文件中不再存在，则恢复
     if not has_pppoe and saved_wan6_lines:
-        has_wan6 = any(re.match(r"config interface 'wan6'", l.strip()) for l in new_lines)
+        has_wan6 = any(_uci_is_section(l, 'interface', 'wan6') for l in new_lines)
         if not has_wan6:
             new_lines.append('\n')
             new_lines.extend(saved_wan6_lines)
 
     # 如果文件中没有 wan 块，在末尾追加
-    has_wan_block = any(re.match(r"config interface 'wan'$", l.strip()) for l in new_lines)
+    has_wan_block = any(_uci_is_section(l, 'interface', 'wan') for l in new_lines)
     if not has_wan_block:
         new_lines.append('\n')
         if has_pppoe:
@@ -4492,7 +4591,7 @@ def update_uci_wan_config(path, data):
             new_lines.append(f"\toption proto 'dhcp'\n")
 
     # 如果没有 wan6 块，在末尾追加
-    has_wan6_block = any(re.match(r"config interface 'wan6'", l.strip()) for l in new_lines)
+    has_wan6_block = any(_uci_is_section(l, 'interface', 'wan6') for l in new_lines)
     if not has_wan6_block:
         new_lines.append('\n')
         new_lines.append("config interface 'wan6'\n")
@@ -4540,7 +4639,7 @@ def get_interfaces():
 def get_network_config():
     """读取 OpenWrt 网络配置"""
     try:
-        config = parse_uci_config('/etc/config/network')
+        config = parse_uci_config(NETWORK_CONF_PATH)
         config['lan_ip6'] = get_lan_ipv6()
     except FileNotFoundError:
         return jsonify({"success": True, "message": "网络配置文件不存在，显示默认值", **dict(
@@ -4557,10 +4656,9 @@ def _ensure_lan_essentials(path, has_pppoe=False):
     """确保 LAN 接口关键字段存在，防止配置丢失导致路由器失联"""
     with open(path, 'r') as f:
         content = f.read()
-    lan_match = re.search(r"config interface 'lan'\n((?:[ \t][^\n]*\n)*?)(?=\nconfig |\n*\Z)", content)
-    if not lan_match:
+    lan_block, lan_start, lan_end = _uci_find_section(content, 'interface', 'lan')
+    if lan_block is None:
         return
-    lan_block = lan_match.group(1)
     defaults = {
         'ipaddr': '192.168.100.1',
         'netmask': '255.255.255.0',
@@ -4570,7 +4668,11 @@ def _ensure_lan_essentials(path, has_pppoe=False):
     }
     needs_update = False
     for key, default in defaults.items():
-        if f'option {key}' not in lan_block:
+        # 用 _uci_has_option 而不是 f'option {key}' —— 后者要求精确串，
+        # 用户写成 `option  ipaddr`（多一个空格）就被判成「字段不存在」
+        # ⇒ 这里会往段里**追加一份默认值的重复 option**，
+        # 用户的真实 IP 被默认值覆盖 ⇒ 路由器失联。
+        if not _uci_has_option(lan_block, key):
             needs_update = True
             break
     # PPPoE 模式下强制 LAN proto 为 static
@@ -4579,9 +4681,11 @@ def _ensure_lan_essentials(path, has_pppoe=False):
         needs_update = True
     if needs_update:
         for key, default in defaults.items():
-            if f'option {key}' not in lan_block:
+            if not _uci_has_option(lan_block, key):
                 lan_block = lan_block.rstrip('\n') + f"\n\toption {key} '{default}'\n"
-        new_content = content.replace(lan_match.group(1), lan_block)
+        # 按**偏移**写回，而不是 content.replace(段文本) ——
+        # replace 会把文件里所有相同的段文本一起换掉（不止 LAN 段）。
+        new_content = content[:lan_start] + lan_block + content[lan_end:]
         # 这也是 /etc/config/network ⇒ 同样必须「校验 + 原子替换」（P1-29）。
         # 原地 truncate 重写的话，写一半断电就只剩半截 LAN 段，
         # 路由器当场没有 LAN 地址 —— 而这一步恰恰是在**抢救**失联。
@@ -4610,17 +4714,21 @@ def save_network_config():
                     "message": "防火墙规则未生效，PPPoE 拨号成功后将无防火墙保护。请先配置好防火墙规则并点击\"应用规则\"，再\"保存网络配置\"。",
                     "code": "RULES_NOT_APPLIED"
                 }), 400
-        update_uci_wan_config('/etc/config/network', data)
+        update_uci_wan_config(NETWORK_CONF_PATH, data)
         if data.get('wan_pppoe', False):
-            _ensure_lan_essentials('/etc/config/network', has_pppoe=True)
+            _ensure_lan_essentials(NETWORK_CONF_PATH, has_pppoe=True)
         # 同步 LAN IP 到 Web 配置
-        with open('/etc/config/network', 'r') as f:
+        with open(NETWORK_CONF_PATH, 'r') as f:
             content = f.read()
-        lan_match = re.search(r"config interface 'lan'\n((?:[ \t][^\n]*\n)*?)(?=\nconfig |\n*\Z)", content)
-        if lan_match:
-            ip_match = re.search(r"option\s+ipaddr\s+'([^']+)'", lan_match.group(1))
-            if ip_match:
-                new_ip = ip_match.group(1)
+        lan_block, _ls, _le = _uci_find_section(content, 'interface', 'lan')
+        if lan_block:
+            new_ip = ''
+            for line in lan_block.splitlines():
+                kind, key, val = _uci_option_of(line)
+                if kind == 'option' and key == 'ipaddr':
+                    new_ip = val
+                    break
+            if new_ip:
                 web_config = load_config()
                 if web_config.get('router_ip4') != new_ip:
                     web_config['router_ip4'] = new_ip
@@ -9837,6 +9945,25 @@ def _sanitize_cert_domain(raw):
     return d, wildcard
 
 
+def _cert_dir_name(domain, wildcard=False):
+    """证书的存放目录名（不含 NGINX_SSL_DIR 前缀）。
+
+    为什么泛域名要单独一个目录
+    --------------------------
+    普通证书（example.com）和泛域名证书（*.example.com）的 base_domain
+    **相同** ⇒ 共用 /etc/nginx/ssl/example.com/ ⇒ 装一张就把另一张的
+    fullchain/privkey 冲掉 ⇒ nginx 立刻握手失败，而面板显示一切正常。
+    （用户手工上传了 example.com，再申请 *.example.com 就会撞上。）
+
+    ⇒ 泛域名用 '<base>.wildcard' 这种**不带星号**的目录名 ——
+      目录名带 '*' 在 shell 通配和运维操作里是坑（_sanitize_cert_domain
+      的注释里也是这么说的）。
+
+    兼容性：存量证书的目录名就是 base_domain（wildcard=False）⇒ 不变。
+    """
+    return f"{domain}.wildcard" if wildcard else domain
+
+
 def _get_cert_san(cert_path):
     """读证书的 subjectAltName，返回列表（没有 SAN 时返回空列表）。
 
@@ -12843,7 +12970,7 @@ def _acme_issue(domain, dns_provider="ali", dns_credentials=None, wildcard=False
             f"需要完整版 acme.sh（setup.sh 会自动补装）"
         ), "log": "已查找的路径:\n  " + "\n  ".join(plugin_paths)}
 
-    cert_dir = os.path.join(NGINX_SSL_DIR, domain)
+    cert_dir = os.path.join(NGINX_SSL_DIR, _cert_dir_name(domain, wildcard))
     os.makedirs(cert_dir, exist_ok=True)
 
     env = os.environ.copy()
@@ -12900,7 +13027,7 @@ def _acme_issue(domain, dns_provider="ali", dns_credentials=None, wildcard=False
     }
 
 
-def _acme_renew(domain, dns_provider="ali", dns_credentials=None):
+def _acme_renew(domain, dns_provider="ali", dns_credentials=None, wildcard=False):
     """使用 acme.sh 续期证书"""
     domain = _sanitize_domain(domain)
     provider = DNS_PROVIDERS.get(dns_provider)
@@ -12929,7 +13056,7 @@ def _acme_renew(domain, dns_provider="ali", dns_credentials=None):
     except Exception as e:
         return False, {"error": str(e)}
 
-    cert_dir = os.path.join(NGINX_SSL_DIR, domain)
+    cert_dir = os.path.join(NGINX_SSL_DIR, _cert_dir_name(domain, wildcard))
     fullchain = os.path.join(cert_dir, "fullchain.pem")
     keyfile = os.path.join(cert_dir, "privkey.pem")
     certfile = os.path.join(cert_dir, "cert.pem")
@@ -13863,7 +13990,7 @@ def rp_upload_cert():
     if not domain or not cert_file or not key_file:
         return jsonify({"success": False, "message": "domain, cert_file, key_file 不能为空"}), 400
 
-    cert_dir = os.path.join(NGINX_SSL_DIR, domain)
+    cert_dir = os.path.join(NGINX_SSL_DIR, _cert_dir_name(domain, _parsed_wildcard))
     os.makedirs(cert_dir, exist_ok=True)
     fullchain_path = os.path.join(cert_dir, "fullchain.pem")
     key_path = os.path.join(cert_dir, "privkey.pem")
@@ -13908,17 +14035,24 @@ def rp_upload_cert():
     expires_at, days = _get_cert_expiry(fullchain_path)
     now_iso = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S+08:00")
 
-    # 同 domain 已存在 manual 证书时，视为"重新上传/续期"：
-    # 复用旧 id 和 created_at，替换 entry 内容（保留反代规则的引用关系）
-    existing_manual = None
-    for c in rp.get("certificates", []):
-        if c.get("domain") == domain and c.get("source") == "manual":
-            existing_manual = c
-            break
-
     # 是不是泛域名，以**证书自己的 SAN** 为准，不看用户填的标签 ——
     # 标签填错的话，面板显示的覆盖范围就是错的。
     is_wildcard = any(s.startswith("*.") for s in _get_cert_san(fullchain_path))
+
+    # 同 domain **且同类型**（普通 / 泛域名）的 manual 证书已存在时，视为
+    # "重新上传/续期"：复用旧 id 和 created_at，替换 entry 内容
+    # （保留反代规则的引用关系）。
+    #
+    # ⚠ 判定必须带上 wildcard：泛域名证书与普通证书现在**分目录存放**
+    # （见 _cert_dir_name），它们是两张不同的证书，文件互不覆盖。
+    # 只按 domain 匹配的话，上传一张泛域名证书会把普通证书的**条目**挤掉，
+    # 而普通证书的文件还留在磁盘上没人引用 ⇒ 面板里凭空少一张证书。
+    existing_manual = None
+    for c in rp.get("certificates", []):
+        if (c.get("domain") == domain and c.get("source") == "manual"
+                and bool(c.get("wildcard")) == is_wildcard):
+            existing_manual = c
+            break
 
     if existing_manual:
         new_id = existing_manual["id"]
@@ -14171,10 +14305,24 @@ def rp_request_cert():
     # 两种写法都能表达泛域名：域名框里直接写 *.example.com，
     # 或者写 example.com 再勾「包含泛域名」。
     wildcard = bool(data.get("wildcard")) or parsed_wildcard
-    # 检查域名唯一
-    for c in rp.get("certificates", []):
-        if c["domain"] == domain:
-            return jsonify({"success": False, "message": f"域名 {domain} 已有证书"}), 400
+    # ── 同域名的旧证书：不拦，但要处理 ──
+    #
+    # 为什么原来要拦：怕同一个域名挂两张证书，nginx 不知道用哪张。
+    # 但泛域名证书（*.example.com）**完全覆盖**普通证书（example.com）——
+    # 两张不是冲突而是**包含**关系。原来的「已有证书 ⇒ 400」把用户卡死了：
+    #   手动上传过 fzyto.top 之后，*.fzyto.top 永远申请不下来；
+    #   而那张手动上传的又因为是默认证书删不掉 ⇒ 死锁（用户报的现象）。
+    #
+    # ⇒ 同 domain + 同 wildcard ⇒ 原地替换那张（**保留 id** ——
+    #   default_cert_id 指向的是 id，换 id 会让它指向一张不存在的证书，
+    #   网关会静默退到面板自签证书）；
+    #   同 domain + 不同 wildcard ⇒ 两张都留着（覆盖范围不同，各有用途），
+    #   新证书显示在列表下面，用户可以手动「设为默认」。
+    same_idx = -1
+    for _i, _c in enumerate(rp.get("certificates", [])):
+        if _c.get("domain") == domain and bool(_c.get("wildcard")) == wildcard:
+            same_idx = _i
+            break
 
     dns_provider = data.get("dns_provider", "ali").strip()
     if dns_provider not in DNS_PROVIDERS:
@@ -14201,9 +14349,8 @@ def rp_request_cert():
         return jsonify({"success": False, "message": result.get("error", "证书申请失败"), "log": result.get("log", "")}), 400
 
     now_iso = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S+08:00")
-    new_id = _next_id("cert", [c["id"] for c in rp.get("certificates", [])])
     cert_entry = {
-        "id": new_id,
+        "id": "",
         "domain": domain,
         "wildcard": wildcard,
         "source": "auto",
@@ -14215,9 +14362,25 @@ def rp_request_cert():
         "renew_days": data.get("renew_days", 60),
         "created_at": now_iso,
     }
-    rp["certificates"].append(cert_entry)
+    replaced = False
+    if same_idx >= 0:
+        # 原地替换：保留原 id（默认证书指向的是 id，换 id 会让
+        # default_cert_id 指向一张不存在的证书 ⇒ 网关退到自签证书）。
+        cert_entry["id"] = rp["certificates"][same_idx]["id"]
+        rp["certificates"][same_idx] = cert_entry
+        replaced = True
+    else:
+        cert_entry["id"] = _next_id("cert", [c["id"] for c in rp.get("certificates", [])])
+        rp["certificates"].append(cert_entry)
     _save_rp_config(config)
-    return jsonify({"success": True, "data": {"cert_id": new_id, "domain": domain, "wildcard": wildcard, **result, "message": "证书申请成功"}})
+    if replaced:
+        msg = "证书申请成功（已覆盖原有的同名证书）"
+    else:
+        msg = ("证书申请成功，已添加到证书列表；"
+               "要让它成为网关证书，请点「设为默认」")
+    return jsonify({"success": True, "data": {
+        "cert_id": cert_entry["id"], "domain": domain, "wildcard": wildcard,
+        "replaced": replaced, **result, "message": msg}})
 
 
 @app.route('/api/reverse-proxy/certificates/<cert_id>/renew', methods=['POST'])
@@ -14234,7 +14397,8 @@ def rp_renew_cert(cert_id):
     if not dns_credentials:
         return jsonify({"success": False, "message": "未找到 DNS 凭证，无法续期"}), 400
 
-    ok, result = _acme_renew(cert["domain"], cert_provider, dns_credentials)
+    ok, result = _acme_renew(cert["domain"], cert_provider, dns_credentials,
+                              wildcard=bool(cert.get("wildcard")))
     if not ok:
         return jsonify({"success": False, "message": result.get("error", "续期失败")}), 400
 
@@ -14256,13 +14420,20 @@ def rp_delete_cert(cert_id):
     # 用户看到的是「浏览器证书警告」，而面板显示一切正常。
     settings = rp.setdefault("settings", dict(RP_DEFAULT_SETTINGS))
     is_gateway_default = settings.get("default_cert_id") == cert_id
+    default_cleared = False
 
     if is_gateway_default:
-        return jsonify({
-            "success": False,
-            "message": "该证书正在被认证网关使用（网关统一证书），"
-                       "请先在证书管理里切换网关默认证书再删除",
-        }), 400
+        # 不能悄悄把正在用的证书删掉（删了网关会退到面板自签证书，
+        # 用户看到的是「浏览器证书警告」而面板一切正常，排障方向全偏）。
+        #
+        # 但也不能一棍子打死 —— 用户只有一张证书时，
+        # 「先切换网关默认证书再删除」根本做不到（没有第二张可切），
+        # 于是这张证书永远删不掉（用户报的现象：上传了删不掉）。
+        #
+        # ⇒ 改成：**取消默认 + 放行删除**，并在消息里说清后果
+        #   （网关回退到面板自签证书，重新设一张默认即可）。
+        settings["default_cert_id"] = ""
+        default_cleared = True
 
     # 兼容旧结构里可能残留的按规则引用
     referenced_by = [r for r in rp.get("rules", []) if r.get("ssl_cert_id") == cert_id]
@@ -14296,7 +14467,7 @@ def rp_delete_cert(cert_id):
     # 删除证书文件前，先检查同目录下是否还有别的 cert_entry 在用
     # 防止误删共享文件（例如 ACME 续期后原 auto 证书和新 manual 证书指向同目录）
     domain = _sanitize_domain(cert.get("domain", ""))
-    cert_dir = os.path.join(NGINX_SSL_DIR, domain)
+    cert_dir = os.path.join(NGINX_SSL_DIR, _cert_dir_name(domain, bool(cert.get("wildcard"))))
     other_uses_same_dir = [
         c for c in rp.get("certificates", [])
         if c["id"] != cert_id
@@ -14312,7 +14483,33 @@ def rp_delete_cert(cert_id):
 
     rp["certificates"] = [c for c in rp["certificates"] if c["id"] != cert_id]
     _save_rp_config(config)
-    return jsonify({"success": True, "data": {"message": "证书已删除", "migrated_rules": len(referenced_by) if referenced_by else 0}})
+
+    # 删掉的正是网关默认证书 ⇒ 必须把 nginx 配置重新生成并下发。
+    # 不下发的话：磁盘上的证书文件已经没了，而 nginx.conf 还指着它 ⇒
+    # 下次 nginx reload 直接失败（证书文件不存在），
+    # 而运行中的 nginx 还在用内存里那张旧证书 ⇒ 表面一切正常。
+    nginx_reloaded = True
+    deploy_msg = ''
+    if default_cleared:
+        try:
+            deploy_ok, deploy_msg = _deploy_all_rules(config)
+            if not deploy_ok:
+                nginx_reloaded = False
+        except Exception as e:
+            nginx_reloaded = False
+            deploy_msg = f'{type(e).__name__}: {e}'
+
+    msg = "证书已删除"
+    if default_cleared:
+        msg += ("；它原是网关默认证书，已取消默认，"
+                "网关将回退到面板自签证书（请重新选择默认证书）")
+    if default_cleared and not nginx_reloaded:
+        msg += f"，但 nginx 未生效: {deploy_msg}"
+    return jsonify({"success": True, "data": {
+        "message": msg,
+        "default_cleared": default_cleared,
+        "nginx_reloaded": nginx_reloaded,
+        "migrated_rules": len(referenced_by) if referenced_by else 0}})
 
 
 # ======================= nginx 管理 API =======================

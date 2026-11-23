@@ -201,7 +201,7 @@ MUTATIONS = [
        "    ok, err = (True, '')\n    if not ok:")]),
 
     ('M7b 校验器不再拦「丢了 LAN 段」的内容',
-     [("    if old_lan and not new_lan:\n"
+     [("    if old_lan is not None and new_lan is None:\n"
        "        return False, '新配置里找不到 LAN 接口段，已拒绝写入（丢了 LAN 段 = 整机失联）'",
        "    if False:\n"
        "        return False, '新配置里找不到 LAN 接口段，已拒绝写入（丢了 LAN 段 = 整机失联）'")]),

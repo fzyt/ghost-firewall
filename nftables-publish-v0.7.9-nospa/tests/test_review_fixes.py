@@ -296,6 +296,13 @@ r4 = app4._migrate_rp_rules(nod)['reverse_proxy']['rules']
 check('无 domain 时也有可用前缀', bool(r4[0]['path_prefix']), str(r4[0].get('path_prefix')))
 
 sec('v0.8.1  证书删除保护的是网关默认证书')
+# 2026-11-24 语义变更（用户拍板）：网关默认证书**也删得掉** ——
+# 用户只有一张证书时，「先切默认再删」根本做不到（没有第二张可切），
+# 于是这张证书永远删不掉（用户实机报的现象）。
+# ⇒ 保护方式从「拒绝删除」改成「**取消默认 + 放行删除 + 重新下发 nginx**」。
+# 老行为保护的东西一点没少：删掉默认证书后，nginx.conf 绝不能还指着
+# 已经删掉的文件（下次 reload 必失败，而运行中的 nginx 还在用内存里的
+# 旧证书 ⇒ 表面一切正常）。
 app = fresh()
 cfg = app._get_rp_config()[0]
 cfg['reverse_proxy']['certificates'] = [
@@ -307,12 +314,23 @@ cfg['reverse_proxy']['settings']['default_cert_id'] = 'cert_001'
 app.save_config(cfg)
 app.app.before_request_funcs[None] = []
 app.app.config['TESTING'] = True
+
+# 记录「有没有真的重新下发 nginx」—— 这是新语义下的关键防线
+_deploys = []
+app._deploy_all_rules = lambda config=None: (_deploys.append(config), (True, ''))[1]
+
 cli = app.app.test_client()
 r = cli.delete('/api/reverse-proxy/certificates/cert_001')
-check('拒绝删除正在被网关使用的默认证书', r.status_code == 400, str(r.status_code))
-check('拒绝时给出可操作的提示',
-      '网关' in (r.get_json() or {}).get('message', ''),
-      (r.get_json() or {}).get('message', '')[:50])
+check('网关默认证书也删得掉（不再硬拒 400）', r.status_code == 200, str(r.status_code))
+check('删除默认证书后重新下发了 nginx（nginx.conf 不能还指着已删文件）',
+      len(_deploys) == 1, '下发了 %d 次' % len(_deploys))
+_cfg2 = app._get_rp_config()[0]
+check('删除默认证书后不留指向已删证书的 id',
+      _cfg2['reverse_proxy']['settings'].get('default_cert_id') in ('', None),
+      str(_cfg2['reverse_proxy']['settings'].get('default_cert_id')))
+_msg = (r.get_json() or {}).get('data', {}).get('message', '')
+check('删除默认证书时说清了后果（网关回退自签）',
+      '网关' in _msg and '默认' in _msg, _msg[:80])
 cfg['reverse_proxy']['settings']['default_cert_id'] = 'cert_002'
 app.save_config(cfg)
 r = cli.delete('/api/reverse-proxy/certificates/cert_001')
