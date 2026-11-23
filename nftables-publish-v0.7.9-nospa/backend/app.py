@@ -2840,9 +2840,15 @@ def config_to_variables(config):
     # 只保证「从面板存进去的」是合法的 —— 配置文件可以被手工改坏。
     router_ip6 = _safe_ip(config.get("router_ip6"), 6, "")
     if router_ip6:
+        # ⚠️ 只放行路由器自己（2026-11-23 改）：原来还写死了两个公共 IPv6 DNS
+        #    （2400:3200::1 阿里、2400:3200:baba::1 DNSPod），而它们排在下面
+        #    IPv4 那条 `ip daddr != $ROUTER_IP4 drop` **之前**被单独 accept ——
+        #    递归解析模式宣称「LAN 只能走本机，防止绕过本机解析与日志」，
+        #    实际却仍能被绕到公共 DNS ⇒ 开关形同虚设。
+        #    与模板里那两条 IPv4 的改动是同一件事的两面。
         variables["IPV6_LAN_WAN_DNS_BLOCK"] = (
-            f"        iifname $LAN_IF oifname $WAN_IF meta nfproto ipv6 udp dport 53 ip6 daddr {{ {router_ip6}, 2400:3200::1, 2400:3200:baba::1 }} accept\n"
-            f"        iifname $LAN_IF oifname $WAN_IF meta nfproto ipv6 tcp dport 53 ip6 daddr {{ {router_ip6}, 2400:3200::1, 2400:3200:baba::1 }} accept"
+            f"        iifname $LAN_IF oifname $WAN_IF meta nfproto ipv6 udp dport 53 ip6 daddr {{ {router_ip6} }} accept\n"
+            f"        iifname $LAN_IF oifname $WAN_IF meta nfproto ipv6 tcp dport 53 ip6 daddr {{ {router_ip6} }} accept"
         )
     else:
         variables["IPV6_LAN_WAN_DNS_BLOCK"] = ""
