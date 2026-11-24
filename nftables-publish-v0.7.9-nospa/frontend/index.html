@@ -2988,7 +2988,32 @@
           <div class="space-y-4">
             <template x-for="(rule, index) in rp.rules" :key="index">
               <div class="bg-gray-50 border rounded-lg p-5">
-                <div class="flex items-start justify-between gap-3 mb-3">
+                <!--
+                  ⚠️ 手机上这一行**原来**会挤成「URL 一行几个字」——
+                  原因是右边那 4 个按钮 shrink-0（不收缩），把左边内容
+                  压到只剩几十像素宽，而 URL **原来**用的是 break-all
+                  （任意字符断行）⇒ 一个字一个字往下掉。
+
+                  修法（手机纵向、桌面横向）：
+                    · flex-col sm:flex-row —— 窄屏时按钮组整体换到下一行，
+                      左列独占整行宽度（原来是横排挤成一条）；
+                    · items-stretch sm:items-start —— 手机上让左列**撑满整行**
+                      （align-items:start 时子项按 fit-content 收缩，左列只有
+                      259px，URL 还是短了一截）；桌面端仍靠 items-start 顶对齐，
+                      否则按钮会被拉高；
+                    · 左列保留 min-w-0（不写 flex-1：flex-1 的 basis 是 0，
+                      左列就不占自然宽度，按钮组反而不会换行）；
+                    · 按钮组自身 flex-wrap —— 极窄屏时按钮内部换行。
+
+                  实测（2026-11-24，headless chromium 真视口 375px，
+                  用项目真实的 tailwind.js + styles.css 渲染）：
+                    改前：URL 元素 57px 宽 / 5 行（目标地址 153px / 2 行）
+                    改后：URL 元素 317px 宽 / 1 行（目标地址 317px / 1 行）
+                  ⚠️ 测视口不能用 `--window-size`：headless chromium 会把它
+                  钳到最小 500px（实测 innerWidth 恒为 500）⇒ 测出来的
+                  不是手机宽度。改用 iframe 建立窄视口。
+                -->
+                <div class="flex flex-col sm:flex-row items-stretch sm:items-start justify-between gap-3 mb-3">
                   <div class="min-w-0">
                     <h3 class="font-bold flex items-center gap-2 flex-wrap">
                       <span x-text="rule.name || '(未命名服务)'"></span>
@@ -2996,17 +3021,17 @@
                         class="text-xs px-2 py-0.5 rounded bg-gray-200 text-gray-500">已停用</span>
                     </h3>
                     <!-- 访问路径是这条服务的真实入口，必须一眼可见 -->
-                    <p class="text-sm mt-1 nf-mono text-gray-600 break-all"
+                    <p class="text-sm mt-1 nf-mono text-gray-600 break-words"
                        x-text="gatewayPreviewUrl() + (rule.path_prefix || '/') + '/'"></p>
                     <!-- host 分发入口：另开一个域名，服务挂到那个域名的根路径。
                          两个入口并存时都要显示出来 —— 只显示一个，用户会以为
                          另一个不存在。 -->
-                    <p class="text-sm mt-1 nf-mono text-indigo-700 break-all"
+                    <p class="text-sm mt-1 nf-mono text-indigo-700 break-words"
                        x-show="rule.host" x-cloak>
                       <span class="text-gray-400">域名入口：</span><span x-text="'https://' + rule.host + ':' + (gw.gateway_port || 8443) + '/'"></span>
                     </p>
                   </div>
-                  <div class="flex gap-2 shrink-0">
+                  <div class="flex flex-wrap gap-2 shrink-0">
                     <button @click="editRpRule(index)"
                       class="px-3 py-1 border rounded text-xs hover:bg-gray-100 transition-colors">编辑</button>
                     <button @click="testRpRule(rule)"
@@ -3020,10 +3045,12 @@
                   </div>
                 </div>
 
-                <dl class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-3 pt-3 border-t text-sm">
+                <!-- 手机上单列：两列会把「目标地址」那格挤成半行宽，
+                     长地址原来还得靠 break-all 断行（一个字一行） -->
+                <dl class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3 mt-3 pt-3 border-t text-sm">
                   <div>
                     <dt class="text-xs text-gray-400">目标地址</dt>
-                    <dd class="nf-mono text-gray-700 break-all"
+                    <dd class="nf-mono text-gray-700 break-words"
                         x-text="(rule.target_protocol || 'http') + '://' + (rule.target_address || '-')"></dd>
                   </div>
                   <div>

@@ -1865,6 +1865,15 @@ function app() {
           error: '',
           data: info || null,
         };
+        // 公网 IP：首屏**不等**它（外网探测最多 2 个源 × 5 秒超时，
+        // 等它会把首屏拖住），但也不能一次都不问 ——
+        // 不问的话这一栏永远是「未知」，用户会以为路由器查不到自己的公网 IP
+        // （.1 实测 2026-11-24：设备上 collect_public_ip() 明明能采到）。
+        // ⇒ 首次进页面时并行查一次；之后靠「查询」按钮手动刷新。
+        //   自动刷新（isAuto）绝不再问外网，否则每 5 秒问一次。
+        if (!isAuto && !this.deviceInfo.publicIp) {
+          this.loadPublicIp();
+        }
       } catch (e) {
         this.deviceInfo = {
           ...this.deviceInfo,

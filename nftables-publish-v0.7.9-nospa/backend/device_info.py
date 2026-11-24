@@ -588,7 +588,7 @@ def _ipv6_by_iface():
 
 
 def _ipv4_by_iface():
-    """`/proc/net/route` + `/proc/net/fib_trie` → {接口名: [地址, ...]}。
+    """`/proc/net/route` + `/proc/net/fib_trie` + `getifaddrs()` → {接口名: [地址, ...]}。
 
     做法：
       1. `/proc/net/route` 给出「接口 → 该接口直连的网段」
@@ -601,14 +601,27 @@ def _ipv4_by_iface():
     ⚠️ **`/proc/net/fib_trie` 依赖内核的 CONFIG_FIB_TRIES**，
     OpenWrt 上不一定开 ⇒ 采不到时必须退到 `getifaddrs`（libc 标准函数，
     musl 也有），不能就此显示「未知」。
+
+    ⚠️ **两个来源要「合并」，不是「二选一」**（.1 实测 2026-11-24）：
+    前面第 1~3 步靠「接口的直连网段」反查地址，而 **PPPoE 这类点到点接口
+    在路由表里没有直连网段**（只有默认路由）⇒ 它的公网地址那条路永远采不到。
+    .1 实测：fib_trie 只给出 `br-lan`，`getifaddrs` 才给出
+    `pppoe-wan` 的公网 IPv4 ⇒ 原来的「fib_trie 成功就不用 getifaddrs」
+    ⇒ **WAN 口的公网 IP 永远显示不出来**（页面上一片「—」）。
+    ⇒ getifaddrs 永远也要跑一趟，两边结果去重合并。
     """
+    out = {}
     nets_by_iface = _direct_nets_by_iface()
     if nets_by_iface:
-        out = _ipv4_from_fib_trie(nets_by_iface)
-        if out:
-            return out
-    # fib_trie 不可用（或采不到）⇒ 退到 getifaddrs
-    return _ipv4_by_getifaddrs()
+        for iface, addrs in _ipv4_from_fib_trie(nets_by_iface).items():
+            out.setdefault(iface, []).extend(addrs)
+    # getifaddrs 补齐 fib_trie 采不到的接口（最典型就是 PPPoE 的 WAN 口）
+    for iface, addrs in _ipv4_by_getifaddrs().items():
+        cur = out.setdefault(iface, [])
+        for addr in addrs:
+            if addr not in cur:
+                cur.append(addr)
+    return out
 
 
 def _direct_nets_by_iface():
@@ -801,9 +814,21 @@ def _iface_state(name):
     """接口状态：up / down / unknown。"""
     # /sys/class/net/<name>/operstate：up / down / unknown / dormant
     v = _read_first_line('/sys/class/net/%s/operstate' % name)
-    if v:
+    if v and v.strip() not in ('', 'unknown'):
         return v.strip()
-    # 有些系统（容器里）没有 operstate，退回 flags
+    # ⚠️ PPPoE 接口的 operstate **恒为 'unknown'**（.1 实测 2026-11-24：
+    # pppoe-wan 的 operstate=unknown，而 carrier=1、flags 里 IFF_UP 置位）。
+    # ⇒ operstate 不可用时不能直接说「未知」——
+    #   用户在状态页看到的就是「WAN 口状态未知」，像坏了。
+    #   改看 carrier：PPP 链路建立 ⇒ carrier=1（以太网口则是「网线插着」，
+    #   但对以太网口 operstate 本来就是 up，走不到这一支）。
+    c = _read_first_line('/sys/class/net/%s/carrier' % name)
+    if c:
+        try:
+            return 'up' if int(c.strip()) == 1 else 'down'
+        except ValueError:
+            pass
+    # 容器里既没有 operstate 也没有 carrier，退回 flags 的 IFF_UP 位
     try:
         with open('/sys/class/net/%s/flags' % name) as f:
             flags = int(f.read().strip(), 16)
