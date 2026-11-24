@@ -154,8 +154,14 @@ APP_MUTANTS = [
      '        if len(parts) >= 1:'),
 
     ('探测返回完整路径而不是第一段（拿到 /api/search/html/ 这种没法用）',
-     '            segs.add(parts[0])',
-     "            segs.add('/'.join(parts))"),
+     '            segs[parts[0]] = segs.get(parts[0], 0) + 1',
+     "            segs['/'.join(parts)] = segs.get('/'.join(parts), 0) + 1"),
+
+    # ⚠️ 锚点 2026-11-24 更新：候选前缀改成**按命中条数**降序排
+    # （自动装配直接取第一个；按名字排的话 "/admin/" 会排在 "/api/" 前面）。
+    ('API 前缀候选退回按名字排（/admin/ 排到 /api/ 前面 ⇒ 自动装配选错前缀）',
+     '    ordered = sorted(segs.items(), key=lambda kv: (-kv[1], kv[0]))',
+     '    ordered = sorted(segs.items(), key=lambda kv: kv[0])'),
 
     # ⚠️ 锚点 2026-10-30 更新：P2-9 修复把错误信息改成**不回显 URL 与异常原文**
     # （能区分「超时/拒绝/404/500」的错误信息就是端口扫描器 oracle）。
@@ -209,49 +215,37 @@ APP_MUTANTS = [
 ]
 
 JS_MUTANTS = [
-    # 第十七节那个 bug 的同款：读错 JSON 层级
-    ('前端读 res.prefixes 而不是 res.data.prefixes（探测定成功了却显示「没探测到」）',
-     '        const prefixes = (res.data && res.data.prefixes) || [];\n'
-     '        const err = (res.data && res.data.error) || \'\';',
-     '        const prefixes = (res.prefixes) || [];\n'
-     '        const err = (res.error) || \'\';'),
+    # ⚠️ 2026-11-24：界面上手填的输入框与「自动探测」按钮已撤掉，
+    #   改成新建时由后端自动探测 ⇒ 针对旧界面的变异全部作废，
+    #   换成针对**新链路**的变异（探测结论回填、结论回显）。
+    ('前端不再把探测结论写回本地规则对象（列表显示与实际生效值对不上）',
+     '              this.rp.rules[i].api_path_prefix = created.api_path_prefix;',
+     '              // not applied'),
 
-    ('探测结果不回填到表单字段（用户看不到也存不进去）',
-     '          r.api_path_prefix = prefixes[0];',
-     '          // not applied'),
+    ('前端不再回显自动探测的结论（用户不知道系统替它做了什么决定）',
+     "          + (autofillNote ? '（' + autofillNote + '）' : ''), 'success');",
+     "          + '', 'success');"),
 
     ('newRpRule 不带 api_path_prefix 字段（新建时是 undefined）',
-     "        client_max_body_size: '1M',\n"
      "        api_path_prefix: '',",
-     "        client_max_body_size: '1M',"),
+     '        // 少了这个字段'),
 
     ('editRpRule 不归一化 api_path_prefix（老规则编辑时是 undefined）',
      "      r.api_path_prefix = r.api_path_prefix || '';",
      '      // not normalized'),
-
-    ('探测没有 pending 状态（连点会并发打探测）',
-     '      this.rpDetectingPrefix = true;',
-     '      // no pending state'),
-
-    ('探测异常被静默吞掉（用户看不到任何提示）',
-     "        this.rpApiPrefixHint = '探测失败: ' + e.message;",
-     "        this.rpApiPrefixHint = '';"),
 ]
-
 HTML_MUTANTS = [
-    ('API 路径前缀输入框不再绑定这个字段（填了也不生效）',
-     '                  <input type="text" x-model="rpEditingRule.api_path_prefix"\n'
-     '                    placeholder="例如 /api/" class="flex-1 nf-mono">',
-     '                  <input type="text" x-model="rpEditingRule.some_other_field"\n'
-     '                    placeholder="例如 /api/" class="flex-1 nf-mono">'),
-
-    ('「自动探测」按钮不再调 detectRpApiPrefix',
-     '<button type="button" @click="detectRpApiPrefix()"',
-     '<button type="button" @click="noop()"'),
-
     ('列表里不再显示已配置的 API 路径前缀',
      '                        x-text="rule.api_path_prefix"></dd>',
      '                        x-text=""></dd>'),
+
+    ('编辑表单里不再展示当前 API 路径前缀（用户看不到系统探测出了什么）',
+     'x-text="rpEditingRule?.api_path_prefix"',
+     "x-text=\"''\""),
+
+    ('编辑表单里不再展示根绝对路径改写状态',
+     'x-show="rpEditingRule?.rewrite_root_paths"',
+     'x-show="false"'),
 ]
 
 
@@ -270,23 +264,44 @@ def run_js():
 RUNNERS = {PY: run_py, JS_KEY: run_js}
 
 
+def _fail_lines(stdout):
+    """挑出**真正的断言失败行**（排除汇总行）。
+
+    ⚠️ 汇总行自带失败标记（「合计: 通过 N 失败 M」「通过 N / 失败 M」），
+    把它当失败就是「什么都没抓也报抓住」—— 指标自己骗自己。
+    """
+    out = []
+    for line in stdout.splitlines():
+        s = line.strip()
+        if s.startswith('合计') or s.startswith('通过'):
+            continue
+        if '[FAIL]' in s or '❌' in s:
+            out.append(s)
+    return out
+
+
+def _pass_count(stdout):
+    return stdout.count('[PASS]') + stdout.count('✅')
+
+
 def report(name, results):
     """results = [(label, CompletedProcess), ...]"""
     caught = False
     detail = ''
     for label, r in results:
-        fails = [l.strip() for l in r.stdout.splitlines() if '❌' in l]
-        # 变异让代码自己崩掉也算抓到 —— 崩掉正是要防的事。
-        if r.returncode != 0 and (fails or r.stderr.strip()):
+        fails = _fail_lines(r.stdout)
+        # ⚠️ 口径：**必须有真正的断言失败行**才算捕获。
+        #   rc≠0 但一条失败行都没有 = 测试自己崩了（不是被变异打红的），
+        #   按项目口径不算捕获 —— 否则「测试崩了」会被记成「变异抓住了」。
+        if fails:
             caught = True
-            detail = (fails[0][:86] if fails
-                      else ('测试崩溃: ' + r.stderr.strip().splitlines()[-1][:70]))
+            detail = fails[0][:86]
             break
     if caught:
-        print(f'  ✅ 抓住 {name}')
+        print(f'  [OK] 抓住 {name}')
         print(f'        首个失败: {detail}')
     else:
-        print(f'  ❌ 漏过 {name}')
+        print(f'  [FAIL] 漏过 {name}')
     return caught
 
 
@@ -299,19 +314,19 @@ def main():
     base_py = run_py()
     base_js = run_js()
     if base_py.returncode != 0:
-        print('❌ 基线（Python）没过：')
+        print('[FAIL] 基线（Python）没过：')
         print(base_py.stdout[-3000:])
         if base_py.stderr:
             print(base_py.stderr[-1500:])
         return 1
     if base_js.returncode != 0:
-        print('❌ 基线（前端契约）没过：')
+        print('[FAIL] 基线（前端契约）没过：')
         print(base_js.stdout[-3000:])
         if base_js.stderr:
             print(base_js.stderr[-1500:])
         return 1
-    print(f'基线通过  Python {base_py.stdout.count("✅")} 条  '
-          f'前端契约 {base_js.stdout.count("✅")} 条\n')
+    print(f'基线通过  Python {_pass_count(base_py.stdout)} 条  '
+          f'前端契约 {_pass_count(base_js.stdout)} 条\n')
 
     caught, noanchor = 0, []
     try:
@@ -322,13 +337,13 @@ def main():
         ):
             for name, old, new in mutants:
                 if old not in src:
-                    print(f'  ⚠️  锚点未命中 [{label}]: {name}')
+                    print(f'  [WARN] 锚点未命中 [{label}]: {name}')
                     noanchor.append(name)
                     continue
                 mutated = src.replace(old, new, 1)
                 if mutated == src:
                     # 理论上不可能（old 在 src 里），但留着当保险
-                    print(f'  ⚠️  变异没改到内容 [{label}]: {name}')
+                    print(f'  [WARN] 变异没改到内容 [{label}]: {name}')
                     noanchor.append(name)
                     continue
                 open(path, 'w', encoding='utf-8').write(mutated)
@@ -338,7 +353,7 @@ def main():
                 # 6 个变异全「漏过」还看不出来。写完立刻回读比对。
                 on_disk = open(path, encoding='utf-8').read()
                 if on_disk != mutated:
-                    print(f'  ❌ 变异没落到 [{label}]: {name}（写到了 {path}，'
+                    print(f'  [FAIL] 变异没落到 [{label}]: {name}（写到了 {path}，'
                           f'实际路径 {os.path.abspath(path)}）')
                     noanchor.append(name)
                     open(path, 'w', encoding='utf-8').write(src)

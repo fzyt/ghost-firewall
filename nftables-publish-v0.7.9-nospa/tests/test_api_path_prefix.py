@@ -67,17 +67,31 @@ sec('1  _sanitize_api_path_prefix —— 规整与拒绝')
 
 app = fresh()
 
+def san(value):
+    """规整结果；抛异常时返回哨兵串，而不是掀翻整个测试脚本。
+
+    ⚠️ 为什么必须包一层：变异脚本的判定口径是「**必须有真正的失败行**」。
+    裸调一旦抛 ValueError，脚本直接 Traceback 退出 —— 一条失败行都没有 ⇒
+    变异被判「漏过」，而实际上行为确实被改坏了（合法的 '/api/' 被拒）。
+    哨兵串让断言正常判失败，问题被如实报出来。
+    """
+    try:
+        return app._sanitize_api_path_prefix(value)
+    except Exception as e:
+        return f'<抛异常: {type(e).__name__}>'
+
+
 # 空值合法：绝大多数服务不需要改写，「清空这个字段」是正常操作
-check('空串是合法的（= 不做改写）', app._sanitize_api_path_prefix('') == '')
-check('None 是合法的（= 不做改写）', app._sanitize_api_path_prefix(None) == '')
-check('全空白是合法的（= 不做改写）', app._sanitize_api_path_prefix('   ') == '')
+check('空串是合法的（= 不做改写）', san('') == '')
+check('None 是合法的（= 不做改写）', san(None) == '')
+check('全空白是合法的（= 不做改写）', san('   ') == '')
 
 # 规范化：统一补上尾斜杠
-check("'/api' → '/api/'", app._sanitize_api_path_prefix('/api') == '/api/')
-check("'/api/' → '/api/'（幂等）", app._sanitize_api_path_prefix('/api/') == '/api/')
-check("'/api/v1' → '/api/v1/'", app._sanitize_api_path_prefix('/api/v1') == '/api/v1/')
-check("'/api/v1/' → '/api/v1/'", app._sanitize_api_path_prefix('/api/v1/') == '/api/v1/')
-check("两侧空白被裁掉", app._sanitize_api_path_prefix('  /api/  ') == '/api/')
+check("'/api' → '/api/'", san('/api') == '/api/')
+check("'/api/' → '/api/'（幂等）", san('/api/') == '/api/')
+check("'/api/v1' → '/api/v1/'", san('/api/v1') == '/api/v1/')
+check("'/api/v1/' → '/api/v1/'", san('/api/v1/') == '/api/v1/')
+check("两侧空白被裁掉", san('  /api/  ') == '/api/')
 
 # 拒绝：这些值一旦进 nginx 配置就是注入或误伤
 BAD = [
@@ -188,6 +202,23 @@ def gen_conf(rules):
     return a._generate_gateway_nginx_conf(cfg)
 
 
+def gen_conf_try(rules):
+    """生成配置，但不让异常掀翻整个测试脚本。
+
+    ⚠️ 为什么要这个：非法值必须**降级**（只放弃「改写」这一项，不放弃
+    整条服务），不能让异常冒泡 —— 冒泡会让**整份**网关配置生成失败，
+    所有服务一起挂。测试要能判出这条不变量，所以异常必须变成**失败行**，
+    而不是把脚本带崩（脚本崩了 ⇒ 一条失败行都没有 ⇒ 变异被判「漏过」）。
+
+    返回 (配置文本, 异常)：异常非 None 时配置文本为空串，
+    后续「某内容是否在配置里」的断言自然判失败。
+    """
+    try:
+        return gen_conf(rules), None
+    except Exception as e:
+        return '', e
+
+
 rule_with = {
     'id': 'rp_1', 'name': 'logcenter', 'enabled': True,
     'path_prefix': '/logcenter', 'target_address': '127.0.0.1:5080',
@@ -255,7 +286,9 @@ check('多段前缀也正确改写',
 # 「有人填了坏值」）。所以断言不能是「整份配置里不含该字符串」，
 # 而必须是「**指令行**里不含该字符串」+「注释里能看到」。
 INJECT = '/api/"; evil_directive; #'
-conf_inject = gen_conf([{**rule_with, 'api_path_prefix': INJECT}])
+conf_inject, inj_err = gen_conf_try([{**rule_with, 'api_path_prefix': INJECT}])
+check('非法值时配置生成不抛异常（一份坏配置不能拖垮整份网关配置）',
+      inj_err is None, str(inj_err))
 sub_lines = [ln for ln in conf_inject.splitlines() if 'sub_filter "' in ln]
 check('非法值不会出现在任何 sub_filter 指令里（生成期二次净化）',
       not any('evil_directive' in ln for ln in sub_lines),
@@ -273,10 +306,12 @@ check('非法值时不生成 Accept-Encoding 空头（不多余副作用）',
 
 # 换行注入：配置生成必须仍然成功（不能抛异常拖垮整份网关配置）
 NL = '/api/\n    return 200;'
-conf_nl = gen_conf([{**rule_with, 'api_path_prefix': NL}])
+conf_nl, nl_err = gen_conf_try([{**rule_with, 'api_path_prefix': NL}])
 check('带换行的非法值不会让配置生成失败（只跳过改写）',
-      'location /logcenter/' in conf_nl
-      and not [ln for ln in conf_nl.splitlines() if 'sub_filter "' in ln])
+      nl_err is None
+      and 'location /logcenter/' in conf_nl
+      and not [ln for ln in conf_nl.splitlines() if 'sub_filter "' in ln],
+      f'生成异常: {nl_err}' if nl_err else '')
 check('带换行的非法值不会把内容写进指令（回显时已转义成单行）',
       'return 200;' not in conf_nl
       or all(ln.strip().startswith('#')
@@ -337,7 +372,9 @@ try:
 finally:
     srv.shutdown()
 
-# 多个前缀时全部返回，由前端/用户挑
+# 多个前缀时全部返回。排序规则（2026-11-24 起）：
+#   **命中条数多的排前面**；条数相同时按名字排（保证同一份 openapi.json
+#   每次探测结果一致）。自动装配直接取第一个 ⇒ 排在前面的那个必须是真前缀。
 srv, port = start_server(json.dumps({
     'paths': {'/api/x': {}, '/admin/y': {}, '/health': {}}}).encode())
 try:
@@ -345,6 +382,25 @@ try:
     prefixes, err = app._detect_upstream_api_prefixes('127.0.0.1', port, 'http')
     check('多个前缀时全部返回（不替用户瞎猜）',
           prefixes == ['/admin/', '/api/'], str(prefixes))
+    check('条数相同时按名字排（保证结果稳定）',
+          prefixes == sorted(prefixes), str(prefixes))
+finally:
+    srv.shutdown()
+
+# 条数不等时，**覆盖条数多的**排前面。
+# 这条不是锦上添花：同一份路由表里混着 /api/ 与 /admin/ 时，
+# 按名字排会把 "/admin/" 排到 "/api/" 前面 ⇒ 自动装配选错前缀 ⇒
+# 改写出来的路径指向不存在的地方 ⇒ 页面能开、接口全 404。
+srv, port = start_server(json.dumps({
+    'paths': {'/api/a': {}, '/api/b': {}, '/api/c': {},
+              '/admin/y': {}, '/health': {}}}).encode())
+try:
+    app = fresh()
+    prefixes, err = app._detect_upstream_api_prefixes('127.0.0.1', port, 'http')
+    check('命中条数多的前缀排前面（/api/ 三条 > /admin/ 一条）',
+          prefixes and prefixes[0] == '/api/', str(prefixes))
+    check('两个候选都还在（只是换了顺序）',
+          sorted(prefixes or []) == ['/admin/', '/api/'], str(prefixes))
 finally:
     srv.shutdown()
 

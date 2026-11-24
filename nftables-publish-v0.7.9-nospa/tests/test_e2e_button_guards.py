@@ -202,8 +202,11 @@ EXPECT = {
     'cancelRpEdit':       ('normal', '取消'),
     'cancelSaveConfig':   ('normal', '取消'),
     'closePresetModal':   ('normal', '关闭'),
-    'detectRpApiPrefix':  ('normal', '自动探测'),
-    'detectRpProtocolRelative': ('normal', '检测协议相对 URL'),
+    # ⚠️ detectRpApiPrefix / detectRpProtocolRelative 已于 2026-11-24 移除：
+    #   「上游 API 路径前缀」输入框与「根绝对路径改写」勾选框都撤掉了，
+    #   改成新建时由后端自动探测（backend 的 _rp_autofill_path_rewrite）。
+    #   本表第 5 组会断言「表里没有 index.html 里已不存在的动作」，
+    #   所以这两个条目必须一起删，否则就是一条陈旧项。
     'doLogout':           ('normal', '退出登录'),
     'downloadRpCert':     ('normal', '下载'),
     'editDdnsService':    ('normal', '编辑'),

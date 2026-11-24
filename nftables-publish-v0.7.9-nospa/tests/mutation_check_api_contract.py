@@ -133,11 +133,19 @@ APP_MUTANTS = [
     ('dns-providers 改成平铺式（前端 data.data.providers 读不到）',
      'return jsonify({"success": True, "data": {"providers": providers_out}})',
      'return jsonify({"success": True, "providers": providers_out})'),
-    ('detect-api-prefix 改成平铺式（前端 res.data.prefixes 读不到）',
-     'return jsonify({"success": True,\n'
-     '                    "data": {"prefixes": prefixes, "error": err}})',
-     'return jsonify({"success": True,\n'
-     '                    "prefixes": prefixes, "error": err})'),
+    # 2026-11-24：「detect-api-prefix 改成平铺式」这条**从本脚本移走**。
+    #
+    # 原因：这条变异靠的是「前端真的去读 res.data.prefixes」才暴露 ——
+    # 而第七批把前端的 detectRpApiPrefix() 整个删掉了（改成新建时由
+    # 后端自动探测），前端不再引用这个端点 ⇒ 本脚本的契约扫描器
+    # 没有可对账的调用点 ⇒ 变异打不红（实测捕获数 19 → 18）。
+    #
+    # 覆盖并没有消失，搬到真正读它的两条判据上：
+    #   · tests/test_api_path_prefix.py 第 6 节（端点契约：data 是嵌套对象）
+    #   · tests/mutation_check_api_prefix.py（「探测端点不再把结果放在
+    #     data 信封里」—— 实测已捕获）
+    # 端点本身保留为诊断入口，返回结构不变（docstring 已注明）。
+    #
     # 2026-10-21：set-default 的返回多了 nginx_reloaded、message 变成变量
     # （证书部署失败时要如实说），**envelope 形状没变** —— 前端仍读
     # data.data.message，所以这个变异依然成立。

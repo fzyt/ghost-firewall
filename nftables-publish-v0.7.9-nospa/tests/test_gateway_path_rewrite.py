@@ -373,12 +373,18 @@ def main():
     th = threading.Thread(target=srv.serve_forever, daemon=True)
     th.start()
     try:
-        cnt, samples, err = app._detect_upstream_protocol_relative(
+        root_cnt, cnt, samples, err = app._detect_upstream_path_shapes(
             '127.0.0.1', port, 'http')
         check('检测到协议相对 URL', err is None and cnt == 2, f'count={cnt} err={err}')
         check('样本里能看到 href 形态',
               any('href=' in s for s in samples), str(samples))
-        cnt2, _, err2 = app._detect_upstream_protocol_relative(
+        # 同一份正文里还有 href="/a.css" 这种根绝对路径 ——
+        # 宽模式 sub_filter 是**字面量**匹配，`href="/` 这个前缀
+        # 连 `href="//cdn/x.css` 都会命中 ⇒ 协议相对 URL 被改坏
+        # 正是这个原因。所以根绝对计数是 3（1 个单斜杠 + 2 个双斜杠）。
+        check('同时数出根绝对路径',
+              err is None and root_cnt == 3, f'root={root_cnt} err={err}')
+        _r2, _c2, _s2, err2 = app._detect_upstream_path_shapes(
             '127.0.0.1', 1, 'http', timeout=0.5)
         check('连不上时如实报错，不假装干净', err2 is not None, str(err2))
     finally:

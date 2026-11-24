@@ -2536,8 +2536,13 @@ def _detect_upstream_api_prefixes(host, port, protocol='http', timeout=3.0):
     改写规则一宽就把应用改坏。openapi.json 是上游自己声明的路由表，
     读它没有猜测成分 —— FastAPI / Flask / Django-REST 都有。
 
-    返回 (prefixes, error)。prefixes 形如 ['/api/']（已排序去重）。
+    返回 (prefixes, error)。prefixes 形如 ['/api/']。
     探测不到就返回空列表 + 原因，不抛异常：上游可能压根没开这个端点。
+
+    ⚠️ 排序：**命中条数多的排前面**（条数相同按名字排，保证同一份 openapi.json
+    每次探测结果一致）。自动装配直接取第一个 —— 同一份路由表里可能混着
+    /api/ 与 /admin/，覆盖条数多的那个才是这个应用真正的 API 前缀；
+    按名字排的话 "/admin/" 会排在 "/api/" 前面（字母序），选它就选错了。
     """
     if not host or not _is_port(port):
         return [], "目标地址不合法"
@@ -2564,17 +2569,18 @@ def _detect_upstream_api_prefixes(host, port, protocol='http', timeout=3.0):
     paths = data.get('paths')
     if not isinstance(paths, dict):
         return [], "openapi.json 里没有 paths 字段（可能不是 OpenAPI 文档）"
-    segs = set()
+    segs = {}
     for p in paths.keys():
         if not isinstance(p, str) or not p.startswith('/'):
             continue
         parts = [x for x in p.split('/') if x]
         # 只要两段以上才有「第一段是 API 前缀」的意义
         if len(parts) >= 2:
-            segs.add(parts[0])
+            segs[parts[0]] = segs.get(parts[0], 0) + 1
     if not segs:
         return [], "openapi.json 里没有多段路径，探测不到 API 前缀"
-    return sorted('/%s/' % s for s in segs), None
+    ordered = sorted(segs.items(), key=lambda kv: (-kv[1], kv[0]))
+    return ['/%s/' % s for s, _ in ordered], None
 
 
 # 协议相对 URL（属性值以 // 开头，如 href="//cdn.example.com/x.css"）。
@@ -2582,28 +2588,42 @@ def _detect_upstream_api_prefixes(host, port, protocol='http', timeout=3.0):
 _RE_PROTO_RELATIVE = re.compile(
     r'(?:href|src|action)\s*=\s*["\']//[^"\'\s>]{0,120}')
 
+# 根绝对路径（属性值以单个 / 开头，如 href="/static/app.css"）。
+#
+# ⚠️ 这几种字面量必须与生成器里 sf_rules 的宽模式条目**一一对应**
+#    （app.py 里 `for _attr in ("href","src","action")` 与 `url('/`、`url("/`）——
+#    改了那边不改这里，就会「探测说要开、实际没改」或反过来。
+#    写成字面量形态（不认 href = "/x" 这种带空格的写法）也是刻意的：
+#    nginx 的 sub_filter 是**字面量**匹配，带空格的写法它根本不会改。
+_RE_ROOT_ABSOLUTE = re.compile(r'(?:href|src|action)="/|url\(["\']/')
 
-def _detect_upstream_protocol_relative(host, port, protocol='http', timeout=3.0,
-                                       path='/'):
-    """检测上游首页里有没有「协议相对 URL」。
 
-    为什么需要它：宽模式（rewrite_root_paths）用的 sub_filter 模式是
-    `href="/` 这种**字面量**，它会连 `href="//cdn.example.com/x.css`
-    （协议相对 URL）一起改掉 —— 改成 /ght//cdn.example.com/x.css，
-    浏览器就会去请求一个根本不存在的地址，页面照样崩。
+def _detect_upstream_path_shapes(host, port, protocol='http', timeout=3.0,
+                                 path='/'):
+    """抓一次上游首页，数出两种路径形态。
 
-    nginx 的 sub_filter **不支持正则**（只能字面量替换），所以没法用
-    负向断言把 // 排除掉；而多条 sub_filter 之间是**各自独立作用于
-    原文**的（真机实测确认，不是链式），所以「先保护再改写再还原」
-    那套也走不通。
+    返回 (root_abs_count, proto_rel_count, samples, error)：
 
-    ⇒ 只能靠**告知用户**：检测到就明确警告，由用户自己决定要不要开这个开关。
-    检测不到（=没有协议相对 URL）时，开关是安全的。
+    - **root_abs_count**：根绝对路径（href="/x" 等）命中数。
+      宽模式 sub_filter 会给它们补上路径前缀 ⇒ 不开这个开关，
+      样式表/脚本/链接全跑到别的服务去 → 404。
+    - **proto_rel_count**：协议相对 URL（href="//cdn/x.css"）命中数。
+      宽模式**必然**把它们一起改坏（nginx sub_filter 只支持字面量，
+      没法把 // 排除掉）。
+    - **samples**：协议相对 URL 的样本（最多 5 个）。
+    - **error**：抓取失败的原因。
 
-    返回 (count, samples, error)。count=0 且 error=None 表示干净。
+    为什么合成一次抓取：两个计数都来自**同一份首页正文**，
+    分两次抓既慢，又可能拿到两个不同版本（上游正好在改页面时）。
+
+    ⚠️ 这个检测数的是**正文里的字符串**，分不清「真资源引用」与
+    「页面里写着给人看的示例」—— 实测面板自己的首页就把
+    `href="//cdn.example.com/x.css` 写在说明文字里（文档示例），
+    照样被数进去。所以**不能**拿 proto_rel_count>0 当成「绝对不能开」的判据，
+    自动装配的判据见 _rp_autofill_path_rewrite。
     """
     if not host or not _is_port(port):
-        return 0, [], "目标地址不合法"
+        return 0, 0, [], "目标地址不合法"
     proto = 'https' if str(protocol or '').lower() == 'https' else 'http'
     url = f"{proto}://{host}:{port}{path}"
     try:
@@ -2612,11 +2632,12 @@ def _detect_upstream_protocol_relative(host, port, protocol='http', timeout=3.0,
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read(2 * 1024 * 1024)
     except Exception as e:
-        return 0, [], "探测失败：目标无响应，或不是提供首页的服务"
+        return 0, 0, [], "探测失败：目标无响应，或不是提供首页的服务"
     try:
         text = body.decode('utf-8', 'replace')
     except Exception as e:
-        return 0, [], "探测失败：目标返回的内容无法解码"
+        return 0, 0, [], "探测失败：目标返回的内容无法解码"
+    root_hits = _RE_ROOT_ABSOLUTE.findall(text)
     hits = _RE_PROTO_RELATIVE.findall(text)
     samples = []
     for h in hits:
@@ -2624,7 +2645,75 @@ def _detect_upstream_protocol_relative(host, port, protocol='http', timeout=3.0,
             samples.append(h)
         if len(samples) >= 5:
             break
-    return len(hits), samples, None
+    return len(root_hits), len(hits), samples, None
+
+
+def _rp_autofill_path_rewrite(clean):
+    """新建反代规则时，自动探测上游的路径形态并填好改写开关。
+
+    就地改写 clean['api_path_prefix'] 与 clean['rewrite_root_paths']，
+    返回一句人类可读的说明（给前端提示用）。
+
+    为什么不让用户手填这两个字段：填错的后果是「页面能开、数据接口全 404」
+    ——症状极具迷惑性，用户会以为是自己部署坏了。系统探得到
+    （上游自己声明的路由表 + 首页正文），就没必要让用户猜。
+
+    判定口径：
+      · **API 路径前缀**：读上游的 openapi.json，取**命中条数最多**的第一段
+        （同一份路由表里可能混着 /api/ 与 /admin/，覆盖条数多的才是真前缀）。
+      · **根绝对路径改写**：首页正文里有 href="/x" 这类形态**才**需要开
+        （不开 ⇒ 样式表/脚本跑出 location → 404）；
+        **有协议相对 URL 时不开** —— 宽模式的 sub_filter 是字面量匹配，
+        必然把 href="//cdn/x.css" 一起改坏，nginx 没法排除 //。
+        宁可保持原状，也不要为了修一批资源去弄坏另一批。
+
+    探测不出来时**不动**这两个字段（探测失败 ≠ 结论是「不需要」）。
+
+    ⚠️ 只对 **LAN 网段内** 的目标探测：探测本质是「用面板去抓一个 URL」，
+       放开就等于把面板变成通用抓取器（P2-9 的同一条边界）。
+    """
+    addr = str(clean.get('target_address') or '').strip()
+    if not addr:
+        return ''
+    proto = str(clean.get('target_protocol') or 'http').strip().lower()
+    if '://' in addr:
+        proto, _, addr = addr.partition('://')
+        proto = proto.lower()
+    host, _, port = addr.rpartition(':')
+    host, port = host.strip(), port.strip()
+    if proto not in ('http', 'https') or not host or not _is_port(port):
+        return ''
+    if not _detect_target_allowed(host):
+        return '目标不在局域网网段内，已跳过自动检测（路径改写保持原样）'
+
+    notes = []
+    # ── API 路径前缀 ──
+    prefixes, err = _detect_upstream_api_prefixes(host, port, proto)
+    if prefixes:
+        try:
+            clean['api_path_prefix'] = _sanitize_api_path_prefix(prefixes[0])
+            notes.append('API 路径前缀已自动设为 ' + clean['api_path_prefix'])
+        except ValueError:
+            notes.append('探测到的 API 路径前缀不合法，未采用')
+    else:
+        notes.append('未探测到上游 API 路径前缀（'
+                     + (err or '上游未暴露 openapi.json') + '）')
+
+    # ── 根绝对路径改写 ──
+    root_abs, proto_rel, _samples, err2 = _detect_upstream_path_shapes(host, port, proto)
+    if err2:
+        notes.append('根绝对路径检测失败：' + err2)
+    elif root_abs == 0:
+        clean['rewrite_root_paths'] = False
+        notes.append('上游页面没有根绝对路径，未开启根绝对路径改写')
+    elif proto_rel > 0:
+        clean['rewrite_root_paths'] = False
+        notes.append('上游存在协议相对 URL，开启改写会改坏它们，未开启根绝对路径改写')
+    else:
+        clean['rewrite_root_paths'] = True
+        notes.append('已自动开启根绝对路径改写（检测到 %d 处根绝对路径）' % root_abs)
+
+    return '；'.join(notes)
 
 
 def config_to_variables(config):
@@ -13529,8 +13618,10 @@ def rp_detect_api_prefix():
     「页面里普通的路径字符串」误当成 API 前缀（那是扫 HTML 的老办法
     会犯的错，实测会把应用改坏）。
 
-    只探测、不落盘 —— 探测结果由前端填进表单，用户确认后才保存。
-    这样「探测」不会在保存规则的路径上引入网络依赖。
+    只探测、不落盘 —— 探测结果由调用方自己决定怎么用。
+
+    ⚠️ 2026-11-24 起界面上的两个输入框已撤掉，新建规则时由
+    _rp_autofill_path_rewrite 自动探测并填好；本端点保留为**诊断入口**。
     """
     data = request.get_json(silent=True) or {}
     addr = str(data.get('target_address', '') or '').strip()
@@ -13566,6 +13657,10 @@ def rp_detect_protocol_relative():
     探到了就明确告诉用户这个开关会改坏哪些东西。
 
     只探测、不落盘 —— 探测结果由前端显示，用户自己决定要不要开。
+
+    ⚠️ 2026-11-24 起界面上的两个输入框已撤掉，改由保存时自动检测
+    （见 _rp_autofill_path_rewrite）；本端点保留为**诊断入口**，
+    用来查「这台上游开了改写到底会不会改坏资源」。
     """
     data = request.get_json(silent=True) or {}
     addr = str(data.get('target_address', '') or '').strip()
@@ -13585,7 +13680,7 @@ def rp_detect_protocol_relative():
     if not _detect_target_allowed(host):
         return jsonify({"success": False,
                         "message": "target_address 必须是 LAN 网段内的内网 IP:端口"}), 400
-    count, samples, err = _detect_upstream_protocol_relative(host, port, proto)
+    _root_abs, count, samples, err = _detect_upstream_path_shapes(host, port, proto)
     return jsonify({"success": True,
                     "data": {"count": count, "samples": samples, "error": err}})
 
@@ -13732,6 +13827,20 @@ def rp_create_rule():
     if err:
         return jsonify({"success": False, "message": err}), 400
 
+    # 自动探测上游的路径形态，按需填好改写开关（2026-11-24）。
+    #
+    # ⚠️ **只在新建时做**，编辑时不覆盖：
+    #   · 界面上的两个输入框已经撤掉，用户没机会手填这两个字段
+    #     ⇒ 它们只可能来自「上一次自动探测的结论」或「内置预设的硬编码值」，
+    #     重新探测只会用「这次探测的结果」覆盖掉已经生效的正确配置；
+    #   · 内置的「防火墙控制」入口（/fw）上游就是面板自己，
+    #     面板首页正文里写着 `href="//cdn.example.com/x.css` 这句**说明文字**
+    #     （实测命中），按协议相对规则会判成「不能开」⇒ 会把 /fw 的改写关掉、
+    #     把面板自己的 CSS/JS 放跑 ⇒ 内置入口直接坏掉。
+    #   · 前端保存时会把**所有**规则逐条 PUT 一遍，编辑路径上加探测
+    #     ⇒ 每次保存都要 N×2 次网络请求，保存会明显变慢。
+    autofill_note = _rp_autofill_path_rewrite(clean)
+
     # 落盘与生效的顺序（先部署后落盘、冲突回滚）统一走 _rp_add_validated_rule，
     # 「防火墙控制」预设那条规则走的是同一段 ⇒ 两处行为不会分叉。
     new_id, err_msg, status = _rp_add_validated_rule(config, rp, clean)
@@ -13740,7 +13849,12 @@ def rp_create_rule():
 
     return jsonify({"success": True, "data": {
         "rule_id": new_id, "message": "反代服务已创建",
-        "nginx_reloaded": True}})
+        "nginx_reloaded": True, "autofill_note": autofill_note,
+        # 自动探测的结果回传给前端：前端本地那份规则对象还带着保存前的
+        # 空值，不回写的话列表里会显示「API 路径前缀：空」，
+        # 而服务端其实已经填好了 —— 界面与实际生效值对不上。
+        "api_path_prefix": clean.get("api_path_prefix", ""),
+        "rewrite_root_paths": bool(clean.get("rewrite_root_paths"))}})
 
 @app.route('/api/reverse-proxy/rules/<rule_id>', methods=['PUT'])
 def rp_update_rule(rule_id):

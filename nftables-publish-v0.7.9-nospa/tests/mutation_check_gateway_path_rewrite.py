@@ -148,29 +148,30 @@ JS_MUTANTS = [
     ('newRpRule 不带 rewrite_root_paths 字段',
      "        rewrite_root_paths: false,",
      "        // 少了这个字段"),
-
-    ('前端不再读 res.data 这一层（预检结果永远读不到）',
-     "        const d = (res && res.data) || {};",
-     "        const d = res || {};"),
-
-    ('前端把预检端点路径写错（探测会打到不存在的路由）',
-     "api.post('/api/reverse-proxy/detect-protocol-relative', {",
-     "api.post('/api/reverse-proxy/detect-proto-relative', {"),
 ]
 
 HTML_MUTANTS = [
-    ('表单里 checkbox 不再绑定 rewrite_root_paths（开关打不开）',
-     '<input type="checkbox" x-model="rpEditingRule.rewrite_root_paths" class="mt-1">',
-     '<input type="checkbox" x-model="rpEditingRule.rewriteRootPaths" class="mt-1">'),
-
-    ('表单里删掉了预检按钮（用户没法知道会不会误伤）',
-     '@click="detectRpProtocolRelative()"',
-     '@click="detectRpProtoRel()"'),
-
     ('列表里不再显示「根绝对路径改写」这一项',
      '<div x-show="rule.rewrite_root_paths">',
      '<div x-show="false">'),
 ]
+
+
+def _fail_lines(stdout):
+    """从测试输出里挑出**真正的断言失败行**。
+
+    ⚠️ 必须排除汇总行：两套测试的汇总行都自带失败标记
+    （`合计: ✅ 30   ❌ 0` 与 `合计: 通过 23   失败 0`），
+    把它当失败就是「什么都没抓也报抓住」—— 指标自己骗自己。
+    """
+    out = []
+    for line in stdout.splitlines():
+        s = line.strip()
+        if s.startswith('合计'):
+            continue
+        if '[FAIL]' in s or '❌' in s:
+            out.append(s)
+    return out
 
 
 def run_py():
@@ -188,23 +189,29 @@ def run_js():
 RUNNERS = {PY: run_py, JS_KEY: run_js}
 
 
+def _pass_count(stdout):
+    """数通过条数：两套测试的通过标记不一样（emoji 与 [PASS]）。"""
+    return stdout.count('[PASS]') + stdout.count('✅')
+
+
 def report(name, results):
     """results = [(label, CompletedProcess), ...]"""
     caught = False
     detail = ''
     for label, r in results:
-        fails = [l.strip() for l in r.stdout.splitlines() if '❌' in l]
-        # 变异让代码自己崩掉也算抓到 —— 崩掉正是要防的事。
-        if r.returncode != 0 and (fails or r.stderr.strip()):
+        fails = _fail_lines(r.stdout)
+        # ⚠️ 口径：**必须有真正的断言失败行**才算捕获。
+        #   rc≠0 但一条失败行都没有 = 测试自己崩了（不是被变异打红的），
+        #   按项目口径不算捕获 —— 否则「测试崩了」会被记成「变异抓住了」。
+        if fails:
             caught = True
-            detail = (fails[0][:86] if fails
-                      else ('测试崩溃: ' + r.stderr.strip().splitlines()[-1][:70]))
+            detail = fails[0][:86]
             break
     if caught:
-        print(f'  ✅ 抓住 {name}')
+        print(f'  [OK] 抓住 {name}')
         print(f'        首个失败: {detail}')
     else:
-        print(f'  ❌ 漏过 {name}')
+        print(f'  [FAIL] 漏过 {name}')
     return caught
 
 
@@ -217,19 +224,19 @@ def main():
     base_py = run_py()
     base_js = run_js()
     if base_py.returncode != 0:
-        print('❌ 基线（Python）没过：')
+        print('[FAIL] 基线（Python）没过：')
         print(base_py.stdout[-3000:])
         if base_py.stderr:
             print(base_py.stderr[-1500:])
         return 1
     if base_js.returncode != 0:
-        print('❌ 基线（前端契约）没过：')
+        print('[FAIL] 基线（前端契约）没过：')
         print(base_js.stdout[-3000:])
         if base_js.stderr:
             print(base_js.stderr[-1500:])
         return 1
-    print(f'基线通过  Python {base_py.stdout.count("✅")} 条  '
-          f'前端契约 {base_js.stdout.count("✅")} 条\n')
+    print(f'基线通过  Python {_pass_count(base_py.stdout)} 条  '
+          f'前端契约 {_pass_count(base_js.stdout)} 条\n')
 
     caught, noanchor = 0, []
     try:
@@ -240,19 +247,19 @@ def main():
         ):
             for name, old, new in mutants:
                 if old not in src:
-                    print(f'  ⚠️  锚点未命中 [{label}]: {name}')
+                    print(f'  [WARN] 锚点未命中 [{label}]: {name}')
                     noanchor.append(name)
                     continue
                 mutated = src.replace(old, new, 1)
                 if mutated == src:
-                    print(f'  ⚠️  变异没改到内容 [{label}]: {name}')
+                    print(f'  [WARN] 变异没改到内容 [{label}]: {name}')
                     noanchor.append(name)
                     continue
                 open(path, 'w', encoding='utf-8').write(mutated)
                 # 闸：变异必须真的落到这个文件上。写完立刻回读比对。
                 on_disk = open(path, encoding='utf-8').read()
                 if on_disk != mutated:
-                    print(f'  ❌ 变异没落到 [{label}]: {name}')
+                    print(f'  [FAIL] 变异没落到 [{label}]: {name}')
                     noanchor.append(name)
                     open(path, 'w', encoding='utf-8').write(src)
                     continue

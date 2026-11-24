@@ -352,10 +352,6 @@ function app() {
     rpRequestWildcard: false,
     rpRequestRenewDays: 60,
     rpRequestAutoRenew: true,
-    rpDetectingPrefix: false,
-    rpApiPrefixHint: '',
-    rpDetectingProtoRel: false,
-    rpProtoRelHint: '',
 
     ddns: {
       services: [],
@@ -2535,90 +2531,6 @@ function app() {
       this.saveRpRules();
     },
 
-    // ── 反代规则：上游 API 路径前缀探测 ──────────────────────────
-    //
-    // 上游页面里写死的绝对路径（典型 /api/xxx）会逃出网关的 path 前缀
-    // location → 匹配不到任何 location → 404。这一段填上之后，
-    // 网关在转发时会把这类路径改写成带前缀的版本。
-    //
-    // 探测读的是上游自己的 openapi.json（路由表），不是扫 HTML ——
-    // 扫 HTML 只能靠猜，猜宽了会把应用里普通的路径字符串也改掉。
-    async detectRpApiPrefix() {
-      const r = this.rpEditingRule;
-      if (!r) return;
-      const addr = String(r.target_address || '').trim();
-      if (!addr) {
-        this.rpApiPrefixHint = '请先填写目标地址';
-        return;
-      }
-      this.rpDetectingPrefix = true;
-      this.rpApiPrefixHint = '';
-      try {
-        const res = await api.post('/api/reverse-proxy/detect-api-prefix', {
-          target_address: addr,
-          target_protocol: r.target_protocol || 'http',
-        });
-        // 后端返回 {success, data:{prefixes, error}} —— api.request 只剥
-        // 顶层的 success/message，data 信封原样留着，所以要读 res.data.*。
-        const prefixes = (res.data && res.data.prefixes) || [];
-        const err = (res.data && res.data.error) || '';
-        if (prefixes.length === 1) {
-          r.api_path_prefix = prefixes[0];
-          this.rpApiPrefixHint = '已填入 ' + prefixes[0] + '（保存后生效）';
-        } else if (prefixes.length > 1) {
-          this.rpApiPrefixHint = '探测到多个前缀：' + prefixes.join('、')
-            + '，请自行填写其中一个';
-        } else {
-          this.rpApiPrefixHint = '没探测到：' + (err || '上游未暴露 openapi.json');
-        }
-      } catch (e) {
-        this.rpApiPrefixHint = '探测失败: ' + e.message;
-      } finally {
-        this.rpDetectingPrefix = false;
-      }
-    },
-
-    // ── 反代规则：协议相对 URL 预检 ──────────────────────────────
-    //
-    // 「根绝对路径改写」用的 sub_filter 是字面量匹配（nginx 不支持正则），
-    // 它会把协议相对 URL（href="//cdn.example.com/x.css"）一起改坏。
-    // 开启前先探一下，探到了就明确告诉用户。
-    async detectRpProtocolRelative() {
-      const r = this.rpEditingRule;
-      if (!r) return;
-      const addr = String(r.target_address || '').trim();
-      if (!addr) {
-        this.rpProtoRelHint = '先填目标地址';
-        return;
-      }
-      this.rpDetectingProtoRel = true;
-      this.rpProtoRelHint = '';
-      try {
-        const res = await api.post('/api/reverse-proxy/detect-protocol-relative', {
-          target_address: addr,
-          target_protocol: r.target_protocol || 'http',
-        });
-        const d = (res && res.data) || {};
-        const count = d.count || 0;
-        const samples = d.samples || [];
-        const err = d.error || '';
-        if (err) {
-          this.rpProtoRelHint = '探测失败：' + err;
-        } else if (count === 0) {
-          this.rpProtoRelHint = '✅ 没发现协议相对 URL —— 开启「根绝对路径改写」是安全的。';
-        } else {
-          this.rpProtoRelHint = '⚠️ 发现 ' + count + ' 处协议相对 URL：'
-            + samples.join('、')
-            + ' —— 开启「根绝对路径改写」会把它们改坏（nginx sub_filter 只支持字面量，'
-            + '排除不掉 //）。请先确认这些资源能不能改成 https:// 绝对地址。';
-        }
-      } catch (e) {
-        this.rpProtoRelHint = '探测失败: ' + e.message;
-      } finally {
-        this.rpDetectingProtoRel = false;
-      }
-    },
-
     // 新建一条服务。字段名必须与 _validate_rp_service 的 clean 输出一致，
     // 之前这里内联写了 domain / listen_port / ssl_cert_id —— v0.8.1 已砍掉这三个，
     // 再带着它们提交会被后端忽略，而 path_prefix 反而缺省成 undefined。
@@ -2631,10 +2543,13 @@ function app() {
         // 默认 1M（nginx 自己的默认值）—— 公网入口的请求体上限不宜默认「不限」。
         // 需要传大文件时在表单里改大（填 0 = 不限）。
         client_max_body_size: '1M',
+        // ⚠️ 这两个字段**不由界面决定**（2026-11-24 起输入框已撤掉）：
+        // 新建时后端会探测上游的接口清单与首页正文，自动填好它们
+        // （见后端 _rp_autofill_path_rewrite）。这里给的是空值占位。
         api_path_prefix: '',
         // host 分发入口（对外域名）：空 = 不开，只有路径前缀一个入口。
         host: '',
-        // 根绝对路径改写：默认关。用相对路径的应用不需要它。
+        // 根绝对路径改写：同样交给后端自动探测（这里默认关）。
         rewrite_root_paths: false,
         icon: '',
         enabled: true,
@@ -2681,6 +2596,7 @@ function app() {
       try {
         // Save rules one by one: existing rules use PUT, new rules use POST
         // 注意：POST 必须回写后端返回的 rule_id 到 rp.rules[i].id，否则下次保存会重复创建
+        let autofillNote = '';
         for (let i = 0; i < this.rp.rules.length; i++) {
           const { _editIndex, ...clean } = this.rp.rules[i];
           if (clean.id) {
@@ -2694,9 +2610,22 @@ function app() {
             if (created && created.rule_id) {
               this.rp.rules[i].id = created.rule_id;  // 同步后端分配的 id
             }
+            // ⚠️ 这两个字段现在是**后端探测后定的**（界面上没有输入框了），
+            //   必须把后端返回的值写回本地对象 —— 否则列表里显示的还是
+            //   保存前的空值，界面与实际生效值对不上。
+            if (created && created.api_path_prefix !== undefined) {
+              this.rp.rules[i].api_path_prefix = created.api_path_prefix;
+            }
+            if (created && created.rewrite_root_paths !== undefined) {
+              this.rp.rules[i].rewrite_root_paths = !!created.rewrite_root_paths;
+            }
+            if (created && created.autofill_note) {
+              autofillNote = created.autofill_note;
+            }
           }
         }
-        this.showToast('反代规则已保存', 'success');
+        this.showToast('反代规则已保存'
+          + (autofillNote ? '（' + autofillNote + '）' : ''), 'success');
         // auto reload nginx
         try {
           await api.post('/api/reverse-proxy/nginx/reload');
