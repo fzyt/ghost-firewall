@@ -55,7 +55,7 @@ Ghost Firewall（原内部代号 **nftables-web-v2**）是部署在 OpenWrt 路�
 | **认证网关** | 单端口汇聚所有服务，按路径前缀区分，公网访问需认证 |
 | **端口敲门** | 自定义 4 端口敲门序列，敲对才把来源 IP 加进白名单 |
 | **端口转发** | TCP / UDP 转发，IPv4 / IPv6 双栈 |
-| **反代管理** | Nginx 反向代理，SSL 证书（手动上传 + ACME 自动申请），多 DNS 服务商 |
+| **反代管理** | Nginx 反向代理，SSL 证书（手动上传 + ACME 自动申请），多 DNS 服务商；路径改写**新建时自动探测上游**，不用手填 |
 | **DDNS** | 通用 DDNS + 阿里云 DDNS，多 DNS 服务商，支持 IPv6 来源地址选择 |
 | **访问控制** | LAN 模式 / 信任 IP 模式 |
 | **名单管理** | IP 黑白名单 |
@@ -214,6 +214,8 @@ bash tests/run_e2e.sh portal    # 认证门户全链路
   authenticated reverse-proxy gateway.
 - **Features** — firewall rules, port knocking, port forwarding, DDNS, Nginx reverse proxy with
   ACME-managed certificates, IP allow/deny lists, geo-blocking, log management and export.
+  Reverse-proxy path rewriting is **auto-detected when a rule is created** — no manual
+  prefix or toggle to fill in.
 - **Install** — one command on OpenWrt (24.10 / opkg or 25.x / apk):
 
 ```bash
